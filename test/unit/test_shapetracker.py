@@ -44,7 +44,7 @@ class CheckingShapeTracker:
     return self
 
   def flip(self, axis):
-    self.st = self.st.stride(tuple(-1 if i in axis else 1 for i in range(len(self.shape))))
+    self.st = self.st.flip(tuple(i in axis for i in range(len(self.shape))))
     self.t = np.flip(self.t, axis)
     return self
 
@@ -75,7 +75,7 @@ class CheckingShapeTracker:
   def assert_same(self):
     x = [(v[0] if (v:=shapetracker_getitem(self.st, i))[1] else -1) for i in range(prod(self.st.shape))]
     y = [self[i] for i in range(prod(self.shape))]
-    assert self.st.shape == self.shape
+    assert self.st.shape == self.shape, f"mismatch shapetracker shape:{self.st.shape} real:{self.shape}"
     assert x == y, f"mismatch shapetracker:{x} real:{y}"
 
 @unittest.skip("don't create shapetrackers with views")
@@ -573,6 +573,7 @@ class TestSingleShapeTracker(unittest.TestCase):
 class TestShapeTrackerFuzzFailures(unittest.TestCase):
   def setUp(self):
     self.st = CheckingShapeTracker((3,3,3))
+    print("TestShapeTrackerFuzzFailures.setUp: stride ", self.st.stride)
   def tearDown(self):
     self.st.assert_same()
   def test_case_1(self):

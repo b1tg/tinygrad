@@ -9,6 +9,7 @@ on:
   push:
     branches:
       - master
+      - flip
   pull_request:
   workflow_dispatch:
 

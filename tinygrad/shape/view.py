@@ -212,7 +212,7 @@ class View:
   def invert(self, out_shape:tuple[sint, ...]) -> Optional[View]:
     ret = View.create(self.shape)
     if self.mask: ret = ret.shrink(self.mask)
-    ret = ret.stride(tuple(-1 if x < 0 else 1 for x in self.strides)).permute(argsort(tuple(-x if x > 0 else x for x in self.strides)))
+    ret = ret.flip(tuple(x < 0 for x in self.strides)).permute(argsort(tuple(-x if x > 0 else x for x in self.strides)))
     return ret if prod(ret.shape) == prod(out_shape) else None   # don't support shrink, expand, or stride != (-1, 1)
 
   @functools.lru_cache(maxsize=None)  # pylint: disable=method-cache-max-size-none
@@ -265,11 +265,34 @@ class View:
                        tuple(self.mask[a] for a in axis) if self.mask is not None else None)
 
   @functools.lru_cache(maxsize=None)  # pylint: disable=method-cache-max-size-none
-  def stride(self, mul: tuple[int, ...]) -> View:
-    # except for the negative case, you can build this from the others. invertible in the negative case
-    assert all(isinstance(x, int) and x != 0 for x in mul), f"invalid stride {mul} for {self.shape}"
+  def flip(self, arg: tuple[bool, ...]) -> View:
+    # NOTE: this used to be stride, can probably be cleaned up now
+    mul = [-1 if x else 1 for x in arg]
+    # mul = [1, 1, -2]
+    print("View.flip: mul ", mul)
+    print("View.flip: self.strides ", self.strides)
+    print("View.flip: zip(self.strides, mul) ", list(zip(self.strides, mul)))
+    strides = tuple([z*m for z,m in zip(self.strides, mul)])
+    print("View.flip: strides ", strides)
+    print("View.flip old_shape: ", self.shape)
+    #  if mul = [1, 1, -2] , new_shape=(3, 3, 2)
+    new_shape = tuple([ceildiv(s, abs(m)) for s,m in zip(self.shape, mul)])
+    print("View.flip new_shape: ", new_shape)
+    offset = sum([(s-1)*z for s,z,m in zip(self.shape, self.strides, mul) if m < 0])
+    print("View.flip offset: ", offset)
+    mask = tuple([(ceildiv(mx if m > 0 else s-my, abs(m)), ceildiv(my if m > 0 else s-mx, abs(m))) \
+                  for (mx,my),s,m in zip(self.mask, self.shape, mul)]) if self.mask is not None else None
+    print("View.flip mask: ", mask)
+    res = View.create(new_shape, strides, self.offset + offset, mask)
+    # return self.steps(res)
+    return res
+
+  @functools.lru_cache(maxsize=None)  # pylint: disable=method-cache-max-size-none
+  def flip1(self, mul: tuple[int, ...]) -> View:
+    print("View.flip1: steps ", mul)
     strides = tuple([z*m for z,m in zip(self.strides, mul)])
     new_shape = tuple([ceildiv(s, abs(m)) for s,m in zip(self.shape, mul)])
+    print("View.flip1 new_shape: ", new_shape)
     offset = sum([(s-1)*z for s,z,m in zip(self.shape, self.strides, mul) if m < 0])
     mask = tuple([(ceildiv(mx if m > 0 else s-my, abs(m)), ceildiv(my if m > 0 else s-mx, abs(m))) \
                   for (mx,my),s,m in zip(self.mask, self.shape, mul)]) if self.mask is not None else None
