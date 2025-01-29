@@ -9,6 +9,7 @@ from tinygrad.helpers import IMAGE, WINO, _METADATA, Metadata, TRACEMETA, ceildi
 from tinygrad.engine.multi import get_multi_map
 from tinygrad.gradient import compute_gradient
 from tinygrad.ops import smax, smin, resolve, UOp, Ops, sint, Variable, MathTrait, identity_element
+from tinygrad.ops import ConstLike
 from tinygrad.device import Device, BufferSpec
 from tinygrad.engine.realize import run_schedule
 from tinygrad.engine.memory import memory_planner
@@ -2509,7 +2510,22 @@ class Tensor(MathTrait):
     ```
     """
     return self.log2()*math.log(2)
-  def log2(self):
+  def const_like(self, b:ConstLike):
+    # return UPat.const(self.dtype, cast(ConstType, b))
+    return b
+  def alu(self, op:Ops, *src):
+    m = {
+      Ops.LOG2: UOp.log2,
+      Ops.EXP2: UOp.exp2,
+    }
+    # Ops.LOG2 => UOp.log2
+    # print("== op: ", op)
+    # asrc = (self,)+src
+    # return UPat(op, dtypes.bool if op in {Ops.CMPLT, Ops.CMPNE} else asrc[-1].dtype, list(asrc) if op in GroupOp.Commutative else asrc)
+    # return UOp(op, dtypes.int, *src)
+    return self.cast(least_upper_float(dtypes.int))._apply_uop(m[op])
+
+  def log2_(self):
     """
     Computes the base-2 logarithm element-wise.
 
@@ -2531,7 +2547,7 @@ class Tensor(MathTrait):
     ```
     """
     return self.mul(1/math.log(2)).exp2()
-  def exp2(self):
+  def exp2_(self):
     """
     Computes the base-2 exponential function element-wise.
 
@@ -3255,6 +3271,11 @@ class Tensor(MathTrait):
     """
     if self.dtype != dtypes.bool and not dtypes.is_int(self.dtype): raise RuntimeError(f"{self.dtype} is not supported")
     return self.logical_not() if self.dtype == dtypes.bool else self ^ -1
+  # def const_like(self, b:ConstLike):
+  #   return Tensor.const(self.dtype, cast(ConstType, b))
+  # def alu(self, op:Ops, *src:int):
+  #   asrc = (self,)+src
+  #   return UPat(op, dtypes.bool if op in {Ops.CMPLT, Ops.CMPNE} else asrc[-1].dtype, list(asrc) if op in GroupOp.Commutative else asrc)
 
   def lshift(self, x:int, reverse=False):
     """

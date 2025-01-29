@@ -9,6 +9,7 @@ on:
   push:
     branches:
       - master
+      - tensor_mathtrait
   pull_request:
   workflow_dispatch:
 
