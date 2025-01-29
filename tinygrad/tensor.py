@@ -2518,12 +2518,13 @@ class Tensor(MathTrait):
       Ops.LOG2: UOp.log2,
       Ops.EXP2: UOp.exp2,
     }
+    out_dtype = (self, *src)[-1].dtype
     # Ops.LOG2 => UOp.log2
     # print("== op: ", op)
     # asrc = (self,)+src
     # return UPat(op, dtypes.bool if op in {Ops.CMPLT, Ops.CMPNE} else asrc[-1].dtype, list(asrc) if op in GroupOp.Commutative else asrc)
     # return UOp(op, dtypes.int, *src)
-    return self.cast(least_upper_float(dtypes.int))._apply_uop(m[op])
+    return self.cast(least_upper_float(out_dtype))._apply_uop(m[op])
 
   def log2_(self):
     """
