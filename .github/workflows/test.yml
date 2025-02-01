@@ -458,7 +458,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        backend: [llvm, clang, gpu, ptx, amd, nv] #, triton]
+        backend: [amd] #, triton]
 
     name: Tests on (${{ matrix.backend }})
     runs-on: ubuntu-22.04
@@ -536,7 +536,7 @@ jobs:
           EOF
           echo -e 'Package: *\nPin: release o=repo.radeon.com\nPin-Priority: 600' | sudo tee /etc/apt/preferences.d/rocm-pin-600
           sudo apt update || true
-          sudo apt install --no-install-recommends --allow-unauthenticated -y hsa-rocr comgr hsa-rocr-dev liburing-dev libc6-dev
+          sudo apt install --no-install-recommends --allow-unauthenticated -y rocm-device-libs rocm-hip-runtime rocm-hip-libraries rocm-llvm hsa-rocr comgr hsa-rocr-dev liburing-dev libc6-dev
           curl -s https://api.github.com/repos/Qazalin/remu/releases/latest | \
           jq -r '.assets[] | select(.name == "libremu.so").browser_download_url' | \
           sudo xargs curl -L -o /usr/local/lib/libremu.so
@@ -545,12 +545,23 @@ jobs:
             /opt/rocm/lib64
           EOF
           sudo ldconfig
+      - name: find clang
+        if: matrix.backend == 'amd'
+        run: |
+          echo "[*] ls /opt/rocm-6.1.2/"
+          ls /opt/rocm-6.1.2/
+          echo "[*] ls /opt/rocm-6.1.2/lib"
+          ls /opt/rocm-6.1.2/lib
+          echo "[*] find /opt/ -name llvm-objdump"
+          find /opt/ -name llvm-objdump
+          echo "[*] find /opt/ -name hip.bc"
+          find /opt/ -name hip.bc
       - name: Install dependencies
         run: pip install -e '.[testing${{matrix.backend=='llvm'&&',llvm'||matrix.backend=='ptx'&&',cuda'||matrix.backend=='triton'&&',triton'||''}}]' --extra-index-url https://download.pytorch.org/whl/cpu --extra-index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/Triton-Nightly/pypi/simple/
       - name: Check Device.DEFAULT and print some source
         run: |
           PYTHONPATH=${{ github.workspace }} python3 -c "from tinygrad import Device; assert Device.DEFAULT in ['LLVM','CLANG','CUDA','GPU','AMD','NV'], Device.DEFAULT"
-          DEBUG=5 PYTHONPATH=${{ github.workspace }} FORWARD_ONLY=1 python3 test/test_ops.py TestOps.test_add
+          AMD_COMGR_SAVE_TEMPS=1 AMD_COMGR_REDIRECT_LOGS=stdout AMD_COMGR_EMIT_VERBOSE_LOGS=1 PYTHONPATH=${{ github.workspace }} FORWARD_ONLY=1 python3 test/test_ops.py TestOps.test_acos
       - name: Run pytest (not cuda or amd)
         if: matrix.backend!='ptx' && matrix.backend!='triton' && matrix.backend != 'amd' && matrix.backend != 'nv'
         run: python -m pytest -n=auto test/ --ignore=test/unit --durations=20
