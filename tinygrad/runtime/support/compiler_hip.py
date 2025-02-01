@@ -56,7 +56,49 @@ def compile_hip_comgr(prg:str, arch="gfx1100", asm=False) -> bytes:
   check(comgr.amd_comgr_destroy_action_info(action_info))
   return ret
 
+def compile_hip_sh(prg:str, arch="gfx1100", asm=False) -> bytes:
+  with open("/tmp/1.c", "w") as f:
+    f.write(prg)
+
+  subprocess.run(['/home/b1tg/tinygrad/1.sh'], input=prg.encode('utf-8'), check=True)
+  with open("/tmp/comgr-24faa3/output/a.so", "rb") as f:
+    return f.read()
 def compile_hip(prg:str, arch="gfx1100", asm=False) -> bytes:
+  # print("[*] stage 1")
+  args = [
+"-cc1", "-triple", "amdgcn-amd-amdhsa", "-aux-triple", "x86_64-unknown-linux-gnu", "-E",  "-clear-ast-before-backend", "-disable-llvm-verifier", "-discard-value-names", "-main-file-name", "<null>", "-mrelocation-model", "pic", "-pic-level", "2", "-fhalf-no-semantic-interposition", "-mframe-pointer=none", "-fno-rounding-math", "-mconstructor-aliases", "-aux-target-cpu", "x86-64", "-fcuda-is-device", "-mllvm", "-amdgpu-internalize-symbols", "-fcuda-allow-variadic-functions", "-fvisibility=hidden", "-fapply-global-visibility-to-externs", "-mlink-builtin-bitcode", "/opt/rocm/amdgcn/bitcode/hip.bc", "-mlink-builtin-bitcode", "/opt/rocm/amdgcn/bitcode/ocml.bc", "-mlink-builtin-bitcode", "/opt/rocm/amdgcn/bitcode/ockl.bc", "-mlink-builtin-bitcode", "/opt/rocm/amdgcn/bitcode/oclc_daz_opt_off.bc", "-mlink-builtin-bitcode", "/opt/rocm/amdgcn/bitcode/oclc_unsafe_math_off.bc", "-mlink-builtin-bitcode", "/opt/rocm/amdgcn/bitcode/oclc_finite_only_off.bc", "-mlink-builtin-bitcode", "/opt/rocm/amdgcn/bitcode/oclc_correctly_rounded_sqrt_on.bc", "-mlink-builtin-bitcode", "/opt/rocm/amdgcn/bitcode/oclc_wavefrontsize64_off.bc", "-mlink-builtin-bitcode", f"/opt/rocm/amdgcn/bitcode/oclc_isa_version_{arch[3:]}.bc", "-mlink-builtin-bitcode", "/opt/rocm/amdgcn/bitcode/oclc_abi_version_500.bc", "-target-cpu", arch, "-target-feature", "+cumode", "-debugger-tuning=gdb", "-fdebug-compilation-dir=/home/b1tg/tinygrad", "-resource-dir", "/opt/rocm-6.2.4/llvm/lib/clang/18", "-internal-isystem", "/opt/rocm-6.2.4/llvm/lib/clang/18/include/cuda_wrappers", "-isystem", "/opt/rocm-6.2.4/include", "-isystem", "/opt/rocm-6.2.4/hip/include", "-I", "/tmp/comgr-6c7c96/include", "-D", "HIP_VERSION_MAJOR=6", "-D", "HIP_VERSION_MINOR=0", "-D", "HIP_VERSION_PATCH=32830", "-D", "__HIPCC_RTC__", "-I", "/opt/rocm/include", "-internal-isystem", "/usr/lib/gcc/x86_64-linux-gnu/12/../../../../include/c++/12", "-internal-isystem", "/usr/lib/gcc/x86_64-linux-gnu/12/../../../../include/x86_64-linux-gnu/c++/12", "-internal-isystem", "/usr/lib/gcc/x86_64-linux-gnu/12/../../../../include/c++/12/backward", "-internal-isystem", "/usr/lib/gcc/x86_64-linux-gnu/12/../../../../include/c++/12", "-internal-isystem", "/usr/lib/gcc/x86_64-linux-gnu/12/../../../../include/x86_64-linux-gnu/c++/12", "-internal-isystem", "/usr/lib/gcc/x86_64-linux-gnu/12/../../../../include/c++/12/backward", "-internal-isystem", "/opt/rocm-6.2.4/llvm/lib/clang/18/include", "-internal-isystem", "/usr/local/include", "-internal-isystem", "/usr/lib/gcc/x86_64-linux-gnu/12/../../../../x86_64-linux-gnu/include", "-internal-externc-isystem", "/usr/include/x86_64-linux-gnu", "-internal-externc-isystem", "/include", "-internal-externc-isystem", "/usr/include", "-internal-isystem", "/opt/rocm-6.2.4/llvm/lib/clang/18/include", "-internal-isystem", "/usr/local/include", "-internal-isystem", "/usr/lib/gcc/x86_64-linux-gnu/12/../../../../x86_64-linux-gnu/include", "-internal-externc-isystem", "/usr/include/x86_64-linux-gnu", "-internal-externc-isystem", "/include", "-internal-externc-isystem", "/usr/include", "-O3", "-Wno-gnu-line-marker", "-Wno-missing-prototypes", "-std=c++14", "-fdeprecated-macro", "-fno-autolink", "-ferror-limit", "19", "-fhip-new-launch-api", "-fgnuc-version=4.2.1", "-fcxx-exceptions", "-fexceptions", "-fcolor-diagnostics", "-vectorize-loops", "-vectorize-slp", "-mlink-builtin-bitcode-postopt", "-disable-llvm-passes", "-cuid=d4ddbcdbb98e61b8", "-fcuda-allow-variadic-functions", "-faddrsig", "-D__GCC_HAVE_DWARF2_CFI_ASM=1", "-o", "-", "-x", "hip", "-" #noqa:E501
+  ]
+  obj = subprocess.check_output(['/opt/rocm/llvm/bin/clang', *args], input=prg.encode('utf-8'))
+  args = [
+"-cc1", "-triple", "amdgcn-amd-amdhsa", "-aux-triple", "x86_64-unknown-linux-gnu", "-emit-llvm-bc", "-emit-llvm-uselists", "-save-temps=/tmp/comgr-6c7c96/output", "-clear-ast-before-backend", "-disable-llvm-verifier", "-discard-value-names", "-main-file-name", "<null>", "-mrelocation-model", "pic", "-pic-level", "2", "-fhalf-no-semantic-interposition", "-mframe-pointer=none", "-fno-rounding-math", "-mconstructor-aliases", "-aux-target-cpu", "x86-64", "-fcuda-is-device", "-mllvm", "-amdgpu-internalize-symbols", "-fcuda-allow-variadic-functions", "-fvisibility=hidden", "-fapply-global-visibility-to-externs", "-mlink-builtin-bitcode", "/opt/rocm/amdgcn/bitcode/hip.bc", "-mlink-builtin-bitcode", "/opt/rocm/amdgcn/bitcode/ocml.bc", "-mlink-builtin-bitcode", "/opt/rocm/amdgcn/bitcode/ockl.bc", "-mlink-builtin-bitcode", "/opt/rocm/amdgcn/bitcode/oclc_daz_opt_off.bc", "-mlink-builtin-bitcode", "/opt/rocm/amdgcn/bitcode/oclc_unsafe_math_off.bc", "-mlink-builtin-bitcode", "/opt/rocm/amdgcn/bitcode/oclc_finite_only_off.bc", "-mlink-builtin-bitcode", "/opt/rocm/amdgcn/bitcode/oclc_correctly_rounded_sqrt_on.bc", "-mlink-builtin-bitcode", "/opt/rocm/amdgcn/bitcode/oclc_wavefrontsize64_off.bc", "-mlink-builtin-bitcode", f"/opt/rocm/amdgcn/bitcode/oclc_isa_version_{arch[3:]}.bc", "-mlink-builtin-bitcode", "/opt/rocm/amdgcn/bitcode/oclc_abi_version_500.bc", "-target-cpu", arch, "-target-feature", "+cumode", "-debugger-tuning=gdb", "-fdebug-compilation-dir=/home/b1tg/tinygrad", "-resource-dir", "/opt/rocm-6.2.4/llvm/lib/clang/18", "-O3", "-Wno-gnu-line-marker", "-Wno-missing-prototypes", "-std=c++14", "-fdeprecated-macro", "-fno-autolink", "-ferror-limit", "19", "-fhip-new-launch-api", "-fgnuc-version=4.2.1", "-fcxx-exceptions", "-fexceptions", "-fcolor-diagnostics", "-vectorize-loops", "-vectorize-slp", "-mlink-builtin-bitcode-postopt", "-disable-llvm-passes", "-disable-llvm-passes", "-cuid=d4ddbcdbb98e61b8", "-fcuda-allow-variadic-functions", "-faddrsig", "-D__GCC_HAVE_DWARF2_CFI_ASM=1", "-o", "-", "-x", "hip-cpp-output", "-" #noqa:E501
+  ]
+  obj = subprocess.check_output(['/opt/rocm/llvm/bin/clang', *args], input=obj)
+
+  args = [
+"-cc1", "-triple", "amdgcn-amd-amdhsa", "-aux-triple", "x86_64-unknown-linux-gnu", "-emit-llvm-bc", "-emit-llvm-uselists", "-save-temps=/tmp/comgr-6c7c96/output", "-clear-ast-before-backend", "-disable-llvm-verifier", "-discard-value-names", "-main-file-name", "<null>", "-mrelocation-model", "pic", "-pic-level", "2", "-fhalf-no-semantic-interposition", "-mframe-pointer=none", "-fno-rounding-math", "-mconstructor-aliases", "-aux-target-cpu", "x86-64", "-fcuda-is-device", "-mllvm", "-amdgpu-internalize-symbols", "-fcuda-allow-variadic-functions", "-fvisibility=hidden", "-fapply-global-visibility-to-externs", "-mlink-builtin-bitcode", "/opt/rocm/amdgcn/bitcode/hip.bc", "-mlink-builtin-bitcode", "/opt/rocm/amdgcn/bitcode/ocml.bc", "-mlink-builtin-bitcode", "/opt/rocm/amdgcn/bitcode/ockl.bc", "-mlink-builtin-bitcode", "/opt/rocm/amdgcn/bitcode/oclc_daz_opt_off.bc", "-mlink-builtin-bitcode", "/opt/rocm/amdgcn/bitcode/oclc_unsafe_math_off.bc", "-mlink-builtin-bitcode", "/opt/rocm/amdgcn/bitcode/oclc_finite_only_off.bc", "-mlink-builtin-bitcode", "/opt/rocm/amdgcn/bitcode/oclc_correctly_rounded_sqrt_on.bc", "-mlink-builtin-bitcode", "/opt/rocm/amdgcn/bitcode/oclc_wavefrontsize64_off.bc", "-mlink-builtin-bitcode", f"/opt/rocm/amdgcn/bitcode/oclc_isa_version_{arch[3:]}.bc", "-mlink-builtin-bitcode", "/opt/rocm/amdgcn/bitcode/oclc_abi_version_500.bc", "-target-cpu", arch, "-target-feature", "+cumode", "-debugger-tuning=gdb", "-fdebug-compilation-dir=/home/b1tg/tinygrad", "-resource-dir", "/opt/rocm-6.2.4/llvm/lib/clang/18", "-O3", "-Wno-gnu-line-marker", "-Wno-missing-prototypes", "-std=c++14", "-fno-autolink", "-ferror-limit", "19", "-fhip-new-launch-api", "-fgnuc-version=4.2.1", "-fcolor-diagnostics", "-vectorize-loops", "-vectorize-slp", "-mlink-builtin-bitcode-postopt", "-disable-llvm-passes", "-cuid=d4ddbcdbb98e61b8", "-fcuda-allow-variadic-functions", "-faddrsig", "-o", "-", "-x", "ir", "-" #noqa:E501
+  ]
+  obj = subprocess.check_output(['/opt/rocm/llvm/bin/clang', *args], input=obj)
+  # print("[*] stage 2")
+  args = [
+"-cc1", "-triple", "amdgcn-amd-amdhsa", "-S", "-clear-ast-before-backend", "-disable-llvm-verifier", "-discard-value-names", "-main-file-name", "<null>.bc", "-mrelocation-model", "pic", "-pic-level", "2", "-fhalf-no-semantic-interposition", "-mframe-pointer=none", "-ffp-contract=on", "-fno-rounding-math", "-mconstructor-aliases", "-fvisibility=hidden", "-fapply-global-visibility-to-externs", "-target-cpu", arch, "-debugger-tuning=gdb", "-fdebug-compilation-dir=/home/b1tg/tinygrad", "-resource-dir", "/opt/rocm-6.2.4/llvm/lib/clang/18", "-O3", "-ferror-limit", "19", "-nogpulib", "-fcolor-diagnostics", "-vectorize-loops", "-vectorize-slp", "-mllvm", "-amdgpu-internalize-symbols", "-mllvm", "-amdgpu-internalize-symbols", "-faddrsig", "-o", "-", "-x", "ir", "-" #noqa:E501
+  ]
+  obj = subprocess.check_output(['/opt/rocm/llvm/bin/clang', *args], input=obj)
+
+  with tempfile.NamedTemporaryFile(delete=True) as relo_file:
+    args = [
+  "-cc1as", "-triple", "amdgcn-amd-amdhsa", "-filetype", "obj", "-main-file-name", "<null>.bc", "-target-cpu", arch, "-fdebug-compilation-dir=/home/b1tg/tinygrad", "-dwarf-version=5", "-mrelocation-model", "pic", "-mllvm", "-amdgpu-internalize-symbols", "-mllvm", "-amdgpu-internalize-symbols", "-o", relo_file.name, "-" #noqa:E501
+    ]
+    subprocess.run(['/opt/rocm/llvm/bin/clang', *args], input=obj, check=True)
+
+    # print("[*] stage 3")
+    args = [
+  "--no-undefined", "-shared", "--enable-new-dtags", relo_file.name, f"-plugin-opt=mcpu={arch}", "-o", "-"
+    ]
+    obj = subprocess.check_output(['/opt/rocm/llvm/bin/ld.lld', *args])
+    return obj
+
+
+def compile_hip_old(prg:str, arch="gfx1100", asm=False) -> bytes:
   args = ["-cc1", "-triple", "amdgcn-amd-amdhsa", "-aux-triple", "x86_64-unknown-linux-gnu",
     "-emit-llvm-bc", "-emit-llvm-uselists", "-clear-ast-before-backend", "-disable-llvm-verifier", "-discard-value-names",
     "-mrelocation-model", "pic", "-pic-level", "2", "-fhalf-no-semantic-interposition", "-mframe-pointer=none",
@@ -66,10 +108,10 @@ def compile_hip(prg:str, arch="gfx1100", asm=False) -> bytes:
     "-mlink-builtin-bitcode", "/opt/rocm/amdgcn/bitcode/hip.bc",
     "-mlink-builtin-bitcode", "/opt/rocm/amdgcn/bitcode/ocml.bc",
     "-mlink-builtin-bitcode", "/opt/rocm/amdgcn/bitcode/ockl.bc",
-    "-mlink-builtin-bitcode", "/opt/rocm/amdgcn/bitcode/oclc_daz_opt_on.bc",
+    "-mlink-builtin-bitcode", "/opt/rocm/amdgcn/bitcode/oclc_daz_opt_off.bc",
+    "-mlink-builtin-bitcode", "/opt/rocm/amdgcn/bitcode/oclc_correctly_rounded_sqrt_on.bc",
     "-mlink-builtin-bitcode", "/opt/rocm/amdgcn/bitcode/oclc_unsafe_math_off.bc",
     "-mlink-builtin-bitcode", "/opt/rocm/amdgcn/bitcode/oclc_finite_only_off.bc",
-    "-mlink-builtin-bitcode", "/opt/rocm/amdgcn/bitcode/oclc_correctly_rounded_sqrt_on.bc",
     "-mlink-builtin-bitcode", "/opt/rocm/amdgcn/bitcode/oclc_wavefrontsize64_off.bc",
     "-mlink-builtin-bitcode", f"/opt/rocm/amdgcn/bitcode/oclc_isa_version_{arch[3:]}.bc",
     "-mlink-builtin-bitcode", "/opt/rocm/amdgcn/bitcode/oclc_abi_version_500.bc",
@@ -77,12 +119,14 @@ def compile_hip(prg:str, arch="gfx1100", asm=False) -> bytes:
     "-D", "HIP_VERSION_MAJOR=6", "-D", "HIP_VERSION_MINOR=0", "-D", "HIP_VERSION_PATCH=32830", "-D", "__HIPCC_RTC__", "-I", "/opt/rocm/include",
     "-O3", "-Wno-gnu-line-marker", "-Wno-missing-prototypes", "-std=c++14", "-fdeprecated-macro", "-fno-autolink",
     "-fhip-new-launch-api", "-fgnuc-version=4.2.1", "-fcxx-exceptions", "-fexceptions", "-fcolor-diagnostics", "-vectorize-loops",
+    # ""
     "-vectorize-slp", "-disable-llvm-passes", "-fcuda-allow-variadic-functions", "-faddrsig",
     "-D__GCC_HAVE_DWARF2_CFI_ASM=1", "-o", "-", "-x", "hip", "-"]
   bc_obj = subprocess.check_output(['/opt/rocm/llvm/bin/clang', *args], input=prg.encode('utf-8'))
   with tempfile.NamedTemporaryFile(delete=True) as relo_file:
     args = [
-      "-cc1", "-triple", "amdgcn-amd-amdhsa", "-emit-obj", "-clear-ast-before-backend", "-disable-llvm-verifier",
+      "-cc1",
+      "-triple", "amdgcn-amd-amdhsa", "-emit-obj", "-clear-ast-before-backend", "-disable-llvm-verifier",
       "-discard-value-names", "-mrelocation-model", "pic", "-pic-level", "2", "-fhalf-no-semantic-interposition",
       "-mframe-pointer=none", "-fdenormal-fp-math-f32=preserve-sign,preserve-sign", "-ffp-contract=on", "-fno-rounding-math",
       "-mconstructor-aliases", "-fvisibility=hidden", "-fapply-global-visibility-to-externs", "-target-cpu", arch,
