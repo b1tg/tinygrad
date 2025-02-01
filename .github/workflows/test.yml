@@ -608,7 +608,7 @@ jobs:
           path: /Users/runner/Library/Python/3.12/lib/python/site-packages
           key: mockgpu-osx-${{ matrix.backend }}-packages-${{ hashFiles('**/setup.py') }}
       - name: Set env
-        run: printf "${{ matrix.backend == 'amd' && 'MOCKGPU=1\nAMD=1\nFORWARD_ONLY=1' }}" >> $GITHUB_ENV
+        run: printf "${{ matrix.backend == 'amd' && 'MOCKGPU=1\nAMD=1\nFORWARD_ONLY=1\nNEW=1' }}" >> $GITHUB_ENV
       - name: Install comgr
         if: matrix.backend == 'amd'
         run: |
