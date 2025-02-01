@@ -608,7 +608,7 @@ jobs:
           path: /Users/runner/Library/Python/3.12/lib/python/site-packages
           key: mockgpu-osx-${{ matrix.backend }}-packages-${{ hashFiles('**/setup.py') }}
       - name: Set env
-        run: printf "${{ matrix.backend == 'amd' && 'MOCKGPU=1\nAMD=1\nFORWARD_ONLY=1\nNEW=1' }}" >> $GITHUB_ENV
+        run: printf "${{ matrix.backend == 'amd' && 'MOCKGPU=1\nAMD=1\nFORWARD_ONLY=1' }}" >> $GITHUB_ENV
       - name: Install comgr
         if: matrix.backend == 'amd'
         run: |
@@ -627,7 +627,7 @@ jobs:
       - name: Check Device.DEFAULT and print some source
         run: |
           PYTHONPATH=${{ github.workspace }} python3 -c "from tinygrad import Device; assert Device.DEFAULT == 'AMD', Device.DEFAULT"
-          DEBUG=5 PYTHONPATH=${{ github.workspace }} FORWARD_ONLY=1 python3 test/test_ops.py TestOps.test_add
+          AMD_COMGR_SAVE_TEMPS=1 AMD_COMGR_REDIRECT_LOGS=stdout AMD_COMGR_EMIT_VERBOSE_LOGS=1 DEBUG=5 PYTHONPATH=${{ github.workspace }} FORWARD_ONLY=1 python3 test/test_ops.py TestOps.test_add
       - name: Run pytest (amd)
         if: matrix.backend=='amd'
         run: python -m pytest -n=auto test/test_hcq.py test/test_tiny.py --durations=20
