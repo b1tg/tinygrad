@@ -100,7 +100,7 @@ def compile_hip_0202(prg:str, arch="gfx1100", asm=False) -> bytes:
   args = ["-x", "hip", f"--offload-arch={arch}", "-O3", "-S", "-emit-llvm", "--cuda-device-only", "-", "-o", "-"]
   obj = subprocess.check_output(['/opt/rocm/llvm/bin/clang', *args], input=prg.encode('utf-8'))
   with tempfile.NamedTemporaryFile(delete=True) as relo_file:
-    args = ["-mtriple=amdgcn-amd-amdhsa", f"-mcpu={arch}", "-O3", "-filetype=obj", "-", "-o", relo_file.name]
+    args = ["-mtriple=amdgcn-amd-amdhsa", f"-mcpu={arch}", "-O3", "-filetype=obj", "-mattr=+cumode", "-", "-o", relo_file.name]
     subprocess.run(['/opt/rocm/llvm/bin/llc', *args], input=obj, check=True)
     args = [relo_file.name, "--no-undefined", "-shared", "-o", "-"]
     obj = subprocess.check_output(['/opt/rocm/llvm/bin/ld.lld', *args])
