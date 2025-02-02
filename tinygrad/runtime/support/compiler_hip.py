@@ -96,7 +96,15 @@ def compile_hip(prg:str, arch="gfx1100", asm=False) -> bytes:
     ]
     obj = subprocess.check_output(['/opt/rocm/llvm/bin/ld.lld', *args])
     return obj
-
+def compile_hip_0202(prg:str, arch="gfx1100", asm=False) -> bytes:
+  args = ["-x", "hip", f"--offload-arch={arch}", "-O3", "-S", "-emit-llvm", "--cuda-device-only", "-", "-o", "-"]
+  obj = subprocess.check_output(['/opt/rocm/llvm/bin/clang', *args], input=prg.encode('utf-8'))
+  with tempfile.NamedTemporaryFile(delete=True) as relo_file:
+    args = ["-mtriple=amdgcn-amd-amdhsa", f"-mcpu={arch}", "-O3", "-filetype=obj", "-", "-o", relo_file.name]
+    subprocess.run(['/opt/rocm/llvm/bin/llc', *args], input=obj, check=True)
+    args = [relo_file.name, "--no-undefined", "-shared", "-o", "-"]
+    obj = subprocess.check_output(['/opt/rocm/llvm/bin/ld.lld', *args])
+    return obj
 
 def compile_hip_old(prg:str, arch="gfx1100", asm=False) -> bytes:
   args = ["-cc1", "-triple", "amdgcn-amd-amdhsa", "-aux-triple", "x86_64-unknown-linux-gnu",
@@ -144,7 +152,7 @@ class AMDCompiler(Compiler):
     super().__init__(f"compile_hip_{self.arch}")
   def compile(self, src:str) -> bytes:
     import os
-    try: return compile_hip(src, self.arch) if os.getenv("NEW") else compile_hip_comgr(src, self.arch)
+    try: return compile_hip_0202(src, self.arch) if os.getenv("NEW") else compile_hip_comgr(src, self.arch)
     except RuntimeError as e: raise CompileError(e) from e
   def disassemble(self, lib:bytes):
     asm = subprocess.check_output(["/opt/rocm/llvm/bin/llvm-objdump", '-d', '-'], input=lib)
