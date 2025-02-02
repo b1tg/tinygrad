@@ -9,6 +9,7 @@ on:
   push:
     branches:
       - master
+      - llvmyes
   pull_request:
   workflow_dispatch:
 

@@ -1,7 +1,7 @@
 import ctypes, subprocess, tempfile
 import tinygrad.runtime.autogen.comgr as comgr
 from tinygrad.device import Compiler, CompileError
-
+# import tinygrad.runtime.autogen.llvm as llvm
 def check(status):
   if status != 0:
     comgr.amd_comgr_status_string(status, ctypes.byref(status_str := ctypes.POINTER(ctypes.c_char)()))
@@ -57,8 +57,9 @@ def compile_hip_comgr(prg:str, arch="gfx1100", asm=False) -> bytes:
   return ret
 
 def compile_hip(prg:str, arch="gfx1100", asm=False) -> bytes:
-  args = ["-x", "hip", f"--offload-arch={arch}", "-O3", "-S", "-emit-llvm", "--cuda-device-only", "-", "-o", "-"]
-  obj = subprocess.check_output(['/opt/rocm/llvm/bin/clang', *args], input=prg.encode('utf-8'))
+  # args = ["-x", "hip", f"-mcpu={arch}", f"--offload-arch={arch}", "-O3", "-S", "-emit-llvm", "--cuda-device-only", "-", "-o", "-"]
+  # obj = subprocess.check_output(['/opt/rocm/llvm/bin/clang', *args], input=prg.encode('utf-8'))
+  obj = prg.encode('utf-8')
   with tempfile.NamedTemporaryFile(delete=True) as f:
     args = ["-mtriple=amdgcn-amd-amdhsa", f"-mcpu={arch}", "-O3", "-filetype=obj", "-mattr=+cumode", "-", "-o", f.name]
     subprocess.run(['/opt/rocm/llvm/bin/llc', *args], input=obj, check=True)
@@ -68,6 +69,7 @@ def compile_hip(prg:str, arch="gfx1100", asm=False) -> bytes:
 
 class AMDCompiler(Compiler):
   def __init__(self, arch:str):
+    # self.arch = "gfx803"
     self.arch = arch
     super().__init__(f"compile_hip_{self.arch}")
   def compile(self, src:str) -> bytes:
