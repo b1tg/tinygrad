@@ -5,6 +5,7 @@ from tinygrad.ops import GroupOp, Ops, UOp, PatternMatcher, UPat
 from tinygrad.helpers import strip_parens, getenv, prod, dedup, AMX
 from tinygrad.dtype import ImageDType, dtypes, DType, PtrDType
 from tinygrad.renderer import Renderer, TensorCore
+from tinygrad.renderer.llvmir import LLVMRenderer
 
 base_rewrite = PatternMatcher([
   (UPat(Ops.DEFINE_ACC, name="x"), lambda ctx,x: ctx[x.src[0]]),
@@ -444,5 +445,5 @@ class AMDRenderer(CStyleLanguage):
     return f"__attribute__((amdgpu_flat_work_group_size(1, {requiredMaxThreadsPerBlock})))"
 
 class NVRenderer(CUDARenderer): device = "NV"
-class HIPRenderer(AMDRenderer): device = "HIP"
+class HIPRenderer(LLVMRenderer): device = "HIP"
 class QCOMRenderer(OpenCLRenderer): device = "QCOM"
