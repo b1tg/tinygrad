@@ -147,6 +147,7 @@ class FunctionFactoryStub:
 # Or manually fix this by comment the ctypes.CDLL loading
 _libraries = {}
 llvm_support.LLVM_PATH = "/tmp/opt/amdgpu/lib/x86_64-linux-gnu/llvm-16.0/lib/libLLVM-16.so"
+llvm_support.LLVM_PATH = "/tmp/opt/amdgpu/lib/x86_64-linux-gnu/llvm-18.1/lib/libLLVM.so.18.1"
 print("llvm_support.LLVM_PATH: ", llvm_support.LLVM_PATH)
 _libraries['llvm'] = ctypes.CDLL(llvm_support.LLVM_PATH) #  ctypes.CDLL('llvm')
 c_int128 = ctypes.c_ubyte*16
