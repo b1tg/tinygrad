@@ -1,5 +1,6 @@
 import ctypes, subprocess, tempfile
 import tinygrad.runtime.autogen.comgr as comgr
+import tinygrad.runtime.autogen.llvm as llvm
 from tinygrad.device import Compiler, CompileError
 
 def check(status):
@@ -56,12 +57,45 @@ def compile_hip_comgr(prg:str, arch="gfx1100", asm=False) -> bytes:
   check(comgr.amd_comgr_destroy_action_info(action_info))
   return ret
 
+def cerr(): return ctypes.pointer(ctypes.pointer(ctypes.c_char()))
+def expect(x, err, ret=None):
+  if x: raise RuntimeError(llvm.string_cast(err.contents) if not isinstance(err, str) else err)
+  return ret
+def ir_to_relo(src, arch="gfx1100"):
+  llvm.LLVMInitializeAMDGPUTarget()
+  llvm.LLVMInitializeAMDGPUTargetInfo()
+  llvm.LLVMInitializeAMDGPUTargetMC()
+  llvm.LLVMInitializeAMDGPUDisassembler()
+  llvm.LLVMInitializeAMDGPUAsmParser()
+  llvm.LLVMInitializeAMDGPUAsmPrinter()
+  triple=b"amdgcn-amd-amdhsa"
+  features = b'+cumode'
+  passes = b'default<O3>'
+  target = expect(llvm.LLVMGetTargetFromTriple(triple, ctypes.pointer(tgt:=llvm.LLVMTargetRef()), err:=cerr()), err, tgt)
+  target_machine = llvm.LLVMCreateTargetMachine(target, triple, arch.encode(), features, llvm.LLVMCodeGenLevelAggressive, llvm.LLVMRelocPIC,
+                                                llvm.LLVMCodeModelDefault)
+  src_buf = llvm.LLVMCreateMemoryBufferWithMemoryRangeCopy(ctypes.create_string_buffer(src_bytes:=src), len(src_bytes), b'src')
+  mod = expect(llvm.LLVMParseIRInContext(llvm.LLVMGetGlobalContext(), src_buf, ctypes.pointer(m:=llvm.LLVMModuleRef()), err:=cerr()), err, m)
+  expect(llvm.LLVMVerifyModule(mod, llvm.LLVMReturnStatusAction, err:=cerr()), err)
+  pbo = llvm.LLVMCreatePassBuilderOptions()
+  llvm.LLVMPassBuilderOptionsSetLoopUnrolling(pbo, True)
+  llvm.LLVMPassBuilderOptionsSetLoopVectorization(pbo, True)
+  llvm.LLVMPassBuilderOptionsSetSLPVectorization(pbo, True)
+  llvm.LLVMPassBuilderOptionsSetVerifyEach(pbo, True)
+  expect(llvm.LLVMRunPasses(mod, passes, target_machine, pbo), 'failed to run passes')
+  obj_buf = expect(llvm.LLVMTargetMachineEmitToMemoryBuffer(target_machine, mod, llvm.LLVMObjectFile, err:=cerr(),
+                                                            ctypes.pointer(buf:=llvm.LLVMMemoryBufferRef())), err, buf)
+  obj = ctypes.string_at(llvm.LLVMGetBufferStart(obj_buf), llvm.LLVMGetBufferSize(obj_buf))
+  llvm.LLVMDisposeModule(mod)
+  llvm.LLVMDisposeMemoryBuffer(obj_buf)
+  return obj
 def compile_hip(prg:str, arch="gfx1100", asm=False) -> bytes:
   args = ["-x", "hip", f"--offload-arch={arch}", "-O3", "-S", "-emit-llvm", "--cuda-device-only", "-", "-o", "-"]
   obj = subprocess.check_output(['/opt/rocm/llvm/bin/clang', *args], input=prg.encode('utf-8'))
   with tempfile.NamedTemporaryFile(delete=True) as f:
-    args = ["-mtriple=amdgcn-amd-amdhsa", f"-mcpu={arch}", "-O3", "-filetype=obj", "-mattr=+cumode", "-", "-o", f.name]
-    subprocess.run(['/opt/rocm/llvm/bin/llc', *args], input=obj, check=True)
+    relo = ir_to_relo(obj, arch)
+    f.write(relo)
+    f.flush()
     args = [f.name, "--no-undefined", "-shared", "-o", "-"]
     obj = subprocess.check_output(['/opt/rocm/llvm/bin/ld.lld', *args])
     return obj
