@@ -46,13 +46,27 @@ def compile_hip_comgr(prg:str, arch="gfx1100", asm=False) -> bytes:
     if status != 0:
       print(_get_comgr_data(data_set_bc, comgr.AMD_COMGR_DATA_KIND_LOG).decode())
       raise RuntimeError("compile failed")
-    check(comgr.amd_comgr_action_info_set_options(action_info, b"-O3 -mllvm -amdgpu-internalize-symbols"))
-    check(comgr.amd_comgr_do_action(comgr.AMD_COMGR_ACTION_CODEGEN_BC_TO_RELOCATABLE, action_info, data_set_bc, data_set_reloc))
-
+    # print("==== IR === ")
+    data_relo = None
+    # print(bc[:10])
+    # print("==== IR end === ")
+    # print("=== IR -> relo ===")
+    # check(comgr.amd_comgr_action_info_set_options(action_info, b"-O3 -mllvm -amdgpu-internalize-symbols"))
+    # check(comgr.amd_comgr_do_action(comgr.AMD_COMGR_ACTION_CODEGEN_BC_TO_RELOCATABLE, action_info, data_set_bc, data_set_reloc))
+    print("--- use llvm ---")
+    bc = _get_comgr_data(data_set_bc, comgr.AMD_COMGR_DATA_KIND_BC)
+    relo = ir_to_relo(bc, arch)
+    check(comgr.amd_comgr_create_data(comgr.AMD_COMGR_DATA_KIND_RELOCATABLE, ctypes.byref(data_relo := comgr.amd_comgr_data_t())))
+    check(comgr.amd_comgr_set_data(data_relo, len(relo), relo))
+    check(comgr.amd_comgr_set_data_name(data_relo, b"DO"))
+    check(comgr.amd_comgr_data_set_add(data_set_reloc, data_relo))
+    # print("=== IR -> relo end ===")
   check(comgr.amd_comgr_action_info_set_options(action_info, b""))
+  # relo -> ELF
   check(comgr.amd_comgr_do_action(comgr.AMD_COMGR_ACTION_LINK_RELOCATABLE_TO_EXECUTABLE, action_info, data_set_reloc, data_set_exec))
   ret = _get_comgr_data(data_set_exec, comgr.AMD_COMGR_DATA_KIND_EXECUTABLE)
   check(comgr.amd_comgr_release_data(data_src))
+  if data_relo: check(comgr.amd_comgr_release_data(data_relo))
   for x in [data_set_src, data_set_bc, data_set_reloc, data_set_exec]: check(comgr.amd_comgr_destroy_data_set(x))
   check(comgr.amd_comgr_destroy_action_info(action_info))
   return ret
@@ -105,7 +119,7 @@ class AMDCompiler(Compiler):
     self.arch = arch
     super().__init__(f"compile_hip_{self.arch}")
   def compile(self, src:str) -> bytes:
-    try: return compile_hip(src, self.arch)
+    try: return compile_hip_comgr(src, self.arch)
     except RuntimeError as e: raise CompileError(e) from e
   def disassemble(self, lib:bytes):
     asm = subprocess.check_output(["/opt/rocm/llvm/bin/llvm-objdump", '-d', '-'], input=lib)
