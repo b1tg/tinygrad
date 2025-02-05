@@ -110,6 +110,8 @@ jobs:
       - name: newer llvm
         if: matrix.backend == 'amd'
         run: |
+          sudo apt install --no-install-recommends --allow-unauthenticated -y libllvm17
+
           /opt/rocm/llvm/bin/clang --version
           # wget https://repo.radeon.com/amdgpu/6.2.1/ubuntu/pool/main/l/llvm-amdgpu/libllvm18.1-amdgpu_18.1.60201-2038383.22.04_amd64.deb
           # dpkg-deb --fsys-tarfile libllvm18.1-amdgpu_18.1.60201-2038383.22.04_amd64.deb | tar -xvf - -C /tmp ./opt/amdgpu/lib/x86_64-linux-gnu/llvm-18.1/lib/libLLVM.so.18.1
@@ -121,9 +123,9 @@ jobs:
           # dpkg-deb --fsys-tarfile  libllvm17.0.60000-amdgpu_17.0.60000-1697589.20.04_amd64.deb | tar -xvf - -C /tmp ./opt/amdgpu/lib/x86_64-linux-gnu/llvm-17.0/lib/libLLVM-17.so          
           # ldd /tmp/opt/amdgpu/lib/x86_64-linux-gnu/llvm-17.0/lib/libLLVM-17.so
           # CI ubuntu22.04 AMD clang version 17.0.0 roc-6.1.2
-          wget https://repo.radeon.com/amdgpu/6.1.2/ubuntu/pool/main/l/llvm-amdgpu/libllvm17.0-amdgpu_17.0.60102-1781449.22.04_amd64.deb
-          dpkg-deb --fsys-tarfile  libllvm17.0-amdgpu_17.0.60102-1781449.22.04_amd64.deb | tar -xvf - -C /tmp ./opt/amdgpu/lib/x86_64-linux-gnu/llvm-17.0/lib/libLLVM-17.so          
-          ldd /tmp/opt/amdgpu/lib/x86_64-linux-gnu/llvm-17.0/lib/libLLVM-17.so          
+          # wget https://repo.radeon.com/amdgpu/6.1.2/ubuntu/pool/main/l/llvm-amdgpu/libllvm17.0-amdgpu_17.0.60102-1781449.22.04_amd64.deb
+          # dpkg-deb --fsys-tarfile  libllvm17.0-amdgpu_17.0.60102-1781449.22.04_amd64.deb | tar -xvf - -C /tmp ./opt/amdgpu/lib/x86_64-linux-gnu/llvm-17.0/lib/libLLVM-17.so          
+          # ldd /tmp/opt/amdgpu/lib/x86_64-linux-gnu/llvm-17.0/lib/libLLVM-17.so          
           
       - name: Check Device.DEFAULT and print some source
         run: |

@@ -146,11 +146,11 @@ class FunctionFactoryStub:
 # You can either re-run clan2py with -l /path/to/library.so
 # Or manually fix this by comment the ctypes.CDLL loading
 _libraries = {}
-llvm_support.LLVM_PATH = "/tmp/opt/amdgpu/lib/x86_64-linux-gnu/llvm-16.0/lib/libLLVM-16.so"
-llvm_support.LLVM_PATH = "/tmp/opt/amdgpu/lib/x86_64-linux-gnu/llvm-18.1/lib/libLLVM.so.18.1"
+# llvm_support.LLVM_PATH = "/tmp/opt/amdgpu/lib/x86_64-linux-gnu/llvm-16.0/lib/libLLVM-16.so"
+# llvm_support.LLVM_PATH = "/tmp/opt/amdgpu/lib/x86_64-linux-gnu/llvm-18.1/lib/libLLVM.so.18.1"
 # /tmp/opt/amdgpu/lib/x86_64-linux-gnu/llvm-18.1/lib/libLLVM.so.18.1
 # llvm_support.LLVM_PATH = "/home/tiny/code/tinygrad/tmp/opt/amdgpu/lib/x86_64-linux-gnu/llvm-16.0/lib/libLLVM-16.so"
-llvm_support.LLVM_PATH = "/tmp/opt/amdgpu/lib/x86_64-linux-gnu/llvm-17.0/lib/libLLVM-17.so"
+# llvm_support.LLVM_PATH = "/tmp/opt/amdgpu/lib/x86_64-linux-gnu/llvm-17.0/lib/libLLVM-17.so"
 # llvm_support.LLVM_PATH = "/home/tiny/code/tinygrad/tmp/opt/amdgpu/lib/x86_64-linux-gnu/llvm-17.0/lib/libLLVM-17.so"
 # llvm_support.LLVM_PATH = "/tmp/opt/amdgpu/lib/x86_64-linux-gnu/llvm-17.0/lib/libLLVM-17.so"
 print("llvm_support.LLVM_PATH: ", llvm_support.LLVM_PATH)
