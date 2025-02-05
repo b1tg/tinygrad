@@ -84,19 +84,29 @@ def ir_to_relo(src, arch="gfx1100"):
   llvm.LLVMInitializeAMDGPUAsmPrinter()
   triple=b"amdgcn-amd-amdhsa"
   features = b'+cumode'
-  passes = b'default<O3>'
   target = expect(llvm.LLVMGetTargetFromTriple(triple, ctypes.pointer(tgt:=llvm.LLVMTargetRef()), err:=cerr()), err, tgt)
   target_machine = llvm.LLVMCreateTargetMachine(target, triple, arch.encode(), features, llvm.LLVMCodeGenLevelAggressive, llvm.LLVMRelocPIC,
                                                 llvm.LLVMCodeModelDefault)
   src_buf = llvm.LLVMCreateMemoryBufferWithMemoryRangeCopy(ctypes.create_string_buffer(src_bytes:=src), len(src_bytes), b'src')
   mod = expect(llvm.LLVMParseIRInContext(llvm.LLVMGetGlobalContext(), src_buf, ctypes.pointer(m:=llvm.LLVMModuleRef()), err:=cerr()), err, m)
   expect(llvm.LLVMVerifyModule(mod, llvm.LLVMReturnStatusAction, err:=cerr()), err)
-  pbo = llvm.LLVMCreatePassBuilderOptions()
-  llvm.LLVMPassBuilderOptionsSetLoopUnrolling(pbo, True)
-  llvm.LLVMPassBuilderOptionsSetLoopVectorization(pbo, True)
-  llvm.LLVMPassBuilderOptionsSetSLPVectorization(pbo, True)
-  llvm.LLVMPassBuilderOptionsSetVerifyEach(pbo, True)
-  expect(llvm.LLVMRunPasses(mod, passes, target_machine, pbo), 'failed to run passes')
+  # ==== pass 1
+  # passes = b'default<O3>'
+  # pbo = llvm.LLVMCreatePassBuilderOptions()
+  # llvm.LLVMPassBuilderOptionsSetLoopUnrolling(pbo, True)
+  # llvm.LLVMPassBuilderOptionsSetLoopVectorization(pbo, True)
+  # llvm.LLVMPassBuilderOptionsSetSLPVectorization(pbo, True)
+  # llvm.LLVMPassBuilderOptionsSetVerifyEach(pbo, True)
+  # expect(llvm.LLVMRunPasses(mod, passes, target_machine, pbo), 'failed to run passes')
+  # ==== pass 1 end
+  # ==== pass 2
+  optimizer = llvm.LLVMCreatePassManager()
+  pmb = llvm.LLVMPassManagerBuilderCreate()
+  llvm.LLVMPassManagerBuilderSetOptLevel(pmb, 3)
+  llvm.LLVMPassManagerBuilderSetSizeLevel(pmb, 0)
+  llvm.LLVMPassManagerBuilderPopulateModulePassManager(pmb, optimizer)
+  llvm.LLVMRunPassManager(optimizer, mod)
+  # ==== pass 2 end
   obj_buf = expect(llvm.LLVMTargetMachineEmitToMemoryBuffer(target_machine, mod, llvm.LLVMObjectFile, err:=cerr(),
                                                             ctypes.pointer(buf:=llvm.LLVMMemoryBufferRef())), err, buf)
   obj = ctypes.string_at(llvm.LLVMGetBufferStart(obj_buf), llvm.LLVMGetBufferSize(obj_buf))
@@ -119,6 +129,7 @@ class AMDCompiler(Compiler):
     self.arch = arch
     super().__init__(f"compile_hip_{self.arch}")
   def compile(self, src:str) -> bytes:
+    # self.arch = "gfx803"
     try: return compile_hip_comgr(src, self.arch)
     except RuntimeError as e: raise CompileError(e) from e
   def disassemble(self, lib:bytes):
