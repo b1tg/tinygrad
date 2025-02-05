@@ -137,7 +137,7 @@ jobs:
       - name: Run pytest test_dtype A (amd)
         if: matrix.backend=='amd'
         run: |
-          PYTHONPATH=${{ github.workspace } python test/test_dtype.py 
+          PYTHONPATH=${{ github.workspace }} python test/test_dtype.py 
       - name: Run pytest test_dtype B (amd)
         if: matrix.backend=='amd'
         run: |
