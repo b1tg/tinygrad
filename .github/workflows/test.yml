@@ -111,15 +111,15 @@ jobs:
         if: matrix.backend == 'amd'
         run: |
           /opt/rocm/llvm/bin/clang --version
-          wget https://repo.radeon.com/amdgpu/6.2.1/ubuntu/pool/main/l/llvm-amdgpu/libllvm18.1-amdgpu_18.1.60201-2038383.22.04_amd64.deb
-          dpkg-deb --fsys-tarfile libllvm18.1-amdgpu_18.1.60201-2038383.22.04_amd64.deb | tar -xvf - -C /tmp ./opt/amdgpu/lib/x86_64-linux-gnu/llvm-18.1/lib/libLLVM.so.18.1
-          ldd /tmp/opt/amdgpu/lib/x86_64-linux-gnu/llvm-18.1/lib/libLLVM.so.18.1
+          # wget https://repo.radeon.com/amdgpu/6.2.1/ubuntu/pool/main/l/llvm-amdgpu/libllvm18.1-amdgpu_18.1.60201-2038383.22.04_amd64.deb
+          # dpkg-deb --fsys-tarfile libllvm18.1-amdgpu_18.1.60201-2038383.22.04_amd64.deb | tar -xvf - -C /tmp ./opt/amdgpu/lib/x86_64-linux-gnu/llvm-18.1/lib/libLLVM.so.18.1
+          # ldd /tmp/opt/amdgpu/lib/x86_64-linux-gnu/llvm-18.1/lib/libLLVM.so.18.1
           # wget https://repo.radeon.com/amdgpu/5.7.1/ubuntu/pool/main/l/llvm-amdgpu/libllvm16.0.50701-amdgpu_16.0.50701-1664922.20.04_amd64.deb
           # dpkg-deb --fsys-tarfile  libllvm16.0.50701-amdgpu_16.0.50701-1664922.20.04_amd64.deb | tar -xvf - -C /tmp ./opt/amdgpu/lib/x86_64-linux-gnu/llvm-16.0/lib/libLLVM-16.so          
           # ldd /tmp/opt/amdgpu/lib/x86_64-linux-gnu/llvm-16.0/lib/libLLVM-16.so
-          # wget https://repo.radeon.com/amdgpu/6.0/ubuntu/pool/main/l/llvm-amdgpu/libllvm17.0.60000-amdgpu_17.0.60000-1697589.20.04_amd64.deb
-          # dpkg-deb --fsys-tarfile  libllvm17.0.60000-amdgpu_17.0.60000-1697589.20.04_amd64.deb | tar -xvf - -C /tmp ./opt/amdgpu/lib/x86_64-linux-gnu/llvm-17.0/lib/libLLVM-17.so          
-          # ldd /tmp/opt/amdgpu/lib/x86_64-linux-gnu/llvm-17.0/lib/libLLVM-17.so
+          wget https://repo.radeon.com/amdgpu/6.0/ubuntu/pool/main/l/llvm-amdgpu/libllvm17.0.60000-amdgpu_17.0.60000-1697589.20.04_amd64.deb
+          dpkg-deb --fsys-tarfile  libllvm17.0.60000-amdgpu_17.0.60000-1697589.20.04_amd64.deb | tar -xvf - -C /tmp ./opt/amdgpu/lib/x86_64-linux-gnu/llvm-17.0/lib/libLLVM-17.so          
+          ldd /tmp/opt/amdgpu/lib/x86_64-linux-gnu/llvm-17.0/lib/libLLVM-17.so
           
       - name: Check Device.DEFAULT and print some source
         run: |
