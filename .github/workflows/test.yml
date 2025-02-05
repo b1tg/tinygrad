@@ -110,7 +110,8 @@ jobs:
       - name: newer llvm
         if: matrix.backend == 'amd'
         run: |
-          sudo apt install --no-install-recommends --allow-unauthenticated -y libllvm17
+          # sudo apt install --no-install-recommends --allow-unauthenticated -y libllvm17
+          sudo apt search libllvm
 
           /opt/rocm/llvm/bin/clang --version
           # wget https://repo.radeon.com/amdgpu/6.2.1/ubuntu/pool/main/l/llvm-amdgpu/libllvm18.1-amdgpu_18.1.60201-2038383.22.04_amd64.deb
