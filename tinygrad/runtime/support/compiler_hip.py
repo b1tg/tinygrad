@@ -52,7 +52,7 @@ def compile_hip_comgr(prg:str, arch="gfx1100", asm=False) -> bytes:
     # print("==== IR end === ")
     # print("=== IR -> relo ===")
     # check(comgr.amd_comgr_action_info_set_options(action_info, b"-O3 -mllvm -amdgpu-internalize-symbols"))
-    check(comgr.amd_comgr_action_info_set_options(action_info, b""))
+    check(comgr.amd_comgr_action_info_set_options(action_info, b"-O1"))
     check(comgr.amd_comgr_do_action(comgr.AMD_COMGR_ACTION_CODEGEN_BC_TO_RELOCATABLE, action_info, data_set_bc, data_set_reloc))
     # print("--- use llvm ---")
     # bc = _get_comgr_data(data_set_bc, comgr.AMD_COMGR_DATA_KIND_BC)
