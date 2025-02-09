@@ -13,7 +13,7 @@ from tinygrad.engine.schedule import ScheduleItem
 
 logkerns, logkerns_level = open(getenv("LOGKERNS", ""), "a") if getenv("LOGKERNS", "") else None, getenv("LOGKERNS_LEVEL", 1)
 def get_kernel(renderer:Renderer, ast:UOp) -> Kernel:
-  if DEBUG >= 5: print(ast)
+  if DEBUG >= 5: print("==ast==\n", ast, "\n==ast end==\n")
   k = Kernel(ast, opts=renderer).required_optimizations()
   if not NOOPT:
     if not k.apply_tensor_cores(getenv("TC", 1)): k.hand_coded_optimizations()
@@ -23,7 +23,8 @@ def get_kernel(renderer:Renderer, ast:UOp) -> Kernel:
       rawbufs = bufs_from_lin(kb, allocate=False)
       k = beam_search(kb, rawbufs, BEAM.value, bool(getenv("BEAM_ESTIMATE", 1)))
   if logkerns is not None: logkerns.writelines([f"{(k.ast, k.applied_opts)}\n"])
-  if DEBUG >= 5: print((k.ast, k.applied_opts)) # print here to show final applied_opts for all kernels instead of just in beam_search
+  if DEBUG >= 5: print("==what==\n", (k.ast, "\n--\n", k.applied_opts), "\n==what end==\n")
+  # print here to show final applied_opts for all kernels instead of just in beam_search
   return k
 
 # **************** Runners ****************
@@ -51,6 +52,7 @@ class CompiledRunner(Runner):
 
   def __call__(self, rawbufs:list[Buffer], var_vals:dict[Variable, int], wait=False) -> Optional[float]:
     global_size, local_size = self.p.launch_dims(var_vals)
+    # print(f"=== CompiledRunner global_size={global_size}, local_size={local_size}")
     if global_size is not None and local_size is None and all_int(self.p.global_size): # type: ignore[arg-type]
       # TODO: this is copied from get_program
       from tinygrad.engine.search import optimize_local_size
@@ -105,9 +107,9 @@ def get_runner(device:str, ast:UOp) -> CompiledRunner:
   # TODO: this should be all context relevant to rendering
   context = (BEAM.value, NOOPT.value, DEVECTORIZE.value)
   ckey = (device, ast.key, context, False)
-  if cret:=method_cache.get(ckey): return cret
+  if cret:=method_cache.get(ckey) and False: return cret
   bkey = (device.split(":")[0], ast.key, context, True)
-  if bret:=method_cache.get(bkey):
+  if bret:=method_cache.get(bkey) and False:
     method_cache[ckey] = ret = CompiledRunner(replace(bret.p, device=device), bret.lib)
   else:
     prg: ProgramSpec = get_kernel(Device[device].renderer, ast).to_program()

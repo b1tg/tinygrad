@@ -55,7 +55,7 @@ class TensorCoreOptions:
 class Kernel:
   def __init__(self, ast:UOp, opts:Optional[Renderer]=None):
     if ast.op is Ops.SINK: self.ast = ast
-
+    # print("=== Kernel opt, ", opts)
     self.opts = opts if opts is not None else Device[Device.DEFAULT].renderer
     # verify AST matches the spec
     if __debug__: type_verify(list(self.ast.toposort), shape_spec)
@@ -312,6 +312,7 @@ class Kernel:
 
   def apply_tensor_cores(self, use_tensor_cores=1, extra_opts:Optional[list[Opt]]=None, axis:int=0, tc_select:Optional[int]=None,
                          tc_opt:Optional[int]=None) -> bool:
+    # print(f"== apply_tensor_cores, use_tensor_cores={use_tensor_cores}")
     """ Attempts to apply a tensor core optimization to the kernel. If one exists and applies properly, return true, otherwise return false.
     Tensor cores are optimized instructions that matrix multiply-accumulate across a wave of threads: D(M, N) = A(M, K) * B(K, N) + C(M, N).
 
@@ -546,7 +547,7 @@ class Kernel:
         self.apply_opt(Opt(OptOps.UPCAST, len(self.full_unupcasted_shape)-1, splits))
 
     # **** local groups ****
-
+    # print("=== self.opts.has_local:", self.opts.has_local, self.local_dims)
     if self.opts.has_local:
       if getenv("NOLOCALS") and self.local_dims == 0 and not self.group_for_reduces:
         self.apply_opt(Opt(OptOps.NOLOCALS))
@@ -562,6 +563,7 @@ class Kernel:
         for axis, local_sz in sorted(to_local[:3]):
           axis = axis - deleted_shape
           will_delete_shape = local_sz == self.full_shape[axis]
+          # print("== apply_tensor_cores, B self.apply_opt(Opt(OptOps.LOCAL")
           self.apply_opt(Opt(OptOps.LOCAL, axis, local_sz))
           if will_delete_shape: deleted_shape += 1
 
@@ -666,17 +668,21 @@ class Kernel:
     modified_ast = self.get_optimized_ast()
 
     if DEBUG >= 3:
+      print("=== kernel.py linearize ===")
       print(self.name)
       if getenv("RAWAST"): print(self.ast)
       print(modified_ast)
       print(self.applied_opts)
+      print("=== kernel.py linearize end ===")
     # verify AST matches the spec after applying opts
     if __debug__: type_verify(list(modified_ast.toposort))
     # TODO: sadly modified_ast doesn't pass the shape spec because of how group_for_reduces constructs UOps, there's probably a way to fix this
     #if __debug__: type_verify(list(modified_ast.toposort), shape_spec)
-
+    # if DEBUG >= 5: print("== kernel.py: A print_uops\n"); print_uops(self.applied_opts)
     self.uops:list[UOp] = linearize_uop(full_graph_rewrite(rewrite_shapetracker_with_index(modified_ast, self.opts), self.opts))
-    if DEBUG >= 5: print_uops(self.uops)
+    if DEBUG >= 5:
+      print("== kernel.py: B print_uops\n")
+      print_uops(self.uops)
     return self
 
   def to_program(self, name_override:Optional[str]=None) -> ProgramSpec:

@@ -3,25 +3,54 @@ import math, struct
 from tinygrad.renderer import Renderer
 from tinygrad.ops import UOp, PatternMatcher, UPat, Ops, GroupOp
 from tinygrad.dtype import dtypes, DType, PtrDType, truncate
+from tinygrad.renderer import TensorCore
 
+ww_dict = {
+  "0": "x",
+  "1": "y",
+  "2": "z",
+}
+
+code_for_workitem = {
+  "g": lambda x: f"tail call i32 @llvm.amdgcn.workgroup.id.{ww_dict[x]}()",
+  "l": lambda x: f"tail call i32 @llvm.amdgcn.workitem.id.{ww_dict[x]}()",
+  "i": lambda x: f"(__ockl_get_group_id({x})*__ockl_get_local_size({x})+__ockl_get_local_id({x}))"
+}
 def ldt(dt:DType):
   if dt.vcount > 1: return f"<{dt.vcount} x {ldt(dt.scalar())}>"
   if isinstance(dt, PtrDType): return ldt(dt.base) + "*"
   return {dtypes.int8: "i8", dtypes.int16: "i16", dtypes.int32: "i32", dtypes.int64: "i64",
           dtypes.uint8: "i8", dtypes.uint16: "i16", dtypes.uint32: "i32", dtypes.uint64: "i64",
-          dtypes.float16: "half", dtypes.float32: "float", dtypes.float64: "double", dtypes.bool: "i1", dtypes.void: "void"}[dt]
+          dtypes.float16: "half", dtypes.float32: "float", dtypes.float64: "double", dtypes.bool: "i1",
+          dtypes.void: "void",
+          dtypes.bfloat16: "bfloat"
+          }[dt]
 
 def lconst(x, dtype:DType):
   if dtype in dtypes.floats:
     if math.isinf(x) or math.isnan(x): return "0x%02X%02X%02X%02X%02X%02X%02X%02X" % tuple(struct.pack("d",x)[::-1])
     return truncate[dtype](x)
   return int(x)
-
+# note: /opt/rocm/llvm/bin/llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx1100 -O3 -filetype=obj -mattr=+cumode /tmp/a.il -o /tmp/tmp58rsm8nw
 def lcast(input_type:DType, output_type:DType):
   if dtypes.is_float(input_type):
-    if dtypes.is_float(output_type): return 'fpext' if output_type.itemsize > input_type.itemsize else 'fptrunc'
+    if dtypes.is_float(output_type):
+      # %v3 = fptrunc half %v2 to bfloat
+      # return 'fpext' if output_type.itemsize > input_type.itemsize else 'fptrunc'
+      # 特殊处理：将 half 转换为 bfloat16 时
+      # LLVM 后端不支持直接进行 fptrunc half -> bfloat，
+      # 所以先 fpext（half -> float），再调用自定义的 bfloat16 截断转换
+      if input_type == dtypes.half and output_type == dtypes.bfloat16:
+        # 这里返回一个 tuple，表示需要先执行 'fpext' 再执行 'bf16_trunc'
+        pass
+        # return ' '.join(['fpext', 'bf16_trunc'])
+      # 其他浮点间转换，如果目标精度更高用 fpext，否则用 fptrunc
+      return 'fpext' if output_type.itemsize > input_type.itemsize else 'fptrunc'
     if dtypes.is_int(output_type): return 'fptoui' if dtypes.is_unsigned(output_type) else 'fptosi'
   if dtypes.is_unsigned(input_type) or dtypes.is_bool(input_type):
+    # ;; test/test_dtype.py::TestBoolDType::test_casts_from
+    if dtypes.is_bool(input_type) and output_type == dtypes.bfloat16:
+      pass
     if dtypes.is_float(output_type): return 'uitofp'
     if dtypes.is_int(output_type): return 'trunc' if output_type.itemsize < input_type.itemsize else 'zext'
   if dtypes.is_int(input_type):
@@ -37,7 +66,45 @@ flags = " nsz arcp contract afn"
 float_lop = {Ops.ADD: "fadd"+flags, Ops.MUL: "fmul"+flags, Ops.CMPLT: f"fcmp{flags} ult", Ops.CMPNE: f"fcmp{flags} une", Ops.FDIV: "fdiv"+flags}
 lop = {**{x:unsigned_lop for x in (dtypes.bool,)+dtypes.uints}, **{x:signed_lop for x in dtypes.sints}, **{x:float_lop for x in dtypes.floats}}
 
+def llvm_rewrite_f1(ctx, x):
+  output_type = x.dtype
+  input_type = x.src[0].dtype
+  if x.src[0].dtype == dtypes.half and x.dtype == dtypes.bfloat16:
+    return f"  {ctx[x]}_ext = fpext {ldt(x.src[0].dtype)} {ctx[x.src[0]]} to float\n" + \
+      f"  {ctx[x]}     = fptrunc float {ctx[x]}_ext to {ldt(x.dtype)}\n"
+  # %v8 = fptrunc bfloat %v7 to half
+    # ; Step 1: Promote bfloat to float
+    # %v7_ext = fpext bfloat %v7 to float
+    # ; Step 2: Truncate to half
+    # %v8 = fptrunc float %v7_ext to half
+  if x.src[0].dtype == dtypes.bfloat16 and x.dtype == dtypes.half:
+    return f"  {ctx[x]}_ext = fpext bfloat {ctx[x.src[0]]} to float\n" + \
+      f"  {ctx[x]}     = fptrunc float {ctx[x]}_ext to {ldt(x.dtype)}\n"
+  if dtypes.is_bool(input_type) and output_type == dtypes.bfloat16:
+    return f"  {ctx[x]}_ext = zext i1 {ctx[x.src[0]]} to i32\n" + \
+      f"  {ctx[x]}     = uitofp i32 {ctx[x]}_ext to bfloat\n"
+  if input_type == dtypes.float and output_type == dtypes.bfloat16:
+    # test/test_dtype_alu.py  TestDTypeALU.test_bfloat16
+    # %v4 = call bfloat @llvm.convert.to.bfloat.f32(float %v1)  ; Requires hardware support
+    # return f"  {ctx[x]} = call bfloat @llvm.convert.to.bfloat.f32(float {ctx[x.src[0]]})"
+    return f"  {ctx[x]}_i32 = bitcast float {ctx[x.src[0]]} to i32\n" + \
+      f"  {ctx[x]}_i32_1 = lshr i32 {ctx[x]}_i32, 16\n" + \
+      f"  {ctx[x]}_i16 = trunc i32 {ctx[x]}_i32_1 to i16\n" + \
+      f"  {ctx[x]} = bitcast i16 {ctx[x]}_i16 to bfloat\n"
+
+    # return f"  {ctx[x]}_ext = zext i1 {ctx[x.src[0]]} to i32\n" + \
+    #   f"  {ctx[x]}     = uitofp i32 {ctx[x]}_ext to bfloat\n"
+  # else:
+  return f"  {ctx[x]} = {lcast(x.src[0].dtype, x.dtype)} {ldt(x.src[0].dtype)} {ctx[x.src[0]]} to {ldt(x.dtype)}"
+
+string_rewrite = PatternMatcher([
+  # (UPat(Ops.SPECIAL, name="x"), lambda ctx,x: f"{ctx.code_for_workitem[x.arg[0][0]](x.arg[0][-1])}; /* {x.arg[1]} */"),
+  (UPat(Ops.SPECIAL, name="x"), lambda ctx, x: f"  {ctx[x]} = " + f"{ code_for_workitem[x.arg[0][0]](x.arg[0][-1])}; /* {x.arg[1]} */"),
+])
+
 llvm_rewrite = PatternMatcher([
+  # (UPat(Ops.SPECIAL, name="x"), lambda ctx,x: f"{ctx.code_for_workitem[x.arg[0][0]](x.arg[0][-1])}; /* {x.arg[1]} */"),
+
   # memory load/store
   (UPat(Ops.INDEX, name="x"), lambda ctx,x:
    f"  {ctx[x]} = getelementptr inbounds {ldt(x.dtype.base)}, {ldt(x.src[0].dtype)} {ctx[x.src[0]]}, {ldt(x.src[1].dtype)} {ctx[x.src[1]]}"),
@@ -65,7 +132,7 @@ llvm_rewrite = PatternMatcher([
   (UPat(Ops.SQRT, name="x"), lambda ctx,x:
    f"  {ctx[x]} = call{flags} {ldt(x.dtype)} @llvm.sqrt.{ldt(x.src[0].dtype)}({ldt(x.src[0].dtype)} {ctx[x.src[0]]})"),
   (UPat(Ops.BITCAST, name="x"), lambda ctx,x: f"  {ctx[x]} = bitcast {ldt(x.src[0].dtype)} {ctx[x.src[0]]} to {ldt(x.dtype)}"),
-  (UPat(Ops.CAST, name="x"), lambda ctx,x: f"  {ctx[x]} = {lcast(x.src[0].dtype, x.dtype)} {ldt(x.src[0].dtype)} {ctx[x.src[0]]} to {ldt(x.dtype)}"),
+  (UPat(Ops.CAST, name="x"), lambda ctx,x: llvm_rewrite_f1),
   (UPat(GroupOp.Binary, name="x"), lambda ctx,x:
    f"  {ctx[x]} = {lop[x.src[0].dtype.scalar()][x.op]} {ldt(x.src[0].dtype)} {ctx[x.src[0]]}, {ctx[x.src[1]]}"),
   (UPat(Ops.WHERE, name="x"), lambda ctx,x:
@@ -86,6 +153,8 @@ llvm_rewrite = PatternMatcher([
   (UPat(Ops.ENDIF, name="x"), lambda ctx,x: f"  br label %ifskip_{ctx[x.src[0]][1:]}\nifskip_{ctx[x.src[0]][1:]}:"),
 ])
 
+# TODO: Intel’s AVX-512 BF16 extensions https://llvm.org/docs/LangRef.html
+
 def llvm_bf16_cast(buf:UOp, idx:UOp, root:UOp):
   u16_buf = buf.replace(dtype=dtypes.ushort.ptr(size=cast(PtrDType,buf.dtype).size))
   return UOp.load(UOp.index(u16_buf, idx), dtype=dtypes.ushort).cast(dtypes.uint).mul(1<<16).bitcast(dtypes.float32).cast(root.dtype)
@@ -93,9 +162,18 @@ def llvm_bf16_cast(buf:UOp, idx:UOp, root:UOp):
 class LLVMRenderer(Renderer):
   device = "LLVM"
   supports_float4 = True
-  has_local = False
+  has_local = True
   has_shared = False
-  global_max = None
+  # global_max = None
+  # code_for_workitem = {
+  #   "g": lambda x: f"__ockl_get_group_id({x})",
+  #   "l": lambda x: f"__ockl_get_local_id({x})",
+  #   "i": lambda x: f"(__ockl_get_group_id({x})*__ockl_get_local_size({x})+__ockl_get_local_id({x}))"
+  # }
+
+  tensor_cores = [TensorCore(dims=(16,16,16), threads=32, elements_per_thread=(16,16,8), dtype_in=di, dtype_out=do,
+    opts=("l0","l0","l0","l0","l1","u1","u1","u1"), swizzle=(((4,9,10,11,0),(1,2,3,5,6,7,8)), ((0,1,2,3,4),(9,10,11,5,6,7,8))))
+    for di,do in [(dtypes.half,dtypes.float),(dtypes.half,dtypes.half)]]
 
   extra_matcher = PatternMatcher([
     # rewrite RECIP with FDIV
@@ -145,7 +223,11 @@ class LLVMRenderer(Renderer):
           r[u] = f"%v{vc}"
 
         # do the rendering of the llvm ir code
-        if (l:=llvm_rewrite.rewrite(u, ctx=r)) is None: raise RuntimeError(f"failed to render {u.op} with {u.dtype} srcs {[x.dtype for x in u.src]}")
+        l = None
+        if u.op is Ops.SPECIAL:
+          l = string_rewrite.rewrite(u, ctx=r)
+        elif (l:=llvm_rewrite.rewrite(u, ctx=r)) is None:
+          raise RuntimeError(f"failed to render {u.op} with {u.dtype} srcs {[x.dtype for x in u.src]}")
         kernel.append(cast(str, l))
 
         # generate the phi nodes for the assigns
@@ -155,7 +237,7 @@ class LLVMRenderer(Renderer):
               vc += 1
               kernel.append(f"  %acc{vc} = phi {ldt(x.dtype)}" f"[{r[x]}, %loop_entry_{u.arg}], [{r[acc_to_assign[x]]}, %loop_latch_{u.arg}]")
               r[x] = f"%acc{vc}"
-
+    self.abi = "protected amdgpu_kernel"
     # output the function. chr(10) is '\n' (python < 3.12 doesn't support backslashes in f-strings)
     return f'''\
 define{(' '+self.abi) if self.abi is not None else ''} void @{name}({','.join(args)}) #0 {{

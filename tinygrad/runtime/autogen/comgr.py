@@ -8,6 +8,7 @@
 #
 import ctypes, ctypes.util, os
 PATHS_TO_TRY = [
+#   '/opt/rocm-6.1.3/lib/libamd_comgr.so',
   '/opt/rocm/lib/libamd_comgr.so',
   os.getenv('ROCM_PATH', '')+'/lib/libamd_comgr.so',
   '/usr/local/lib/libamd_comgr.dylib',
