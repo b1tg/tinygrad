@@ -1,5 +1,6 @@
 import ctypes, subprocess
 import tinygrad.runtime.autogen.comgr as comgr
+from tinygrad.runtime.ops_llvm import LLVMCompiler
 from tinygrad.device import Compiler, CompileError
 
 def check(status):
@@ -57,21 +58,26 @@ def compile_hip(prg:str, arch="gfx1100", asm=False) -> bytes:
   return ret
 import tempfile, os
 def compile_hip_cli(prg:str, arch="gfx1100", asm=False) -> bytes:
+  if os.getenv("IR") == "1":
+    print("=== C ===")
+    if not os.getenv("AMD_LLVM")== "1":
+      print(prg)
   if os.getenv("AMD_LLVM")=="1":
     obj = prg.encode()
   else:
     args = ["-x", "hip", f"--offload-arch={arch}", "-Wno-macro-redefined", "-O3", "-S", "-emit-llvm", "--cuda-device-only", "-", "-o", "-"]
     obj = subprocess.check_output(['/opt/rocm/llvm/bin/clang', *args], input=prg.encode('utf-8'))
   if os.getenv("IR") == "1":
-    print("=== C ===")
-    if not os.getenv("AMD_LLVM")== "1":
-      print(prg)
     print("=== IR ===")
     print(obj.decode("utf8"))
     print("===  ===")
   with tempfile.NamedTemporaryFile(delete=True) as f:
-    args = ["-mtriple=amdgcn-amd-amdhsa", f"-mcpu={arch}", "-O3", "-filetype=obj", "-mattr=+cumode", "-", "-o", f.name]
-    subprocess.run(['/opt/rocm/llvm/bin/llc', *args], input=obj, check=True)
+    llvm_backend = LLVMCompiler("AMDGPU", True, triple="amdgcn-amd-amdhsa", arch=arch, feats="+cumode")
+    relo = llvm_backend.compile(obj, load=False)
+    f.write(relo)
+    f.flush()
+    # args = ["-mtriple=amdgcn-amd-amdhsa", f"-mcpu={arch}", "-O3", "-filetype=obj", "-mattr=+cumode", "-", "-o", f.name]
+    # subprocess.run(['/opt/rocm/llvm/bin/llc', *args], input=obj, check=True)
     # obj = f.read()
     args = [f.name, "--no-undefined", "-shared", "-o", "-"]
     obj = subprocess.check_output(['/opt/rocm/llvm/bin/ld.lld', *args])

@@ -591,7 +591,7 @@ class AMDDevice(HCQCompiled):
 
     self.sdma_queue = self.create_queue(kfd.KFD_IOC_QUEUE_TYPE_SDMA, 0x800000)
 
-    super().__init__(device, AMDAllocator(self), LLVMRenderer() if os.getenv("AMD_LLVM")=="1" else AMDRenderer(),
+    super().__init__(device, AMDAllocator(self), LLVMRenderer("protected amdgpu_kernel") if os.getenv("AMD_LLVM")=="1" else AMDRenderer(),
                      AMDCompiler(self.arch), functools.partial(AMDProgram, self),
                      AMDSignal, AMDComputeQueue, AMDCopyQueue)
 

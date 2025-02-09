@@ -66,7 +66,7 @@ flags = " nsz arcp contract afn"
 float_lop = {Ops.ADD: "fadd"+flags, Ops.MUL: "fmul"+flags, Ops.CMPLT: f"fcmp{flags} ult", Ops.CMPNE: f"fcmp{flags} une", Ops.FDIV: "fdiv"+flags}
 lop = {**{x:unsigned_lop for x in (dtypes.bool,)+dtypes.uints}, **{x:signed_lop for x in dtypes.sints}, **{x:float_lop for x in dtypes.floats}}
 
-def llvm_rewrite_f1(ctx, x):
+def llvm_rewrite_cast(ctx, x):
   output_type = x.dtype
   input_type = x.src[0].dtype
   if x.src[0].dtype == dtypes.half and x.dtype == dtypes.bfloat16:
@@ -132,7 +132,7 @@ llvm_rewrite = PatternMatcher([
   (UPat(Ops.SQRT, name="x"), lambda ctx,x:
    f"  {ctx[x]} = call{flags} {ldt(x.dtype)} @llvm.sqrt.{ldt(x.src[0].dtype)}({ldt(x.src[0].dtype)} {ctx[x.src[0]]})"),
   (UPat(Ops.BITCAST, name="x"), lambda ctx,x: f"  {ctx[x]} = bitcast {ldt(x.src[0].dtype)} {ctx[x.src[0]]} to {ldt(x.dtype)}"),
-  (UPat(Ops.CAST, name="x"), lambda ctx,x: llvm_rewrite_f1),
+  (UPat(Ops.CAST, name="x"), llvm_rewrite_cast),
   (UPat(GroupOp.Binary, name="x"), lambda ctx,x:
    f"  {ctx[x]} = {lop[x.src[0].dtype.scalar()][x.op]} {ldt(x.src[0].dtype)} {ctx[x.src[0]]}, {ctx[x.src[1]]}"),
   (UPat(Ops.WHERE, name="x"), lambda ctx,x:
@@ -162,7 +162,7 @@ def llvm_bf16_cast(buf:UOp, idx:UOp, root:UOp):
 class LLVMRenderer(Renderer):
   device = "LLVM"
   supports_float4 = True
-  has_local = True
+  has_local = False
   has_shared = False
   # global_max = None
   # code_for_workitem = {
@@ -188,7 +188,10 @@ class LLVMRenderer(Renderer):
 
   def __init__(self, abi:str|None=None):
     self.abi = abi
-
+    if self.abi and "amdgpu_kernel" in self.abi:
+      self.has_local = True
+    else:
+      self.global_max = None
   def render(self, name: str, uops: list[UOp]) -> str:
     r: dict[UOp, str] = {}
     args: list[str] = []
@@ -237,7 +240,6 @@ class LLVMRenderer(Renderer):
               vc += 1
               kernel.append(f"  %acc{vc} = phi {ldt(x.dtype)}" f"[{r[x]}, %loop_entry_{u.arg}], [{r[acc_to_assign[x]]}, %loop_latch_{u.arg}]")
               r[x] = f"%acc{vc}"
-    self.abi = "protected amdgpu_kernel"
     # output the function. chr(10) is '\n' (python < 3.12 doesn't support backslashes in f-strings)
     return f'''\
 define{(' '+self.abi) if self.abi is not None else ''} void @{name}({','.join(args)}) #0 {{
