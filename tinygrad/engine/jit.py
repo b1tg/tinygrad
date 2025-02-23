@@ -211,6 +211,7 @@ class TinyJit(Generic[ReturnType]):
     self.captured: Optional[CapturedJit] = captured
     self.cnt: int = 2 if self.fxn is None else 0
     self.prune = prune
+    self.fallback: bool = False
 
   def add_buffer(self, b:Buffer) -> Buffer:
     if found:=self._buffer_replace.get(b, None): return found
@@ -242,6 +243,7 @@ class TinyJit(Generic[ReturnType]):
   def __get__(self, obj, objtype): return functools.partial(self.__call__, obj) # add support for instance methods
 
   def __call__(self, *args, **kwargs) -> ReturnType:
+    if self.fallback: return self.fxn(*args, **kwargs)
     input_buffers, var_vals, names, st_vars_dtype_device = _prepare_jit_inputs(args, kwargs)
     if not JIT or self.cnt == 0:
       # jit ignore
@@ -268,6 +270,7 @@ class TinyJit(Generic[ReturnType]):
       assert len(jit_cache), "didn't JIT anything!"
       if DEBUG >= 1: print(f"JIT captured {len(jit_cache)} kernels with {len(input_buffers)} inputs")
 
+      if len(jit_cache) == 1 and not getenv("GRAPH_ONE_KERNEL"): self.fallback = True
       # track inputs that are views of buffers
       # TODO: eventually expected_buffers should live in ExecItem
       extra_view_inputs: list[tuple[int, int, str, int, DType]] = []
