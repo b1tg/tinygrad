@@ -205,7 +205,8 @@ class LLVMRenderer(Renderer):
       elif u.op == Ops.DEFINE_LOCAL:
         r[u] = f"@local_{u.arg}"
         local_map[r[u]] = 1
-        if isinstance(u.dtype, PtrDType): local_args.append(f"{r[u]} = internal unnamed_addr addrspace(3) global [{u.dtype.size} x {ldt(u.dtype)}] undef, align 16")
+        if isinstance(u.dtype, PtrDType): 
+          local_args.append(f"{r[u]} = internal unnamed_addr addrspace(3) global [{u.dtype.size} x {ldt(u.dtype)}] undef, align 16")
         else: NotImplementedError("DEFINE_LOCAL u.dtype is not PtrDType") # workaround mypy
       elif u.op is Ops.ASSIGN: pass  # assign is already handled by the first pass
       elif u.op is Ops.DEFINE_ACC: r[u] = r[u.src[0]]  # a define acc can be used and never be assigned to
