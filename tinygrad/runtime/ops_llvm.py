@@ -13,7 +13,8 @@ def get_llvm_version():
   return major.value, minor.value, patch.value
 
 if getenv("AMD_LLVM", 0):
-  llvm_major = get_llvm_version()[0]
+  try: llvm_major = get_llvm_version()[0] 
+  except: llvm_major = -1
   assert llvm_major >= 18, f"AMD with LLVM backend need LLVM >= 18, got {llvm_major}"
 
 
