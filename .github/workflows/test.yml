@@ -40,7 +40,7 @@ jobs:
         AMD_LLVM: 1
         FORWARD_ONLY: 1
       run: |
-        python3 test/test_tiny.py
+        PYTHONPATH=. python3 test/test_tiny.py
     - name: Run pytest (amd with llvm backend)
       env:
         MOCKGPU: 1
