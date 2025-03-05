@@ -71,7 +71,7 @@ class AMDCompiler(Compiler):
 
 class AMDLLVMCompiler(AMDCompiler):
   def __init__(self, arch:str):
-    super().__init__(f"compile_amd_llvm_{arch}")
+    super().__init__(arch)
     self.llvm_compiler = LLVMCompiler("AMDGPU", arch)
   def __reduce__(self): return (AMDLLVMCompiler,(self.arch,))
   def compile(self, src:str) -> bytes:
