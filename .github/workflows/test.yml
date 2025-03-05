@@ -33,6 +33,14 @@ jobs:
         amd: 'true'
         cuda: 'true'
         llvm: 'true'
+    - name: Run pytest1 (amd with llvm backend)
+      env:
+        MOCKGPU: 1
+        AMD: 1
+        AMD_LLVM: 1
+        FORWARD_ONLY: 1
+      run: |
+        python3 test/test_tiny.py
     - name: Run pytest (amd with llvm backend)
       env:
         MOCKGPU: 1
