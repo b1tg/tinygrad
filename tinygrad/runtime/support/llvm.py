@@ -26,7 +26,10 @@ else:
 if DEBUG>=3: print(f'Using LLVM at {repr(LLVM_PATH)}')
 if getenv("AMD_LLVM", 0):
   # 'libLLVM.so.21.0', 'libLLVM-15.so.1'
-  llvm_ver = int(LLVM_PATH.split("-")[-1].split(".")[0] if "-" in LLVM_PATH else LLVM_PATH.split(".")[2])
+  try:
+    llvm_ver = int(LLVM_PATH.split("-")[-1].split(".")[0] if "-" in LLVM_PATH else LLVM_PATH.split(".")[2])
+  except:
+    raise Exception(f"fail to parse {LLVM_PATH}")
   assert llvm_ver >= 18, f"AMD with LLVM backend need LLVM >= 18, got {llvm_ver}"
 
 @functools.lru_cache(None)
