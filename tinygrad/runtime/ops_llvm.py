@@ -5,6 +5,18 @@ from tinygrad.renderer.llvmir import LLVMRenderer
 import tinygrad.runtime.autogen.llvm as llvm
 from tinygrad.runtime.support.elf import jit_loader
 
+def get_llvm_version():
+  major = ctypes.c_uint32(0)
+  minor = ctypes.c_uint32(0)
+  patch = ctypes.c_uint32(0)
+  llvm.LLVMGetVersion(ctypes.byref(major), ctypes.byref(minor), ctypes.byref(patch))
+  return major.value, minor.value, patch.value
+
+if getenv("AMD_LLVM", 0):
+  llvm_major = get_llvm_version()[0]
+  assert llvm_major >= 18, f"AMD with LLVM backend need LLVM >= 18, got {llvm_major}"
+
+
 def cerr(): return ctypes.pointer(ctypes.pointer(ctypes.c_char()))
 
 def expect(x, err, ret=None):

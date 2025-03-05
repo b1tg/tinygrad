@@ -7386,6 +7386,12 @@ try:
 except AttributeError:
     pass
 try:
+    LLVMGetVersion = _libraries['llvm'].LLVMGetVersion
+    LLVMGetVersion.restype = ctypes.POINTER(ctypes.c_char)
+    LLVMGetVersion.argtypes = [ctypes.POINTER(ctypes.c_uint32), ctypes.POINTER(ctypes.c_uint32), ctypes.POINTER(ctypes.c_uint32)]
+except AttributeError as e:
+    pass
+try:
     LLVMGetHostCPUFeatures = _libraries['llvm'].LLVMGetHostCPUFeatures
     LLVMGetHostCPUFeatures.restype = ctypes.POINTER(ctypes.c_char)
     LLVMGetHostCPUFeatures.argtypes = []
@@ -10664,7 +10670,7 @@ __all__ = \
     'LLVMGetGEPSourceElementType', 'LLVMGetGlobalContext',
     'LLVMGetGlobalIFuncResolver', 'LLVMGetGlobalParent',
     'LLVMGetGlobalPassRegistry', 'LLVMGetGlobalValueAddress',
-    'LLVMGetHandlers', 'LLVMGetHostCPUFeatures', 'LLVMGetHostCPUName',
+    'LLVMGetHandlers', 'LLVMGetHostCPUFeatures', 'LLVMGetHostCPUName','LLVMGetVersion',
     'LLVMGetICmpPredicate', 'LLVMGetIncomingBlock',
     'LLVMGetIncomingValue', 'LLVMGetIndices', 'LLVMGetInitializer',
     'LLVMGetInlineAsm', 'LLVMGetInsertBlock',
