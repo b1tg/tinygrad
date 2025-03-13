@@ -21,8 +21,8 @@ def lconst(x, dtype:DType):
 
 def render_cast(ctx, x: UOp) -> str:
   ot, it, cast_op = x.dtype, x.src[0].dtype, ""
-  pre, pre_type = (f"  {ctx[x]}_ext = fpext {ldt(it)} {ctx[x.src[0]]} to float\n", "float") if {it, ot} == {dtypes.half, dtypes.bfloat16} else \
-                  (f"  {ctx[x]}_ext = zext i1 {ctx[x.src[0]]} to i32\n", "i32") if dtypes.is_bool(it) and ot == dtypes.bfloat16 else ("", "")
+  pre, pre_type = (f" {ctx[x]}_ext = fpext {ldt(it)} {ctx[x.src[0]]} to float\n", "float") if {it, ot} == {dtypes.half, dtypes.bfloat16} else ("", "")
+                  # (f"  {ctx[x]}_ext = zext i1 {ctx[x.src[0]]} to i32\n", "i32") if dtypes.is_bool(it) and ot == dtypes.bfloat16 else ("", "")
   if dtypes.is_float(it) and dtypes.is_float(ot): cast_op = 'fpext' if ot.itemsize > it.itemsize else 'fptrunc'
   elif dtypes.is_float(it) and dtypes.is_int(ot): cast_op = 'fptoui' if dtypes.is_unsigned(ot) else 'fptosi'
   elif dtypes.is_int(it) or dtypes.is_bool(it):
