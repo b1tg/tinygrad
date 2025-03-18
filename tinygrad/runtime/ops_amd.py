@@ -10,7 +10,7 @@ from tinygrad.helpers import getenv, to_mv, round_up, data64_le, mv_address, DEB
 from tinygrad.renderer.cstyle import AMDRenderer
 from tinygrad.runtime.autogen import kfd, hsa, amd_gpu, libc, pci, vfio, sqtt
 from tinygrad.runtime.autogen.am import am, gc_11_0_0
-from tinygrad.runtime.ops_llvm import AMDGPULLVMCompiler
+from tinygrad.runtime.support.comipler_llvm import AMDGPULLVMCompiler
 from tinygrad.runtime.support.compiler_hip import AMDCompiler
 from tinygrad.runtime.support.elf import elf_loader
 from tinygrad.runtime.support.am.amdev import AMDev, AMMapping
