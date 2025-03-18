@@ -1,8 +1,9 @@
 import ctypes, platform
 from tinygrad.device import Compiled, CompileError, Compiler, MallocAllocator, CPUProgram
-from tinygrad.helpers import OSX, getenv, amdgpu_disassemble, capstone_flatdump, DEBUG
+from tinygrad.helpers import OSX, getenv, capstone_flatdump, DEBUG
 from tinygrad.renderer.llvmir import LLVMRenderer
 import tinygrad.runtime.autogen.llvm as llvm
+from tinygrad.runtime.support.compiler_hip import amdgpu_disassemble
 from tinygrad.runtime.support.elf import jit_loader
 
 def cerr(): return ctypes.pointer(ctypes.pointer(ctypes.c_char()))
