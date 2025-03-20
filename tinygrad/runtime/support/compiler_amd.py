@@ -61,7 +61,7 @@ def compile_hip(prg:str, arch="gfx1100", asm=False) -> bytes:
   check(comgr.amd_comgr_destroy_action_info(action_info))
   return ret
 
-class AMDHIPCompiler(Compiler):
+class HIPCompiler(Compiler):
   def __init__(self, arch:str):
     self.arch = arch
     super().__init__(f"compile_hip_{self.arch}")
