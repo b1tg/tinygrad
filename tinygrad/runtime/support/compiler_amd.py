@@ -1,7 +1,7 @@
 import ctypes, subprocess
 import tinygrad.runtime.autogen.comgr as comgr
-from tinygrad.runtime.ops_llvm import LLVMCompiler
 from tinygrad.device import Compiler, CompileError
+from tinygrad.runtime.ops_llvm import LLVMCompiler
 
 def amdgpu_disassemble(lib:bytes):
   asm = subprocess.check_output(["/opt/rocm/llvm/bin/llvm-objdump", '-d', '-'], input=lib)

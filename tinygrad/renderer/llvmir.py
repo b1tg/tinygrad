@@ -130,8 +130,7 @@ class LLVMRenderer(Renderer):
     # copied from cstyle.py, upcast to float32 all the ops that don't support bfloat16
     (UPat((Ops.SQRT, Ops.EXP2, Ops.LOG2, Ops.SIN), dtype=dtypes.bfloat16, name="x"),
       lambda x: (UOp(x.op, dtypes.float, tuple(vv.cast(dtypes.float) for vv in x.src), x.arg).cast(dtypes.bfloat16))),
-    # copied from cstyle.py, add float intermediate casting.
-    # fix half <==> bfloat16 cast
+    # copied from cstyle.py, add float intermediate casting
     (UPat(Ops.CAST, name="x", src=UPat.var("y", dtypes.bfloat16)),lambda x,y: y.cast(dtypes.float).cast(x.dtype) if x.dtype!=dtypes.float else None),
     (UPat(Ops.CAST, dtypes.bfloat16, UPat.var("x")),lambda x: x.cast(dtypes.float).cast(dtypes.bfloat16) if x.dtype!=dtypes.float else None),
   ])
