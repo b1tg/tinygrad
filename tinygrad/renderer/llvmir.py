@@ -194,7 +194,7 @@ class LLVMRenderer(Renderer):
               r[x] = f"%acc{vc}"
 
     # output the function. chr(10) is '\n' (python < 3.12 doesn't support backslashes in f-strings)
-    return "\n".join(local_args) +"\n"f'''\
+    prg = f'''\
 define{(' '+self.abi) if self.abi is not None else ''} void @{name}({','.join(args)}) #0 {{
 {chr(10).join(kernel)}
   ret void
@@ -202,6 +202,8 @@ define{(' '+self.abi) if self.abi is not None else ''} void @{name}({','.join(ar
 {chr(10).join(end_lines.keys())}
 attributes #0 = {{ nounwind "no-builtins" "no-trapping-math"="true" }}
 '''
+    return prg if len(local_args) == 0 else "\n".join(local_args)+f"\n{prg}"
+
 barrier = 'fence syncscope("workgroup") release\ntail call void @llvm.amdgcn.s.barrier()\nfence syncscope("workgroup") acquire\n'
 code_for_workitem = {"g": lambda x: f"tail call i32 @llvm.amdgcn.workgroup.id.{chr(120+int(x))}()",
                      "l": lambda x: f"tail call i32 @llvm.amdgcn.workitem.id.{chr(120+int(x))}()"}
@@ -210,8 +212,8 @@ class AMDLLVMRenderer(LLVMRenderer):
   has_local = True
   has_shared = True
   shared_max = AMDRenderer.shared_max
-  global_max = Renderer.global_max
-  abi = "protected amdgpu_kernel"
+  global_max = AMDRenderer.global_max
+  abi = "amdgpu_kernel"
   string_rewrite = base_rewrite + PatternMatcher([
     (UPat(Ops.SPECIAL, name="x"), lambda ctx, x: f"  {ctx[x]} = " + f"{ code_for_workitem[x.arg[0][0]](x.arg[0][-1])}; "),
     (UPat(Ops.BARRIER), lambda ctx: barrier),
