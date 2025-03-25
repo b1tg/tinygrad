@@ -9,6 +9,7 @@ from tinygrad.helpers import prod, strip_parens
   # (UPat(Ops.EXP2, name="x"), lambda ctx, x: f"  {ctx[x]} = xxxcall float @llvm.amdgcn.exp2.f32(float {ctx[x.src[0]]});"),
 # %log = call half @llvm.amdgcn.log.f16(half %fabs.src)
 code_for_op = {   **CStyleLanguage.code_for_op,
+  # test_sin failed with @llvm.amdgcn.sin.f
   Ops.SIN: lambda x,dtype: f" { {dtypes.half:'half', dtypes.float:'float'}.get(dtype)} @llvm.amdgcn.sin.f{ {dtypes.half:'16', dtypes.float:'32'}.get(dtype)}({ {dtypes.half:'half', dtypes.float:'float'}.get(dtype)} {x});",
   Ops.LOG2: lambda x,dtype: f" { {dtypes.half:'half', dtypes.float:'float'}.get(dtype)} @llvm.amdgcn.log.f{ {dtypes.half:'16', dtypes.float:'32'}.get(dtype)}({ {dtypes.half:'half', dtypes.float:'float'}.get(dtype)} {x});",
   Ops.EXP2: lambda x,dtype: f" { {dtypes.half:'half', dtypes.float:'float'}.get(dtype)} @llvm.amdgcn.exp2.f{ {dtypes.half:'16', dtypes.float:'32'}.get(dtype)}({ {dtypes.half:'half', dtypes.float:'float'}.get(dtype)} {x});",
@@ -156,7 +157,7 @@ class LLVMRenderer(Renderer):
   extra_matcher = PatternMatcher([
     # rewrite RECIP with FDIV
     (UPat(Ops.RECIP, name="x"), lambda x: UOp(Ops.FDIV, x.dtype, (x.const_like(1), x.src[0]))),
-    (UPat(Ops.NEG, name="x"), lambda x: UOp(Ops.SUB, x.dtype, (x.src[0], x.const_like(0)))),
+    (UPat(Ops.NEG, name="x"), lambda x: UOp(Ops.SUB, x.dtype, (x.const_like(0), x.src[0]))),
     # rewrite cast to bool to CMPNE 0
     (UPat(Ops.CAST, dtype=dtypes.bool, name="x"), lambda x: x.src[0] != x.src[0].const_like(0)),
     # rewrite MAX to CMPLT + WHERE
