@@ -1,11 +1,23 @@
 from typing import cast
 import math, struct, sys
 from tinygrad.renderer import Renderer
-from tinygrad.renderer.cstyle import ClangRenderer, AMDRenderer
+from tinygrad.renderer.cstyle import AMDRenderer, CStyleLanguage
 from tinygrad.ops import UOp, PatternMatcher, UPat, Ops, GroupOp
 from tinygrad.dtype import dtypes, DType, PtrDType, truncate
-from tinygrad.helpers import prod, AMX
+from tinygrad.helpers import prod, strip_parens
 
+  # (UPat(Ops.EXP2, name="x"), lambda ctx, x: f"  {ctx[x]} = xxxcall float @llvm.amdgcn.exp2.f32(float {ctx[x.src[0]]});"),
+# %log = call half @llvm.amdgcn.log.f16(half %fabs.src)
+code_for_op = {   **CStyleLanguage.code_for_op,
+  Ops.SIN: lambda x,dtype: f" { {dtypes.half:'half', dtypes.float:'float'}.get(dtype)} @llvm.amdgcn.sin.f{ {dtypes.half:'16', dtypes.float:'32'}.get(dtype)}({ {dtypes.half:'half', dtypes.float:'float'}.get(dtype)} {x});",
+  Ops.LOG2: lambda x,dtype: f" { {dtypes.half:'half', dtypes.float:'float'}.get(dtype)} @llvm.amdgcn.log.f{ {dtypes.half:'16', dtypes.float:'32'}.get(dtype)}({ {dtypes.half:'half', dtypes.float:'float'}.get(dtype)} {x});",
+  Ops.EXP2: lambda x,dtype: f" { {dtypes.half:'half', dtypes.float:'float'}.get(dtype)} @llvm.amdgcn.exp2.f{ {dtypes.half:'16', dtypes.float:'32'}.get(dtype)}({ {dtypes.half:'half', dtypes.float:'float'}.get(dtype)} {x});",
+  Ops.SQRT: lambda x,dtype:  f" { {dtypes.half:'half', dtypes.float:'float'}.get(dtype)} @llvm.amdgcn.sqrt.f{ {dtypes.half:'16', dtypes.float:'32'}.get(dtype)}({ {dtypes.half:'half', dtypes.float:'float'}.get(dtype)} {x});",
+  Ops.ADD: lambda x,dtype:  f" { {dtypes.half:'half', dtypes.float:'float'}.get(dtype)} @llvm.amdgcn.add.f{ {dtypes.half:'16', dtypes.float:'32'}.get(dtype)}({ {dtypes.half:'half', dtypes.float:'float'}.get(dtype)} {x});",
+  Ops.SUB: lambda x,dtype:  f" { {dtypes.half:'half', dtypes.float:'float'}.get(dtype)} @llvm.amdgcn.sub.f{ {dtypes.half:'16', dtypes.float:'32'}.get(dtype)}({ {dtypes.half:'half', dtypes.float:'float'}.get(dtype)} {x});",
+  Ops.MUL: lambda x,dtype:  f" { {dtypes.half:'half', dtypes.float:'float'}.get(dtype)} @llvm.amdgcn.mul.f{ {dtypes.half:'16', dtypes.float:'32'}.get(dtype)}({ {dtypes.half:'half', dtypes.float:'float'}.get(dtype)} {x});",
+  }
+  # Ops.SQRT: lambda x,dtype: f"__ocml_sqrt_f{ {dtypes.half:16, dtypes.double:64}.get(dtype, 32)}({x})" }
 def ldt(dt:DType):
   if dt.vcount > 1: return f"<{dt.vcount} x {ldt(dt.scalar())}>"
   if isinstance(dt, PtrDType): return ldt(dt.base) + (" addrspace(3)*" if dt.local else "*")
@@ -30,10 +42,25 @@ def lcast(input_type:DType, output_type:DType):
     if dtypes.is_float(output_type): return 'sitofp'
     if dtypes.is_int(output_type): return 'trunc' if output_type.itemsize < input_type.itemsize else 'sext'
   raise NotImplementedError(f"cast from {input_type} -> {output_type} not implemented")
-
+# declare <8 x float> @llvm.amdgcn.wmma.f32.16x16x16.f16(<16 x half>, <16 x half> , <8 x float>)
+# declare <8 x float> @llvm.amdgcn.wmma.f32.16x16x16.bf16(<16 x i16>, <16 x i16> , <8 x float>)
+# declare <16 x half> @llvm.amdgcn.wmma.f16.16x16x16.f16(<16 x half>, <16 x half> , <16 x half>, i1 immarg)
+# declare <16 x half> @llvm.amdgcn.wmma.f16.16x16x16.f16.tied(<16 x half>, <16 x half> , <16 x half>, i1 immarg)
+# declare <16 x i16> @llvm.amdgcn.wmma.bf16.16x16x16.bf16(<16 x i16>, <16 x i16> , <16 x i16>, i1 immarg)
+# declare <16 x i16> @llvm.amdgcn.wmma.bf16.16x16x16.bf16.tied(<16 x i16>, <16 x i16> , <16 x i16>, i1 immarg)
+# declare <8 x i32> @llvm.amdgcn.wmma.i32.16x16x16.iu8(i1 immarg, <4 x i32>, i1 immarg, <4 x i32> , <8 x i32>, i1 immarg)
+# declare <8 x i32> @llvm.amdgcn.wmma.i32.16x16x16.iu4(i1 immarg, <2 x i32>, i1 immarg, <2 x i32> , <8 x i32>, i1 immarg)
 # https://github.com/corsix/amx
 def render_wmma(ctx, wmma: UOp) -> str:
   def AMX(op, gpr): return f'call void asm sideeffect ".word (0x201000+($0<<5)+0$1-((0$1>>4)*6))", "i,r,~{{memory}}"(i32 {op}, i64 {gpr}) #0; AMX'
+  f_map = {"half": "f16", "float": "f32"}
+  # %res = call <4 x float> @llvm.amdgcn.wmma.f32.16x16x16.f16(<16 x half> %A, <16 x half> %B, <4 x float> %C)
+  # @llvm.amdgcn.wmma.f32.16x16x16.f16
+  # %wmma7 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x16.f16(<16 x half> %v616, <16 x half> %v622, <8 x float> %v630)
+  return "\n".join([
+  *[f'  store {ldt(src.dtype)} {ctx[src]}, {ldt(src.dtype.ptr())} {ctx[wmma]}_amx{i}, align {src.dtype.itemsize}' for i,src in enumerate(wmma.src)],
+  f"{ctx[wmma]} = call {ldt(wmma.dtype)} @llvm.amdgcn.wmma.{f_map[ldt(wmma.src[2].dtype.scalar())]}.16x16x16.{f_map[ldt(wmma.src[0].dtype.scalar())]}({ldt(wmma.src[0].dtype)} {ctx[wmma.src[0]]}, {ldt(wmma.src[1].dtype)} {ctx[wmma.src[1]]}, {ldt(wmma.src[2].dtype)} {ctx[wmma.src[2]]})"
+  ])
 
   return "\n".join([
     *[f'  store {ldt(src.dtype)} {ctx[src]}, {ldt(src.dtype.ptr())} {ctx[wmma]}_amx{i}, align {src.dtype.itemsize}' for i,src in enumerate(wmma.src)],
@@ -46,10 +73,15 @@ def render_wmma(ctx, wmma: UOp) -> str:
 
 # llvm ops, lop[<dtype>][<op>]
 unsigned_lop = { Ops.ADD: "add", Ops.MUL: "mul", Ops.IDIV: "udiv", Ops.MOD: "urem",
-                 Ops.CMPLT: "icmp ult", Ops.CMPNE: "icmp ne", Ops.OR: "or", Ops.AND: "and", Ops.XOR: "xor", }
+                 Ops.CMPLT: "icmp ult", Ops.CMPNE: "icmp ne", Ops.OR: "or", Ops.AND: "and", Ops.XOR: "xor",
+                 Ops.SHL: "shl",
+                 Ops.SHR: "lshr",
+                 Ops.SUB: "sub",
+                 Ops.FDIV: "fdiv", # 107
+                 }
 signed_lop = {**unsigned_lop, Ops.CMPLT: "icmp slt", Ops.IDIV: "sdiv", Ops.MOD: "srem"}
 flags = " nsz arcp contract afn"
-float_lop = {Ops.ADD: "fadd"+flags, Ops.MUL: "fmul"+flags, Ops.CMPLT: f"fcmp{flags} ult", Ops.CMPNE: f"fcmp{flags} une", Ops.FDIV: "fdiv"+flags}
+float_lop = {Ops.ADD: "fadd"+flags, Ops.SUB: "fsub"+flags, Ops.FDIV: "fdiv"+flags, Ops.MUL: "fmul"+flags, Ops.CMPLT: f"fcmp{flags} ult", Ops.CMPNE: f"fcmp{flags} une", Ops.FDIV: "fdiv"+flags}
 lop = {**{x:unsigned_lop for x in (dtypes.bool,)+dtypes.uints}, **{x:signed_lop for x in dtypes.sints}, **{x:float_lop for x in dtypes.floats}}
 
 base_rewrite = PatternMatcher([
@@ -83,6 +115,9 @@ base_rewrite = PatternMatcher([
   (UPat(Ops.CAST, name="x"), lambda ctx,x: f"  {ctx[x]} = {lcast(x.src[0].dtype, x.dtype)} {ldt(x.src[0].dtype)} {ctx[x.src[0]]} to {ldt(x.dtype)}"),
   (UPat(GroupOp.Binary, name="x"), lambda ctx,x:
    f"  {ctx[x]} = {lop[x.src[0].dtype.scalar()][x.op]} {ldt(x.src[0].dtype)} {ctx[x.src[0]]}, {ctx[x.src[1]]}"),
+  # (UPat(Ops.EXP2, name="x"), lambda ctx, x: f"  {ctx[x]} = xxxcall float @llvm.amdgcn.exp2.f32(float {ctx[x.src[0]]});"),
+  (UPat(GroupOp.Unary, name="x"), lambda ctx,x: f"  {ctx[x]} = call " + code_for_op[x.op](
+    *([strip_parens(ctx[v]) if v.op == x.op and x.op in {Ops.ADD, Ops.MUL, Ops.XOR} else ctx[v] for v in x.src]), x.dtype)),
   (UPat(Ops.WHERE, name="x"), lambda ctx,x:
    f"  {ctx[x]} = select {ldt(x.src[0].dtype)} {ctx[x.src[0]]}, {ldt(x.src[1].dtype)} {ctx[x.src[1]]}, {ldt(x.src[2].dtype)} {ctx[x.src[2]]}"),
 
@@ -116,11 +151,12 @@ class LLVMRenderer(Renderer):
   has_shared = False
   global_max: tuple[int, ...] | None = None
   string_rewrite = base_rewrite
-  if AMX: tensor_cores = ClangRenderer.amx_tc
+  # if AMX: tensor_cores = ClangRenderer.amx_tc
 
   extra_matcher = PatternMatcher([
     # rewrite RECIP with FDIV
     (UPat(Ops.RECIP, name="x"), lambda x: UOp(Ops.FDIV, x.dtype, (x.const_like(1), x.src[0]))),
+    (UPat(Ops.NEG, name="x"), lambda x: UOp(Ops.SUB, x.dtype, (x.src[0], x.const_like(0)))),
     # rewrite cast to bool to CMPNE 0
     (UPat(Ops.CAST, dtype=dtypes.bool, name="x"), lambda x: x.src[0] != x.src[0].const_like(0)),
     # rewrite MAX to CMPLT + WHERE
@@ -128,8 +164,8 @@ class LLVMRenderer(Renderer):
     # rewrite bf16 CAST(LOAD) to CAST(BITCAST)
     (UPat(Ops.CAST, name="root", src=(UPat.load(UPat.index(UPat.var("buf"), UPat.var("idx")), dtype=dtypes.bfloat16),)), llvm_bf16_cast),
     # copied from cstyle.py, upcast to float32 all the ops that don't support bfloat16
-    (UPat((Ops.SQRT, Ops.EXP2, Ops.LOG2, Ops.SIN), dtype=dtypes.bfloat16, name="x"),
-      lambda x: (UOp(x.op, dtypes.float, tuple(vv.cast(dtypes.float) for vv in x.src), x.arg).cast(dtypes.bfloat16))),
+    # (UPat((Ops.SQRT, Ops.EXP2, Ops.LOG2, Ops.SIN), dtype=dtypes.bfloat16, name="x"),
+    #   lambda x: (UOp(x.op, dtypes.float, tuple(vv.cast(dtypes.float) for vv in x.src), x.arg).cast(dtypes.bfloat16))),
     # copied from cstyle.py, add float intermediate casting
     (UPat(Ops.CAST, name="x", src=UPat.var("y", dtypes.bfloat16)),lambda x,y: y.cast(dtypes.float).cast(x.dtype) if x.dtype!=dtypes.float else None),
     (UPat(Ops.CAST, dtypes.bfloat16, UPat.var("x")),lambda x: x.cast(dtypes.float).cast(dtypes.bfloat16) if x.dtype!=dtypes.float else None),
@@ -213,8 +249,14 @@ class AMDLLVMRenderer(LLVMRenderer):
   has_shared = True
   shared_max = AMDRenderer.shared_max
   global_max = AMDRenderer.global_max
+  tensor_cores = AMDRenderer.tensor_cores
   abi = "amdgpu_kernel"
-  string_rewrite = base_rewrite + PatternMatcher([
+  code_for_op = {   **CStyleLanguage.code_for_op,
+    Ops.SIN: lambda x,dtype: f"__ocml_sin_f{ {dtypes.half:16, dtypes.double:64}.get(dtype, 32)}({x})",
+    Ops.LOG2: lambda x,dtype: f"__ocml_log2_f{ {dtypes.half:16, dtypes.double:64}.get(dtype, 32)}({x})",
+    Ops.EXP2: lambda x,dtype: f"__ocml_exp2_f{ {dtypes.half:16, dtypes.double:64}.get(dtype, 32)}({x})",
+    Ops.SQRT: lambda x,dtype: f"__ocml_sqrt_f{ {dtypes.half:16, dtypes.double:64}.get(dtype, 32)}({x})" }
+  string_rewrite =   PatternMatcher([
     (UPat(Ops.SPECIAL, name="x"), lambda ctx, x: f"  {ctx[x]} = " + f"{ code_for_workitem[x.arg[0][0]](x.arg[0][-1])}; "),
     (UPat(Ops.BARRIER), lambda ctx: barrier),
-  ])
+  ]) + base_rewrite
