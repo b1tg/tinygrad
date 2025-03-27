@@ -1,11 +1,20 @@
 from typing import cast
-import math, struct, sys
+import math, os, struct, sys
 from tinygrad.renderer import Renderer
 from tinygrad.renderer.cstyle import AMDRenderer, CStyleLanguage
 from tinygrad.ops import UOp, PatternMatcher, UPat, Ops, GroupOp
+from tinygrad.codegen.transcendental import xsin
 from tinygrad.dtype import dtypes, DType, PtrDType, truncate
 from tinygrad.helpers import prod, strip_parens
 
+'''
+for NUM=35, tinygrad generate function r_8_4_8_16_2_16_4_16n1,
+but acutally rocm generate llvmir unroll the 2_16 to 1_1_16
+
+NUM=130, comgr:2.43 fast, hip1.30 fast
+
+NUM=171, r_32_ 2_112_28 _4n1 , 2 被展开了
+'''
   # (UPat(Ops.EXP2, name="x"), lambda ctx, x: f"  {ctx[x]} = xxxcall float @llvm.amdgcn.exp2.f32(float {ctx[x.src[0]]});"),
 # %log = call half @llvm.amdgcn.log.f16(half %fabs.src)
 code_for_op = {   **CStyleLanguage.code_for_op,
@@ -73,15 +82,18 @@ def render_wmma(ctx, wmma: UOp) -> str:
       f'  {ctx[wmma]} = load {ldt(wmma.dtype)}, ptr {ctx[wmma]}_amx2, align {wmma.dtype.itemsize}'])
 
 # llvm ops, lop[<dtype>][<op>]
-unsigned_lop = { Ops.ADD: "add", Ops.MUL: "mul", Ops.IDIV: "udiv", Ops.MOD: "urem",
+# #11 need nsw, why?
+unsigned_lop = { Ops.ADD: "add nsw", Ops.MUL: "mul nsw", Ops.IDIV: "udiv", Ops.MOD: "urem",
                  Ops.CMPLT: "icmp ult", Ops.CMPNE: "icmp ne", Ops.OR: "or", Ops.AND: "and", Ops.XOR: "xor",
-                 Ops.SHL: "shl",
+                 Ops.SHL: "shl nsw",
                  Ops.SHR: "lshr",
                  Ops.SUB: "sub",
                  Ops.FDIV: "fdiv", # 107
                  }
 signed_lop = {**unsigned_lop, Ops.CMPLT: "icmp slt", Ops.IDIV: "sdiv", Ops.MOD: "srem"}
 flags = " nsz arcp contract afn"
+flags = " reassoc nnan nsz arcp contract afn"
+flags = "  contract"
 float_lop = {Ops.ADD: "fadd"+flags, Ops.SUB: "fsub"+flags, Ops.FDIV: "fdiv"+flags, Ops.MUL: "fmul"+flags, Ops.CMPLT: f"fcmp{flags} ult", Ops.CMPNE: f"fcmp{flags} une", Ops.FDIV: "fdiv"+flags}
 lop = {**{x:unsigned_lop for x in (dtypes.bool,)+dtypes.uints}, **{x:signed_lop for x in dtypes.sints}, **{x:float_lop for x in dtypes.floats}}
 
@@ -155,6 +167,8 @@ class LLVMRenderer(Renderer):
   # if AMX: tensor_cores = ClangRenderer.amx_tc
 
   extra_matcher = PatternMatcher([
+    # llvm.amdgcn.sin not work
+    ((UPat(Ops.SIN, name="x"), lambda x: xsin(x.src[0]))),
     # rewrite RECIP with FDIV
     (UPat(Ops.RECIP, name="x"), lambda x: UOp(Ops.FDIV, x.dtype, (x.const_like(1), x.src[0]))),
     (UPat(Ops.NEG, name="x"), lambda x: UOp(Ops.SUB, x.dtype, (x.const_like(0), x.src[0]))),
@@ -237,9 +251,28 @@ define{(' '+self.abi) if self.abi is not None else ''} void @{name}({','.join(ar
   ret void
 }}
 {chr(10).join(end_lines.keys())}
-attributes #0 = {{ nounwind "no-builtins" "no-trapping-math"="true" }}
 '''
-    return prg if len(local_args) == 0 else "\n".join(local_args)+f"\n{prg}"
+    # NUM=35 need target-features
+    # NUM=130 can't use target-features, 而且和字段无关
+    end = '''
+attributes #0 = { nounwind "no-builtins" "no-trapping-math"="true" "target-features"="" }
+    '''
+
+    # test with test/external/speed_compare_hip_llvm.py
+    speed_nums = ("130", "83", "244")
+    if os.getenv("NUM") in speed_nums or os.getenv("NUM1") in speed_nums:
+      end = '''
+attributes #0 = { nounwind "no-builtins" "no-trapping-math"="true"  }
+      '''
+    # with open("/tmp/1/11.ll.1") as f:
+    #   inject_il = f.read()
+    #   return inject_il
+    res = (prg if len(local_args) == 0 else "\n".join(local_args)+f"\n{prg}" ) + end
+    # num = os.getenv("NUM")
+    # if num:
+    #   with open(f"/tmp/1/{num}.ll", "w") as f:
+    #     f.write(res)
+    return res
 
 barrier = 'fence syncscope("workgroup") release\ntail call void @llvm.amdgcn.s.barrier()\nfence syncscope("workgroup") acquire\n'
 code_for_workitem = {"g": lambda x: f"tail call i32 @llvm.amdgcn.workgroup.id.{chr(120+int(x))}()",
