@@ -205,7 +205,7 @@ define{(' '+self.abi) if self.abi is not None else ''} void @{name}({','.join(ar
   ret void
 }}
 {chr(10).join(end_lines.keys())}
-attributes #0 = {{ nounwind "no-builtins" "no-trapping-math"="true" }}
+attributes #0 = {{ nounwind "no-builtins" "no-trapping-math"="true" "target-features"="" }}
 '''
     return prg if len(local_args) == 0 else "\n".join(local_args)+f"\n{prg}"
 
