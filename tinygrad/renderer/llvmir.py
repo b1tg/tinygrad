@@ -1,11 +1,34 @@
 from typing import cast
 import math, struct, sys
 from tinygrad.renderer import Renderer
-from tinygrad.renderer.cstyle import ClangRenderer, AMDRenderer
+from tinygrad.renderer.cstyle import ClangRenderer, AMDRenderer, CStyleLanguage
 from tinygrad.ops import UOp, PatternMatcher, UPat, Ops, GroupOp
+from tinygrad.codegen.transcendental import xsin, xpow, xexp2, xlog2
 from tinygrad.dtype import dtypes, DType, PtrDType, truncate
-from tinygrad.helpers import prod, AMX
+from tinygrad.helpers import prod, AMX, strip_parens
 
+'''
+for NUM=35, tinygrad generate function r_8_4_8_16_2_16_4_16n1,
+but acutally rocm generate llvmir unroll the 2_16 to 1_1_16
+
+NUM=130, comgr:2.43 fast, hip1.30 fast
+
+NUM=171, r_32_ 2_112_28 _4n1 , 2 被展开了
+'''
+  # (UPat(Ops.EXP2, name="x"), lambda ctx, x: f"  {ctx[x]} = xxxcall float @llvm.amdgcn.exp2.f32(float {ctx[x.src[0]]});"),
+# %log = call half @llvm.amdgcn.log.f16(half %fabs.src)
+tp_map = {dtypes.half:'half', dtypes.float:'float'}
+sz_map = {dtypes.half:'half', dtypes.float:'float'}
+code_for_op = {   **CStyleLanguage.code_for_op,
+  # test_sin failed with @llvm.amdgcn.sin.f
+  Ops.SIN: lambda x,dtype: f" { tp_map.get(dtype)} @llvm.amdgcn.sin.f{ sz_map.get(dtype)}({ tp_map.get(dtype)} {x});",
+  Ops.LOG2: lambda x,dtype: f" { tp_map.get(dtype)} @llvm.amdgcn.log.f{ sz_map.get(dtype)}({ tp_map.get(dtype)} {x});",
+  Ops.EXP2: lambda x,dtype: f" { tp_map.get(dtype)} @llvm.amdgcn.exp2.f{ sz_map.get(dtype)}({ tp_map.get(dtype)} {x});",
+  Ops.SQRT: lambda x,dtype:  f" { tp_map.get(dtype)} @llvm.amdgcn.sqrt.f{ sz_map.get(dtype)}({ tp_map.get(dtype)} {x});",
+  Ops.ADD: lambda x,dtype:  f" { tp_map.get(dtype)} @llvm.amdgcn.add.f{ sz_map.get(dtype)}({ tp_map.get(dtype)} {x});",
+  Ops.SUB: lambda x,dtype:  f" { tp_map.get(dtype)} @llvm.amdgcn.sub.f{ sz_map.get(dtype)}({ tp_map.get(dtype)} {x});",
+  Ops.MUL: lambda x,dtype:  f" { tp_map.get(dtype)} @llvm.amdgcn.mul.f{ sz_map.get(dtype)}({ tp_map.get(dtype)} {x});",
+  }
 def ldt(dt:DType):
   if dt.vcount > 1: return f"<{dt.vcount} x {ldt(dt.scalar())}>"
   if isinstance(dt, PtrDType): return ldt(dt.base) + (" addrspace(3)*" if dt.local else "*")
@@ -53,11 +76,20 @@ def render_wmma_amd(ctx, wmma: UOp) -> str:
       if wmma.dtype.scalar() != dtypes.float else ")")
 
 # llvm ops, lop[<dtype>][<op>]
-unsigned_lop = { Ops.ADD: "add", Ops.MUL: "mul", Ops.IDIV: "udiv", Ops.MOD: "urem",
-                 Ops.CMPLT: "icmp ult", Ops.CMPNE: "icmp ne", Ops.OR: "or", Ops.AND: "and", Ops.XOR: "xor", }
+# #11 need nsw, why?
+unsigned_lop = { Ops.ADD: "add nsw", Ops.MUL: "mul nsw", Ops.IDIV: "udiv", Ops.MOD: "urem",
+                 Ops.CMPLT: "icmp ult", Ops.CMPNE: "icmp ne", Ops.OR: "or", Ops.AND: "and", Ops.XOR: "xor",
+                 Ops.SHL: "shl nsw",
+                 Ops.SHR: "lshr",
+                 Ops.SUB: "sub",
+                 Ops.FDIV: "fdiv", # 107
+                 }
 signed_lop = {**unsigned_lop, Ops.CMPLT: "icmp slt", Ops.IDIV: "sdiv", Ops.MOD: "srem"}
 flags = " nsz arcp contract afn"
-float_lop = {Ops.ADD: "fadd"+flags, Ops.MUL: "fmul"+flags, Ops.CMPLT: f"fcmp{flags} ult", Ops.CMPNE: f"fcmp{flags} une", Ops.FDIV: "fdiv"+flags}
+# flags = " reassoc nnan nsz arcp contract afn"
+# flags = "  contract"
+float_lop = {Ops.ADD: "fadd"+flags, Ops.SUB: "fsub"+flags, Ops.FDIV: "fdiv"+flags, Ops.MUL: "fmul"+flags, Ops.CMPLT: f"fcmp{flags} ult",
+            Ops.CMPNE: f"fcmp{flags} une", Ops.FDIV: "fdiv"+flags}
 lop = {**{x:unsigned_lop for x in (dtypes.bool,)+dtypes.uints}, **{x:signed_lop for x in dtypes.sints}, **{x:float_lop for x in dtypes.floats}}
 
 base_rewrite = PatternMatcher([
@@ -91,6 +123,9 @@ base_rewrite = PatternMatcher([
   (UPat(Ops.CAST, name="x"), lambda ctx,x: f"  {ctx[x]} = {lcast(x.src[0].dtype, x.dtype)} {ldt(x.src[0].dtype)} {ctx[x.src[0]]} to {ldt(x.dtype)}"),
   (UPat(GroupOp.Binary, name="x"), lambda ctx,x:
    f"  {ctx[x]} = {lop[x.src[0].dtype.scalar()][x.op]} {ldt(x.src[0].dtype)} {ctx[x.src[0]]}, {ctx[x.src[1]]}"),
+  # (UPat(Ops.EXP2, name="x"), lambda ctx, x: f"  {ctx[x]} = xxxcall float @llvm.amdgcn.exp2.f32(float {ctx[x.src[0]]});"),
+  (UPat(GroupOp.Unary, name="x"), lambda ctx,x: f"  {ctx[x]} = call " + code_for_op[x.op](
+    *([strip_parens(ctx[v]) if v.op == x.op and x.op in {Ops.ADD, Ops.MUL, Ops.XOR} else ctx[v] for v in x.src]), x.dtype)),
   (UPat(Ops.WHERE, name="x"), lambda ctx,x:
    f"  {ctx[x]} = select {ldt(x.src[0].dtype)} {ctx[x.src[0]]}, {ldt(x.src[1].dtype)} {ctx[x.src[1]]}, {ldt(x.src[2].dtype)} {ctx[x.src[2]]}"),
 
@@ -124,8 +159,14 @@ class LLVMRenderer(Renderer):
   if AMX: tensor_cores = ClangRenderer.amx_tc
 
   extra_matcher = PatternMatcher([
+    # llvm.amdgcn.sin not work
+    ((UPat(Ops.SIN, name="x"), lambda x: xsin(x.src[0]))),
+    ((UPat(Ops.SQRT, dtype=dtypes.double, name="x"), lambda x: xpow(x.src[0], x.src[0].const_like(0.5)))),
+    ((UPat(Ops.EXP2, dtype=dtypes.double, name="x"), lambda x: xexp2(x.src[0]))),
+    ((UPat(Ops.LOG2, dtype=dtypes.double, name="x"), lambda x: xlog2(x.src[0]))),
     # rewrite RECIP with FDIV
     (UPat(Ops.RECIP, name="x"), lambda x: UOp(Ops.FDIV, x.dtype, (x.const_like(1), x.src[0]))),
+    (UPat(Ops.NEG, name="x"), lambda x: UOp(Ops.SUB, x.dtype, (x.const_like(0), x.src[0]))),
     # rewrite cast to bool to CMPNE 0
     (UPat(Ops.CAST, dtype=dtypes.bool, name="x"), lambda x: x.src[0] != x.src[0].const_like(0)),
     # rewrite MAX to CMPLT + WHERE
