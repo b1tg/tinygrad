@@ -82,14 +82,14 @@ unsigned_lop = { Ops.ADD: "add nsw", Ops.MUL: "mul nsw", Ops.IDIV: "udiv", Ops.M
                  Ops.SHL: "shl nsw",
                  Ops.SHR: "lshr",
                  Ops.SUB: "sub",
-                 Ops.FDIV: "fdiv", # 107
+                #  Ops.FDIV: "fdiv", # 107
                  }
 signed_lop = {**unsigned_lop, Ops.CMPLT: "icmp slt", Ops.IDIV: "sdiv", Ops.MOD: "srem"}
 flags = " nsz arcp contract afn"
 # flags = " reassoc nnan nsz arcp contract afn"
 # flags = "  contract"
 float_lop = {Ops.ADD: "fadd"+flags, Ops.SUB: "fsub"+flags, Ops.FDIV: "fdiv"+flags, Ops.MUL: "fmul"+flags, Ops.CMPLT: f"fcmp{flags} ult",
-            Ops.CMPNE: f"fcmp{flags} une", Ops.FDIV: "fdiv"+flags}
+            Ops.CMPNE: f"fcmp{flags} une"}
 lop = {**{x:unsigned_lop for x in (dtypes.bool,)+dtypes.uints}, **{x:signed_lop for x in dtypes.sints}, **{x:float_lop for x in dtypes.floats}}
 
 base_rewrite = PatternMatcher([
