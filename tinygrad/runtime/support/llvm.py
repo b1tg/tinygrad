@@ -1,4 +1,4 @@
-import ctypes, ctypes.util, os, sys, subprocess
+import ctypes, ctypes.util, os, shutil, sys, subprocess
 from tinygrad.helpers import DEBUG, OSX, getenv
 
 if sys.platform == 'win32':
@@ -22,4 +22,6 @@ else:
   if LLVM_PATH is None:
     raise FileNotFoundError("No LLVM library found on the system. Install it via your distro's package manager and ensure it's findable as 'LLVM'")
 
+OBJDUMP_PATH = next((path for ver in reversed(range(14, 19+1)) if (path := shutil.which(f"llvm-objdump-{ver}"))), "/opt/rocm/llvm/bin/llvm-objdump")
 if DEBUG>=3: print(f'Using LLVM at {repr(LLVM_PATH)}')
+if DEBUG>=3: print(f'Using objdump at {repr(OBJDUMP_PATH)}')
