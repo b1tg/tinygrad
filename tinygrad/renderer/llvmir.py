@@ -5,6 +5,7 @@ from tinygrad.renderer.cstyle import ClangRenderer, AMDRenderer
 from tinygrad.ops import UOp, PatternMatcher, UPat, Ops, GroupOp
 from tinygrad.dtype import dtypes, DType, PtrDType, truncate
 from tinygrad.helpers import prod, AMX
+from tinygrad.codegen.transcendental import xpow, xexp2, xlog2
 
 def ldt(dt:DType):
   if dt.vcount > 1: return f"<{dt.vcount} x {ldt(dt.scalar())}>"
@@ -214,7 +215,7 @@ attributes #0 = {{ nounwind "no-builtins" "no-trapping-math"="true" }}
 barrier = 'fence syncscope("workgroup") release\ntail call void @llvm.amdgcn.s.barrier()\nfence syncscope("workgroup") acquire\n'
 code_for_workitem = {"g": lambda x: f"tail call i32 @llvm.amdgcn.workgroup.id.{chr(120+int(x))}()",
                      "l": lambda x: f"tail call i32 @llvm.amdgcn.workitem.id.{chr(120+int(x))}()"}
-tp_map, sz_map = {dtypes.half:'half', dtypes.float:'float'}, {dtypes.half:'f16', dtypes.float:'f32'}
+tp_map, sz_map = { dtypes.half: 'half', dtypes.float: 'float' }, { dtypes.half: 'f16', dtypes.float: 'f32' }
 class AMDLLVMRenderer(LLVMRenderer):
   device = "AMD"
   has_local = True
@@ -223,14 +224,14 @@ class AMDLLVMRenderer(LLVMRenderer):
   global_max = AMDRenderer.global_max
   tensor_cores = AMDRenderer.tensor_cores
   code_for_op = {
-    Ops.EXP2: lambda x,dtype: f" { tp_map.get(dtype)} @llvm.amdgcn.exp2.{ sz_map.get(dtype)}({ tp_map.get(dtype)} {x});",
-    Ops.LOG2: lambda x,dtype: f" { tp_map.get(dtype)} @llvm.amdgcn.log.{ sz_map.get(dtype)}({ tp_map.get(dtype)} {x});",
-    Ops.SIN: lambda x,dtype: f" { tp_map.get(dtype)} @llvm.amdgcn.sin.{ sz_map.get(dtype)}({ tp_map.get(dtype)} {x});",
-    Ops.SQRT: lambda x,dtype:  f" { tp_map.get(dtype)} @llvm.amdgcn.sqrt.{ sz_map.get(dtype)}({ tp_map.get(dtype)} {x});",
+    # llvm.amdgcn.sin failed TestOps::test_sin
+    Ops.LOG2: lambda x, dtype: f"  {tp_map[dtype]} @llvm.amdgcn.log.{sz_map[dtype]}({tp_map[dtype]} {x});",
+    Ops.EXP2: lambda x, dtype: f"  {tp_map[dtype]} @llvm.amdgcn.exp2.{sz_map[dtype]}({tp_map[dtype]} {x});",
+    Ops.SQRT: lambda x, dtype: f"  {tp_map[dtype]} @llvm.amdgcn.sqrt.{sz_map[dtype]}({tp_map[dtype]} {x});",
   }
   abi = "amdgpu_kernel"
   string_rewrite = PatternMatcher([
-    (UPat(GroupOp.Unary, name="x"), lambda ctx,x: f"  {ctx[x]} = call " + ctx.code_for_op[x.op](*([ctx[v] for v in x.src]), x.dtype)),
+    (UPat(GroupOp.Unary, name="x"), lambda ctx, x: f"  {ctx[x]} = call " + ctx.code_for_op[x.op](*([ctx[v] for v in x.src]), x.dtype)),
     (UPat(Ops.SPECIAL, name="x"), lambda ctx, x: f"  {ctx[x]} = " + f"{ code_for_workitem[x.arg[0][0]](x.arg[0][-1])}; "),
     (UPat(Ops.BARRIER), lambda ctx: barrier),
     (UPat(Ops.CAST, name="x", dtype=dtypes.half.vec(16), src=UPat.var("y", dtypes.half.vec(8))), lambda ctx, x, y: f"  {ctx[x]} = shufflevector "\
@@ -240,6 +241,10 @@ class AMDLLVMRenderer(LLVMRenderer):
     (UPat(Ops.WMMA, name="wmma"), render_wmma_amd),
   ]) + base_rewrite
   extra_matcher = PatternMatcher([
+    # double intrinsics missing for sqrt/exp2/log2
+    ((UPat(Ops.SQRT, dtype=dtypes.double, name="x"), lambda x: xpow(x.src[0], x.src[0].const_like(0.5)))),
+    ((UPat(Ops.EXP2, dtype=dtypes.double, name="x"), lambda x: xexp2(x.src[0]))),
+    ((UPat(Ops.LOG2, dtype=dtypes.double, name="x"), lambda x: xlog2(x.src[0]))),
     (UPat(Ops.WMMA, name="x", dtype=dtypes.half.vec(8)),
      lambda x: UOp(Ops.WMMA, dtypes.half.vec(16), (x.src[0], x.src[1], x.src[2].cast(dtypes.half.vec(16))), (*x.arg,)).cast(dtypes.half.vec(8)))
   ]) + LLVMRenderer.extra_matcher
