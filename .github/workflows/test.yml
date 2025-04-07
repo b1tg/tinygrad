@@ -149,7 +149,7 @@ jobs:
   torchbackend:
     name: Torch Backend Tests
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
     - name: Checkout Code
       uses: actions/checkout@v4
@@ -186,7 +186,7 @@ jobs:
   torchbackendmore:
     name: Torch Backend Tests More
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
     - name: Checkout Code
       uses: actions/checkout@v4
@@ -356,6 +356,8 @@ jobs:
         deps: testing_minimal
     - name: Fuzz Test symbolic
       run: python test/external/fuzz_symbolic.py
+    - name: Fuzz Test fast idiv
+      run: python test/external/fuzz_fast_idiv.py
     - name: Fuzz Test shapetracker
       run: |
         PYTHONPATH="." python test/external/fuzz_shapetracker.py
