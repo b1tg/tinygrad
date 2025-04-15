@@ -41,11 +41,14 @@ def rm_control(cmd, sttyp, fd, client, obj, **kwargs):
   return params
 
 def make_rmctrl_type():
+  # print({name[name.find("_CTRL_CMD_")+10:].lower(): functools.partial(rm_control, dt, sttyp)
+  #   for name,dt in nv_gpu.__dict__.items() if name.find("_CTRL_CMD_")>=0 and (sttyp:=getattr(nv_gpu, name.replace("_CTRL_CMD_", "_CTRL_")+"_PARAMS", \
+  #     getattr(nv_gpu, name+"_PARAMS", getattr(nv_gpu, name.replace("_CTRL_CMD_", "_CTRL_DEBUG_")+"_PARAMETERS", None))))})
   return type("NVRMCTRL", (object,), {name[name.find("_CTRL_CMD_")+10:].lower(): functools.partial(rm_control, dt, sttyp)
     for name,dt in nv_gpu.__dict__.items() if name.find("_CTRL_CMD_")>=0 and (sttyp:=getattr(nv_gpu, name.replace("_CTRL_CMD_", "_CTRL_")+"_PARAMS", \
       getattr(nv_gpu, name+"_PARAMS", getattr(nv_gpu, name.replace("_CTRL_CMD_", "_CTRL_DEBUG_")+"_PARAMETERS", None))))})
 rmctrl = make_rmctrl_type()
-
+# print("== rmctrl:", rmctrl)
 def uvm_ioctl(cmd, sttyp, fd:HWInterface, **kwargs):
   ret = fd.ioctl(cmd, made:=sttyp(**kwargs))
   if ret != 0: raise RuntimeError(f"ioctl(uvm) returned {ret}")
@@ -57,7 +60,7 @@ def make_uvm_type():
                                    for name,dt in nv_gpu.__dict__.items() if name.startswith("UVM_") and nv_gpu.__dict__.get(name+"_PARAMS")})
 uvm = make_uvm_type()
 
-def make_qmd_struct_type():
+def make_qmd_struct_type(): # TODO
   fields: list[tuple[str, Union[Type[ctypes.c_uint64], Type[ctypes.c_uint32]], Any]] = []
   bits = [(name,dt) for name,dt in nv_gpu.__dict__.items() if name.startswith("NVC6C0_QMDV03_00") and isinstance(dt, tuple)]
   bits += [(name+f"_{i}",dt(i)) for name,dt in nv_gpu.__dict__.items() for i in range(8) if name.startswith("NVC6C0_QMDV03_00") and callable(dt)]
@@ -235,7 +238,7 @@ class NVProgram(HCQProgram):
                             invalidate_texture_data_cache=1, invalidate_shader_data_cache=1, api_visible_call_limit=1, sampler_index=1,
                             cwd_membar_type=nv_gpu.NVC6C0_QMDV03_00_CWD_MEMBAR_TYPE_L1_SYSMEMBAR, qmd_major_version=3, constant_buffer_invalidate_0=1,
                             shared_memory_size=self.shmem_usage, min_sm_config_shared_mem_size=smem_cfg, target_sm_config_shared_mem_size=smem_cfg,
-                            max_sm_config_shared_mem_size=0x1a, register_count_v=self.regs_usage, program_address=self.prog_addr, sass_version=0x89,
+                            max_sm_config_shared_mem_size=0x1a, register_count_v=self.regs_usage, program_address=self.prog_addr, sass_version=0x89, # TODO
                             barrier_count=1, shader_local_memory_high_size=self.dev.slm_per_thread, program_prefetch_size=self.prog_sz>>8,
                             program_prefetch_addr_lower_shifted=self.prog_addr>>8, program_prefetch_addr_upper_shifted=self.prog_addr>>40)
 
@@ -281,7 +284,7 @@ class NVAllocator(HCQAllocator['NVDevice']):
 @dataclass
 class GPFifo:
   ring: memoryview
-  controls: nv_gpu.AmpereAControlGPFifo
+  controls: nv_gpu.BlackwellBControlGPFifo
   entries_count: int
   token: int
   put_value: int = 0
@@ -325,7 +328,7 @@ class NVDevice(HCQCompiled[NVSignal]):
 
     if host:
       va_addr = HWInterface.anon_mmap(va_addr, size, mmap.PROT_READ | mmap.PROT_WRITE, MAP_FIXED | mmap.MAP_SHARED | mmap.MAP_ANONYMOUS, 0)
-
+      # TODO
       flags = (nv_gpu.NVOS02_FLAGS_PHYSICALITY_NONCONTIGUOUS << 4) | (nv_gpu.NVOS02_FLAGS_COHERENCY_CACHED << 12) \
             | (nv_gpu.NVOS02_FLAGS_MAPPING_NO_MAP << 30)
 
@@ -386,8 +389,15 @@ class NVDevice(HCQCompiled[NVSignal]):
   def _setup_nvclasses(self):
     classlist = memoryview(bytearray(100 * 4)).cast('I')
     clsinfo = rmctrl.gpu_get_classlist(self.fd_ctl, self.root, self.nvdevice, numClasses=100, classList=mv_address(classlist))
+    print(f"clsinfo.numClasses: {clsinfo.numClasses}")
     self.nvclasses = {classlist[i] for i in range(clsinfo.numClasses)}
-    self.compute_class = next(clss for clss in [nv_gpu.ADA_COMPUTE_A, nv_gpu.AMPERE_COMPUTE_B] if clss in self.nvclasses)
+    print(f"self.nvclasses: {self.nvclasses}")
+# clsinfo.numClasses: 56
+# self.nvclasses: {41088, 20608, 41089, 50017, 41092, 51824, 37014, 52887, 20640, 52130, 36909, 53168, 52019, 51893, 51834, 53175, 20539, 20540, 51835, 52928, 52544, 64, 51837, 50031, 33868, 50287, 53201, 222, 96, 50529, 51041, 50785, 53242, 50021, 37094, 36967, 37095, 50025, 50273, 41068, 51567, 50543, 51823, 37105, 36978, 36980, 51311, 49270, 112, 115, 50034, 51825, 51827, 125, 51838, 51071}
+# == [nv_gpu.ADA_COMPUTE_A, nv_gpu.AMPERE_COMPUTE_B]: [51648, 51136]    0xc9c0, 0xc7c0 
+    # BLACKWELL_COMPUTE_A                      (0x0000cdc0) 52672
+    # BLACKWELL_COMPUTE_B 0x0000cec0
+    self.compute_class = next(clss for clss in [nv_gpu.ADA_COMPUTE_A, nv_gpu.AMPERE_COMPUTE_B, nv_gpu.BLACKWELL_COMPUTE_B] if clss in self.nvclasses)
 
   def __init__(self, device:str=""):
     if NVDevice.root is None:
@@ -403,7 +413,7 @@ class NVDevice(HCQCompiled[NVSignal]):
       NVDevice.gpus_info = [gpus_info[x] for x in visible_devices] if visible_devices else gpus_info
 
     self.device_id = int(device.split(":")[1]) if ":" in device else 0
-
+    print(f"== self.device_id: {self.device_id}")
     if self.device_id >= len(NVDevice.gpus_info) or not NVDevice.gpus_info[self.device_id].valid:
       raise RuntimeError(f"No device found for {device}. Requesting more devices than the system has?")
 
@@ -457,8 +467,13 @@ class NVDevice(HCQCompiled[NVSignal]):
 
     self.num_gpcs, self.num_tpc_per_gpc, self.num_sm_per_tpc, self.max_warps_per_sm, self.sm_version = self._query_gpu_info('num_gpcs',
       'num_tpc_per_gpc', 'num_sm_per_tpc', 'max_warps_per_sm', 'sm_version')
-    self.arch: str = f"sm_{(self.sm_version>>8)&0xff}{(val>>4) if (val:=self.sm_version&0xff) > 0xf else val}"
-
+    # == versions, 12, 8, 2, 48, 2564(0xa04)
+    # NV2080_CTRL_GR_INFO_SM_VERSION_10_04
+    print(f"== versions, {self.num_gpcs}, {self.num_tpc_per_gpc}, {self.num_sm_per_tpc}, {self.max_warps_per_sm}, {self.sm_version}")
+    self.arch: str = f"sm_{(self.sm_version>>8)&0xff}{(val>>4) if (val:=self.sm_version&0xff) > 0xf else val}" # TODO
+    print(f"== self.arch: {self.arch}") 
+    # 5070Ti: sm_104
+    self.arch = "sm_120" # pytorch/google say this
     compiler_t = (PTXCompiler if PTX else CUDACompiler) if MOCKGPU else (NVPTXCompiler if PTX else NVCompiler)
     super().__init__(device, NVAllocator(self), PTXRenderer(self.arch, device="NV") if PTX else NVRenderer(self.arch), compiler_t(self.arch),
                      functools.partial(NVProgram, self), NVSignal, NVComputeQueue, NVCopyQueue)
@@ -466,13 +481,15 @@ class NVDevice(HCQCompiled[NVSignal]):
     self._setup_gpfifos()
 
   def _new_gpu_fifo(self, gpfifo_area, ctxshare, channel_group, offset=0, entries=0x400, enable_debug=False) -> GPFifo:
+    # BLACKWELL_CHANNEL_GPFIFO_A = 0x0000c96f
+    # BLACKWELL_DMA_COPY_B = 0x0000cab5
     notifier = self._gpu_alloc(48 << 20, uncached=True)
     params = nv_gpu.NV_CHANNELGPFIFO_ALLOCATION_PARAMETERS(hObjectError=notifier.meta.hMemory, hObjectBuffer=gpfifo_area.meta.hMemory,
       gpFifoOffset=gpfifo_area.va_addr+offset, gpFifoEntries=entries, hContextShare=ctxshare,
       hUserdMemory=(ctypes.c_uint32*8)(gpfifo_area.meta.hMemory), userdOffset=(ctypes.c_uint64*8)(entries*8+offset))
     gpfifo = rm_alloc(self.fd_ctl, nv_gpu.AMPERE_CHANNEL_GPFIFO_A, self.root, channel_group, params).hObjectNew
     comp = rm_alloc(self.fd_ctl, self.compute_class, self.root, gpfifo, None).hObjectNew
-    rm_alloc(self.fd_ctl, nv_gpu.AMPERE_DMA_COPY_B, self.root, gpfifo, None)
+    rm_alloc(self.fd_ctl, nv_gpu.BLACKWELL_DMA_COPY_B, self.root, gpfifo, None)
 
     if enable_debug:
       self.debug_compute_obj, self.debug_channel = comp, gpfifo
@@ -496,6 +513,7 @@ class NVDevice(HCQCompiled[NVSignal]):
     return [x.data for x in infos]
 
   def _setup_gpfifos(self):
+    # BLACKWELL_DMA_COPY_B  =                   (0x0000cab5)
     # Set windows addresses to not collide with other allocated buffers.
     self.shared_mem_window, self.local_mem_window, self.slm_per_thread, self.shader_local_mem = 0xfe000000, 0xff000000, 0, None
 
@@ -532,6 +550,9 @@ class NVDevice(HCQCompiled[NVSignal]):
     # TODO: Restore the GPU using NV83DE_CTRL_CMD_CLEAR_ALL_SM_ERROR_STATES if needed.
 
     report = []
+    print(f"=== on_device_hang, {self.fd_ctl}, {self.root}, {self.debugger}, {self.debug_channel}")
+    # info right, so self.fd_ctl, self.root is ok
+    # sm_errors = rmctrl.debug_read_all_sm_error_states(self.fd_ctl, self.root, self.debugger, hTargetChannel=self.debug_channel, numSMsToRead=100)
     sm_errors = rmctrl.debug_read_all_sm_error_states(self.fd_ctl, self.root, self.debugger, hTargetChannel=self.debug_channel, numSMsToRead=100)
 
     if sm_errors.mmuFault.valid:

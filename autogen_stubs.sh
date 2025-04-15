@@ -9,7 +9,7 @@ if [[ ! $(clang2py -V) ]]; then
   pip install clang==14.0.6
   git clone https://github.com/nimlgen/ctypeslib.git
   cd ctypeslib
-  pip install --user .
+  pip install  .
   clang2py -V
   popd
 fi
@@ -104,10 +104,10 @@ generate_nvrtc() {
 }
 
 generate_nv() {
-  NVKERN_COMMIT_HASH=d6b75a34094b0f56c2ccadf14e5d0bd515ed1ab6
+  NVKERN_COMMIT_HASH=c5e439fea4fe81c78d52b95419c30cabe44e48fd
   NVKERN_SRC=/tmp/open-gpu-kernel-modules-$NVKERN_COMMIT_HASH
   if [ ! -d "$NVKERN_SRC" ]; then
-    git clone https://github.com/tinygrad/open-gpu-kernel-modules $NVKERN_SRC
+    git clone https://github.com/NVIDIA/open-gpu-kernel-modules $NVKERN_SRC
     pushd .
     cd $NVKERN_SRC
     git reset --hard $NVKERN_COMMIT_HASH
@@ -122,9 +122,14 @@ generate_nv() {
     $NVKERN_SRC/src/common/sdk/nvidia/inc/class/clc56f.h \
     $NVKERN_SRC/src/common/sdk/nvidia/inc/class/clc56f.h \
     $NVKERN_SRC/src/common/sdk/nvidia/inc/class/cl83de.h \
+    $NVKERN_SRC/src/common/sdk/nvidia/inc/class/clca6f.h \
+    $NVKERN_SRC/src/common/sdk/nvidia/inc/class/clca6fsw.h \
+    $NVKERN_SRC/src/common/sdk/nvidia/inc/class/clcdc0.h \
+    $NVKERN_SRC/src/common/sdk/nvidia/inc/class/clcec0.h \
     $NVKERN_SRC/src/nvidia/generated/g_allclasses.h \
     $NVKERN_SRC/src/common/sdk/nvidia/inc/class/clc6c0.h \
     $NVKERN_SRC/kernel-open/nvidia-uvm/clc6b5.h \
+    $NVKERN_SRC/kernel-open/nvidia-uvm/clca6f.h \
     $NVKERN_SRC/kernel-open/nvidia-uvm/uvm_ioctl.h \
     $NVKERN_SRC/kernel-open/nvidia-uvm/uvm_linux_ioctl.h \
     $NVKERN_SRC/kernel-open/nvidia-uvm/hwref/ampere/ga100/dev_fault.h \
@@ -142,6 +147,7 @@ generate_nv() {
     $NVKERN_SRC/src/common/sdk/nvidia/inc/ctrl/ctrlc36f.h \
     $NVKERN_SRC/src/common/sdk/nvidia/inc/ctrl/ctrlcb33.h \
     $NVKERN_SRC/src/common/sdk/nvidia/inc/ctrl/ctrla06c.h \
+    $NVKERN_SRC/src/common/sdk/nvidia/inc/ctrl/ctrlca6f.h \
     --clang-args="-include $NVKERN_SRC/src/common/sdk/nvidia/inc/nvtypes.h -I$NVKERN_SRC/src/common/inc -I$NVKERN_SRC/kernel-open/nvidia-uvm -I$NVKERN_SRC/kernel-open/common/inc -I$NVKERN_SRC/src/common/sdk/nvidia/inc -I$NVKERN_SRC/src/nvidia/arch/nvalloc/unix/include -I$NVKERN_SRC/src/common/sdk/nvidia/inc/ctrl" \
     -o $BASE/nv_gpu.py
   fixup $BASE/nv_gpu.py
