@@ -9,7 +9,7 @@ if [[ ! $(clang2py -V) ]]; then
   pip install clang==14.0.6
   git clone https://github.com/nimlgen/ctypeslib.git
   cd ctypeslib
-  pip install --user .
+  pip install  .
   clang2py -V
   popd
 fi
@@ -78,11 +78,11 @@ generate_kfd() {
   clang2py /usr/include/linux/kfd_ioctl.h -o $BASE/kfd.py -k cdefstum
 
   fixup $BASE/kfd.py
-  sed -i "s\import ctypes\import ctypes, os\g" $BASE/kfd.py
-  sed -i "s\import fcntl, functools\import functools" $BASE/kfd.py
-  sed -i "s\import ctypes,os\a from tinygrad.runtime.support import HWInterface\g" $BASE/kfd.py
-  sed -i "s\def _do_ioctl(__idir, __base, __nr, __user_struct, __fd, **kwargs):\def _do_ioctl(__idir, __base, __nr, __user_struct, __fd:HWInterface, **kwargs):\g" $BASE/kfd.py
-  sed -i "s\fcntl.ioctl(__fd, (__idir<<30)\__fd.ioctl((__idir<<30)\g" $BASE/kfd.py
+  sed -i "s/import ctypes/import ctypes, os/g" $BASE/kfd.py
+  sed -i "s/import fcntl, functools/import functools/g" $BASE/kfd.py
+  sed -i "/import functools/a from tinygrad.runtime.support.hcq import HWInterface" $BASE/kfd.py
+  sed -i "s/def _do_ioctl(__idir, __base, __nr, __user_struct, __fd, \*\*kwargs):/def _do_ioctl(__idir, __base, __nr, __user_struct, __fd:HWInterface, \*\*kwargs):/g" $BASE/kfd.py
+  sed -i "s/fcntl.ioctl(__fd, (__idir<<30)/__fd.ioctl((__idir<<30)/g" $BASE/kfd.py
   python3 -c "import tinygrad.runtime.autogen.kfd"
 }
 
@@ -104,10 +104,10 @@ generate_nvrtc() {
 }
 
 generate_nv() {
-  NVKERN_COMMIT_HASH=d6b75a34094b0f56c2ccadf14e5d0bd515ed1ab6
+  NVKERN_COMMIT_HASH=c5e439fea4fe81c78d52b95419c30cabe44e48fd
   NVKERN_SRC=/tmp/open-gpu-kernel-modules-$NVKERN_COMMIT_HASH
   if [ ! -d "$NVKERN_SRC" ]; then
-    git clone https://github.com/tinygrad/open-gpu-kernel-modules $NVKERN_SRC
+    git clone https://github.com/NVIDIA/open-gpu-kernel-modules $NVKERN_SRC
     pushd .
     cd $NVKERN_SRC
     git reset --hard $NVKERN_COMMIT_HASH
@@ -122,9 +122,14 @@ generate_nv() {
     $NVKERN_SRC/src/common/sdk/nvidia/inc/class/clc56f.h \
     $NVKERN_SRC/src/common/sdk/nvidia/inc/class/clc56f.h \
     $NVKERN_SRC/src/common/sdk/nvidia/inc/class/cl83de.h \
+    $NVKERN_SRC/src/common/sdk/nvidia/inc/class/clca6f.h \
+    $NVKERN_SRC/src/common/sdk/nvidia/inc/class/clca6fsw.h \
+    $NVKERN_SRC/src/common/sdk/nvidia/inc/class/clcdc0.h \
+    $NVKERN_SRC/src/common/sdk/nvidia/inc/class/clcec0.h \
     $NVKERN_SRC/src/nvidia/generated/g_allclasses.h \
     $NVKERN_SRC/src/common/sdk/nvidia/inc/class/clc6c0.h \
     $NVKERN_SRC/kernel-open/nvidia-uvm/clc6b5.h \
+    $NVKERN_SRC/kernel-open/nvidia-uvm/clca6f.h \
     $NVKERN_SRC/kernel-open/nvidia-uvm/uvm_ioctl.h \
     $NVKERN_SRC/kernel-open/nvidia-uvm/uvm_linux_ioctl.h \
     $NVKERN_SRC/kernel-open/nvidia-uvm/hwref/ampere/ga100/dev_fault.h \
@@ -142,6 +147,7 @@ generate_nv() {
     $NVKERN_SRC/src/common/sdk/nvidia/inc/ctrl/ctrlc36f.h \
     $NVKERN_SRC/src/common/sdk/nvidia/inc/ctrl/ctrlcb33.h \
     $NVKERN_SRC/src/common/sdk/nvidia/inc/ctrl/ctrla06c.h \
+    $NVKERN_SRC/src/common/sdk/nvidia/inc/ctrl/ctrlca6f.h \
     --clang-args="-include $NVKERN_SRC/src/common/sdk/nvidia/inc/nvtypes.h -I$NVKERN_SRC/src/common/inc -I$NVKERN_SRC/kernel-open/nvidia-uvm -I$NVKERN_SRC/kernel-open/common/inc -I$NVKERN_SRC/src/common/sdk/nvidia/inc -I$NVKERN_SRC/src/nvidia/arch/nvalloc/unix/include -I$NVKERN_SRC/src/common/sdk/nvidia/inc/ctrl" \
     -o $BASE/nv_gpu.py
   fixup $BASE/nv_gpu.py
@@ -171,6 +177,7 @@ generate_amd() {
     extra/hip_gpu_driver/sdma_v6_0_0_pkt_open.h \
     extra/hip_gpu_driver/gc_11_0_0_offset.h \
     extra/hip_gpu_driver/gc_10_3_0_offset.h \
+    extra/hip_gpu_driver/sienna_cichlid_ip_offset.h \
     --clang-args="-I/opt/rocm/include -x c++" \
     -o $BASE/amd_gpu.py
 
@@ -291,75 +298,233 @@ generate_vfio() {
 }
 
 generate_am() {
+  AMKERN_COMMIT_HASH=ceb12c04e2b5b53ec0779362831f5ee40c4921e4
+  AMKERN_SRC=/tmp/ROCK-Kernel-Driver-$AMKERN_COMMIT_HASH
+  if [ ! -d "$AMKERN_SRC" ]; then
+    git clone https://github.com/ROCm/ROCK-Kernel-Driver $AMKERN_SRC --depth 1
+  fi
+  AMKERN_AMD=$AMKERN_SRC/drivers/gpu/drm/amd/
+  AMKERN_INC=$AMKERN_AMD/include/
+
   clang2py -k cdefstum \
     extra/amdpci/headers/v11_structs.h \
+    extra/amdpci/headers/v12_structs.h \
     extra/amdpci/headers/amdgpu_vm.h \
     extra/amdpci/headers/discovery.h \
     extra/amdpci/headers/amdgpu_ucode.h \
-    extra/amdpci/headers/soc21_enum.h \
     extra/amdpci/headers/psp_gfx_if.h \
     extra/amdpci/headers/amdgpu_psp.h \
     extra/amdpci/headers/amdgpu_irq.h \
     extra/amdpci/headers/amdgpu_doorbell.h \
-    extra/amdpci/headers/soc15_ih_clientid.h \
+    $AMKERN_INC/soc15_ih_clientid.h \
+    --clang-args="-include stdint.h" \
     -o $BASE/am/am.py
   fixup $BASE/am/am.py
+  sed -i "s\(int64_t)\ \g" $BASE/am/am.py
+  sed -i "s\AMDGPU_PTE_MTYPE_VG10(2)\AMDGPU_PTE_MTYPE_VG10(0, 2)\g" $BASE/am/am.py # incorrect parsing (TODO: remove when clang2py is gone).
 
   clang2py -k cdefstum \
-    extra/amdpci/headers/mp_13_0_0_offset.h \
-    extra/amdpci/headers/mp_13_0_0_sh_mask.h \
+    $AMKERN_AMD/amdkfd/kfd_pm4_headers_ai.h \
+    $AMKERN_AMD/amdgpu/soc15d.h \
+    -o $BASE/am/pm4_soc15.py
+  fixup $BASE/am/pm4_soc15.py
+
+  clang2py -k cdefstum \
+    $AMKERN_AMD/amdkfd/kfd_pm4_headers_ai.h \
+    $AMKERN_AMD/amdgpu/nvd.h \
+    -o $BASE/am/pm4_nv.py
+  fixup $BASE/am/pm4_nv.py
+
+  clang2py -k cdefstum \
+    $AMKERN_INC/vega10_enum.h \
+    -o $BASE/am/vega10.py
+  fixup $BASE/am/vega10.py
+
+  clang2py -k cdefstum \
+    $AMKERN_INC/navi10_enum.h \
+    -o $BASE/am/navi10.py
+  fixup $BASE/am/navi10.py
+
+  clang2py -k cdefstum \
+    $AMKERN_INC/soc21_enum.h \
+    -o $BASE/am/soc21.py
+  fixup $BASE/am/soc21.py
+
+  clang2py -k cdefstum \
+    $AMKERN_INC/soc24_enum.h \
+    -o $BASE/am/soc24.py
+  fixup $BASE/am/soc24.py
+
+  clang2py -k cdefstum \
+    $AMKERN_INC/asic_reg/mp/mp_13_0_0_offset.h \
+    $AMKERN_INC/asic_reg/mp/mp_13_0_0_sh_mask.h \
     -o $BASE/am/mp_13_0_0.py
   fixup $BASE/am/mp_13_0_0.py
 
+  # 14_0_3 reuses 14_0_2
   clang2py -k cdefstum \
-    extra/amdpci/headers/mp_11_0_offset.h \
-    extra/amdpci/headers/mp_11_0_sh_mask.h \
+    $AMKERN_INC/asic_reg/mp/mp_14_0_2_offset.h \
+    $AMKERN_INC/asic_reg/mp/mp_14_0_2_sh_mask.h \
+    -o $BASE/am/mp_14_0_3.py
+  fixup $BASE/am/mp_14_0_3.py
+
+  clang2py -k cdefstum \
+    $AMKERN_INC/asic_reg/mp/mp_11_0_offset.h \
+    $AMKERN_INC/asic_reg/mp/mp_11_0_sh_mask.h \
     -o $BASE/am/mp_11_0.py
   fixup $BASE/am/mp_11_0.py
 
   clang2py -k cdefstum \
-    extra/amdpci/headers/gc_11_0_0_offset.h \
-    extra/amdpci/headers/gc_11_0_0_sh_mask.h \
+    $AMKERN_INC/asic_reg/gc/gc_9_4_3_offset.h \
+    $AMKERN_INC/asic_reg/gc/gc_9_4_3_sh_mask.h \
+    extra/amdpci/overlay/gc_9_4_3.h \
+    -o $BASE/am/gc_9_4_3.py
+  fixup $BASE/am/gc_9_4_3.py
+
+  clang2py -k cdefstum \
+    $AMKERN_INC/asic_reg/gc/gc_10_3_0_offset.h \
+    $AMKERN_INC/asic_reg/gc/gc_10_3_0_sh_mask.h \
+    -o $BASE/am/gc_10_3_0.py
+  fixup $BASE/am/gc_10_3_0.py
+
+  clang2py -k cdefstum \
+    $AMKERN_INC/asic_reg/gc/gc_11_0_0_offset.h \
+    $AMKERN_INC/asic_reg/gc/gc_11_0_0_sh_mask.h \
     -o $BASE/am/gc_11_0_0.py
   fixup $BASE/am/gc_11_0_0.py
 
   clang2py -k cdefstum \
-    extra/amdpci/headers/mmhub_3_0_0_offset.h \
-    extra/amdpci/headers/mmhub_3_0_0_sh_mask.h \
+    $AMKERN_INC/asic_reg/gc/gc_12_0_0_offset.h \
+    $AMKERN_INC/asic_reg/gc/gc_12_0_0_sh_mask.h \
+    -o $BASE/am/gc_12_0_0.py
+  fixup $BASE/am/gc_12_0_0.py
+
+  clang2py -k cdefstum \
+    extra/hip_gpu_driver/sdma_registers.h \
+    $AMKERN_AMD/amdgpu/vega10_sdma_pkt_open.h \
+    --clang-args="-I/opt/rocm/include -x c++" \
+    -o $BASE/am/sdma_4_0_0.py
+  fixup $BASE/am/sdma_4_0_0.py
+
+  clang2py -k cdefstum \
+    extra/hip_gpu_driver/sdma_registers.h \
+    $AMKERN_AMD/amdgpu/navi10_sdma_pkt_open.h \
+    --clang-args="-I/opt/rocm/include -x c++" \
+    -o $BASE/am/sdma_5_0_0.py
+  fixup $BASE/am/sdma_5_0_0.py
+
+  clang2py -k cdefstum \
+    extra/hip_gpu_driver/sdma_registers.h \
+    $AMKERN_AMD/amdgpu/sdma_v6_0_0_pkt_open.h \
+    --clang-args="-I/opt/rocm/include -x c++" \
+    -o $BASE/am/sdma_6_0_0.py
+  fixup $BASE/am/sdma_6_0_0.py
+
+  clang2py -k cdefstum \
+    $AMKERN_INC/asic_reg/mmhub/mmhub_3_0_0_offset.h \
+    $AMKERN_INC/asic_reg/mmhub/mmhub_3_0_0_sh_mask.h \
     -o $BASE/am/mmhub_3_0_0.py
   fixup $BASE/am/mmhub_3_0_0.py
 
   clang2py -k cdefstum \
-    extra/amdpci/headers/mmhub_3_0_2_offset.h \
-    extra/amdpci/headers/mmhub_3_0_2_sh_mask.h \
+    $AMKERN_INC/asic_reg/mmhub/mmhub_3_0_2_offset.h \
+    $AMKERN_INC/asic_reg/mmhub/mmhub_3_0_2_sh_mask.h \
     -o $BASE/am/mmhub_3_0_2.py
   fixup $BASE/am/mmhub_3_0_2.py
 
   clang2py -k cdefstum \
-    extra/amdpci/headers/nbio_4_3_0_offset.h \
-    extra/amdpci/headers/nbio_4_3_0_sh_mask.h \
+    $AMKERN_INC/asic_reg/nbio/nbio_2_3_offset.h \
+    $AMKERN_INC/asic_reg/nbio/nbio_2_3_sh_mask.h \
+    -o $BASE/am/nbio_2_3_0.py
+  fixup $BASE/am/nbio_2_3_0.py
+
+  clang2py -k cdefstum \
+    $AMKERN_INC/asic_reg/mmhub/mmhub_4_1_0_offset.h \
+    $AMKERN_INC/asic_reg/mmhub/mmhub_4_1_0_sh_mask.h \
+    -o $BASE/am/mmhub_4_1_0.py
+  fixup $BASE/am/mmhub_4_1_0.py
+
+  clang2py -k cdefstum \
+    $AMKERN_INC/asic_reg/nbio/nbio_4_3_0_offset.h \
+    $AMKERN_INC/asic_reg/nbio/nbio_4_3_0_sh_mask.h \
     -o $BASE/am/nbio_4_3_0.py
   fixup $BASE/am/nbio_4_3_0.py
 
   clang2py -k cdefstum \
-    extra/amdpci/headers/osssys_6_0_0_offset.h \
-    extra/amdpci/headers/osssys_6_0_0_sh_mask.h \
+    $AMKERN_INC/asic_reg/nbif/nbif_6_3_1_offset.h \
+    $AMKERN_INC/asic_reg/nbif/nbif_6_3_1_sh_mask.h \
+    -o $BASE/am/nbif_6_3_1.py
+  fixup $BASE/am/nbif_6_3_1.py
+
+  clang2py -k cdefstum \
+    $AMKERN_INC/asic_reg/nbio/nbio_7_9_0_offset.h \
+    $AMKERN_INC/asic_reg/nbio/nbio_7_9_0_sh_mask.h \
+    -o $BASE/am/nbio_7_9_0.py
+  fixup $BASE/am/nbio_7_9_0.py
+
+  clang2py -k cdefstum \
+    $AMKERN_INC/asic_reg/nbio/nbio_7_11_0_offset.h \
+    $AMKERN_INC/asic_reg/nbio/nbio_7_11_0_sh_mask.h \
+    -o $BASE/am/nbio_7_11_0.py
+  fixup $BASE/am/nbio_7_11_0.py
+
+  clang2py -k cdefstum \
+    $AMKERN_INC/asic_reg/oss/osssys_6_0_0_offset.h \
+    $AMKERN_INC/asic_reg/oss/osssys_6_0_0_sh_mask.h \
     -o $BASE/am/osssys_6_0_0.py
   fixup $BASE/am/osssys_6_0_0.py
 
   clang2py -k cdefstum \
-    extra/amdpci/headers/smu_v13_0_0_ppsmc.h \
-    extra/amdpci/headers/smu13_driver_if_v13_0_0.h \
+    $AMKERN_INC/asic_reg/oss/osssys_7_0_0_offset.h \
+    $AMKERN_INC/asic_reg/oss/osssys_7_0_0_sh_mask.h \
+    -o $BASE/am/osssys_7_0_0.py
+  fixup $BASE/am/osssys_7_0_0.py
+
+  clang2py -k cdefstum \
+    $AMKERN_AMD/pm/swsmu/inc/pmfw_if/smu_v13_0_0_ppsmc.h \
+    $AMKERN_AMD/pm/swsmu/inc/pmfw_if/smu13_driver_if_v13_0_0.h \
     extra/amdpci/headers/amdgpu_smu.h \
     -o $BASE/am/smu_v13_0_0.py
   fixup $BASE/am/smu_v13_0_0.py
+
+  clang2py -k cdefstum \
+    $AMKERN_AMD/pm/swsmu/inc/pmfw_if/smu_v14_0_0_pmfw.h \
+    $AMKERN_AMD/pm/swsmu/inc/pmfw_if/smu_v14_0_2_ppsmc.h \
+    $AMKERN_AMD/pm/swsmu/inc/pmfw_if/smu14_driver_if_v14_0.h \
+    extra/amdpci/headers/amdgpu_smu.h \
+    --clang-args="-include stdint.h" \
+    -o $BASE/am/smu_v14_0_3.py
+  fixup $BASE/am/smu_v14_0_3.py
+
+  clang2py -k cdefstum \
+    $AMKERN_INC/asic_reg/hdp/hdp_6_0_0_offset.h \
+    $AMKERN_INC/asic_reg/hdp/hdp_6_0_0_sh_mask.h \
+    -o $BASE/am/hdp_6_0_0.py
+  fixup $BASE/am/hdp_6_0_0.py
+
+  clang2py -k cdefstum \
+    $AMKERN_INC/asic_reg/hdp/hdp_7_0_0_offset.h \
+    $AMKERN_INC/asic_reg/hdp/hdp_7_0_0_sh_mask.h \
+    -o $BASE/am/hdp_7_0_0.py
+  fixup $BASE/am/hdp_7_0_0.py
+}
+
+generate_sqtt() {
+  clang2py -k cdefstum \
+    extra/sqtt/sqtt.h \
+    -o $BASE/sqtt.py
+
+  fixup $BASE/sqtt.py
+  sed -i "s\import ctypes\import ctypes, os\g" $BASE/sqtt.py
+  python3 -c "import tinygrad.runtime.autogen.sqtt"
 }
 
 generate_webgpu() {
-  clang2py -l /usr/local/lib/libwebgpu_dawn.so extra/webgpu/webgpu.h -o $BASE/webgpu.py
+  clang2py extra/webgpu/webgpu.h -o $BASE/webgpu.py
   fixup $BASE/webgpu.py
-  sed -i 's/import ctypes/import ctypes, ctypes.util/g' $BASE/webgpu.py
-  sed -i "s|ctypes.CDLL('/usr/local/lib/libwebgpu_dawn.so')|ctypes.CDLL(ctypes.util.find_library('webgpu_dawn'))|g" $BASE/webgpu.py
+  sed -i "s/FIXME_STUB/webgpu/g" "$BASE/webgpu.py"
+  sed -i "s/FunctionFactoryStub()/ctypes.CDLL(webgpu_support.WEBGPU_PATH)/g" "$BASE/webgpu.py"
+  sed -i "s/import ctypes/import ctypes, tinygrad.runtime.support.webgpu as webgpu_support/g" "$BASE/webgpu.py"
   python3 -c "import tinygrad.runtime.autogen.webgpu"
 }
 
@@ -373,6 +538,7 @@ elif [ "$1" == "kfd" ]; then generate_kfd
 elif [ "$1" == "nv" ]; then generate_nv
 elif [ "$1" == "amd" ]; then generate_amd
 elif [ "$1" == "am" ]; then generate_am
+elif [ "$1" == "sqtt" ]; then generate_sqtt
 elif [ "$1" == "qcom" ]; then generate_qcom
 elif [ "$1" == "io_uring" ]; then generate_io_uring
 elif [ "$1" == "libc" ]; then generate_libc

@@ -1,0 +1,357 @@
+#1: NV_ESC_RM_ALLOC    hClass=NV01_ROOT_CLIENT              , hRoot=0, hObjectParent=0, pAllocParms=None, hObjectNew=3251726314 status=0
+#2: UVM_INITIALIZE
+	 struct_c__SA_UVM_INITIALIZE_PARAMS { flags=0 rmStatus=0 PADDING_0=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13b47b73c0> }
+#3: UVM_MM_INITIALIZE
+	 struct_c__SA_UVM_MM_INITIALIZE_PARAMS { uvmFd=4 rmStatus=0 }
+#4: NV_ESC_CARD_INFO
+#5: NV_ESC_RM_CONTROL    cmd=NV0000_CTRL_CMD_SYSTEM_PFM_REQ_HNDLR_DATA_GET_POWER_BURDEN hClient=3251726314, hObject=3251726314, flags=0, params=139722817269072, paramsSize=32, status=0
+#6: NV_ESC_REGISTER_FD  fd=3
+#7: NV_ESC_RM_ALLOC    hClass=unk=0x80                      , hRoot=3251726314, hObjectParent=3251726314, pAllocParms=139722606950320, hObjectNew=3404726272 status=0
+	 struct_NV0080_ALLOC_PARAMETERS { deviceId=0 hClientShare=3251726314 hTargetClient=0 hTargetDevice=0 flags=0 PADDING_0=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13b47b5040> vaSpaceSize=0 vaStartInternal=0 vaLimitInternal=0 vaMode=2 PADDING_1=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13b47b4040> }
+#8: NV_ESC_RM_ALLOC    hClass=NV20_SUBDEVICE_0              , hRoot=3251726314, hObjectParent=3404726272, pAllocParms=None, hObjectNew=3404726273 status=0
+#9: NV_ESC_RM_ALLOC    hClass=BLACKWELL_USERMODE_A          , hRoot=3251726314, hObjectParent=3404726273, pAllocParms=None, hObjectNew=3404726274 status=0
+#10: NV_ESC_REGISTER_FD  fd=3
+#11: NV_ESC_RM_MAP_MEMORY   hClient=3251726314, hDevice=3404726272, hMemory=3404726274, length=65536 flags=50331650 pLinearAddress=1891303424
+#12: NV_ESC_RM_CONTROL    cmd=NV0080_CTRL_CMD_GPU_GET_CLASSLIST hClient=3251726314, hObject=3404726272, flags=0, params=139722609094160, paramsSize=16, status=0
+	 struct_NV0080_CTRL_GPU_GET_CLASSLIST_PARAMS { numClasses=56 PADDING_0=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13b47b5640> classList=139722817302768 }
+#13: NV_ESC_RM_CONTROL    cmd=NV2080_CTRL_CMD_PERF_BOOST     hClient=3251726314, hObject=3404726273, flags=0, params=139722609085200, paramsSize=8, status=0
+	 struct_NV2080_CTRL_PERF_BOOST_PARAMS { flags=82 duration=4294967295 }
+#14: NV_ESC_RM_ALLOC    hClass=FERMI_VASPACE_A               , hRoot=3251726314, hObjectParent=3404726272, pAllocParms=139722817376288, hObjectNew=3404726275 status=0
+	 struct_c__SA_NV_VASPACE_ALLOCATION_PARAMETERS { index=0 flags=72 vaSize=562949869535232 vaStartInternal=0 vaLimitInternal=0 bigPageSize=0 PADDING_0=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13b47b5640> vaBase=4096 }
+#15: NV_ESC_RM_CONTROL    cmd=NV2080_CTRL_CMD_GPU_GET_GID_INFO hClient=3251726314, hObject=3404726273, flags=0, params=139722825215184, paramsSize=268, status=0
+	 struct_NV2080_CTRL_GPU_GET_GID_INFO_PARAMS { index=0 flags=2 length=16 data=<tinygrad.runtime.autogen.nv_gpu.c_ubyte_Array_256 object at 0x7f13b47b71c0> }
+#16: UVM_REGISTER_GPU
+	 struct_c__SA_UVM_REGISTER_GPU_PARAMS { gpu_uuid=<tinygrad.runtime.autogen.nv_gpu.struct_nv_uuid object at 0x7f13b47b63c0> numaEnabled=0 PADDING_0=<tinygrad.runtime.autogen.nv_gpu.c_ubyte_Array_3 object at 0x7f13b47b7dc0> numaNodeId=-1 rmCtrlFd=-1 hClient=0 hSmcPartRef=0 rmStatus=0 }
+#17: UVM_REGISTER_GPU_VASPACE
+	 struct_c__SA_UVM_REGISTER_GPU_VASPACE_PARAMS { gpuUuid=<tinygrad.runtime.autogen.nv_gpu.struct_nv_uuid object at 0x7f13b47b7dc0> rmCtrlFd=3 hClient=3251726314 hVaSpace=3404726275 rmStatus=0 }
+#18: NV_ESC_RM_ALLOC    hClass=KEPLER_CHANNEL_GROUP_A        , hRoot=3251726314, hObjectParent=3404726272, pAllocParms=139722604784240, hObjectNew=3404726276 status=0
+	 struct_c__SA_NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS { hObjectError=0 hObjectEccError=0 hVASpace=0 engineType=1 bIsCallingContextVgpuPlugin=0 PADDING_0=<tinygrad.runtime.autogen.nv_gpu.c_ubyte_Array_3 object at 0x7f13b47b68c0> }
+#19: NV_ESC_RM_ALLOC    hClass=NV1_MEMORY_USER               , hRoot=3251726314, hObjectParent=3404726272, pAllocParms=139722609092400, hObjectNew=3404726278 status=0
+	 struct_c__SA_NV_MEMORY_ALLOCATION_PARAMS { owner=3251726314 type=0 flags=114945 width=0 height=0 pitch=0 attr=293601280 attr2=1048581 format=6 comprCovg=0 zcullCovg=0 PADDING_0=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13b47b5740> rangeLo=0 rangeHi=0 size=2097152 alignment=2097152 offset=50331648 limit=2097151 address=None ctagOffset=0 hVASpace=0 internalflags=0 tag=0 numaNode=0 PADDING_1=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13b47b71c0> }
+#20: NV_ESC_REGISTER_FD  fd=3
+#21: NV_ESC_RM_MAP_MEMORY   hClient=3251726314, hDevice=3404726272, hMemory=3404726278, length=2097152 flags=17629184 pLinearAddress=343601577984
+#22: UVM_CREATE_EXTERNAL_RANGE
+	 struct_c__SA_UVM_CREATE_EXTERNAL_RANGE_PARAMS { base=68719476736 length=2097152 rmStatus=0 PADDING_0=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13b47b5740> }
+#23: UVM_MAP_EXTERNAL_ALLOCATION
+	 struct_c__SA_UVM_MAP_EXTERNAL_ALLOCATION_PARAMS { base=68719476736 length=2097152 offset=0 perGpuAttributes=<tinygrad.runtime.autogen.nv_gpu.struct_c__SA_UvmGpuMappingAttributes_Array_256 object at 0x7f13b47b71c0> gpuAttributesCount=1 rmCtrlFd=3 hClient=3251726314 hMemory=3404726278 rmStatus=0 }
+perGpuAttributes[{i}] = 	 struct_c__SA_UvmGpuMappingAttributes { gpuUuid=<tinygrad.runtime.autogen.nv_gpu.struct_nv_uuid object at 0x7f13b47b74c0> gpuMappingType=1 gpuCachingType=0 gpuFormatType=0 gpuElementBits=0 gpuCompressionType=0 }
+#24: NV_ESC_RM_ALLOC    hClass=FERMI_CONTEXT_SHARE_A         , hRoot=3251726314, hObjectParent=3404726276, pAllocParms=139722609098384, hObjectNew=3404726279 status=0
+#25: NV_ESC_RM_ALLOC    hClass=NV1_MEMORY_SYSTEM             , hRoot=3251726314, hObjectParent=3404726272, pAllocParms=139722609097904, hObjectNew=3404726280 status=0
+	 struct_c__SA_NV_MEMORY_ALLOCATION_PARAMS { owner=3251726314 type=13 flags=49409 width=0 height=0 pitch=0 attr=176160768 attr2=9 format=6 comprCovg=0 zcullCovg=0 PADDING_0=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13b47b5440> rangeLo=0 rangeHi=0 size=50331648 alignment=4096 offset=0 limit=50331647 address=None ctagOffset=0 hVASpace=0 internalflags=0 tag=0 numaNode=0 PADDING_1=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13b47b5340> }
+#26: UVM_CREATE_EXTERNAL_RANGE
+	 struct_c__SA_UVM_CREATE_EXTERNAL_RANGE_PARAMS { base=137438953472 length=50331648 rmStatus=0 PADDING_0=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13b47b54c0> }
+#27: UVM_MAP_EXTERNAL_ALLOCATION
+	 struct_c__SA_UVM_MAP_EXTERNAL_ALLOCATION_PARAMS { base=137438953472 length=50331648 offset=0 perGpuAttributes=<tinygrad.runtime.autogen.nv_gpu.struct_c__SA_UvmGpuMappingAttributes_Array_256 object at 0x7f13b47b5340> gpuAttributesCount=1 rmCtrlFd=3 hClient=3251726314 hMemory=3404726280 rmStatus=0 }
+perGpuAttributes[{i}] = 	 struct_c__SA_UvmGpuMappingAttributes { gpuUuid=<tinygrad.runtime.autogen.nv_gpu.struct_nv_uuid object at 0x7f13b47b6cc0> gpuMappingType=1 gpuCachingType=0 gpuFormatType=0 gpuElementBits=0 gpuCompressionType=0 }
+#28: NV_ESC_RM_ALLOC    hClass=BLACKWELL_CHANNEL_GPFIFO_A    , hRoot=3251726314, hObjectParent=3404726276, pAllocParms=139722817684240, hObjectNew=3404726281 status=0
+	 struct_NV_CHANNEL_ALLOC_PARAMS { hObjectError=3404726280 hObjectBuffer=3404726278 gpFifoOffset=68719476736 gpFifoEntries=65536 flags=0 hContextShare=3404726279 hVASpace=0 hUserdMemory=<tinygrad.runtime.autogen.nv_gpu.c_uint_Array_8 object at 0x7f13b47b6cc0> userdOffset=<tinygrad.runtime.autogen.nv_gpu.c_ulong_Array_8 object at 0x7f13b47b7940> engineType=0 cid=33237 subDeviceId=0 hObjectEccError=0 instanceMem=<tinygrad.runtime.autogen.nv_gpu.struct_NV_MEMORY_DESC_PARAMS object at 0x7f13b47b6cc0> userdMem=<tinygrad.runtime.autogen.nv_gpu.struct_NV_MEMORY_DESC_PARAMS object at 0x7f13b47b6cc0> ramfcMem=<tinygrad.runtime.autogen.nv_gpu.struct_NV_MEMORY_DESC_PARAMS object at 0x7f13b47b6cc0> mthdbufMem=<tinygrad.runtime.autogen.nv_gpu.struct_NV_MEMORY_DESC_PARAMS object at 0x7f13b47b6cc0> hPhysChannelGroup=0 internalFlags=0 errorNotifierMem=<tinygrad.runtime.autogen.nv_gpu.struct_NV_MEMORY_DESC_PARAMS object at 0x7f13b47b6cc0> eccErrorNotifierMem=<tinygrad.runtime.autogen.nv_gpu.struct_NV_MEMORY_DESC_PARAMS object at 0x7f13b47b6cc0> ProcessID=0 SubProcessID=0 encryptIv=<tinygrad.runtime.autogen.nv_gpu.c_uint_Array_3 object at 0x7f13b47b6cc0> decryptIv=<tinygrad.runtime.autogen.nv_gpu.c_uint_Array_3 object at 0x7f13b47b7940> hmacNonce=<tinygrad.runtime.autogen.nv_gpu.c_uint_Array_8 object at 0x7f13b47b7940> tpcConfigID=0 PADDING_0=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13b47b6ac0> }
+#29: NV_ESC_RM_ALLOC    hClass=unk=0xCEC0                    , hRoot=3251726314, hObjectParent=3404726281, pAllocParms=None, hObjectNew=3404726282 status=0
+#30: NV_ESC_RM_ALLOC    hClass=BLACKWELL_DMA_COPY_B          , hRoot=3251726314, hObjectParent=3404726281, pAllocParms=None, hObjectNew=3404726283 status=0
+#31: NV_ESC_RM_ALLOC    hClass=unk=0x83DE                    , hRoot=3251726314, hObjectParent=3404726272, pAllocParms=139722609098000, hObjectNew=3404726284 status=0
+	 struct_NV83DE_ALLOC_PARAMETERS { hDebuggerClient_Obsolete=0 hAppClient=3251726314 hClass3dObject=3404726282 }
+#32: NV_ESC_RM_CONTROL    cmd=NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN hClient=3251726314, hObject=3404726281, flags=0, params=139722609095056, paramsSize=4, status=0
+	 struct_NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN_PARAMS { workSubmitToken=1073741829 }
+#33: UVM_REGISTER_CHANNEL
+	 struct_c__SA_UVM_REGISTER_CHANNEL_PARAMS { gpuUuid=<tinygrad.runtime.autogen.nv_gpu.struct_nv_uuid object at 0x7f13b468ba40> rmCtrlFd=3 hClient=3251726314 hChannel=3404726281 PADDING_0=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13b468b5c0> base=68721573888 length=67108864 rmStatus=0 PADDING_1=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13b468ba40> }
+#34: NV_ESC_RM_ALLOC    hClass=NV1_MEMORY_SYSTEM             , hRoot=3251726314, hObjectParent=3404726272, pAllocParms=139722609097904, hObjectNew=3404726285 status=0
+	 struct_c__SA_NV_MEMORY_ALLOCATION_PARAMS { owner=3251726314 type=13 flags=49409 width=0 height=0 pitch=0 attr=176160768 attr2=9 format=6 comprCovg=0 zcullCovg=0 PADDING_0=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13b468aec0> rangeLo=0 rangeHi=0 size=50331648 alignment=4096 offset=0 limit=50331647 address=None ctagOffset=0 hVASpace=0 internalflags=0 tag=0 numaNode=0 PADDING_1=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13b468b440> }
+#35: UVM_CREATE_EXTERNAL_RANGE
+	 struct_c__SA_UVM_CREATE_EXTERNAL_RANGE_PARAMS { base=137489285120 length=50331648 rmStatus=0 PADDING_0=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13b468bb40> }
+#36: UVM_MAP_EXTERNAL_ALLOCATION
+	 struct_c__SA_UVM_MAP_EXTERNAL_ALLOCATION_PARAMS { base=137489285120 length=50331648 offset=0 perGpuAttributes=<tinygrad.runtime.autogen.nv_gpu.struct_c__SA_UvmGpuMappingAttributes_Array_256 object at 0x7f13b468b440> gpuAttributesCount=1 rmCtrlFd=3 hClient=3251726314 hMemory=3404726285 rmStatus=0 }
+perGpuAttributes[{i}] = 	 struct_c__SA_UvmGpuMappingAttributes { gpuUuid=<tinygrad.runtime.autogen.nv_gpu.struct_nv_uuid object at 0x7f13b468b640> gpuMappingType=1 gpuCachingType=0 gpuFormatType=0 gpuElementBits=0 gpuCompressionType=0 }
+#37: NV_ESC_RM_ALLOC    hClass=BLACKWELL_CHANNEL_GPFIFO_A    , hRoot=3251726314, hObjectParent=3404726276, pAllocParms=139722817684240, hObjectNew=3404726286 status=0
+	 struct_NV_CHANNEL_ALLOC_PARAMS { hObjectError=3404726285 hObjectBuffer=3404726278 gpFifoOffset=68720525312 gpFifoEntries=65536 flags=0 hContextShare=3404726279 hVASpace=0 hUserdMemory=<tinygrad.runtime.autogen.nv_gpu.c_uint_Array_8 object at 0x7f13b468b640> userdOffset=<tinygrad.runtime.autogen.nv_gpu.c_ulong_Array_8 object at 0x7f13b468af40> engineType=0 cid=33238 subDeviceId=0 hObjectEccError=0 instanceMem=<tinygrad.runtime.autogen.nv_gpu.struct_NV_MEMORY_DESC_PARAMS object at 0x7f13b468b640> userdMem=<tinygrad.runtime.autogen.nv_gpu.struct_NV_MEMORY_DESC_PARAMS object at 0x7f13b468b640> ramfcMem=<tinygrad.runtime.autogen.nv_gpu.struct_NV_MEMORY_DESC_PARAMS object at 0x7f13b468b640> mthdbufMem=<tinygrad.runtime.autogen.nv_gpu.struct_NV_MEMORY_DESC_PARAMS object at 0x7f13b468b640> hPhysChannelGroup=0 internalFlags=0 errorNotifierMem=<tinygrad.runtime.autogen.nv_gpu.struct_NV_MEMORY_DESC_PARAMS object at 0x7f13b468b640> eccErrorNotifierMem=<tinygrad.runtime.autogen.nv_gpu.struct_NV_MEMORY_DESC_PARAMS object at 0x7f13b468b640> ProcessID=0 SubProcessID=0 encryptIv=<tinygrad.runtime.autogen.nv_gpu.c_uint_Array_3 object at 0x7f13b468b640> decryptIv=<tinygrad.runtime.autogen.nv_gpu.c_uint_Array_3 object at 0x7f13b468af40> hmacNonce=<tinygrad.runtime.autogen.nv_gpu.c_uint_Array_8 object at 0x7f13b468b640> tpcConfigID=0 PADDING_0=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13b468af40> }
+#38: NV_ESC_RM_ALLOC    hClass=unk=0xCEC0                    , hRoot=3251726314, hObjectParent=3404726286, pAllocParms=None, hObjectNew=3404726287 status=0
+#39: NV_ESC_RM_ALLOC    hClass=BLACKWELL_DMA_COPY_B          , hRoot=3251726314, hObjectParent=3404726286, pAllocParms=None, hObjectNew=3404726288 status=0
+#40: NV_ESC_RM_CONTROL    cmd=NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN hClient=3251726314, hObject=3404726286, flags=0, params=139722609098000, paramsSize=4, status=0
+	 struct_NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN_PARAMS { workSubmitToken=1073741830 }
+#41: UVM_REGISTER_CHANNEL
+	 struct_c__SA_UVM_REGISTER_CHANNEL_PARAMS { gpuUuid=<tinygrad.runtime.autogen.nv_gpu.struct_nv_uuid object at 0x7f13b468b340> rmCtrlFd=3 hClient=3251726314 hChannel=3404726286 PADDING_0=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13b468bf40> base=68788682752 length=67108864 rmStatus=0 PADDING_1=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13b468b340> }
+#42: NV_ESC_RM_CONTROL    cmd=NVA06C_CTRL_CMD_GPFIFO_SCHEDULE hClient=3251726314, hObject=3404726276, flags=0, params=139722609098000, paramsSize=2, status=0
+	 struct_NVA06F_CTRL_GPFIFO_SCHEDULE_PARAMS { bEnable=234 bSkipSubmit=103 }
+#43: NV_ESC_RM_ALLOC    hClass=NV1_MEMORY_USER               , hRoot=3251726314, hObjectParent=3404726272, pAllocParms=139722817585200, hObjectNew=3404726289 status=0
+	 struct_c__SA_NV_MEMORY_ALLOCATION_PARAMS { owner=3251726314 type=0 flags=114945 width=0 height=0 pitch=0 attr=293601280 attr2=1048581 format=6 comprCovg=0 zcullCovg=0 PADDING_0=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13c0d82840> rangeLo=0 rangeHi=0 size=2097152 alignment=2097152 offset=52428800 limit=2097151 address=None ctagOffset=0 hVASpace=0 internalflags=0 tag=0 numaNode=0 PADDING_1=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13c0d81dc0> }
+#44: NV_ESC_REGISTER_FD  fd=3
+#45: NV_ESC_RM_MAP_MEMORY   hClient=3251726314, hDevice=3404726272, hMemory=3404726289, length=2097152 flags=16842752 pLinearAddress=343603675136
+#46: UVM_CREATE_EXTERNAL_RANGE
+	 struct_c__SA_UVM_CREATE_EXTERNAL_RANGE_PARAMS { base=68855791616 length=2097152 rmStatus=0 PADDING_0=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13c0d81dc0> }
+#47: UVM_MAP_EXTERNAL_ALLOCATION
+	 struct_c__SA_UVM_MAP_EXTERNAL_ALLOCATION_PARAMS { base=68855791616 length=2097152 offset=0 perGpuAttributes=<tinygrad.runtime.autogen.nv_gpu.struct_c__SA_UvmGpuMappingAttributes_Array_256 object at 0x7f13c0d800c0> gpuAttributesCount=1 rmCtrlFd=3 hClient=3251726314 hMemory=3404726289 rmStatus=0 }
+perGpuAttributes[{i}] = 	 struct_c__SA_UvmGpuMappingAttributes { gpuUuid=<tinygrad.runtime.autogen.nv_gpu.struct_nv_uuid object at 0x7f13c0d82140> gpuMappingType=1 gpuCachingType=0 gpuFormatType=0 gpuElementBits=0 gpuCompressionType=0 }
+#48: NV_ESC_RM_CONTROL    cmd=NV2080_CTRL_CMD_GR_GET_INFO    hClient=3251726314, hObject=3404726273, flags=0, params=139722604787568, paramsSize=32, status=0
+	 struct_NV2080_CTRL_GR_GET_INFO_PARAMS { grInfoListSize=5 PADDING_0=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13b468b8c0> grInfoList=139722604773120 grRouteInfo=<tinygrad.runtime.autogen.nv_gpu.struct_NV0080_CTRL_GR_ROUTE_INFO object at 0x7f13b468b8c0> }
+#49: NV_ESC_RM_ALLOC_MEMORY  fd=-1, hRoot=3251726314, hObjectParent=3404726272, hObjectNew=4097, hClass=113, flags=1073745936, pMemory=137539616768, limit=2097151, status=0
+#50: UVM_CREATE_EXTERNAL_RANGE
+	 struct_c__SA_UVM_CREATE_EXTERNAL_RANGE_PARAMS { base=137539616768 length=2097152 rmStatus=0 PADDING_0=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13c0d800c0> }
+#51: UVM_MAP_EXTERNAL_ALLOCATION
+	 struct_c__SA_UVM_MAP_EXTERNAL_ALLOCATION_PARAMS { base=137539616768 length=2097152 offset=0 perGpuAttributes=<tinygrad.runtime.autogen.nv_gpu.struct_c__SA_UvmGpuMappingAttributes_Array_256 object at 0x7f13c0d800c0> gpuAttributesCount=1 rmCtrlFd=3 hClient=3251726314 hMemory=4097 rmStatus=0 }
+perGpuAttributes[{i}] = 	 struct_c__SA_UvmGpuMappingAttributes { gpuUuid=<tinygrad.runtime.autogen.nv_gpu.struct_nv_uuid object at 0x7f13c0d815c0> gpuMappingType=1 gpuCachingType=0 gpuFormatType=0 gpuElementBits=0 gpuCompressionType=0 }
+#52: NV_ESC_RM_ALLOC_MEMORY  fd=-1, hRoot=3251726314, hObjectParent=3404726272, hObjectNew=4098, hClass=113, flags=1073745936, pMemory=137541713920, limit=2097151, status=0
+#53: UVM_CREATE_EXTERNAL_RANGE
+	 struct_c__SA_UVM_CREATE_EXTERNAL_RANGE_PARAMS { base=137541713920 length=2097152 rmStatus=0 PADDING_0=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13c0d81440> }
+#54: UVM_MAP_EXTERNAL_ALLOCATION
+	 struct_c__SA_UVM_MAP_EXTERNAL_ALLOCATION_PARAMS { base=137541713920 length=2097152 offset=0 perGpuAttributes=<tinygrad.runtime.autogen.nv_gpu.struct_c__SA_UvmGpuMappingAttributes_Array_256 object at 0x7f13c0d803c0> gpuAttributesCount=1 rmCtrlFd=3 hClient=3251726314 hMemory=4098 rmStatus=0 }
+perGpuAttributes[{i}] = 	 struct_c__SA_UvmGpuMappingAttributes { gpuUuid=<tinygrad.runtime.autogen.nv_gpu.struct_nv_uuid object at 0x7f13c0d80ac0> gpuMappingType=1 gpuCachingType=0 gpuFormatType=0 gpuElementBits=0 gpuCompressionType=0 }
+#55: NV_ESC_RM_ALLOC_MEMORY  fd=-1, hRoot=3251726314, hObjectParent=3404726272, hObjectNew=4099, hClass=113, flags=1073745936, pMemory=137543811072, limit=2097151, status=0
+#56: UVM_CREATE_EXTERNAL_RANGE
+	 struct_c__SA_UVM_CREATE_EXTERNAL_RANGE_PARAMS { base=137543811072 length=2097152 rmStatus=0 PADDING_0=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13c0d828c0> }
+#57: UVM_MAP_EXTERNAL_ALLOCATION
+	 struct_c__SA_UVM_MAP_EXTERNAL_ALLOCATION_PARAMS { base=137543811072 length=2097152 offset=0 perGpuAttributes=<tinygrad.runtime.autogen.nv_gpu.struct_c__SA_UvmGpuMappingAttributes_Array_256 object at 0x7f13c0d822c0> gpuAttributesCount=1 rmCtrlFd=3 hClient=3251726314 hMemory=4099 rmStatus=0 }
+perGpuAttributes[{i}] = 	 struct_c__SA_UvmGpuMappingAttributes { gpuUuid=<tinygrad.runtime.autogen.nv_gpu.struct_nv_uuid object at 0x7f13c0d81e40> gpuMappingType=1 gpuCachingType=0 gpuFormatType=0 gpuElementBits=0 gpuCompressionType=0 }
+#58: NV_ESC_RM_ALLOC_MEMORY  fd=-1, hRoot=3251726314, hObjectParent=3404726272, hObjectNew=4100, hClass=113, flags=1073745936, pMemory=137545908224, limit=2097151, status=0
+#59: UVM_CREATE_EXTERNAL_RANGE
+	 struct_c__SA_UVM_CREATE_EXTERNAL_RANGE_PARAMS { base=137545908224 length=2097152 rmStatus=0 PADDING_0=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13c0d80040> }
+#60: UVM_MAP_EXTERNAL_ALLOCATION
+	 struct_c__SA_UVM_MAP_EXTERNAL_ALLOCATION_PARAMS { base=137545908224 length=2097152 offset=0 perGpuAttributes=<tinygrad.runtime.autogen.nv_gpu.struct_c__SA_UvmGpuMappingAttributes_Array_256 object at 0x7f13c0d819c0> gpuAttributesCount=1 rmCtrlFd=3 hClient=3251726314 hMemory=4100 rmStatus=0 }
+perGpuAttributes[{i}] = 	 struct_c__SA_UvmGpuMappingAttributes { gpuUuid=<tinygrad.runtime.autogen.nv_gpu.struct_nv_uuid object at 0x7f13c0d824c0> gpuMappingType=1 gpuCachingType=0 gpuFormatType=0 gpuElementBits=0 gpuCompressionType=0 }
+#61: NV_ESC_RM_ALLOC_MEMORY  fd=-1, hRoot=3251726314, hObjectParent=3404726272, hObjectNew=4101, hClass=113, flags=1073745936, pMemory=137548005376, limit=2097151, status=0
+#62: UVM_CREATE_EXTERNAL_RANGE
+	 struct_c__SA_UVM_CREATE_EXTERNAL_RANGE_PARAMS { base=137548005376 length=2097152 rmStatus=0 PADDING_0=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13c0d820c0> }
+#63: UVM_MAP_EXTERNAL_ALLOCATION
+	 struct_c__SA_UVM_MAP_EXTERNAL_ALLOCATION_PARAMS { base=137548005376 length=2097152 offset=0 perGpuAttributes=<tinygrad.runtime.autogen.nv_gpu.struct_c__SA_UvmGpuMappingAttributes_Array_256 object at 0x7f13c0d81bc0> gpuAttributesCount=1 rmCtrlFd=3 hClient=3251726314 hMemory=4101 rmStatus=0 }
+perGpuAttributes[{i}] = 	 struct_c__SA_UvmGpuMappingAttributes { gpuUuid=<tinygrad.runtime.autogen.nv_gpu.struct_nv_uuid object at 0x7f13c0d80dc0> gpuMappingType=1 gpuCachingType=0 gpuFormatType=0 gpuElementBits=0 gpuCompressionType=0 }
+#64: NV_ESC_RM_ALLOC_MEMORY  fd=-1, hRoot=3251726314, hObjectParent=3404726272, hObjectNew=4102, hClass=113, flags=1073745936, pMemory=137550102528, limit=2097151, status=0
+#65: UVM_CREATE_EXTERNAL_RANGE
+	 struct_c__SA_UVM_CREATE_EXTERNAL_RANGE_PARAMS { base=137550102528 length=2097152 rmStatus=0 PADDING_0=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13c0d82f40> }
+#66: UVM_MAP_EXTERNAL_ALLOCATION
+	 struct_c__SA_UVM_MAP_EXTERNAL_ALLOCATION_PARAMS { base=137550102528 length=2097152 offset=0 perGpuAttributes=<tinygrad.runtime.autogen.nv_gpu.struct_c__SA_UvmGpuMappingAttributes_Array_256 object at 0x7f13c0d82e40> gpuAttributesCount=1 rmCtrlFd=3 hClient=3251726314 hMemory=4102 rmStatus=0 }
+perGpuAttributes[{i}] = 	 struct_c__SA_UvmGpuMappingAttributes { gpuUuid=<tinygrad.runtime.autogen.nv_gpu.struct_nv_uuid object at 0x7f13c0d82c40> gpuMappingType=1 gpuCachingType=0 gpuFormatType=0 gpuElementBits=0 gpuCompressionType=0 }
+#67: NV_ESC_RM_ALLOC_MEMORY  fd=-1, hRoot=3251726314, hObjectParent=3404726272, hObjectNew=4103, hClass=113, flags=1073745936, pMemory=137552199680, limit=2097151, status=0
+#68: UVM_CREATE_EXTERNAL_RANGE
+	 struct_c__SA_UVM_CREATE_EXTERNAL_RANGE_PARAMS { base=137552199680 length=2097152 rmStatus=0 PADDING_0=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13c0d82d40> }
+#69: UVM_MAP_EXTERNAL_ALLOCATION
+	 struct_c__SA_UVM_MAP_EXTERNAL_ALLOCATION_PARAMS { base=137552199680 length=2097152 offset=0 perGpuAttributes=<tinygrad.runtime.autogen.nv_gpu.struct_c__SA_UvmGpuMappingAttributes_Array_256 object at 0x7f13c0d82c40> gpuAttributesCount=1 rmCtrlFd=3 hClient=3251726314 hMemory=4103 rmStatus=0 }
+perGpuAttributes[{i}] = 	 struct_c__SA_UvmGpuMappingAttributes { gpuUuid=<tinygrad.runtime.autogen.nv_gpu.struct_nv_uuid object at 0x7f13c0d80a40> gpuMappingType=1 gpuCachingType=0 gpuFormatType=0 gpuElementBits=0 gpuCompressionType=0 }
+#70: NV_ESC_RM_ALLOC_MEMORY  fd=-1, hRoot=3251726314, hObjectParent=3404726272, hObjectNew=4104, hClass=113, flags=1073745936, pMemory=137554296832, limit=2097151, status=0
+#71: UVM_CREATE_EXTERNAL_RANGE
+	 struct_c__SA_UVM_CREATE_EXTERNAL_RANGE_PARAMS { base=137554296832 length=2097152 rmStatus=0 PADDING_0=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13c0d82bc0> }
+#72: UVM_MAP_EXTERNAL_ALLOCATION
+	 struct_c__SA_UVM_MAP_EXTERNAL_ALLOCATION_PARAMS { base=137554296832 length=2097152 offset=0 perGpuAttributes=<tinygrad.runtime.autogen.nv_gpu.struct_c__SA_UvmGpuMappingAttributes_Array_256 object at 0x7f13c0d82b40> gpuAttributesCount=1 rmCtrlFd=3 hClient=3251726314 hMemory=4104 rmStatus=0 }
+perGpuAttributes[{i}] = 	 struct_c__SA_UvmGpuMappingAttributes { gpuUuid=<tinygrad.runtime.autogen.nv_gpu.struct_nv_uuid object at 0x7f13c0d82ec0> gpuMappingType=1 gpuCachingType=0 gpuFormatType=0 gpuElementBits=0 gpuCompressionType=0 }
+#73: NV_ESC_RM_ALLOC_MEMORY  fd=-1, hRoot=3251726314, hObjectParent=3404726272, hObjectNew=4105, hClass=113, flags=1073745936, pMemory=137556393984, limit=2097151, status=0
+#74: UVM_CREATE_EXTERNAL_RANGE
+	 struct_c__SA_UVM_CREATE_EXTERNAL_RANGE_PARAMS { base=137556393984 length=2097152 rmStatus=0 PADDING_0=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13c0d81c40> }
+#75: UVM_MAP_EXTERNAL_ALLOCATION
+	 struct_c__SA_UVM_MAP_EXTERNAL_ALLOCATION_PARAMS { base=137556393984 length=2097152 offset=0 perGpuAttributes=<tinygrad.runtime.autogen.nv_gpu.struct_c__SA_UvmGpuMappingAttributes_Array_256 object at 0x7f13c0d818c0> gpuAttributesCount=1 rmCtrlFd=3 hClient=3251726314 hMemory=4105 rmStatus=0 }
+perGpuAttributes[{i}] = 	 struct_c__SA_UvmGpuMappingAttributes { gpuUuid=<tinygrad.runtime.autogen.nv_gpu.struct_nv_uuid object at 0x7f13c0d818c0> gpuMappingType=1 gpuCachingType=0 gpuFormatType=0 gpuElementBits=0 gpuCompressionType=0 }
+#76: NV_ESC_RM_ALLOC_MEMORY  fd=-1, hRoot=3251726314, hObjectParent=3404726272, hObjectNew=4106, hClass=113, flags=1073745936, pMemory=137558491136, limit=2097151, status=0
+#77: UVM_CREATE_EXTERNAL_RANGE
+	 struct_c__SA_UVM_CREATE_EXTERNAL_RANGE_PARAMS { base=137558491136 length=2097152 rmStatus=0 PADDING_0=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13c0d818c0> }
+#78: UVM_MAP_EXTERNAL_ALLOCATION
+	 struct_c__SA_UVM_MAP_EXTERNAL_ALLOCATION_PARAMS { base=137558491136 length=2097152 offset=0 perGpuAttributes=<tinygrad.runtime.autogen.nv_gpu.struct_c__SA_UvmGpuMappingAttributes_Array_256 object at 0x7f13c0d82fc0> gpuAttributesCount=1 rmCtrlFd=3 hClient=3251726314 hMemory=4106 rmStatus=0 }
+perGpuAttributes[{i}] = 	 struct_c__SA_UvmGpuMappingAttributes { gpuUuid=<tinygrad.runtime.autogen.nv_gpu.struct_nv_uuid object at 0x7f13c0d83140> gpuMappingType=1 gpuCachingType=0 gpuFormatType=0 gpuElementBits=0 gpuCompressionType=0 }
+#79: NV_ESC_RM_ALLOC_MEMORY  fd=-1, hRoot=3251726314, hObjectParent=3404726272, hObjectNew=4107, hClass=113, flags=1073745936, pMemory=137560588288, limit=2097151, status=0
+#80: UVM_CREATE_EXTERNAL_RANGE
+	 struct_c__SA_UVM_CREATE_EXTERNAL_RANGE_PARAMS { base=137560588288 length=2097152 rmStatus=0 PADDING_0=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13c0d831c0> }
+#81: UVM_MAP_EXTERNAL_ALLOCATION
+	 struct_c__SA_UVM_MAP_EXTERNAL_ALLOCATION_PARAMS { base=137560588288 length=2097152 offset=0 perGpuAttributes=<tinygrad.runtime.autogen.nv_gpu.struct_c__SA_UvmGpuMappingAttributes_Array_256 object at 0x7f13c0d83240> gpuAttributesCount=1 rmCtrlFd=3 hClient=3251726314 hMemory=4107 rmStatus=0 }
+perGpuAttributes[{i}] = 	 struct_c__SA_UvmGpuMappingAttributes { gpuUuid=<tinygrad.runtime.autogen.nv_gpu.struct_nv_uuid object at 0x7f13c0d833c0> gpuMappingType=1 gpuCachingType=0 gpuFormatType=0 gpuElementBits=0 gpuCompressionType=0 }
+#82: NV_ESC_RM_ALLOC_MEMORY  fd=-1, hRoot=3251726314, hObjectParent=3404726272, hObjectNew=4108, hClass=113, flags=1073745936, pMemory=137562685440, limit=2097151, status=0
+#83: UVM_CREATE_EXTERNAL_RANGE
+	 struct_c__SA_UVM_CREATE_EXTERNAL_RANGE_PARAMS { base=137562685440 length=2097152 rmStatus=0 PADDING_0=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13c0d83440> }
+#84: UVM_MAP_EXTERNAL_ALLOCATION
+	 struct_c__SA_UVM_MAP_EXTERNAL_ALLOCATION_PARAMS { base=137562685440 length=2097152 offset=0 perGpuAttributes=<tinygrad.runtime.autogen.nv_gpu.struct_c__SA_UvmGpuMappingAttributes_Array_256 object at 0x7f13c0d834c0> gpuAttributesCount=1 rmCtrlFd=3 hClient=3251726314 hMemory=4108 rmStatus=0 }
+perGpuAttributes[{i}] = 	 struct_c__SA_UvmGpuMappingAttributes { gpuUuid=<tinygrad.runtime.autogen.nv_gpu.struct_nv_uuid object at 0x7f13c0d83640> gpuMappingType=1 gpuCachingType=0 gpuFormatType=0 gpuElementBits=0 gpuCompressionType=0 }
+#85: NV_ESC_RM_ALLOC_MEMORY  fd=-1, hRoot=3251726314, hObjectParent=3404726272, hObjectNew=4109, hClass=113, flags=1073745936, pMemory=137564782592, limit=2097151, status=0
+#86: UVM_CREATE_EXTERNAL_RANGE
+	 struct_c__SA_UVM_CREATE_EXTERNAL_RANGE_PARAMS { base=137564782592 length=2097152 rmStatus=0 PADDING_0=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13c0d836c0> }
+#87: UVM_MAP_EXTERNAL_ALLOCATION
+	 struct_c__SA_UVM_MAP_EXTERNAL_ALLOCATION_PARAMS { base=137564782592 length=2097152 offset=0 perGpuAttributes=<tinygrad.runtime.autogen.nv_gpu.struct_c__SA_UvmGpuMappingAttributes_Array_256 object at 0x7f13c0d83740> gpuAttributesCount=1 rmCtrlFd=3 hClient=3251726314 hMemory=4109 rmStatus=0 }
+perGpuAttributes[{i}] = 	 struct_c__SA_UvmGpuMappingAttributes { gpuUuid=<tinygrad.runtime.autogen.nv_gpu.struct_nv_uuid object at 0x7f13c0d838c0> gpuMappingType=1 gpuCachingType=0 gpuFormatType=0 gpuElementBits=0 gpuCompressionType=0 }
+#88: NV_ESC_RM_ALLOC_MEMORY  fd=-1, hRoot=3251726314, hObjectParent=3404726272, hObjectNew=4110, hClass=113, flags=1073745936, pMemory=137566879744, limit=2097151, status=0
+#89: UVM_CREATE_EXTERNAL_RANGE
+	 struct_c__SA_UVM_CREATE_EXTERNAL_RANGE_PARAMS { base=137566879744 length=2097152 rmStatus=0 PADDING_0=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13c0d83940> }
+#90: UVM_MAP_EXTERNAL_ALLOCATION
+	 struct_c__SA_UVM_MAP_EXTERNAL_ALLOCATION_PARAMS { base=137566879744 length=2097152 offset=0 perGpuAttributes=<tinygrad.runtime.autogen.nv_gpu.struct_c__SA_UvmGpuMappingAttributes_Array_256 object at 0x7f13c0d839c0> gpuAttributesCount=1 rmCtrlFd=3 hClient=3251726314 hMemory=4110 rmStatus=0 }
+perGpuAttributes[{i}] = 	 struct_c__SA_UvmGpuMappingAttributes { gpuUuid=<tinygrad.runtime.autogen.nv_gpu.struct_nv_uuid object at 0x7f13c0d83b40> gpuMappingType=1 gpuCachingType=0 gpuFormatType=0 gpuElementBits=0 gpuCompressionType=0 }
+#91: NV_ESC_RM_ALLOC_MEMORY  fd=-1, hRoot=3251726314, hObjectParent=3404726272, hObjectNew=4111, hClass=113, flags=1073745936, pMemory=137568976896, limit=2097151, status=0
+#92: UVM_CREATE_EXTERNAL_RANGE
+	 struct_c__SA_UVM_CREATE_EXTERNAL_RANGE_PARAMS { base=137568976896 length=2097152 rmStatus=0 PADDING_0=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13c0d83bc0> }
+#93: UVM_MAP_EXTERNAL_ALLOCATION
+	 struct_c__SA_UVM_MAP_EXTERNAL_ALLOCATION_PARAMS { base=137568976896 length=2097152 offset=0 perGpuAttributes=<tinygrad.runtime.autogen.nv_gpu.struct_c__SA_UvmGpuMappingAttributes_Array_256 object at 0x7f13c0d83bc0> gpuAttributesCount=1 rmCtrlFd=3 hClient=3251726314 hMemory=4111 rmStatus=0 }
+perGpuAttributes[{i}] = 	 struct_c__SA_UvmGpuMappingAttributes { gpuUuid=<tinygrad.runtime.autogen.nv_gpu.struct_nv_uuid object at 0x7f13c0d83d40> gpuMappingType=1 gpuCachingType=0 gpuFormatType=0 gpuElementBits=0 gpuCompressionType=0 }
+#94: NV_ESC_RM_ALLOC_MEMORY  fd=-1, hRoot=3251726314, hObjectParent=3404726272, hObjectNew=4112, hClass=113, flags=1073745936, pMemory=137571074048, limit=2097151, status=0
+#95: UVM_CREATE_EXTERNAL_RANGE
+	 struct_c__SA_UVM_CREATE_EXTERNAL_RANGE_PARAMS { base=137571074048 length=2097152 rmStatus=0 PADDING_0=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13b468b340> }
+#96: UVM_MAP_EXTERNAL_ALLOCATION
+	 struct_c__SA_UVM_MAP_EXTERNAL_ALLOCATION_PARAMS { base=137571074048 length=2097152 offset=0 perGpuAttributes=<tinygrad.runtime.autogen.nv_gpu.struct_c__SA_UvmGpuMappingAttributes_Array_256 object at 0x7f13b468af40> gpuAttributesCount=1 rmCtrlFd=3 hClient=3251726314 hMemory=4112 rmStatus=0 }
+perGpuAttributes[{i}] = 	 struct_c__SA_UvmGpuMappingAttributes { gpuUuid=<tinygrad.runtime.autogen.nv_gpu.struct_nv_uuid object at 0x7f13b468aec0> gpuMappingType=1 gpuCachingType=0 gpuFormatType=0 gpuElementBits=0 gpuCompressionType=0 }
+#97: NV_ESC_RM_ALLOC_MEMORY  fd=-1, hRoot=3251726314, hObjectParent=3404726272, hObjectNew=4113, hClass=113, flags=1073745936, pMemory=137573171200, limit=2097151, status=0
+#98: UVM_CREATE_EXTERNAL_RANGE
+	 struct_c__SA_UVM_CREATE_EXTERNAL_RANGE_PARAMS { base=137573171200 length=2097152 rmStatus=0 PADDING_0=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13b468aec0> }
+#99: UVM_MAP_EXTERNAL_ALLOCATION
+	 struct_c__SA_UVM_MAP_EXTERNAL_ALLOCATION_PARAMS { base=137573171200 length=2097152 offset=0 perGpuAttributes=<tinygrad.runtime.autogen.nv_gpu.struct_c__SA_UvmGpuMappingAttributes_Array_256 object at 0x7f13b468bb40> gpuAttributesCount=1 rmCtrlFd=3 hClient=3251726314 hMemory=4113 rmStatus=0 }
+perGpuAttributes[{i}] = 	 struct_c__SA_UvmGpuMappingAttributes { gpuUuid=<tinygrad.runtime.autogen.nv_gpu.struct_nv_uuid object at 0x7f13b468b1c0> gpuMappingType=1 gpuCachingType=0 gpuFormatType=0 gpuElementBits=0 gpuCompressionType=0 }
+#100: NV_ESC_RM_ALLOC_MEMORY  fd=-1, hRoot=3251726314, hObjectParent=3404726272, hObjectNew=4114, hClass=113, flags=1073745936, pMemory=137575268352, limit=2097151, status=0
+#101: UVM_CREATE_EXTERNAL_RANGE
+	 struct_c__SA_UVM_CREATE_EXTERNAL_RANGE_PARAMS { base=137575268352 length=2097152 rmStatus=0 PADDING_0=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13b47b4240> }
+#102: UVM_MAP_EXTERNAL_ALLOCATION
+	 struct_c__SA_UVM_MAP_EXTERNAL_ALLOCATION_PARAMS { base=137575268352 length=2097152 offset=0 perGpuAttributes=<tinygrad.runtime.autogen.nv_gpu.struct_c__SA_UvmGpuMappingAttributes_Array_256 object at 0x7f13b47b4240> gpuAttributesCount=1 rmCtrlFd=3 hClient=3251726314 hMemory=4114 rmStatus=0 }
+perGpuAttributes[{i}] = 	 struct_c__SA_UvmGpuMappingAttributes { gpuUuid=<tinygrad.runtime.autogen.nv_gpu.struct_nv_uuid object at 0x7f13b47b6a40> gpuMappingType=1 gpuCachingType=0 gpuFormatType=0 gpuElementBits=0 gpuCompressionType=0 }
+#103: NV_ESC_RM_ALLOC_MEMORY  fd=-1, hRoot=3251726314, hObjectParent=3404726272, hObjectNew=4115, hClass=113, flags=1073745936, pMemory=137577365504, limit=2097151, status=0
+#104: UVM_CREATE_EXTERNAL_RANGE
+	 struct_c__SA_UVM_CREATE_EXTERNAL_RANGE_PARAMS { base=137577365504 length=2097152 rmStatus=0 PADDING_0=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13b47b6440> }
+#105: UVM_MAP_EXTERNAL_ALLOCATION
+	 struct_c__SA_UVM_MAP_EXTERNAL_ALLOCATION_PARAMS { base=137577365504 length=2097152 offset=0 perGpuAttributes=<tinygrad.runtime.autogen.nv_gpu.struct_c__SA_UvmGpuMappingAttributes_Array_256 object at 0x7f13b47b7140> gpuAttributesCount=1 rmCtrlFd=3 hClient=3251726314 hMemory=4115 rmStatus=0 }
+perGpuAttributes[{i}] = 	 struct_c__SA_UvmGpuMappingAttributes { gpuUuid=<tinygrad.runtime.autogen.nv_gpu.struct_nv_uuid object at 0x7f13b47b5dc0> gpuMappingType=1 gpuCachingType=0 gpuFormatType=0 gpuElementBits=0 gpuCompressionType=0 }
+#106: NV_ESC_RM_ALLOC_MEMORY  fd=-1, hRoot=3251726314, hObjectParent=3404726272, hObjectNew=4116, hClass=113, flags=1073745936, pMemory=137579462656, limit=2097151, status=0
+#107: UVM_CREATE_EXTERNAL_RANGE
+	 struct_c__SA_UVM_CREATE_EXTERNAL_RANGE_PARAMS { base=137579462656 length=2097152 rmStatus=0 PADDING_0=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13b47b7940> }
+#108: UVM_MAP_EXTERNAL_ALLOCATION
+	 struct_c__SA_UVM_MAP_EXTERNAL_ALLOCATION_PARAMS { base=137579462656 length=2097152 offset=0 perGpuAttributes=<tinygrad.runtime.autogen.nv_gpu.struct_c__SA_UvmGpuMappingAttributes_Array_256 object at 0x7f13b47b6ac0> gpuAttributesCount=1 rmCtrlFd=3 hClient=3251726314 hMemory=4116 rmStatus=0 }
+perGpuAttributes[{i}] = 	 struct_c__SA_UvmGpuMappingAttributes { gpuUuid=<tinygrad.runtime.autogen.nv_gpu.struct_nv_uuid object at 0x7f13b47b6c40> gpuMappingType=1 gpuCachingType=0 gpuFormatType=0 gpuElementBits=0 gpuCompressionType=0 }
+#109: NV_ESC_RM_ALLOC_MEMORY  fd=-1, hRoot=3251726314, hObjectParent=3404726272, hObjectNew=4117, hClass=113, flags=1073745936, pMemory=137581559808, limit=2097151, status=0
+#110: UVM_CREATE_EXTERNAL_RANGE
+	 struct_c__SA_UVM_CREATE_EXTERNAL_RANGE_PARAMS { base=137581559808 length=2097152 rmStatus=0 PADDING_0=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13b47b5d40> }
+#111: UVM_MAP_EXTERNAL_ALLOCATION
+	 struct_c__SA_UVM_MAP_EXTERNAL_ALLOCATION_PARAMS { base=137581559808 length=2097152 offset=0 perGpuAttributes=<tinygrad.runtime.autogen.nv_gpu.struct_c__SA_UvmGpuMappingAttributes_Array_256 object at 0x7f13b47b5ec0> gpuAttributesCount=1 rmCtrlFd=3 hClient=3251726314 hMemory=4117 rmStatus=0 }
+perGpuAttributes[{i}] = 	 struct_c__SA_UvmGpuMappingAttributes { gpuUuid=<tinygrad.runtime.autogen.nv_gpu.struct_nv_uuid object at 0x7f13b47b55c0> gpuMappingType=1 gpuCachingType=0 gpuFormatType=0 gpuElementBits=0 gpuCompressionType=0 }
+#112: NV_ESC_RM_ALLOC_MEMORY  fd=-1, hRoot=3251726314, hObjectParent=3404726272, hObjectNew=4118, hClass=113, flags=1073745936, pMemory=137583656960, limit=2097151, status=0
+#113: UVM_CREATE_EXTERNAL_RANGE
+	 struct_c__SA_UVM_CREATE_EXTERNAL_RANGE_PARAMS { base=137583656960 length=2097152 rmStatus=0 PADDING_0=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13b47b74c0> }
+#114: UVM_MAP_EXTERNAL_ALLOCATION
+	 struct_c__SA_UVM_MAP_EXTERNAL_ALLOCATION_PARAMS { base=137583656960 length=2097152 offset=0 perGpuAttributes=<tinygrad.runtime.autogen.nv_gpu.struct_c__SA_UvmGpuMappingAttributes_Array_256 object at 0x7f13b47b71c0> gpuAttributesCount=1 rmCtrlFd=3 hClient=3251726314 hMemory=4118 rmStatus=0 }
+perGpuAttributes[{i}] = 	 struct_c__SA_UvmGpuMappingAttributes { gpuUuid=<tinygrad.runtime.autogen.nv_gpu.struct_nv_uuid object at 0x7f13b47b66c0> gpuMappingType=1 gpuCachingType=0 gpuFormatType=0 gpuElementBits=0 gpuCompressionType=0 }
+#115: NV_ESC_RM_ALLOC_MEMORY  fd=-1, hRoot=3251726314, hObjectParent=3404726272, hObjectNew=4119, hClass=113, flags=1073745936, pMemory=137585754112, limit=2097151, status=0
+#116: UVM_CREATE_EXTERNAL_RANGE
+	 struct_c__SA_UVM_CREATE_EXTERNAL_RANGE_PARAMS { base=137585754112 length=2097152 rmStatus=0 PADDING_0=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13b47b68c0> }
+#117: UVM_MAP_EXTERNAL_ALLOCATION
+	 struct_c__SA_UVM_MAP_EXTERNAL_ALLOCATION_PARAMS { base=137585754112 length=2097152 offset=0 perGpuAttributes=<tinygrad.runtime.autogen.nv_gpu.struct_c__SA_UvmGpuMappingAttributes_Array_256 object at 0x7f13b47b68c0> gpuAttributesCount=1 rmCtrlFd=3 hClient=3251726314 hMemory=4119 rmStatus=0 }
+perGpuAttributes[{i}] = 	 struct_c__SA_UvmGpuMappingAttributes { gpuUuid=<tinygrad.runtime.autogen.nv_gpu.struct_nv_uuid object at 0x7f13b47b64c0> gpuMappingType=1 gpuCachingType=0 gpuFormatType=0 gpuElementBits=0 gpuCompressionType=0 }
+#118: NV_ESC_RM_ALLOC_MEMORY  fd=-1, hRoot=3251726314, hObjectParent=3404726272, hObjectNew=4120, hClass=113, flags=1073745936, pMemory=137587851264, limit=2097151, status=0
+#119: UVM_CREATE_EXTERNAL_RANGE
+	 struct_c__SA_UVM_CREATE_EXTERNAL_RANGE_PARAMS { base=137587851264 length=2097152 rmStatus=0 PADDING_0=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13b47b7640> }
+#120: UVM_MAP_EXTERNAL_ALLOCATION
+	 struct_c__SA_UVM_MAP_EXTERNAL_ALLOCATION_PARAMS { base=137587851264 length=2097152 offset=0 perGpuAttributes=<tinygrad.runtime.autogen.nv_gpu.struct_c__SA_UvmGpuMappingAttributes_Array_256 object at 0x7f13b47b63c0> gpuAttributesCount=1 rmCtrlFd=3 hClient=3251726314 hMemory=4120 rmStatus=0 }
+perGpuAttributes[{i}] = 	 struct_c__SA_UvmGpuMappingAttributes { gpuUuid=<tinygrad.runtime.autogen.nv_gpu.struct_nv_uuid object at 0x7f13b47b7ec0> gpuMappingType=1 gpuCachingType=0 gpuFormatType=0 gpuElementBits=0 gpuCompressionType=0 }
+#121: NV_ESC_RM_ALLOC_MEMORY  fd=-1, hRoot=3251726314, hObjectParent=3404726272, hObjectNew=4121, hClass=113, flags=1073745936, pMemory=137589948416, limit=2097151, status=0
+#122: UVM_CREATE_EXTERNAL_RANGE
+	 struct_c__SA_UVM_CREATE_EXTERNAL_RANGE_PARAMS { base=137589948416 length=2097152 rmStatus=0 PADDING_0=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13b47b6240> }
+#123: UVM_MAP_EXTERNAL_ALLOCATION
+	 struct_c__SA_UVM_MAP_EXTERNAL_ALLOCATION_PARAMS { base=137589948416 length=2097152 offset=0 perGpuAttributes=<tinygrad.runtime.autogen.nv_gpu.struct_c__SA_UvmGpuMappingAttributes_Array_256 object at 0x7f13b47b5c40> gpuAttributesCount=1 rmCtrlFd=3 hClient=3251726314 hMemory=4121 rmStatus=0 }
+perGpuAttributes[{i}] = 	 struct_c__SA_UvmGpuMappingAttributes { gpuUuid=<tinygrad.runtime.autogen.nv_gpu.struct_nv_uuid object at 0x7f13b47b70c0> gpuMappingType=1 gpuCachingType=0 gpuFormatType=0 gpuElementBits=0 gpuCompressionType=0 }
+#124: NV_ESC_RM_ALLOC_MEMORY  fd=-1, hRoot=3251726314, hObjectParent=3404726272, hObjectNew=4122, hClass=113, flags=1073745936, pMemory=137592045568, limit=2097151, status=0
+#125: UVM_CREATE_EXTERNAL_RANGE
+	 struct_c__SA_UVM_CREATE_EXTERNAL_RANGE_PARAMS { base=137592045568 length=2097152 rmStatus=0 PADDING_0=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13b47b59c0> }
+#126: UVM_MAP_EXTERNAL_ALLOCATION
+	 struct_c__SA_UVM_MAP_EXTERNAL_ALLOCATION_PARAMS { base=137592045568 length=2097152 offset=0 perGpuAttributes=<tinygrad.runtime.autogen.nv_gpu.struct_c__SA_UvmGpuMappingAttributes_Array_256 object at 0x7f13b47b4d40> gpuAttributesCount=1 rmCtrlFd=3 hClient=3251726314 hMemory=4122 rmStatus=0 }
+perGpuAttributes[{i}] = 	 struct_c__SA_UvmGpuMappingAttributes { gpuUuid=<tinygrad.runtime.autogen.nv_gpu.struct_nv_uuid object at 0x7f13b47b44c0> gpuMappingType=1 gpuCachingType=0 gpuFormatType=0 gpuElementBits=0 gpuCompressionType=0 }
+#127: NV_ESC_RM_ALLOC_MEMORY  fd=-1, hRoot=3251726314, hObjectParent=3404726272, hObjectNew=4123, hClass=113, flags=1073745936, pMemory=137594142720, limit=2097151, status=0
+#128: UVM_CREATE_EXTERNAL_RANGE
+	 struct_c__SA_UVM_CREATE_EXTERNAL_RANGE_PARAMS { base=137594142720 length=2097152 rmStatus=0 PADDING_0=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13b47b5040> }
+#129: UVM_MAP_EXTERNAL_ALLOCATION
+	 struct_c__SA_UVM_MAP_EXTERNAL_ALLOCATION_PARAMS { base=137594142720 length=2097152 offset=0 perGpuAttributes=<tinygrad.runtime.autogen.nv_gpu.struct_c__SA_UvmGpuMappingAttributes_Array_256 object at 0x7f13b47b7240> gpuAttributesCount=1 rmCtrlFd=3 hClient=3251726314 hMemory=4123 rmStatus=0 }
+perGpuAttributes[{i}] = 	 struct_c__SA_UvmGpuMappingAttributes { gpuUuid=<tinygrad.runtime.autogen.nv_gpu.struct_nv_uuid object at 0x7f13b47b7340> gpuMappingType=1 gpuCachingType=0 gpuFormatType=0 gpuElementBits=0 gpuCompressionType=0 }
+#130: NV_ESC_RM_ALLOC_MEMORY  fd=-1, hRoot=3251726314, hObjectParent=3404726272, hObjectNew=4124, hClass=113, flags=1073745936, pMemory=137596239872, limit=2097151, status=0
+#131: UVM_CREATE_EXTERNAL_RANGE
+	 struct_c__SA_UVM_CREATE_EXTERNAL_RANGE_PARAMS { base=137596239872 length=2097152 rmStatus=0 PADDING_0=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13b47b6140> }
+#132: UVM_MAP_EXTERNAL_ALLOCATION
+	 struct_c__SA_UVM_MAP_EXTERNAL_ALLOCATION_PARAMS { base=137596239872 length=2097152 offset=0 perGpuAttributes=<tinygrad.runtime.autogen.nv_gpu.struct_c__SA_UvmGpuMappingAttributes_Array_256 object at 0x7f13b47b6640> gpuAttributesCount=1 rmCtrlFd=3 hClient=3251726314 hMemory=4124 rmStatus=0 }
+perGpuAttributes[{i}] = 	 struct_c__SA_UvmGpuMappingAttributes { gpuUuid=<tinygrad.runtime.autogen.nv_gpu.struct_nv_uuid object at 0x7f13c0d80f40> gpuMappingType=1 gpuCachingType=0 gpuFormatType=0 gpuElementBits=0 gpuCompressionType=0 }
+#133: NV_ESC_RM_ALLOC_MEMORY  fd=-1, hRoot=3251726314, hObjectParent=3404726272, hObjectNew=4125, hClass=113, flags=1073745936, pMemory=137598337024, limit=2097151, status=0
+#134: UVM_CREATE_EXTERNAL_RANGE
+	 struct_c__SA_UVM_CREATE_EXTERNAL_RANGE_PARAMS { base=137598337024 length=2097152 rmStatus=0 PADDING_0=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13c0d83a40> }
+#135: UVM_MAP_EXTERNAL_ALLOCATION
+	 struct_c__SA_UVM_MAP_EXTERNAL_ALLOCATION_PARAMS { base=137598337024 length=2097152 offset=0 perGpuAttributes=<tinygrad.runtime.autogen.nv_gpu.struct_c__SA_UvmGpuMappingAttributes_Array_256 object at 0x7f13c0d83ac0> gpuAttributesCount=1 rmCtrlFd=3 hClient=3251726314 hMemory=4125 rmStatus=0 }
+perGpuAttributes[{i}] = 	 struct_c__SA_UvmGpuMappingAttributes { gpuUuid=<tinygrad.runtime.autogen.nv_gpu.struct_nv_uuid object at 0x7f13c0d838c0> gpuMappingType=1 gpuCachingType=0 gpuFormatType=0 gpuElementBits=0 gpuCompressionType=0 }
+#136: NV_ESC_RM_ALLOC_MEMORY  fd=-1, hRoot=3251726314, hObjectParent=3404726272, hObjectNew=4126, hClass=113, flags=1073745936, pMemory=137600434176, limit=2097151, status=0
+#137: UVM_CREATE_EXTERNAL_RANGE
+	 struct_c__SA_UVM_CREATE_EXTERNAL_RANGE_PARAMS { base=137600434176 length=2097152 rmStatus=0 PADDING_0=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13c0d839c0> }
+#138: UVM_MAP_EXTERNAL_ALLOCATION
+	 struct_c__SA_UVM_MAP_EXTERNAL_ALLOCATION_PARAMS { base=137600434176 length=2097152 offset=0 perGpuAttributes=<tinygrad.runtime.autogen.nv_gpu.struct_c__SA_UvmGpuMappingAttributes_Array_256 object at 0x7f13c0d83540> gpuAttributesCount=1 rmCtrlFd=3 hClient=3251726314 hMemory=4126 rmStatus=0 }
+perGpuAttributes[{i}] = 	 struct_c__SA_UvmGpuMappingAttributes { gpuUuid=<tinygrad.runtime.autogen.nv_gpu.struct_nv_uuid object at 0x7f13c0d83740> gpuMappingType=1 gpuCachingType=0 gpuFormatType=0 gpuElementBits=0 gpuCompressionType=0 }
+#139: NV_ESC_RM_ALLOC_MEMORY  fd=-1, hRoot=3251726314, hObjectParent=3404726272, hObjectNew=4127, hClass=113, flags=1073745936, pMemory=137602531328, limit=2097151, status=0
+#140: UVM_CREATE_EXTERNAL_RANGE
+	 struct_c__SA_UVM_CREATE_EXTERNAL_RANGE_PARAMS { base=137602531328 length=2097152 rmStatus=0 PADDING_0=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13c0d83840> }
+#141: UVM_MAP_EXTERNAL_ALLOCATION
+	 struct_c__SA_UVM_MAP_EXTERNAL_ALLOCATION_PARAMS { base=137602531328 length=2097152 offset=0 perGpuAttributes=<tinygrad.runtime.autogen.nv_gpu.struct_c__SA_UvmGpuMappingAttributes_Array_256 object at 0x7f13c0d83840> gpuAttributesCount=1 rmCtrlFd=3 hClient=3251726314 hMemory=4127 rmStatus=0 }
+perGpuAttributes[{i}] = 	 struct_c__SA_UvmGpuMappingAttributes { gpuUuid=<tinygrad.runtime.autogen.nv_gpu.struct_nv_uuid object at 0x7f13c0d836c0> gpuMappingType=1 gpuCachingType=0 gpuFormatType=0 gpuElementBits=0 gpuCompressionType=0 }
+#142: NV_ESC_RM_ALLOC_MEMORY  fd=-1, hRoot=3251726314, hObjectParent=3404726272, hObjectNew=4128, hClass=113, flags=1073745936, pMemory=137604628480, limit=2097151, status=0
+#143: UVM_CREATE_EXTERNAL_RANGE
+	 struct_c__SA_UVM_CREATE_EXTERNAL_RANGE_PARAMS { base=137604628480 length=2097152 rmStatus=0 PADDING_0=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13c0d832c0> }
+#144: UVM_MAP_EXTERNAL_ALLOCATION
+	 struct_c__SA_UVM_MAP_EXTERNAL_ALLOCATION_PARAMS { base=137604628480 length=2097152 offset=0 perGpuAttributes=<tinygrad.runtime.autogen.nv_gpu.struct_c__SA_UvmGpuMappingAttributes_Array_256 object at 0x7f13c0d836c0> gpuAttributesCount=1 rmCtrlFd=3 hClient=3251726314 hMemory=4128 rmStatus=0 }
+perGpuAttributes[{i}] = 	 struct_c__SA_UvmGpuMappingAttributes { gpuUuid=<tinygrad.runtime.autogen.nv_gpu.struct_nv_uuid object at 0x7f13c0d83440> gpuMappingType=1 gpuCachingType=0 gpuFormatType=0 gpuElementBits=0 gpuCompressionType=0 }
+#145: NV_ESC_RM_ALLOC_MEMORY  fd=-1, hRoot=3251726314, hObjectParent=3404726272, hObjectNew=4129, hClass=113, flags=1073745936, pMemory=137606725632, limit=4095, status=0
+#146: UVM_CREATE_EXTERNAL_RANGE
+	 struct_c__SA_UVM_CREATE_EXTERNAL_RANGE_PARAMS { base=137606725632 length=4096 rmStatus=0 PADDING_0=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13c0d835c0> }
+#147: UVM_MAP_EXTERNAL_ALLOCATION
+	 struct_c__SA_UVM_MAP_EXTERNAL_ALLOCATION_PARAMS { base=137606725632 length=4096 offset=0 perGpuAttributes=<tinygrad.runtime.autogen.nv_gpu.struct_c__SA_UvmGpuMappingAttributes_Array_256 object at 0x7f13c0d834c0> gpuAttributesCount=1 rmCtrlFd=3 hClient=3251726314 hMemory=4129 rmStatus=0 }
+perGpuAttributes[{i}] = 	 struct_c__SA_UvmGpuMappingAttributes { gpuUuid=<tinygrad.runtime.autogen.nv_gpu.struct_nv_uuid object at 0x7f13c0d83240> gpuMappingType=1 gpuCachingType=0 gpuFormatType=0 gpuElementBits=0 gpuCompressionType=0 }
+#148: NV_ESC_RM_ALLOC    hClass=NV1_MEMORY_USER               , hRoot=3251726314, hObjectParent=3404726272, pAllocParms=139722816499632, hObjectNew=3404726290 status=0
+	 struct_c__SA_NV_MEMORY_ALLOCATION_PARAMS { owner=3251726314 type=0 flags=114945 width=0 height=0 pitch=0 attr=293601280 attr2=1048581 format=6 comprCovg=0 zcullCovg=0 PADDING_0=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13c0d82b40> rangeLo=0 rangeHi=0 size=16777216 alignment=2097152 offset=54525952 limit=16777215 address=None ctagOffset=0 hVASpace=0 internalflags=0 tag=0 numaNode=0 PADDING_1=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13c0d82cc0> }
+#149: NV_ESC_REGISTER_FD  fd=3
+#150: NV_ESC_RM_MAP_MEMORY   hClient=3251726314, hDevice=3404726272, hMemory=3404726290, length=16777216 flags=16842752 pLinearAddress=343605772288
+#151: UVM_CREATE_EXTERNAL_RANGE
+	 struct_c__SA_UVM_CREATE_EXTERNAL_RANGE_PARAMS { base=68857888768 length=16777216 rmStatus=0 PADDING_0=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13c0d82cc0> }
+#152: UVM_MAP_EXTERNAL_ALLOCATION
+	 struct_c__SA_UVM_MAP_EXTERNAL_ALLOCATION_PARAMS { base=68857888768 length=16777216 offset=0 perGpuAttributes=<tinygrad.runtime.autogen.nv_gpu.struct_c__SA_UvmGpuMappingAttributes_Array_256 object at 0x7f13c0d80cc0> gpuAttributesCount=1 rmCtrlFd=3 hClient=3251726314 hMemory=3404726290 rmStatus=0 }
+perGpuAttributes[{i}] = 	 struct_c__SA_UvmGpuMappingAttributes { gpuUuid=<tinygrad.runtime.autogen.nv_gpu.struct_nv_uuid object at 0x7f13c0d80dc0> gpuMappingType=1 gpuCachingType=0 gpuFormatType=0 gpuElementBits=0 gpuCompressionType=0 }
+ok2
+#153: NV_ESC_RM_ALLOC    hClass=NV1_MEMORY_USER               , hRoot=3251726314, hObjectParent=3404726272, pAllocParms=139722609082416, hObjectNew=3404726291 status=0
+	 struct_c__SA_NV_MEMORY_ALLOCATION_PARAMS { owner=3251726314 type=0 flags=114945 width=0 height=0 pitch=0 attr=285212672 attr2=5 format=6 comprCovg=0 zcullCovg=0 PADDING_0=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13b47b7840> rangeLo=0 rangeHi=0 size=65536 alignment=65536 offset=39452672 limit=65535 address=None ctagOffset=0 hVASpace=0 internalflags=0 tag=0 numaNode=0 PADDING_1=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13b47b4e40> }
+#154: UVM_CREATE_EXTERNAL_RANGE
+	 struct_c__SA_UVM_CREATE_EXTERNAL_RANGE_PARAMS { base=137606729728 length=4096 rmStatus=0 PADDING_0=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13b47b7040> }
+#155: UVM_MAP_EXTERNAL_ALLOCATION
+	 struct_c__SA_UVM_MAP_EXTERNAL_ALLOCATION_PARAMS { base=137606729728 length=4096 offset=0 perGpuAttributes=<tinygrad.runtime.autogen.nv_gpu.struct_c__SA_UvmGpuMappingAttributes_Array_256 object at 0x7f13b47b4e40> gpuAttributesCount=1 rmCtrlFd=3 hClient=3251726314 hMemory=3404726291 rmStatus=0 }
+perGpuAttributes[{i}] = 	 struct_c__SA_UvmGpuMappingAttributes { gpuUuid=<tinygrad.runtime.autogen.nv_gpu.struct_nv_uuid object at 0x7f13c0d82b40> gpuMappingType=1 gpuCachingType=0 gpuFormatType=0 gpuElementBits=0 gpuCompressionType=0 }
+#156: NV_ESC_RM_ALLOC    hClass=NV1_MEMORY_USER               , hRoot=3251726314, hObjectParent=3404726272, pAllocParms=139722607869232, hObjectNew=3404726292 status=0
+	 struct_c__SA_NV_MEMORY_ALLOCATION_PARAMS { owner=3251726314 type=0 flags=114945 width=0 height=0 pitch=0 attr=285212672 attr2=5 format=6 comprCovg=0 zcullCovg=0 PADDING_0=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13c0d82b40> rangeLo=0 rangeHi=0 size=65536 alignment=65536 offset=39518208 limit=65535 address=None ctagOffset=0 hVASpace=0 internalflags=0 tag=0 numaNode=0 PADDING_1=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13c0d82bc0> }
+#157: UVM_CREATE_EXTERNAL_RANGE
+	 struct_c__SA_UVM_CREATE_EXTERNAL_RANGE_PARAMS { base=137606733824 length=4096 rmStatus=0 PADDING_0=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13c0d825c0> }
+#158: UVM_MAP_EXTERNAL_ALLOCATION
+	 struct_c__SA_UVM_MAP_EXTERNAL_ALLOCATION_PARAMS { base=137606733824 length=4096 offset=0 perGpuAttributes=<tinygrad.runtime.autogen.nv_gpu.struct_c__SA_UvmGpuMappingAttributes_Array_256 object at 0x7f13c0d82bc0> gpuAttributesCount=1 rmCtrlFd=3 hClient=3251726314 hMemory=3404726292 rmStatus=0 }
+perGpuAttributes[{i}] = 	 struct_c__SA_UvmGpuMappingAttributes { gpuUuid=<tinygrad.runtime.autogen.nv_gpu.struct_nv_uuid object at 0x7f13c0d82c40> gpuMappingType=1 gpuCachingType=0 gpuFormatType=0 gpuElementBits=0 gpuCompressionType=0 }
+#159: NV_ESC_RM_ALLOC    hClass=NV1_MEMORY_USER               , hRoot=3251726314, hObjectParent=3404726272, pAllocParms=139722609086000, hObjectNew=3404726293 status=0
+	 struct_c__SA_NV_MEMORY_ALLOCATION_PARAMS { owner=3251726314 type=0 flags=114945 width=0 height=0 pitch=0 attr=285212672 attr2=5 format=6 comprCovg=0 zcullCovg=0 PADDING_0=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13b468bb40> rangeLo=0 rangeHi=0 size=65536 alignment=65536 offset=39583744 limit=65535 address=None ctagOffset=0 hVASpace=0 internalflags=0 tag=0 numaNode=0 PADDING_1=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13b468af40> }
+#160: NV_ESC_REGISTER_FD  fd=3
+#161: NV_ESC_RM_MAP_MEMORY   hClient=3251726314, hDevice=3404726272, hMemory=3404726293, length=8192 flags=16842752 pLinearAddress=343601512448
+#162: UVM_CREATE_EXTERNAL_RANGE
+	 struct_c__SA_UVM_CREATE_EXTERNAL_RANGE_PARAMS { base=68874665984 length=8192 rmStatus=0 PADDING_0=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13b468af40> }
+#163: UVM_MAP_EXTERNAL_ALLOCATION
+	 struct_c__SA_UVM_MAP_EXTERNAL_ALLOCATION_PARAMS { base=68874665984 length=8192 offset=0 perGpuAttributes=<tinygrad.runtime.autogen.nv_gpu.struct_c__SA_UvmGpuMappingAttributes_Array_256 object at 0x7f13b468afc0> gpuAttributesCount=1 rmCtrlFd=3 hClient=3251726314 hMemory=3404726293 rmStatus=0 }
+perGpuAttributes[{i}] = 	 struct_c__SA_UvmGpuMappingAttributes { gpuUuid=<tinygrad.runtime.autogen.nv_gpu.struct_nv_uuid object at 0x7f13b468b340> gpuMappingType=1 gpuCachingType=0 gpuFormatType=0 gpuElementBits=0 gpuCompressionType=0 }
+0x3704 0
+0x1704 8
+0x1704 24
+0x1704 40
+0x5003 56
+0x1b03 60
+#164: NV_ESC_RM_ALLOC    hClass=NV1_MEMORY_USER               , hRoot=3251726314, hObjectParent=3404726272, pAllocParms=139722609090992, hObjectNew=3404726294 status=0
+	 struct_c__SA_NV_MEMORY_ALLOCATION_PARAMS { owner=3251726314 type=0 flags=114945 width=0 height=0 pitch=0 attr=293601280 attr2=1048581 format=6 comprCovg=0 zcullCovg=0 PADDING_0=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13b468b340> rangeLo=0 rangeHi=0 size=169869312 alignment=2097152 offset=71303168 limit=169869311 address=None ctagOffset=0 hVASpace=0 internalflags=0 tag=0 numaNode=0 PADDING_1=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13b468bd40> }
+#165: UVM_CREATE_EXTERNAL_RANGE
+	 struct_c__SA_UVM_CREATE_EXTERNAL_RANGE_PARAMS { base=137608822784 length=169869312 rmStatus=0 PADDING_0=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13b468b2c0> }
+#166: UVM_MAP_EXTERNAL_ALLOCATION
+	 struct_c__SA_UVM_MAP_EXTERNAL_ALLOCATION_PARAMS { base=137608822784 length=169869312 offset=0 perGpuAttributes=<tinygrad.runtime.autogen.nv_gpu.struct_c__SA_UvmGpuMappingAttributes_Array_256 object at 0x7f13b468bd40> gpuAttributesCount=1 rmCtrlFd=3 hClient=3251726314 hMemory=3404726294 rmStatus=0 }
+perGpuAttributes[{i}] = 	 struct_c__SA_UvmGpuMappingAttributes { gpuUuid=<tinygrad.runtime.autogen.nv_gpu.struct_nv_uuid object at 0x7f13c0d80440> gpuMappingType=1 gpuCachingType=0 gpuFormatType=0 gpuElementBits=0 gpuCompressionType=0 }
+{0: (68874666496, 920)}
+== self.prog_addr: 0x1009400080, self.prog_addr>>8: 0x10094000
+== self.prog_addr>>40: 0x0
+== smem_cfg: 0x9, self.shmem_usage: 0x400
+== const buf: i=0x0, addr=0x1009400200, sz=0x398
+#167: NV_ESC_RM_ALLOC    hClass=NV1_MEMORY_USER               , hRoot=3251726314, hObjectParent=3404726272, pAllocParms=139722818616240, hObjectNew=3404726295 status=0
+	 struct_c__SA_NV_MEMORY_ALLOCATION_PARAMS { owner=3251726314 type=0 flags=114945 width=0 height=0 pitch=0 attr=285212672 attr2=5 format=6 comprCovg=0 zcullCovg=0 PADDING_0=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13b47b5340> rangeLo=0 rangeHi=0 size=65536 alignment=65536 offset=39649280 limit=65535 address=None ctagOffset=0 hVASpace=0 internalflags=0 tag=0 numaNode=0 PADDING_1=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13b47b74c0> }
+#168: UVM_CREATE_EXTERNAL_RANGE
+	 struct_c__SA_UVM_CREATE_EXTERNAL_RANGE_PARAMS { base=137778692096 length=4096 rmStatus=0 PADDING_0=<tinygrad.runtime.autogen.libc.c_ubyte_Array_4 object at 0x7f13b47b54c0> }
+#169: UVM_MAP_EXTERNAL_ALLOCATION
+	 struct_c__SA_UVM_MAP_EXTERNAL_ALLOCATION_PARAMS { base=137778692096 length=4096 offset=0 perGpuAttributes=<tinygrad.runtime.autogen.nv_gpu.struct_c__SA_UvmGpuMappingAttributes_Array_256 object at 0x7f13b47b74c0> gpuAttributesCount=1 rmCtrlFd=3 hClient=3251726314 hMemory=3404726295 rmStatus=0 }
+perGpuAttributes[{i}] = 	 struct_c__SA_UvmGpuMappingAttributes { gpuUuid=<tinygrad.runtime.autogen.nv_gpu.struct_nv_uuid object at 0x7f13b47b5d40> gpuMappingType=1 gpuCachingType=0 gpuFormatType=0 gpuElementBits=0 gpuCompressionType=0 }
+==global_size, local_size: (1, 1, 1), (3, 1, 1)
+==prg.constbufs: {0: (68874666496, 920)}, 920
+00000000: 00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  ................
+00000010: 7F 00 00 00 00 00 00 3C  00 00 00 00 00 00 00 00  .......<........
+00000020: 00 40 09 10 00 00 00 00  00 00 00 00 00 00 01 44  .@.............D
+00000030: 00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  ................
+00000040: 00 00 00 00 00 04 24 34  30 00 00 00 00 00 00 00  ......$40.......
+00000050: 01 10 12 00 00 00 00 00  00 00 00 00 00 00 00 08  ................
+00000060: 00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  ................
+00000070: 00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  ................
+00000080: 00 02 40 09 10 00 C4 1C  00 00 00 00 00 00 00 00  ..@.............
+00000090: 00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  ................
+000000A0: 00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  ................
+000000B0: 00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  ................
+000000C0: 80 00 40 09 10 00 00 00  40 02 00 00 00 02 00 89  ..@.....@.......
+000000D0: 00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  ................
+000000E0: 00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  ................
+000000F0: 00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  ................
