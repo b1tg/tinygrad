@@ -57,7 +57,7 @@ class LLVMCompiler(Compiler):
     llvm.LLVMDisposeModule(mod)
     obj = ctypes.string_at(llvm.LLVMGetBufferStart(obj_buf), llvm.LLVMGetBufferSize(obj_buf))
     llvm.LLVMDisposeMemoryBuffer(obj_buf)
-    if self.diag_msgs: raise RuntimeError("llvm diagnostic:" + "\n".join(self.diag_msgs))
+    if self.diag_msgs: raise RuntimeError("llvm diagnostic: " + "\n".join(self.diag_msgs))
     return jit_loader(obj) if self.jit else obj
 
   def disassemble(self, lib:bytes): capstone_flatdump(lib)
