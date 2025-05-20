@@ -66,11 +66,12 @@ def get_quantized_model(sz):
 @unittest.skipIf(Device.DEFAULT != "CPU", "only tests for CPU")
 class TestQuantizeOnnxCPU(unittest.TestCase):
   def test_quant_128(self, sz=128):
+    from tinygrad.frontend.onnx import OnnxRunner
     try:
       import onnx
     except ImportError:
       raise unittest.SkipTest()
-    from tinygrad.frontend.onnx import OnnxRunner
+
     out_file = get_quantized_model(sz)
     onnx_model = onnx.load(out_file)
     run_onnx = OnnxRunner(onnx_model)
