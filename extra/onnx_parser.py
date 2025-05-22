@@ -1,7 +1,7 @@
 # https://github.com/onnx/onnx/blob/main/onnx/onnx.proto3
 
 import os, struct
-from io import BufferedReader, BytesIO
+from io import BufferedReader
 from types import SimpleNamespace
 from tinygrad.nn.state import TensorIO, accept_filename
 from tinygrad.tensor import Tensor
@@ -139,10 +139,33 @@ class OnnxParser:
   def _handle_packed_repeated_int32s(self, obj, key_name, data, wire_type, parser_func=None, is_repeated=False):
     return self._handle_packed_repeated_int64s(obj, key_name, data, wire_type)
 
-  def _handle_sub_message_field(self, obj, key_name, data, wire_type, parser_func=None, is_repeated=False):
+  def _handle_sub_message_field(self, obj, key_name, reader: BufferedReader, wire_type, parser_func=None, is_repeated=False):
     if wire_type != WIRETYPE_LENGTH_DELIMITED: raise ValueError(f"Expected length-delimited for sub-message field '{key_name}'")
-    value = self._handle_delimited(data)
-    parsed_sub_obj = parser_func(BufferedReader(BytesIO(value)))
+    str_len = decode_varint(reader)
+    class Buf:
+      def __init__(self, reader: BufferedReader, limit):
+        self.pos = 0
+        self.reader = reader
+        self.limit = limit
+      def read(self, n):
+        if self.pos >= self.limit:
+          return b""
+        data = self.reader.read(n)
+        if len(data) == 0:
+          return data
+        else:
+          self.pos += n
+          return data
+      def tell(self):
+        return self.pos
+      def seek(self, rel, off):
+        if rel == os.SEEK_CUR:
+          self.read(off)
+        elif rel == os.SEEK_SET:
+          raise Exception(f"os.SEEK_SET, {rel=}, {off=}")
+        elif rel == os.SEEK_END:
+          raise Exception(f"os.SEEK_END, {rel=}, {off=}")
+    parsed_sub_obj = parser_func(Buf(reader, str_len))
     gen_result(obj, key_name, parsed_sub_obj, is_repeated)
 
   # OperatorSetIdProto
