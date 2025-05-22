@@ -70,7 +70,7 @@ class OnnxParser:
         tag_val = decode_varint(reader)
         field_number = tag_val >> 3
         wire_type = tag_val & 0x07
-        if debug: print(f"DEBUG _parse_message: {field_number=}, {wire_type=}")
+        if debug: print(f"DEBUG _parse_message: {tag_val=}, {field_number=}, {wire_type=}")
         if handler := message_field_handlers.get(field_number):
           handler(obj, reader, wire_type)
         else: skip_field_value(reader, wire_type)
@@ -128,8 +128,8 @@ class OnnxParser:
 
   def _handle_packed_repeated_int64s(self, obj, key_name, reader: BufferedReader, wire_type, parser_func=None, is_repeated=False):
     if wire_type != WIRETYPE_LENGTH_DELIMITED: raise ValueError("Packed int64s expected length_delimited")
-    old_pos = reader.tell()
     total_bytes_len = decode_varint(reader)
+    old_pos = reader.tell()
     values = []
     while reader.tell() < total_bytes_len + old_pos:
       val = decode_varint(reader)
