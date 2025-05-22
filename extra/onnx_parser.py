@@ -21,7 +21,7 @@ class AttributeType:
 def decode_varint(reader: BufferedReader) -> int:
   result = 0
   shift = 0
-  while True: # TODO
+  while True:
     data = reader.read(1)
     if data == b'': raise EOFError("end")
     byte = data[0]
@@ -38,9 +38,7 @@ def skip_field_value(reader: BufferedReader, wire_type):
   if wire_type == WIRETYPE_VARINT: decode_varint(reader)
   elif wire_type == WIRETYPE_FIXED64: reader.seek(os.SEEK_CUR, 8)
   elif wire_type == WIRETYPE_FIXED32: reader.seek(os.SEEK_CUR, 4)
-  elif wire_type == WIRETYPE_LENGTH_DELIMITED:
-    length = decode_varint(reader)
-    reader.seek(os.SEEK_CUR, length)
+  elif wire_type == WIRETYPE_LENGTH_DELIMITED: reader.seek(os.SEEK_CUR, decode_varint(reader))
   elif wire_type == WIRETYPE_START_GROUP or wire_type == WIRETYPE_END_GROUP: raise NotImplementedError("Groups are deprecated")
   else: raise ValueError(f"Unknown wire type: {wire_type}")
 
@@ -72,10 +70,10 @@ class OnnxParser:
         wire_type = tag_val & 0x07
         if debug: print(f"DEBUG _parse_message: {tag_val=}, {field_number=}, {wire_type=}")
         if handler := message_field_handlers.get(field_number):
+          if debug: print(f"DEBUG _parse_message call handler: {handler._debug_info}")
           handler(obj, reader, wire_type)
         else: skip_field_value(reader, wire_type)
-      except EOFError:
-        break
+      except EOFError: break
     return obj
 
   def _handle_int64_field(self, obj, key_name, data, wire_type, parser_func=None, is_repeated=False):
@@ -100,7 +98,9 @@ class OnnxParser:
         if len(config) == 2: fid, name = config
         elif len(config) == 3: fid, name, repeated = config
         elif len(config) == 4: fid, name, repeated, parser_fn = config
-        res[fid] = lambda obj, data, wt, h=handler_fn, n=name, p=parser_fn, r=repeated: h(obj, n, data, wt, parser_func=p, is_repeated=r)
+        def _wrapper_handler(obj, data, wt, h=handler_fn, n=name, p=parser_fn, r=repeated): return h(obj, n, data, wt, parser_func=p, is_repeated=r)
+        _wrapper_handler._debug_info = f"{fid}, {name} => {handler_fn}"
+        res[fid] = _wrapper_handler
     return res
 
   # WIRETYPE_LENGTH_DELIMITED
@@ -134,7 +134,6 @@ class OnnxParser:
     while reader.tell() < total_bytes_len + old_pos:
       val = decode_varint(reader)
       values.append(unsigned_to_signed_64(val))
-
     obj.setdefault(key_name, []).extend(values)
 
   def _handle_packed_repeated_int32s(self, obj, key_name, data, wire_type, parser_func=None, is_repeated=False):
@@ -147,59 +146,59 @@ class OnnxParser:
     gen_result(obj, key_name, parsed_sub_obj, is_repeated)
 
   # OperatorSetIdProto
-  def parse_opset_id_proto(self, data_bytes): return self._parse_message(data_bytes, self.gen_handlers({
+  def parse_opset_id_proto(self, reader): return self._parse_message(reader, self.gen_handlers({
     self._handle_string_field: ((1, 'domain'),), self._handle_int64_field: ((2, 'version'),)}))
 
   # StringStringEntryProto
-  def parse_string_string_entry_proto(self, data_bytes):
-    return self._parse_message(data_bytes, self.gen_handlers({ self._handle_string_field: ((1, 'key'), (2, 'value'))}))
+  def parse_string_string_entry_proto(self, reader):
+    return self._parse_message(reader, self.gen_handlers({ self._handle_string_field: ((1, 'key'), (2, 'value'))}))
 
   # TensorProto: Tensors, A serialized tensor value.
-  def parse_tensor_proto(self, data_bytes):
+  def parse_tensor_proto(self, reader):
     handlers = self.gen_handlers({ self._handle_int64_field: ((1, 'dims', True),), self._handle_int32_field: ((2, 'data_type'),),
       self._handle_packed_repeated_floats: ((4, 'float_data'),), self._handle_packed_repeated_int32s: ((5, 'int32_data'),),
       self._handle_bytes_field: ((6, 'string_data', True), (9, 'raw_data')),
       self._handle_packed_repeated_int64s: ((7, 'int64_data'),), self._handle_string_field: ((8, 'name'),)})
-    obj = self._parse_message(data_bytes, handlers,
+    obj = self._parse_message(reader, handlers,
       lambda: {'dims': [], 'float_data': [], 'int32_data': [], 'string_data':[], 'int64_data':[], 'double_data':[], 'uint64_data':[]})
     return obj
 
   # TensorShapeProto.Dimension
-  def parse_tensor_shape_proto_dimension(self, data_bytes):
-    return self._parse_message(data_bytes, self.gen_handlers({
+  def parse_tensor_shape_proto_dimension(self, reader):
+    return self._parse_message(reader, self.gen_handlers({
       self._handle_int64_field: ((1, 'dim_value'),), self._handle_string_field: ((2, 'dim_param'), (3, 'denotation'))}))
 
   # TensorShapeProto
-  def parse_tensor_shape_proto(self, data_bytes):
-    return self._parse_message(data_bytes, self.gen_handlers({
+  def parse_tensor_shape_proto(self, reader):
+    return self._parse_message(reader, self.gen_handlers({
       self._handle_sub_message_field: ((1, 'dim', True, self.parse_tensor_shape_proto_dimension),)}), lambda: {'dim': []})
 
   # TypeProto.Tensor
-  def parse_type_proto_tensor(self, data_bytes): return self._parse_message(data_bytes, self.gen_handlers({
+  def parse_type_proto_tensor(self, reader): return self._parse_message(reader, self.gen_handlers({
     self._handle_int32_field: ((1, 'elem_type'),), self._handle_sub_message_field: ((2, 'shape', False, self.parse_tensor_shape_proto),)}))
 
   # TypeProto.Optional
-  def parse_type_proto_optional(self, data_bytes): return self._parse_message(data_bytes, self.gen_handlers({
+  def parse_type_proto_optional(self, reader): return self._parse_message(reader, self.gen_handlers({
     self._handle_sub_message_field: ((1, 'elem_type', False, self.parse_type_proto),)}))
 
   # TypeProto.Sequence
-  def parse_type_proto_sequence(self, data_bytes): return self._parse_message(data_bytes, self.gen_handlers({
+  def parse_type_proto_sequence(self, reader): return self._parse_message(reader, self.gen_handlers({
     self._handle_sub_message_field: ((1, 'elem_type', False, self.parse_type_proto),)}))
 
   # TypeProto: Types, The standard ONNX data types.
-  def parse_type_proto(self, data_bytes):
-    return self._parse_message(data_bytes, self.gen_handlers({
+  def parse_type_proto(self, reader):
+    return self._parse_message(reader, self.gen_handlers({
       self._handle_sub_message_field: ((1, 'tensor_type', False, self.parse_type_proto_tensor),
                                        (4, 'sequence_type', False, self.parse_type_proto_sequence),
                                        (9, 'optional_type', False, self.parse_type_proto_optional)),
       self._handle_string_field: ((6, 'denotation'),)}))
 
   # ValueInfoProto
-  def parse_value_info_proto(self, data_bytes):
+  def parse_value_info_proto(self, reader):
     handlers = self.gen_handlers({
       self._handle_sub_message_field: ((2, 'type', False, self.parse_type_proto), (4, 'metadata_props', True, self.parse_string_string_entry_proto)),
       self._handle_string_field: ((1, 'name'), (3, 'doc_string'))})
-    return self._parse_message(data_bytes, handlers, lambda: {'metadata_props': []})
+    return self._parse_message(reader, handlers, lambda: {'metadata_props': []})
 
   def interpret_tensor_raw_data(self, tensor_obj):
     if 'raw_data' not in tensor_obj or 'data_type' not in tensor_obj: return
@@ -223,14 +222,14 @@ class OnnxParser:
     tensor_obj['decoded_data'] = decoded_data
 
   # AttributeProto
-  def parse_attribute_proto(self, data_bytes):
+  def parse_attribute_proto(self, reader):
     handlers = self.gen_handlers({
       self._handle_string_field: ((1, "name"), (13, "doc_string"), (21, "ref_attr_name")), self._handle_int32_field: ((20, "type"),),
       self._handle_int64_field: ((3, "i"), (8, "ints", True)), self._handle_float_field: ((2, "f"), (7, "floats", True)),
       self._handle_bytes_field: ((4, "s"), (9, "strings", True)),
       self._handle_sub_message_field: ((5, "t", False,  self.parse_tensor_proto), (6, "g", False,  self.parse_graph_proto),
                                        (10, "tensors", True,  self.parse_tensor_proto),(11, "graphs", True,  self.parse_graph_proto),)})
-    obj = self._parse_message(data_bytes, handlers, lambda: {'floats': [], 'ints': [], 'strings': [], 'tensors': [], 'graphs': []})
+    obj = self._parse_message(reader, handlers, lambda: {'floats': [], 'ints': [], 'strings': [], 'tensors': [], 'graphs': []})
     if 't' in obj and obj['t']: self.interpret_tensor_raw_data(obj['t'])
     if 'tensors' in obj:
       for tensor in obj['tensors']:
@@ -238,20 +237,20 @@ class OnnxParser:
     return obj
 
   # NodeProto
-  def parse_node_proto(self, data_bytes):
+  def parse_node_proto(self, reader):
     handlers = self.gen_handlers({
       self._handle_sub_message_field: ((5, "attribute", True,  self.parse_attribute_proto),),
       self._handle_string_field: ((1, "input", True), (2, "output", True), (3, "name"), (4, "op_type"), (6, "doc_string"), (7, "domain"))})
-    return self._parse_message(data_bytes, handlers, lambda: {'input': [], 'output': [], 'attribute': [], 'domain': None})
+    return self._parse_message(reader, handlers, lambda: {'input': [], 'output': [], 'attribute': [], 'domain': None})
 
   # GraphProto
-  def parse_graph_proto(self, data_bytes):
+  def parse_graph_proto(self, reader):
     handlers = self.gen_handlers({
       self._handle_string_field: ((2, "name"), (10, "doc_string")),
       self._handle_sub_message_field: ((13, "value_info", True, self.parse_value_info_proto),
         (1, "node", True,  self.parse_node_proto), (5, "initializer", True, self.parse_tensor_proto),
         (11, "input", True, self.parse_value_info_proto), (12, "output", True, self.parse_value_info_proto))})
-    obj = self._parse_message(data_bytes, handlers, lambda: {'node': [], 'initializer': [], 'input':[], 'output':[], 'value_info':[]})
+    obj = self._parse_message(reader, handlers, lambda: {'node': [], 'initializer': [], 'input':[], 'output':[], 'value_info':[]})
     for tensor in obj['initializer']: self.interpret_tensor_raw_data(tensor)
     return obj
 
