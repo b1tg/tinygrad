@@ -1,8 +1,9 @@
 # https://github.com/onnx/onnx/blob/main/onnx/onnx.proto3
 
-import struct
+import io, struct
 from types import SimpleNamespace
-
+from tinygrad.nn.state import TensorIO, accept_filename
+from tinygrad.tensor import Tensor
 # Protobuf Wire Types
 WIRETYPE_VARINT = 0; WIRETYPE_FIXED64 = 1; WIRETYPE_LENGTH_DELIMITED = 2; WIRETYPE_START_GROUP = 3; WIRETYPE_END_GROUP = 4; WIRETYPE_FIXED32 = 5 # noqa: E702
 
@@ -55,10 +56,11 @@ def dict_to_namespace(d):
   elif isinstance(d, list): return [dict_to_namespace(i) for i in d]
   else: return d
 
-def onnx_load(model_path):
+@accept_filename
+def onnx_load(tensor: Tensor):
+  reader = io.BufferedReader(TensorIO(tensor), 1_000_000)
   parser = OnnxParser()
-  with open(model_path, "rb") as f:
-    onnx_model = parser.parse_model_proto_from_bytes(f.read())
+  onnx_model = parser.parse_model_proto_from_bytes(reader.read())
   model = dict_to_namespace(onnx_model)
   return model
 
