@@ -1,11 +1,9 @@
 # https://github.com/onnx/onnx/blob/main/onnx/onnx.proto3
 from typing import Tuple
-import struct
-from io import BufferedReader
 from types import SimpleNamespace
-from tinygrad.nn.state import TensorIO, accept_filename
-from tinygrad.tensor import Tensor
-import numpy as np
+from tinygrad.nn.state import accept_filename
+from tinygrad import Tensor, dtypes
+
 # Protobuf Wire Types
 WIRETYPE_VARINT = 0; WIRETYPE_FIXED64 = 1; WIRETYPE_LENGTH_DELIMITED = 2; WIRETYPE_START_GROUP = 3; WIRETYPE_END_GROUP = 4; WIRETYPE_FIXED32 = 5 # noqa: E702
 
@@ -66,7 +64,7 @@ def onnx_load(tensor: Tensor):
   return model
 
 class OnnxParser:
-  def _parse_message(self, data, offset, message_field_handlers, initial_obj_factory=lambda: {}, debug=False):
+  def _parse_message(self, data: Tensor, offset, message_field_handlers, initial_obj_factory=lambda: {}, debug=False):
     obj = initial_obj_factory()
     current_offset = offset
     end_offset = len(data)
@@ -75,7 +73,9 @@ class OnnxParser:
       field_number = tag_val >> 3
       wire_type = tag_val & 0x07
       if debug: print(f"DEBUG _parse_message: {field_number=}, {wire_type=}")
-      if handler := message_field_handlers.get(field_number): current_offset = handler(obj, data, after_tag_offset, wire_type)
+      if handler := message_field_handlers.get(field_number): 
+        if debug: print(f"DEBUG _parse_message: {handler._debug_info}")
+        current_offset = handler(obj, data, after_tag_offset, wire_type)
       else: current_offset = skip_field_value(data, after_tag_offset, wire_type)
     return obj, current_offset
 
@@ -92,7 +92,7 @@ class OnnxParser:
   def _handle_float_field(self, obj, key_name, data: Tensor, offset, wire_type, parser_func=None, is_repeated=False):
     if wire_type != WIRETYPE_FIXED32: raise ValueError(f"Expected fixed32 for float field '{key_name}'")
     if offset + 4 > len(data): raise EOFError("Buffer too short for float")
-    val, = struct.unpack("<f", data[offset:offset+4].data())
+    val = data[offset:offset+4].bitcast(dtypes.float32)[0].tolist()
     gen_result(obj, key_name, val, is_repeated)
     return offset + 4
 
@@ -105,6 +105,10 @@ class OnnxParser:
         elif len(config) == 3: fid, name, repeated = config
         elif len(config) == 4: fid, name, repeated, parser_fn = config
         res[fid] = lambda obj, data, off, wt, h=handler_fn, n=name, p=parser_fn, r=repeated: h(obj, n, data, off, wt, parser_func=p, is_repeated=r)
+        def _wrapper_handler(obj, data, off, wt, h=handler_fn, n=name, p=parser_fn, r=repeated):
+          return h(obj, n, data, off, wt, parser_func=p, is_repeated=r)
+        _wrapper_handler._debug_info = f"{fid}, {name} => {handler_fn}"
+        res[fid] = _wrapper_handler
     return res
 
   # WIRETYPE_LENGTH_DELIMITED
@@ -133,7 +137,7 @@ class OnnxParser:
     if wire_type != WIRETYPE_LENGTH_DELIMITED: raise ValueError("Packed floats expected length_delimited")
     value, off = self._handle_delimited(data, offset)
     if len(value) % 4 != 0: raise ValueError("Packed float data length not multiple of 4")
-    values = list(struct.unpack(f"<{len(value) // 4}f", value.data()))
+    values = value.bitcast(dtypes.float32).tolist()
     obj.setdefault(key_name, []).extend(values)
     return off
 
@@ -220,15 +224,15 @@ class OnnxParser:
     dims = tensor_obj.get('dims', [])
     num_elements = 1
     for d in dims: num_elements *= d
-    if not dims and not raw_bytes.data(): return
+    if not dims and not len(raw_bytes): return
     if num_elements == 0 and raw_bytes and not dims: num_elements = 1
     decoded_data = []
     if data_type == TensorDataType.FLOAT:
       if len(raw_bytes) != num_elements * 4: raise ValueError(f"FLOAT raw data size mismatch: expected {num_elements*4}, got {len(raw_bytes)}")
-      decoded_data = list(struct.unpack(f"<{num_elements}f", raw_bytes.data()))
+      decoded_data = raw_bytes.bitcast(dtypes.float32).tolist()
     elif data_type == TensorDataType.INT64:
       if len(raw_bytes) != num_elements * 8: raise ValueError(f"INT64 raw data size mismatch: expected {num_elements*8}, got {len(raw_bytes)}")
-      decoded_data = list(struct.unpack(f"<{num_elements}q", raw_bytes.data()))
+      decoded_data = raw_bytes.bitcast(dtypes.int64).tolist()
     else:
       tensor_obj['_warning'] = f"Raw data interpretation for data_type {data_type} not fully implemented."
       decoded_data = "SKIPPED_RAW_DATA_INTERPRETATION"
