@@ -314,7 +314,7 @@ def gguf_load(tensor: Tensor) -> tuple[dict, dict[str, Tensor]]:
 
   NOTE: The provided tensor must be on a device that supports execution.
   """
-  reader, kv_data, state_dict = io.BufferedReader(TensorIO(tensor), 1_000_000), {}, {}
+  reader, kv_data, state_dict = TensorIO(tensor), {}, {}
   def read_unpack(fmt: str, n: int): return struct.unpack(fmt, reader.read(n))[0]
   def read_str(): return str(reader.read(read_uint64()), "utf-8")
   def read_arr():
