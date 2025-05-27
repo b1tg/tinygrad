@@ -46,14 +46,32 @@ def attribute_parse(onnx_attribute: AttributeProto):
 def buffer_parse(onnx_tensor: TensorProto) -> Tensor:
   if onnx_tensor.string_data: raise NotImplementedError("Parsing for buffer with string data is not implemented.")
   dtype, shape = dtype_parse(onnx_tensor.data_type), tuple(onnx_tensor.dims)
-  if data := list(onnx_tensor.float_data) or list(onnx_tensor.int32_data) or list(onnx_tensor.int64_data) or list(onnx_tensor.double_data) or \
-             list(onnx_tensor.uint64_data):
-    if len(data) == 1: return Tensor(data[0], dtype=dtype).reshape(shape)
-    return Tensor(data, dtype=dtype).reshape(shape).realize()
+  # if data := list(onnx_tensor.float_data) or list(onnx_tensor.int32_data) or list(onnx_tensor.int64_data) or list(onnx_tensor.double_data) or \
+  #            list(onnx_tensor.uint64_data):
+  #   print(f"--- {len(data)=}, {data[:3]=} {onnx_tensor.float_data=}")
+  #   if len(data) == 1: return data[0].reshape(shape)
+  #   return data.reshape(shape).realize()
+  data = None
+  if len(onnx_tensor.float_data):
+    data = onnx_tensor.float_data
+  if len(onnx_tensor.int32_data):
+    data = onnx_tensor.int32_data
+  if len(onnx_tensor.int64_data):
+    data = onnx_tensor.int64_data
+  if len(onnx_tensor.double_data):
+    data = onnx_tensor.double_data
+  if len(onnx_tensor.uint64_data):
+    data = onnx_tensor.uint64_data
+  if isinstance(data, Tensor):
+    return data.reshape(shape)
   if has_field(onnx_tensor, "raw_data"):
-    np_buffer = np.frombuffer(onnx_tensor.raw_data, dtype=helper.tensor_dtype_to_np_dtype(onnx_tensor.data_type)).copy().reshape(shape)
+    np_buffer = np.frombuffer(onnx_tensor.raw_data.data() if isinstance(onnx_tensor.raw_data, Tensor) else onnx_tensor.raw_data, dtype=helper.tensor_dtype_to_np_dtype(onnx_tensor.data_type)).copy().reshape(shape)
     if np_buffer.size == 1: return Tensor(np_buffer.item(), dtype=dtype).reshape(shape)
     return Tensor(np_buffer, dtype=dtype)
+  
+    # print(f"=== onnx_tensor-> raw_data {onnx_tensor.raw_data.shape=}, {shape=} {onnx_tensor.raw_data.dtype=}, {helper.tensor_dtype_to_np_dtype(onnx_tensor.data_type)=}")
+    # print(f"=== onnx_tensor-> raw_data {dtype=}, {shape=}, {onnx_tensor.data_type=}, {dtype_parse(onnx_tensor.data_type)=}, {onnx_tensor.raw_data.dtype=}")
+    # return onnx_tensor.raw_data.bitcast(dtype).reshape(shape)
   return Tensor(None)
 
 def type_parse(onnx_type: TypeProto):

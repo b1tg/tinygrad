@@ -5,6 +5,7 @@ from tinygrad.tensor import Tensor
 from tinygrad.dtype import dtypes
 from tinygrad.helpers import prod, argsort, DEBUG, Timing, CI, unwrap, GlobalCounters, tqdm, round_up, T
 from tinygrad.shape.view import strides_for_shape
+from io import BufferedReader
 
 class TensorIO(io.RawIOBase, BinaryIO):
   def __init__(self, t: Tensor):
@@ -30,7 +31,24 @@ class TensorIO(io.RawIOBase, BinaryIO):
   def __enter__(self): return self
   def write(self, s: Any): raise io.UnsupportedOperation("TensorIO.write not supported")
   def writelines(self, lines: Iterable[Any]): raise io.UnsupportedOperation("TensorIO.writelines not supported")
+class TensorIOBufferedReader(BufferedReader):
+  def __init__(self, raw: TensorIO, buffer_size: int = io.DEFAULT_BUFFER_SIZE):
+    """
+    Creates a buffered reader for a TensorIO raw stream.
 
+    Args:
+      raw: The TensorIO instance (must be readable and seekable).
+      buffer_size: The size of the internal buffer.
+    """
+    if not isinstance(raw, TensorIO):
+      raise TypeError("raw argument must be an instance of TensorIO")
+    super().__init__(raw, buffer_size)
+    # BufferedReader's __init__ will check if raw is readable.
+    # No other specific initialization is needed here, as BufferedReader
+    # uses the raw stream's readinto(), seek(), tell(), etc.
+
+  def _ptr(self):
+    return self.raw
 safe_dtypes = {"BOOL":dtypes.bool, "I8":dtypes.int8, "U8":dtypes.uint8, "I16":dtypes.int16, "U16":dtypes.uint16, "I32":dtypes.int, "U32":dtypes.uint,
                "I64":dtypes.int64, "U64":dtypes.uint64, "F16":dtypes.float16, "BF16":dtypes.bfloat16, "F32":dtypes.float32, "F64":dtypes.float64}
 inverse_safe_dtypes = {v:k for k,v in safe_dtypes.items()}

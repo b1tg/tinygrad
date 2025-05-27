@@ -1,10 +1,11 @@
 # https://github.com/onnx/onnx/blob/main/onnx/onnx.proto3
 
 import os, struct
-from io import BytesIO
+from io import BytesIO, BufferedReader
 from types import SimpleNamespace
-from tinygrad.nn.state import TensorIO, accept_filename
-from tinygrad.tensor import Tensor
+from tinygrad.nn.state import TensorIO, accept_filename, TensorIOBufferedReader
+from tinygrad.tensor import Tensor, dtypes
+
 # Protobuf Wire Types
 WIRETYPE_VARINT = 0; WIRETYPE_FIXED64 = 1; WIRETYPE_LENGTH_DELIMITED = 2; WIRETYPE_START_GROUP = 3; WIRETYPE_END_GROUP = 4; WIRETYPE_FIXED32 = 5 # noqa: E702
 
@@ -18,7 +19,7 @@ class AttributeType:
   UNDEFINED = 0; FLOAT = 1; INT = 2; STRING = 3; TENSOR = 4; GRAPH = 5; SPARSE_TENSOR = 11; TYPE_PROTO = 13; FLOATS = 6; INTS = 7 # noqa: E702
   STRINGS = 8; TENSORS = 9; GRAPHS = 10; SPARSE_TENSORS = 12; TYPE_PROTOS = 14 # noqa: E702
 
-def decode_varint(reader) -> int:
+def decode_varint(reader: BufferedReader) -> int:
   result = 0
   shift = 0
   while True:
@@ -51,27 +52,31 @@ def dict_to_namespace(d):
   if isinstance(d, dict): return SimpleNamespace(**{k: dict_to_namespace(v) for k, v in d.items()})
   elif isinstance(d, list): return [dict_to_namespace(i) for i in d]
   else: return d
-
+import io
 @accept_filename
 def onnx_load(tensor: Tensor):
-  reader = TensorIO(tensor)
+  reader = TensorIOBufferedReader(TensorIO(tensor))
+  # reader._tensor = tensor
   parser = OnnxParser()
   onnx_model = parser.parse_model_proto_from_buffer(reader)
   model = dict_to_namespace(onnx_model)
   return model
-
+import time
 class OnnxParser:
-  def _parse_message(self, reader, message_field_handlers, initial_obj_factory=lambda: {}, debug=False):
+  def _parse_message(self, reader: TensorIO, message_field_handlers, initial_obj_factory=lambda: {}, debug=False):
     obj = initial_obj_factory()
     while True:
       try:
         tag_val = decode_varint(reader)
         field_number = tag_val >> 3
         wire_type = tag_val & 0x07
-        if debug: print(f"DEBUG _parse_message: {tag_val=}, {field_number=}, {wire_type=}")
+        # print(f"DEBUG _parse_message: {tag_val=}, {field_number=}, {wire_type=}")
         if handler := message_field_handlers.get(field_number):
-          if debug: print(f"DEBUG _parse_message call handler: {handler._debug_info}")
+          # print(f"DEBUG _parse_message call handler: {handler._debug_info}")
+          st = time.perf_counter()
           handler(obj, reader, wire_type)
+          # if "OnnxParser._handle_sub_message_field" not in str(handler._debug_info):
+          #   print(f"{handler._debug_info} use {(time.perf_counter()-st)*1000:6.2f} ms")
         else: skip_field_value(reader, wire_type)
       except EOFError: break
     return obj
@@ -88,6 +93,7 @@ class OnnxParser:
   def _handle_float_field(self, obj, key_name, reader, wire_type, parser_func=None, repeated=False):
     if wire_type != WIRETYPE_FIXED32: raise ValueError(f"Expected fixed32 for float field '{key_name}'")
     val, = struct.unpack("<f", reader.read(4))
+    # val = data[offset:offset+4].bitcast(dtypes.float32)[0]
     gen_result(obj, key_name, val, repeated)
 
   def gen_handlers(self, tpl):
@@ -104,10 +110,16 @@ class OnnxParser:
     return res
 
   # WIRETYPE_LENGTH_DELIMITED
-  def _handle_delimited(self, reader):
+  def _handle_delimited(self, reader) -> bytes:
     str_len = decode_varint(reader)
     return reader.read(str_len)
 
+  def _handle_delimited_tensor(self, reader:TensorIOBufferedReader) -> Tensor:
+    str_len = decode_varint(reader)
+    # TODO: hack
+    res = reader._ptr()._tensor[reader.tell():(reader.tell()+str_len)]
+    reader.seek(str_len, 1)
+    return res
   def _handle_string_field(self, obj, key_name, reader, wire_type, parser_func=None, repeated=False):
     if wire_type != WIRETYPE_LENGTH_DELIMITED: raise ValueError(f"Expected length-delimited for string field '{key_name}'")
     value = self._handle_delimited(reader)
@@ -121,10 +133,18 @@ class OnnxParser:
 
   def _handle_packed_repeated_floats(self, obj, key_name, reader, wire_type, parser_func=None, repeated=False):
     if wire_type != WIRETYPE_LENGTH_DELIMITED: raise ValueError("Packed floats expected length_delimited")
-    value = self._handle_delimited(reader)
+    st = time.perf_counter()
+    value = self._handle_delimited_tensor(reader)
+    st1 = time.perf_counter()
     if len(value) % 4 != 0: raise ValueError("Packed float data length not multiple of 4")
-    values = list(struct.unpack(f"<{len(value) // 4}f", value))
-    obj.setdefault(key_name, []).extend(values)
+    # values = list(struct.unpack(f"<{len(value) // 4}f", value))
+    values = value.bitcast(dtypes.float32)
+    # print(f"== _handle_bytes_field  {key_name}, {values.tolist()}")
+    # obj.setdefault(key_name, Tensor).extend(value)
+    # TODO
+    obj[key_name] = values
+    st2 = time.perf_counter()
+    # print(f"\t _handle_packed_repeated_floats use {(st1-st)*1000:6.2f} ms, {(st2-st1)*1000:6.2f} ms")
 
   def _handle_packed_repeated_int64s(self, obj, key_name, reader, wire_type, parser_func=None, repeated=False):
     if wire_type != WIRETYPE_LENGTH_DELIMITED: raise ValueError("Packed int64s expected length_delimited")
@@ -141,8 +161,8 @@ class OnnxParser:
 
   def _handle_sub_message_field(self, obj, key_name, reader, wire_type, parser_func=None, repeated=False):
     if wire_type != WIRETYPE_LENGTH_DELIMITED: raise ValueError(f"Expected length-delimited for sub-message field '{key_name}'")
-    value = self._handle_delimited(reader)
-    parsed_sub_obj = parser_func(BytesIO(value))
+    value = self._handle_delimited_tensor(reader)
+    parsed_sub_obj = parser_func(TensorIOBufferedReader(TensorIO(value))) # not copy
     gen_result(obj, key_name, parsed_sub_obj, repeated)
 
   # OperatorSetIdProto
@@ -207,15 +227,16 @@ class OnnxParser:
     dims = tensor_obj.get('dims', [])
     num_elements = 1
     for d in dims: num_elements *= d
-    if not dims and not raw_bytes: return
-    if num_elements == 0 and raw_bytes and not dims: num_elements = 1
+    if not dims and not len(raw_bytes): return
+    if num_elements == 0 and len(raw_bytes) and not dims: num_elements = 1
     decoded_data = []
     if data_type == TensorDataType.FLOAT:
       if len(raw_bytes) != num_elements * 4: raise ValueError(f"FLOAT raw data size mismatch: expected {num_elements*4}, got {len(raw_bytes)}")
-      decoded_data = list(struct.unpack(f"<{num_elements}f", raw_bytes))
+      # decoded_data = list(struct.unpack(f"<{num_elements}f", raw_bytes))
     elif data_type == TensorDataType.INT64:
       if len(raw_bytes) != num_elements * 8: raise ValueError(f"INT64 raw data size mismatch: expected {num_elements*8}, got {len(raw_bytes)}")
-      decoded_data = list(struct.unpack(f"<{num_elements}q", raw_bytes))
+      # decoded_data = list(struct.unpack(f"<{num_elements}q", raw_bytes))
+      decoded_data = raw_bytes
     else:
       tensor_obj['_warning'] = f"Raw data interpretation for data_type {data_type} not fully implemented."
       decoded_data = "SKIPPED_RAW_DATA_INTERPRETATION"
