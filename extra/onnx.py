@@ -64,6 +64,9 @@ def buffer_parse(onnx_tensor: TensorProto) -> Tensor:
     data = onnx_tensor.uint64_data
   if isinstance(data, Tensor):
     return data.reshape(shape).to(Device.DEFAULT) # TODO: wired
+  if data:
+    if len(data) == 1: return Tensor(data[0], dtype=dtype).reshape(shape)
+    return Tensor(data, dtype=dtype).reshape(shape).realize()
   if has_field(onnx_tensor, "raw_data"):
     np_buffer = np.frombuffer(onnx_tensor.raw_data.data() if isinstance(onnx_tensor.raw_data, Tensor) else onnx_tensor.raw_data, dtype=helper.tensor_dtype_to_np_dtype(onnx_tensor.data_type)).copy().reshape(shape)
     if np_buffer.size == 1: return Tensor(np_buffer.item(), dtype=dtype).reshape(shape).realize()
