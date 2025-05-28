@@ -151,7 +151,7 @@ class OnnxRunner:
                        for num,n in enumerate(model.graph.node))
     self.opset_version = model.opset_import[0].version
     self.variable_dims: dict[str, int] = {}
-    print(f"== {self.graph_values=}, {self.graph_inputs=}, {self.graph_outputs=}, {self.graph_nodes=},  ")
+    # print(f"== {self.graph_values=}, {self.graph_inputs=}, {self.graph_outputs=}, {self.graph_nodes=},  ")
     self.onnx_ops = onnx_ops
 
   def _parse_input(self, name: str, value: Any, spec: OnnxValue):
