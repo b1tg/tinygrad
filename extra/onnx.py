@@ -5,7 +5,7 @@ from tinygrad.tensor import Tensor, _broadcast_shape, ReductionStr
 from tinygrad.helpers import getenv, DEBUG, all_same, prod, flatten, make_tuple, argsort
 from tinygrad.dtype import DType, ConstType, dtypes, ImageDType
 from tinygrad.device import is_dtype_supported
-
+from tinygrad import Device
 # ***** protobuf parsing ******
 from onnx import AttributeProto, ModelProto, TensorProto, TypeProto, helper
 import numpy as np
@@ -63,10 +63,10 @@ def buffer_parse(onnx_tensor: TensorProto) -> Tensor:
   if len(onnx_tensor.uint64_data):
     data = onnx_tensor.uint64_data
   if isinstance(data, Tensor):
-    return data.reshape(shape)
+    return data.reshape(shape).to(Device.DEFAULT) # TODO: wired
   if has_field(onnx_tensor, "raw_data"):
     np_buffer = np.frombuffer(onnx_tensor.raw_data.data() if isinstance(onnx_tensor.raw_data, Tensor) else onnx_tensor.raw_data, dtype=helper.tensor_dtype_to_np_dtype(onnx_tensor.data_type)).copy().reshape(shape)
-    if np_buffer.size == 1: return Tensor(np_buffer.item(), dtype=dtype).reshape(shape)
+    if np_buffer.size == 1: return Tensor(np_buffer.item(), dtype=dtype).reshape(shape).realize()
     return Tensor(np_buffer, dtype=dtype)
   
     # print(f"=== onnx_tensor-> raw_data {onnx_tensor.raw_data.shape=}, {shape=} {onnx_tensor.raw_data.dtype=}, {helper.tensor_dtype_to_np_dtype(onnx_tensor.data_type)=}")
