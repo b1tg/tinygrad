@@ -63,6 +63,8 @@ def buffer_parse(onnx_tensor: TensorProto) -> Tensor:
   if len(onnx_tensor.uint64_data):
     data = onnx_tensor.uint64_data
   if isinstance(data, Tensor):
+    if len(data)==1:
+      return Tensor(data.tolist()[0], dtype=dtype).reshape(shape)
     return data.reshape(shape).to(Device.DEFAULT) # TODO: wired
   if data:
     if len(data) == 1: return Tensor(data[0], dtype=dtype).reshape(shape)
@@ -149,7 +151,7 @@ class OnnxRunner:
                        for num,n in enumerate(model.graph.node))
     self.opset_version = model.opset_import[0].version
     self.variable_dims: dict[str, int] = {}
-
+    print(f"== {self.graph_values=}, {self.graph_inputs=}, {self.graph_outputs=}, {self.graph_nodes=},  ")
     self.onnx_ops = onnx_ops
 
   def _parse_input(self, name: str, value: Any, spec: OnnxValue):
