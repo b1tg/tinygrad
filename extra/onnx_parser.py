@@ -128,7 +128,10 @@ class OnnxParser:
 
   def _handle_bytes_field(self, obj, key_name, reader, wire_type, parser_func=None, repeated=False):
     if wire_type != WIRETYPE_LENGTH_DELIMITED: raise ValueError(f"Expected length-delimited for bytes field '{key_name}'")
-    value = self._handle_delimited(reader)
+    if key_name == "raw_data":
+      value = self._handle_delimited_tensor(reader)
+    else:
+      value = self._handle_delimited(reader)
     gen_result(obj, key_name, value, repeated)
 
   def _handle_packed_repeated_floats(self, obj, key_name, reader, wire_type, parser_func=None, repeated=False):
