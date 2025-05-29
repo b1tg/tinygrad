@@ -31,9 +31,9 @@ def dtype_parse(onnx_dtype: int) -> DType:
 def attribute_parse(onnx_attribute: AttributeProto):
   supported: dict[AttributeProto.AttributeType, Callable[[AttributeProto], Any]] = {
     AttributeProto.FLOAT: lambda a: float(a.f), AttributeProto.INT: lambda a: int(a.i),
-    AttributeProto.STRING: lambda a: a.s.decode("utf-8"), AttributeProto.TENSOR: lambda a: buffer_parse(a.t),
+    AttributeProto.STRING: lambda a: a.s, AttributeProto.TENSOR: lambda a: buffer_parse(a.t),
     AttributeProto.FLOATS: lambda a: tuple(float(x) for x in a.floats), AttributeProto.INTS: lambda a: tuple(int(x) for x in a.ints),
-    AttributeProto.STRINGS: lambda a: tuple(x.decode("utf-8") for x in a.strings)
+    AttributeProto.STRINGS: lambda a: tuple(x for x in a.strings)
   }
   unsupported = {
     AttributeProto.UNDEFINED, AttributeProto.GRAPH, AttributeProto.SPARSE_TENSOR, AttributeProto.TYPE_PROTO, AttributeProto.TENSORS,
