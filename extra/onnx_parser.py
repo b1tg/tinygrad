@@ -24,34 +24,33 @@ class PBType: FLOAT = 1; INT = 2; STRING = 3; FLOATS = 4; INTS = 5; STRINGS = 6;
 
 PB_INFOS = {
   "OperatorSetIdProto": {1: ("domain", PBType.STRING), 2: ("version", PBType.INT)},
-  "StringStringEntryProto": {1: ('key', PBType.STRING), 2: ('value', PBType.STRING)},
+  "StringStringEntryProto": {1: ("key", PBType.STRING), 2: ("value", PBType.STRING)},
   "TensorProto": {1: ("dims", PBType.INT, True), 2: ("data_type", PBType.INT), 4: ("float_data", PBType.FLOATS),
-    5: ("int32_data", PBType.INTS),
-    7: ("int64_data", PBType.INTS), 8: ("name", PBType.STRING), 9: ("raw_data", PBType.BYTES)},
-  "TensorShapeProtoDimension": {1: ('dim_value', PBType.INT), 2: ('dim_param', PBType.STRING) },
+    5: ("int32_data", PBType.INTS), 7: ("int64_data", PBType.INTS), 8: ("name", PBType.STRING), 9: ("raw_data", PBType.BYTES)},
+  "TensorShapeProtoDimension": {1: ("dim_value", PBType.INT), 2: ("dim_param", PBType.STRING)},
   "TensorShapeProto": {1: ("dim", PBType.SUB, True, "TensorShapeProtoDimension")},
   "ModelProto": {1: ("ir_version", PBType.INT), 5: ("model_version", PBType.INT),
     2: ("producer_name", PBType.STRING), 3: ("producer_version", PBType.STRING), 4: ("domain", PBType.STRING), 6: ("doc_string", PBType.STRING),
-    7: ("graph", PBType.SUB,False, ("GraphProto", lambda: {'node': [], 'initializer': [], 'input':[], 'output':[], 'value_info':[]})),
-    8: ("opset_import",PBType.SUB,True, "OperatorSetIdProto"), },
+    7: ("graph", PBType.SUB, False, ("GraphProto", lambda: {"node": [], "initializer": [], "input": [], "output": [], "value_info": []})),
+    8: ("opset_import",PBType.SUB, True, "OperatorSetIdProto")},
   "GraphProto": {2: ("name", PBType.STRING), 10: ("doc_string", PBType.STRING),
-    1: ("node", PBType.SUB, True, ("NodeProto", lambda: {'input': [], 'output': [], 'attribute': [], 'domain': None})),
-    5: ("initializer", PBType.SUB, True, ("TensorProto", lambda: {'dims': [], 'float_data': [], 'int32_data': [], 'string_data':[],
-                                                                  'int64_data':[], 'double_data':[], 'uint64_data':[]})),
+    1: ("node", PBType.SUB, True, ("NodeProto", lambda: {"input": [], "output": [], "attribute": [], "domain": None})),
+    5: ("initializer", PBType.SUB, True, ("TensorProto", lambda: {"dims": [], "float_data": [], "int32_data": [], "string_data": [],
+                                                                  "int64_data": [], "double_data": [], "uint64_data": []})),
     11: ("input", PBType.SUB, True, "ValueInfoProto"), 12: ("output", PBType.SUB, True, "ValueInfoProto")},
-  "NodeProto": {4: ("op_type", PBType.STRING), 6: ("doc_string", PBType.STRING), 7: ("domain", PBType.STRING),
-    1: ("input", PBType.STRING, True), 2: ("output", PBType.STRING, True), 3: ("name", PBType.STRING),
-    5: ("attribute", PBType.SUB, True, ("AttributeProto", lambda: {'floats': [], 'ints': [], 'strings': []}))},
+  "NodeProto": { 1: ("input", PBType.STRING, True), 2: ("output", PBType.STRING, True), 3: ("name", PBType.STRING),
+    4: ("op_type", PBType.STRING), 6: ("doc_string", PBType.STRING), 7: ("domain", PBType.STRING),
+    5: ("attribute", PBType.SUB, True, ("AttributeProto", lambda: {"floats": [], "ints": [], "strings": []}))},
   "AttributeProto": {1: ("name", PBType.STRING), 20: ("type", PBType.INT), 3: ("i", PBType.INT), 8: ("ints", PBType.INT, True),
-    2: ("f", PBType.FLOAT), 7: ("floats", PBType.FLOAT, True), 4: ("s", PBType.STRING), 9: ("strings", PBType.STRING, True),
-    5:("t", PBType.SUB, False, ("TensorProto", lambda: {'dims': [], 'float_data': [], 'int32_data': [], 'string_data':[], 'int64_data':[],
-                                                        'double_data':[], 'uint64_data':[]}))},
-  "ValueInfoProto": {1: ('name', PBType.STRING), 2: ('type', PBType.SUB, False, "TypeProto"), 3: ('doc_string', PBType.STRING)},
-  "TypeProto": {1: ('tensor_type', PBType.SUB, False, "TypeProtoTensor"), 4: ('sequence_type', PBType.SUB, False, "TypeProtoSequence"),
-    9: ('optional_type', PBType.SUB, False, "TypeProtoOptional"), 6: ('denotation', PBType.STRING)},
-  "TypeProtoSequence": {1: ('elem_type', PBType.SUB, False, "TypeProto")},
-  "TypeProtoOptional": {1: ('elem_type', PBType.SUB, False, "TypeProto")},
-  "TypeProtoTensor": {1: ('elem_type', PBType.INT), 2: ('shape', PBType.SUB, False, ("TensorShapeProto", lambda: {'dim': []}))},
+    2: ("f", PBType.FLOAT), 7: ("floats", PBType.FLOAT, True), 4: ("s", PBType.BYTES), 9: ("strings", PBType.BYTES, True),
+    5:("t", PBType.SUB, False, ("TensorProto", lambda: {"dims": [], "float_data": [], "int32_data": [], "string_data": [], "int64_data": [],
+                                                        "double_data": [], "uint64_data": []}))},
+  "ValueInfoProto": {1: ("name", PBType.STRING), 2: ("type", PBType.SUB, False, "TypeProto"), 3: ("doc_string", PBType.STRING)},
+  "TypeProto": {1: ("tensor_type", PBType.SUB, False, "TypeProtoTensor"), 4: ("sequence_type", PBType.SUB, False, "TypeProtoSequence"),
+    9: ("optional_type", PBType.SUB, False, "TypeProtoOptional"), 6: ("denotation", PBType.STRING)},
+  "TypeProtoSequence": {1: ("elem_type", PBType.SUB, False, "TypeProto")},
+  "TypeProtoOptional": {1: ("elem_type", PBType.SUB, False, "TypeProto")},
+  "TypeProtoTensor": {1: ("elem_type", PBType.INT), 2: ("shape", PBType.SUB, False, ("TensorShapeProto", lambda: {"dim": []}))},
 }
 
 @accept_filename
@@ -74,7 +73,7 @@ def dict_to_namespace(d):
 class OnnxParser:
   def __init__(self):
     self.attr_func_dict = { PBType.BYTES: self._handle_bytes, PBType.SUB: self._handle_sub_message, PBType.FLOATS: self._handle_packed_floats,
-      PBType.INT: self._handle_int64, PBType.INTS: self._handle_packed_int64s, PBType.STRING: self._handle_string, PBType.FLOAT: self._handle_float }
+      PBType.INT: self._handle_int64, PBType.INTS: self._handle_packed_int64s, PBType.STRING: self._handle_string, PBType.FLOAT: self._handle_float}
     self.registered_handles = {}
     for pb_name in PB_INFOS:
       res = {}
@@ -89,14 +88,14 @@ class OnnxParser:
         res[fid] = _wrapper_handler
       self.registered_handles[pb_name] = res
 
-  def parse(self, reader): return self._parse_message(reader, "ModelProto", lambda: {'opset_import': [], 'domain': None, 'graph': None})
+  def parse(self, reader): return self._parse_message(reader, "ModelProto", lambda: {"opset_import": [], "domain": None, "graph": None})
 
   def decode_varint(self, reader: BufferedReader) -> int:
     result = 0
     shift = 0
     while True:
       data = reader.read(1)
-      if data == b'': raise EOFError("decode_varint EOF")
+      if data == b"": raise EOFError("decode_varint EOF")
       result |= (data[0] & 0x7F) << shift
       if not (data[0] & 0x80): return result
       shift += 7
@@ -108,6 +107,7 @@ class OnnxParser:
     elif wire_type == WIRETYPE_FIXED32: reader.seek(4, os.SEEK_CUR)
     elif wire_type == WIRETYPE_LENGTH_DELIMITED: reader.seek(self.decode_varint(reader), os.SEEK_CUR)
     else: raise ValueError(f"Unknown wire type: {wire_type}")
+
   def _parse_message(self, reader, message_field_handlers_name, initial_obj_factory=lambda: {}):
     message_field_handlers = self.registered_handles[message_field_handlers_name]
     obj = initial_obj_factory()
@@ -132,7 +132,7 @@ class OnnxParser:
   def _handle_string(self, obj, key_name, reader, wire_type, parser_func=None, repeated=False):
     if wire_type != WIRETYPE_LENGTH_DELIMITED: raise ValueError(f"Expected length-delimited for string field '{key_name}'")
     value = self._handle_delimited(reader)
-    gen_result(obj, key_name, value.decode('utf-8'), repeated)
+    gen_result(obj, key_name, value.decode("utf-8"), repeated)
 
   def _handle_bytes(self, obj, key_name, reader, wire_type, parser_func=None, repeated=False):
     if wire_type != WIRETYPE_LENGTH_DELIMITED: raise ValueError(f"Expected length-delimited for bytes field '{key_name}'")
