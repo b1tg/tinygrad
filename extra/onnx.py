@@ -65,7 +65,7 @@ def buffer_parse(onnx_tensor: TensorProto) -> Tensor:
   if isinstance(data, Tensor):
     if len(data)==1:
       return Tensor(data.tolist()[0], dtype=dtype).reshape(shape)
-    return data.reshape(shape).to(Device.DEFAULT) # TODO: wired
+    return data.bitcast(dtype).reshape(shape).to(Device.DEFAULT) # TODO: wired
   if data:
     if len(data) == 1: return Tensor(data[0], dtype=dtype).reshape(shape)
     return Tensor(data, dtype=dtype).reshape(shape).realize()
