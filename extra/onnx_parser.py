@@ -55,7 +55,7 @@ PB_INFOS = {
 
 @accept_filename
 def onnx_load(tensor: Tensor):
-  reader = BufferedReader(TensorIO(tensor))
+  reader = TensorIO(tensor)
   parser = OnnxParser()
   onnx_model = parser.parse(reader)
   model = dict_to_namespace(onnx_model)
@@ -125,7 +125,7 @@ class OnnxParser:
   def _handle_delimited(self, reader:BufferedReader, use_tensor=False) -> Tuple[bytes, Tensor]:
     str_len = self.decode_varint(reader)
     if not use_tensor: return reader.read(str_len)
-    res = reader.raw._tensor[reader.tell():(reader.tell()+str_len)]
+    res = reader._tensor[reader.tell():(reader.tell()+str_len)]
     reader.seek(str_len, os.SEEK_CUR)
     return res
 
@@ -167,7 +167,7 @@ class OnnxParser:
   def _handle_sub_message(self, obj, key_name, reader, wire_type, parser_func=None, repeated=False):
     if wire_type != WIRETYPE_LENGTH_DELIMITED: raise ValueError(f"Expected length-delimited for sub-message field '{key_name}'")
     value = self._handle_delimited(reader, use_tensor=True)
-    if isinstance(parser_func, str): sub_obj = self._parse_message(BufferedReader(TensorIO(value)), parser_func)
-    elif isinstance(parser_func, tuple): sub_obj = self._parse_message(BufferedReader(TensorIO(value)), parser_func[0], parser_func[1])
-    else: sub_obj = parser_func(BufferedReader(TensorIO(value)))
+    if isinstance(parser_func, str): sub_obj = self._parse_message(TensorIO(value), parser_func)
+    elif isinstance(parser_func, tuple): sub_obj = self._parse_message(TensorIO(value), parser_func[0], parser_func[1])
+    else: sub_obj = parser_func(TensorIO(value))
     gen_result(obj, key_name, sub_obj, repeated)
