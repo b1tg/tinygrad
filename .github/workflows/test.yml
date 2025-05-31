@@ -717,6 +717,8 @@ jobs:
         amd: 'true'
         cuda: 'true'
         llvm: 'true'
+    - name: Run model inference benchmark [onnx]
+      run: PYTHONPATH=. METAL=1 python test/external/external_model_benchmark.py        
     - name: Run real world test
       run: METAL=1 python -m pytest -n=auto test/models/test_real_world.py --durations=20
     - name: Test models (Metal)
