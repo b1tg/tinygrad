@@ -55,14 +55,14 @@ def buffer_parse(onnx_tensor: TensorProto) -> Tensor:
   elif len(onnx_tensor.uint64_data): data = onnx_tensor.uint64_data
   if isinstance(data, Tensor):
     if len(data) == 1: return Tensor(data.tolist()[0], dtype=dtype).reshape(shape)
-    return data.cast(dtype).reshape(shape).to(Device.DEFAULT)
+    return data.cast(dtype).reshape(shape).to(Device.DEFAULT).realize()
   if has_field(onnx_tensor, "raw_data"):
     if onnx_tensor.data_type == TensorProto.FLOAT16:
       np_buffer = np.frombuffer(onnx_tensor.raw_data.data().tobytes(),
                                 dtype=helper.tensor_dtype_to_np_dtype(onnx_tensor.data_type)).copy().reshape(shape)
       if np_buffer.size == 1: return Tensor(np_buffer.item(), dtype=dtype).reshape(shape)
       return Tensor(np_buffer, dtype=dtype)
-    return onnx_tensor.raw_data.bitcast(dtype).reshape(shape).to(Device.DEFAULT)
+    return onnx_tensor.raw_data.bitcast(dtype).reshape(shape).to(Device.DEFAULT).realize()
   return Tensor(None)
 
 def type_parse(onnx_type: TypeProto):
