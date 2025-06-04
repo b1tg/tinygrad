@@ -46,9 +46,10 @@ def buffer_parse(onnx_tensor: TensorProto) -> Tensor:
     if len(data) == 1: return Tensor(data[0], dtype=dtype).reshape(shape)
     return Tensor(data, dtype=dtype).reshape(shape).realize()
   if onnx_tensor.HasField("raw_data"):
-    np_buffer = np.frombuffer(onnx_tensor.raw_data, dtype=helper.tensor_dtype_to_np_dtype(onnx_tensor.data_type)).copy().reshape(shape)
-    if np_buffer.size == 1: return Tensor(np_buffer.item(), dtype=dtype).reshape(shape)
-    return Tensor(np_buffer, dtype=dtype)
+    ret = Tensor(onnx_tensor.raw_data, dtype=dtype).reshape(shape)
+    if ret.shape == (): ret = Tensor(ret.item(), dtype=dtype) # without this, qcom test below fails
+    # PYTHONPATH="." QCOM=1 IMAGE=2 python3 examples/openpiSlot/compile3.py https://github.com/commaai/openpilot/raw/v0.9.7/selfdrive/modeld/models/dmonitoring_model.onnx
+    return ret
   return Tensor(None)
 
 def type_parse(onnx_type: TypeProto):
