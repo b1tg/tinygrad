@@ -551,13 +551,18 @@ class Kernel:
     if __debug__: type_verify(list(modified_ast.toposort()))
     # TODO: sadly modified_ast doesn't pass the shape spec because of how group_for_reduces constructs UOps, there's probably a way to fix this
     #if __debug__: type_verify(list(modified_ast.toposort()), ast_spec)
+    if getenv("RECORDING", 0) == 1:
+      print(f"==== recording {self.name=} ===")
+      #print(modified_ast)
+      with open(f"temp/{self.name}", "w") as f:
+        f.write(str(modified_ast))
 
     try:
       self.uops:list[UOp] = full_rewrite(modified_ast, self.opts)
     except RuntimeError:
-      print("***** LINEARIZE FAILURE *****")
-      print(f"ast = {self.ast}")
-      print(f"opts = {self.applied_opts}")
+      #print("***** LINEARIZE FAILURE *****")
+      #print(f"ast = {self.ast}")
+      #print(f"opts = {self.applied_opts}")
       raise
     if DEBUG >= 6: print_uops(self.uops)
     return self

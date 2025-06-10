@@ -143,6 +143,9 @@ class LLVMRenderer(Renderer):
     sprefix = "".join([f" {x}" for x in (prefix or []) + [self.abi] if x is not None])
     return "\n".join([f"define{sprefix} void @{name}({sargs}) #0", "{"] + kernel + ["  ret void\n}"])
   def _render_kernel(self, uops: list[UOp], prefix:list[str]|None=None) -> tuple[tuple[str, ...], str]:
+    #print("===render=")
+    #print(uops)
+    #print("===render=")
     r: dict[UOp, str] = {}
     args: list[tuple[str, DType]] = []
     kernel: list[str] = []
@@ -162,6 +165,55 @@ class LLVMRenderer(Renderer):
         for i, dtype in enumerate(u.arg[2].vec(sz) for sz in [prod(size for _, size in upcast) for upcast in u.arg[6]]):
           kernel += [f"  {r[u]}_amx{i} = alloca {ldt(dtype)}, align {dtype.itemsize}",
                      f"  {r[u]}_ptr_amx{i} = ptrtoint {ldt(dtype.ptr())} {r[u]}_amx{i} to i64"]
+    def _idx(uops, uop):
+      for i, u in enumerate(uops):
+        if u == uop: return i
+      return -1
+    #print(uops[16])
+    if 0:
+      for N in range(1):
+        for i, u in enumerate(uops):
+          if u.op is Ops.ADD:
+            idx0 =_idx(uops, u.src[0])
+            idx1 =_idx(uops, u.src[1])
+            if i-idx1>100 and u.src[1].op is Ops.MUL:
+              #i1 = max(idx0, idx1)
+              i1 = idx1
+              #if u.src[0].op not in (Ops.ADD, Ops.MUL, Ops.WHERE): continue
+              #if u.src[1].op not in (Ops.ADD, Ops.MUL, Ops.WHERE): continue
+              #if i-i1 < 50: continue
+              print(f"{i=}, {idx0=}, {idx1=}")
+              # move u to max(idx0, idx1)
+              print(f"STAGE1: move {i} => {i1}")
+              #uops[i], uops[i1] = uops[i1], uops[i] 
+              uops = uops[:i1+1] + [u] + uops[i1+1:i] + uops[i+1:]
+              break
+    #print(uops[16])
+    # stragy 2: move fmul to fadd if no other deps
+    if 0:
+      print("STAGE2")
+      for N in range(100):
+        for i, u in enumerate(uops):
+          if u.op in (Ops.ADD, Ops.MUL) and u.dtype == dtypes.float:
+            #if u.src[1].op not in (Ops.ADD, Ops.MUL): continue
+            idx0 =_idx(uops, u.src[0])
+            idx1 =_idx(uops, u.src[1])
+            if i-idx1>100 and (i-idx1)<400:
+              print(f"==2: {i=}, {idx0=}, {idx1=}({(i-idx1)=})")
+              # move fmul to fadd if no deps
+              i1_ = -1
+              for i1 in range(idx1+1, i+1):
+                if u.src[1] in uops[i1].src:
+                  i1_ = i1
+                  break
+              # move idx1 => i1
+              print(f"== move {idx1} => {i1_}")
+              #uops = uops[:i1+1] + [u] + uops[i1+1:i] + uops[i+1:]
+              uops = uops[:idx1] + uops[idx1+1:i1_] +[u.src[1]] + uops[i1_:]
+              break
+
+
+    #print(f"=== {len(uops)=}")
 
     name = "test"
     for u in uops:
@@ -220,7 +272,7 @@ class AMDLLVMRenderer(LLVMRenderer):
     (UPat(Ops.CAST, name="x", dtype=dtypes.half.vec(8), src=UPat.var("y", dtypes.half.vec(16))), lambda ctx, x, y:
       f"  {ctx[x]}= shufflevector <16 x half> {ctx[y]}, <16 x half> undef, <8 x i32> <{', '.join([f'i32 {x}' for x in range(0, 16, 2)])}>"),
   ]) + base_rewrite
-  extra_matcher = LLVMRenderer.extra_matcher
+  extra_matcher = LLVMRenderer.extra_matcher 
   def _render_footer(self, uops: list[UOp]) -> str:
     # TODO: this is copied from cstyle
     requiredMaxThreadsPerBlock = prod(u.arg[1] for u in uops if u.op is Ops.SPECIAL and u.arg[0][0] == "l")

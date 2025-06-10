@@ -11,6 +11,7 @@ except AttributeError: pass  # ignore if ROCm isn't installed
 from tinygrad.device import Compiler, CompileError
 from tinygrad.runtime.ops_llvm import LLVMCompiler
 from tinygrad.helpers import OSX, to_char_p_p
+from tinygrad.helpers import getenv, DEBUG
 
 def amdgpu_disassemble(lib:bytes):
   asm = subprocess.check_output(["llvm-objdump" if OSX else "/opt/rocm/llvm/bin/llvm-objdump", '-d', '-'], input=lib)
@@ -75,13 +76,30 @@ def compile_hip(prg:str, arch="gfx1100", asm=False) -> bytes:
   for x in [data_set_src, data_set_bc, data_set_reloc, data_set_exec]: check(comgr.amd_comgr_destroy_data_set(x))
   check(comgr.amd_comgr_destroy_action_info(action_info))
   return ret
-
+import tempfile, os
+# hipcc -S --cuda-device-only --offload-arch=gfx1100 -emit-llvm /tmp/1/cov.hip -o /tmp/1/cov.hip.ll
+def compile_hip_llvm(prg, arch, asm=False):
+  #with tempfile.NamedTemporaryFile(dir="temp/hip_llvm", suffix=".hip", mode="w", delete=False) as f:
+  with open("temp/hip_llvm/"+os.getenv("NUM")+".hip", "w") as f:
+    f.write(prg)
+    f.flush()
+    print(f"{f.name=}")
+    subprocess.check_output(["hipcc", "-S", "--cuda-device-only", f"--offload-arch={arch}", "-emit-llvm", f.name, "-o", f.name+".ll"])
+    with open(f.name+".ll") as f:
+      ir = f.read()
+    cl = AMDLLVMCompiler(arch)
+    if DEBUG >= 5:
+      print(ir)
+    ret = cl.compile(ir)
+    return ret
+  
 class HIPCompiler(Compiler):
   def __init__(self, arch:str):
     self.arch = arch
     super().__init__(f"compile_hip_{self.arch}")
   def compile(self, src:str) -> bytes:
-    try: return compile_hip(src, self.arch, src.split('\n', 1)[0].strip() == '.text')
+    f = compile_hip_llvm if getenv("HIP_LLVM",0)==1 else compile_hip
+    try: return f(src, self.arch, src.split('\n', 1)[0].strip() == '.text')
     except RuntimeError as e: raise CompileError(e) from e
   def disassemble(self, lib:bytes): amdgpu_disassemble(lib)
 
@@ -93,6 +111,9 @@ class AMDLLVMCompiler(LLVMCompiler):
     super().__init__(self.arch, "+cumode")
   def __reduce__(self): return (AMDLLVMCompiler, (self.arch,))
   def compile(self, src:str) -> bytes:
+    if "source_filename" not in src:
+      with open("cur.ll", "w") as f:
+        f.write(src)
     try: return super().compile(src)
     except RuntimeError as e:
       if "undefined value '@llvm.amdgcn." in str(e): raise CompileError(str(e) + "AMD with LLVM backend requires LLVM >= 18") from e
