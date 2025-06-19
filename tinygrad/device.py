@@ -131,22 +131,15 @@ class Buffer:
   def allocator(self) -> Allocator: return Device[self.device].allocator
   @property
   def _buf(self) -> Any:
-    if self._base is not None:
-      if self._base._buf is not None:
-        if not hasattr(self, "_underlying_buf"):
-          self.allocate() # remove this
-          return self._underlying_buf
-        else: return self._underlying_buf
-      # freed or not alloc?
-      else: raise Exception("access subbuffer's buf, but the base buf freed or not alloc yet")
-    else:
-      assert hasattr(self, '_underlying_buf'), "not alloc yet"
-      return self._underlying_buf
+    if self._base is not None: assert self._base._buf is not None, "access subbuffer's buf, but the base buf does not exists"
+    return self._underlying_buf if hasattr(self, '_underlying_buf') else None
   def ref(self, cnt):
     self.base._lb_refcount += cnt
     return self
-  def is_allocated(self) -> bool: return hasattr(self, '_underlying_buf') or (self._base is not None and self.base.is_allocated())
-  def ensure_allocated(self) -> Buffer: return self.allocate() if not self.is_allocated() else self
+  def is_allocated(self) -> bool:
+    if self._base is not None: return self.base.is_allocated()
+    return hasattr(self, '_underlying_buf')
+  def ensure_allocated(self) -> Buffer: return self.allocate() if not self.is_allocated() or not hasattr(self, '_underlying_buf') else self
   def allocate(self, opaque=None, external_ptr=None) -> Buffer:
     assert not hasattr(self, '_underlying_buf'), "can't allocate already allocated buffer"
     if DEBUG >= 7: print(f"buffer: allocate {self.nbytes} bytes on {self.device}")
