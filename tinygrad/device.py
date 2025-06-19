@@ -131,9 +131,17 @@ class Buffer:
   def allocator(self) -> Allocator: return Device[self.device].allocator
   @property
   def _buf(self) -> Any:
-    self.ensure_allocated()
-    if self._base is not None and not hasattr(self, '_underlying_buf'): self.allocate()
-    return self._underlying_buf
+    if self._base is not None:
+      if self._base._buf is not None:
+        if not hasattr(self, "_underlying_buf"):
+          self.allocate() # remove this
+          return self._underlying_buf
+        else: return self._underlying_buf
+      # freed or not alloc?
+      else: raise Exception("access subbuffer's buf, but the base buf freed or not alloc yet")
+    else:
+      assert hasattr(self, '_underlying_buf'), "not alloc yet"
+      return self._underlying_buf
   def ref(self, cnt):
     self.base._lb_refcount += cnt
     return self
@@ -173,8 +181,7 @@ class Buffer:
     return self.__class__, (self.device, self.size, self.dtype, None, self.options, buf, self.lb_refcount)
   @property
   def nbytes(self): return self.size*self.dtype.itemsize
-  def __del__(self):
-    if hasattr(self, '_underlying_buf'): self.deallocate()
+  def __del__(self): self.deallocate()
   def __repr__(self):
     return f"<buf real:{self.is_allocated()} device:{self.device} size:{self.size} dtype:{self.dtype}" + \
            (f" offset:{self.offset}" if self._base is not None else "") + (f" {self.options=}" if self.options is not None else "") + ">"

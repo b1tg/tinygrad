@@ -57,6 +57,20 @@ class TestSubBuffer(unittest.TestCase):
     del sub_buf
     assert self.buf.as_buffer().tolist() == list(range(10))
 
+  def test_uaf(self):
+    # delete subbuffer do not affect base
+    sub_buf = self.buf.view(4, dtypes.int8, offset=3)
+    assert self.buf.as_buffer().tolist(), list(range(10))
+    sub_buf.deallocate()
+    # TODO: .del not work
+    assert self.buf.as_buffer().tolist(), list(range(10))
+
+    # why sub_buf still work here
+    assert sub_buf.as_buffer().tolist(), list(range(3, 7))
+    self.buf.deallocate()
+    with self.assertRaises(AssertionError):
+      sub_buf.as_buffer().tolist()
+
   def test_subbuffer_allocate(self):
     sub_buf = self.buf.view(4, dtypes.int8, offset=3)
     sub_buf.allocate()
