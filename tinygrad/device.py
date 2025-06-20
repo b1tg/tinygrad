@@ -131,10 +131,10 @@ class Buffer:
   def ref(self, cnt):
     self.base._lb_refcount += cnt
     return self
+  # Checks if the underlying buffer is allocated, possibly from the base object
+  def is_allocated(self) -> bool: return self.base.is_allocated() if self._base is not None else hasattr(self, '_buf')
+  # Checks if the underlying buffer is allocated and the current buffer is initialized
   def is_initialized(self) -> bool: return self.is_allocated() and hasattr(self, '_buf')
-  def is_allocated(self) -> bool:
-    if self._base is not None: return self.base.is_allocated()
-    return hasattr(self, '_buf')
   def ensure_allocated(self) -> Buffer: return self.allocate() if not self.is_initialized() else self
   def allocate(self, opaque=None, external_ptr=None) -> Buffer:
     assert not hasattr(self, '_buf'), "can't allocate already allocated buffer"
