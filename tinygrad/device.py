@@ -130,9 +130,7 @@ class Buffer:
   @property
   def allocator(self) -> Allocator: return Device[self.device].allocator
   @property
-  def _buf(self) -> Any:
-    if self._base is not None: assert self._base._buf is not None, "access subbuffer's buf, but the base buf does not exists"
-    return self._underlying_buf if hasattr(self, '_underlying_buf') else None
+  def _buf(self) -> Any: return self._underlying_buf
   def ref(self, cnt):
     self.base._lb_refcount += cnt
     return self
