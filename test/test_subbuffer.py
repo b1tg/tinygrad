@@ -9,9 +9,10 @@ class TestSubBuffer(unittest.TestCase):
   def setUp(self):
     self.buf = Buffer(Device.DEFAULT, 10, dtypes.uint8).ensure_allocated()
     self.buf.copyin(memoryview(bytearray(range(10))))
+    self.buf_unalloc = Buffer(Device.DEFAULT, 10, dtypes.uint8)
 
   def test_is_allocated(self):
-    buf = Buffer(Device.DEFAULT, 10, dtypes.uint8)
+    buf = self.buf_unalloc
     sub_buf = buf.view(3, dtypes.uint8, offset=4)
     self.assertFalse(buf.is_allocated())
     self.assertFalse(buf.is_initialized())
@@ -85,6 +86,11 @@ class TestSubBuffer(unittest.TestCase):
     sub_buf.allocate()
     sub_buf.copyin(memoryview(bytearray(range(10, 14))))
     assert self.buf.as_buffer().tolist()[3:7] == sub_buf.as_buffer().tolist()
+
+    sub_buf = self.buf_unalloc.view(4, dtypes.int8, offset=3)
+    sub_buf.allocate()
+    sub_buf.copyin(memoryview(bytearray(range(10, 14))))
+    assert self.buf_unalloc.as_buffer().tolist()[3:7] == sub_buf.as_buffer().tolist()
 
   def test_subbuffer_dealloc(self):
     sub_buf = self.buf.view(4, dtypes.int8, offset=3).ensure_allocated()
