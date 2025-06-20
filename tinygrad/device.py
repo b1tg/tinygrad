@@ -110,6 +110,7 @@ class Buffer:
     if isinstance(dtype, ImageDType): options = BufferSpec(image=dtype) # TODO: image hack shouldn't be here. where should it be?
     else: assert isinstance(dtype, DType) and not isinstance(dtype, PtrDType)
     self.device, self.size, self.dtype, self.options, self.offset, self.allocated_views = device, size, dtype, options, offset, 0
+    self.allocator: Allocator = Device[self.device].allocator
     if base is None:
       assert offset == 0, "base buffers can't have offset"
       self._base = None
@@ -127,8 +128,6 @@ class Buffer:
   def base(self) -> Buffer: return self._base if self._base is not None else self
   @property
   def lb_refcount(self): return self.base._lb_refcount
-  @property
-  def allocator(self) -> Allocator: return Device[self.device].allocator
   def ref(self, cnt):
     self.base._lb_refcount += cnt
     return self
