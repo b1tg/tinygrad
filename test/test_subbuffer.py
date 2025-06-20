@@ -15,17 +15,26 @@ class TestSubBuffer(unittest.TestCase):
     sub_buf = buf.view(3, dtypes.uint8, offset=4)
     self.assertFalse(buf.is_allocated())
     self.assertFalse(sub_buf.is_allocated())
+
+    # base buffer alloc
     buf.allocate()
     self.assertTrue(buf.is_allocated())
     self.assertTrue(sub_buf.is_allocated())
-    sub_buf.deallocate() # TODO: what behaiour when you run deacllocated on subbuffers
+
+    # subbuffer dealloc, deallocation on subbuffers should not affect the base buf state
+    sub_buf.deallocate()
     self.assertTrue(sub_buf.is_allocated())
     self.assertTrue(buf.is_allocated())
-    sub_buf.allocate()
-    self.assertTrue(sub_buf.is_allocated())
+
+    # base buffer dealloc
     buf.deallocate()
     self.assertFalse(buf.is_allocated())
     self.assertFalse(sub_buf.is_allocated())
+
+    # subbuffer alloc
+    sub_buf.ensure_allocated()
+    self.assertTrue(sub_buf.is_allocated())
+    self.assertTrue(buf.is_allocated())
 
   def test_copy_in_out_subbuffer(self):
     sub_buf = self.buf.view(3, dtypes.uint8, offset=3).ensure_allocated() # [3:6]
@@ -57,33 +66,30 @@ class TestSubBuffer(unittest.TestCase):
     self.buf.copyout(memoryview(data_out_base))
     assert expected_base_data == data_out_base
 
-  def test_del(self):
-    sub_buf = self.buf.view(4, dtypes.int8, offset=3).ensure_allocated()
-    del sub_buf
-    assert self.buf.as_buffer().tolist() == list(range(10))
-
-  def test_uaf(self):
-    # delete subbuffer do not affect base
-    sub_buf = self.buf.view(4, dtypes.int8, offset=3).ensure_allocated()
-    assert self.buf.as_buffer().tolist(), list(range(10))
-    sub_buf.deallocate()
-    # TODO: .del not work
-    assert self.buf.as_buffer().tolist(), list(range(10))
-
-    # sub_buf.allocate()
-    sub_buf = self.buf.view(4, dtypes.int8, offset=3).ensure_allocated()
-    # why sub_buf still work here
-    assert sub_buf.as_buffer().tolist(), list(range(3, 7))
-    self.buf.deallocate()
-    # assert sub_buf.as_buffer().tolist(), list(range(3, 7))
-    with self.assertRaises(AssertionError):
-      sub_buf.as_buffer().tolist()
-
-  def test_subbuffer_allocate(self):
+  def test_subbuffer_alloc(self):
     sub_buf = self.buf.view(4, dtypes.int8, offset=3)
     sub_buf.allocate()
     sub_buf.copyin(memoryview(bytearray(range(10, 14))))
     assert self.buf.as_buffer().tolist()[3:7] == sub_buf.as_buffer().tolist()
+
+  def test_subbuffer_dealloc(self):
+    sub_buf = self.buf.view(4, dtypes.int8, offset=3).ensure_allocated()
+    sub_buf.deallocate()
+    assert self.buf.as_buffer().tolist() == list(range(10))
+
+  def test_uaf(self):
+    sub_buf = self.buf.view(4, dtypes.int8, offset=3).ensure_allocated()
+    assert self.buf.as_buffer().tolist(), list(range(10))
+    sub_buf.deallocate()
+    with self.assertRaises(AttributeError):
+      sub_buf.as_buffer().tolist()
+    assert self.buf.as_buffer().tolist(), list(range(10))
+
+    sub_buf = self.buf.view(4, dtypes.int8, offset=3).ensure_allocated()
+    assert sub_buf.as_buffer().tolist(), list(range(3, 7))
+    self.buf.deallocate()
+    with self.assertRaises(AssertionError):
+      sub_buf.as_buffer().tolist()
 
   def test_subbuffer(self):
     vbuf = self.buf.view(2, dtypes.uint8, offset=3).ensure_allocated()
