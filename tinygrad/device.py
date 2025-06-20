@@ -131,9 +131,9 @@ class Buffer:
   def ref(self, cnt):
     self.base._lb_refcount += cnt
     return self
-  # Checks if the underlying buffer is allocated, possibly from the base object
+  # check if the underlying buffer is allocated, possibly from the base object
   def is_allocated(self) -> bool: return self.base.is_allocated() if self._base is not None else hasattr(self, '_buf')
-  # Checks if the underlying buffer is allocated and the current buffer is initialized
+  # check if the underlying buffer is allocated and the current buffer/view is initialized
   def is_initialized(self) -> bool: return self.is_allocated() and hasattr(self, '_buf')
   def ensure_allocated(self) -> Buffer: return self.allocate() if not self.is_initialized() else self
   def allocate(self, opaque=None, external_ptr=None) -> Buffer:
@@ -152,7 +152,7 @@ class Buffer:
       if not self.device.startswith("DISK"): GlobalCounters.mem_used += self.nbytes
     return self
   def deallocate(self):
-    if not self.is_initialized(): return
+    assert hasattr(self, '_buf'), "buffer must be allocated to deallocate"
     if DEBUG is not None and DEBUG >= 7: print(f"buffer: deallocate {self.nbytes} bytes on {self.device}")
     if self._base is None and (self.options is None or self.options.external_ptr is None):
       if GlobalCounters is not None and not self.device.startswith("DISK"): GlobalCounters.mem_used -= self.nbytes
@@ -170,7 +170,7 @@ class Buffer:
     return self.__class__, (self.device, self.size, self.dtype, None, self.options, buf, self.lb_refcount)
   @property
   def nbytes(self): return self.size*self.dtype.itemsize
-  def __del__(self): self.deallocate()
+  def __del__(self): (not hasattr(self, '_buf')) or self.deallocate()
   def __repr__(self):
     return f"<buf real:{self.is_allocated()} device:{self.device} size:{self.size} dtype:{self.dtype}" + \
            (f" offset:{self.offset}" if self._base is not None else "") + (f" {self.options=}" if self.options is not None else "") + ">"

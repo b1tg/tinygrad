@@ -51,6 +51,15 @@ class TestSubBuffer(unittest.TestCase):
     self.assertTrue(sub_buf.is_allocated())
     self.assertTrue(sub_buf.is_initialized())
 
+  def test_dealloc(self):
+    sub_buf = self.buf.view(3, dtypes.uint8, offset=4).ensure_allocated()
+    self.buf.deallocate()
+    with self.assertRaises(AssertionError):
+      self.buf.deallocate()
+    sub_buf.deallocate()
+    with self.assertRaises(AssertionError):
+      sub_buf.deallocate()
+
   def test_copy_in_out_subbuffer(self):
     sub_buf = self.buf.view(3, dtypes.uint8, offset=3).ensure_allocated() # [3:6]
     sub_buf.copyin(memoryview(bytearray(range(3))))
