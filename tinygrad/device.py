@@ -131,10 +131,11 @@ class Buffer:
   def ref(self, cnt):
     self.base._lb_refcount += cnt
     return self
+  def is_initialized(self) -> bool: return self.is_allocated() and hasattr(self, '_buf')
   def is_allocated(self) -> bool:
     if self._base is not None: return self.base.is_allocated()
     return hasattr(self, '_buf')
-  def ensure_allocated(self) -> Buffer: return self.allocate() if not self.is_allocated() or not hasattr(self, '_buf') else self
+  def ensure_allocated(self) -> Buffer: return self.allocate() if not self.is_initialized() else self
   def allocate(self, opaque=None, external_ptr=None) -> Buffer:
     assert not hasattr(self, '_buf'), "can't allocate already allocated buffer"
     if DEBUG >= 7: print(f"buffer: allocate {self.nbytes} bytes on {self.device}")
@@ -190,13 +191,13 @@ class Buffer:
   def copyin(self, mv:memoryview):
     mv = flat_mv(mv)
     assert len(mv) == self.nbytes, f"size mismatch, {len(mv)=} != {self.dtype=} {self.size=}"
-    assert self.is_allocated(), "can't copyin to unallocated buffer"
+    assert self.is_initialized(), "can't copyin to unallocated buffer"
     self.allocator._copyin(self._buf, mv)
     return self
   def copyout(self, mv:memoryview) -> memoryview:
     mv = flat_mv(mv)
     assert len(mv) == self.nbytes, f"size mismatch, {len(mv)=} != {self.dtype=} {self.size=}"
-    assert self.is_allocated(), "can't copyout unallocated buffer"
+    assert self.is_initialized(), "can't copyout unallocated buffer"
     self.allocator._copyout(mv, self._buf)
     return mv
   def view(self, size:int, dtype:DType, offset:int) -> Buffer:

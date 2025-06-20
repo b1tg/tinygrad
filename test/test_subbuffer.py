@@ -81,7 +81,7 @@ class TestSubBuffer(unittest.TestCase):
     sub_buf = self.buf.view(4, dtypes.int8, offset=3).ensure_allocated()
     assert self.buf.as_buffer().tolist(), list(range(10))
     sub_buf.deallocate()
-    with self.assertRaises(AttributeError):
+    with self.assertRaises(AssertionError):
       sub_buf.as_buffer().tolist()
     assert self.buf.as_buffer().tolist(), list(range(10))
 
