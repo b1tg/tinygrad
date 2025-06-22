@@ -1,10 +1,72 @@
 from __future__ import annotations
-import heapq
+import heapq, time
 from collections import defaultdict
 from dataclasses import dataclass, replace
 from tinygrad.uop.ops import UOp, Ops, PatternMatcher, UPat, GroupOp
 from tinygrad.helpers import dedup, partition, all_same, flatten, getenv
 from tinygrad.uop.spec import type_verify
+from typing import List, Dict, DefaultDict, Set
+def print_uops(uops:list[UOp], ret=False):
+  res = []
+  for i,u in enumerate(uops):
+    formatted_parents = [(uops.index(x) if x.op is not Ops.CONST else f"{x.arg}") if x in uops else "--" for x in u.src]
+    # print(f"{i:4d} {str(u.op):20s}: {str(u.dtype):30s} " f"{str(formatted_parents):32s} {u.arg}")
+    res.append(f"{i:4d} {str(u.op):20s}: {str(u.dtype):30s} " f"{str(formatted_parents):32s} {u.arg}")
+  if ret:
+    return '\n'.join(res)
+  else:
+    print('\n'.join(res))
+def calc_distance(lst: List[UOp]) -> int:
+  """
+  使用扫掠线算法高效计算一个 UOp 列表的最大寄存器压力。
+  时间复杂度: O(N*logN)，其中 N 是 UOps 的数量。
+  """
+  if not lst:
+    return 0
+
+  st=time.perf_counter()
+  in_this_block: Set[UOp] = set(lst)
+
+  # 1. 预计算：找到每个 UOp 被最后一次使用的索引
+  last_use: Dict[UOp, int] = {}
+  for i, u in enumerate(lst):
+    for s in u.src:
+      if s in in_this_block:
+        # 因为我们是正向遍历，所以每次更新都是一个更晚的使用点
+        last_use[s] = i
+
+  # print(f"  last_use use {(et:=(time.perf_counter()-st))*1000:6.2f} ms")
+  # 2. 创建事件点：(index, type)
+  # type=1 表示一个值的生命周期开始（定义）
+  # type=-1 表示一个值的生命周期结束（最后一次使用）
+  events = []
+  for i, u in enumerate(lst):
+    # 只有被使用过的 UOp 才会有生命周期和寄存器压力
+    if u in last_use:
+      # 定义事件：在索引 i 处，u 被定义
+      events.append((i, 1))
+      # 最后使用事件：在索引 last_use[u] 处，u 的生命周期结束
+      events.append((last_use[u], -1))
+
+  # 3. 扫掠计算：对事件排序并计算压力
+  # 排序规则：
+  # 1. 主要按索引排序。
+  # 2. 如果索引相同，则将 -1 (生命周期结束) 排在 1 (生命周期开始) 之前。
+  #    这确保了在同一条指令中，一个值被消费后，我们先释放其寄存器，
+  #    再为新定义的值分配寄存器，这准确地模拟了寄存器分配。
+
+  # st = time.perf_counter()
+  events.sort()
+  # print(f"  event.sort() use {(et:=(time.perf_counter()-st))*1000:6.2f} ms")
+
+  max_pressure = 0
+  current_pressure = 0
+  for _, type in events:
+    current_pressure += type
+    if current_pressure > max_pressure:
+      max_pressure = current_pressure
+
+  return max_pressure
 
 # NOTE: any toposort should be valid here, unlike last time this isn't required, it's just for speed
 def block_reorder(lst:list[UOp]) -> list[UOp]:
@@ -41,6 +103,104 @@ def block_reorder(lst:list[UOp]) -> list[UOp]:
       if in_degree[v] == 0: heapq.heappush(heap, (nkey[v],v))
 
   assert len(newlst) == len(lst), f"len mismatch {len(newlst)} != {len(lst)}"
+
+  if 1 and len(lst)>200:
+    # if vgpr0 == 178:
+    #   with open("target/reorder_0", "w") as f:
+    #     f.write(print_uops(lst, ret=True))
+    #   with open("target/reorder_1", "w") as f:
+    #     f.write(print_uops(newlst, ret=True))
+    st = time.perf_counter()
+
+    vpgr_lst = block_reorder2(lst)
+
+    vgpr0 = calc_distance(lst)
+    vgpr = calc_distance(newlst)
+    vgpr2 = calc_distance(vpgr_lst)
+
+    # if vgpr>256:
+    #   best_lst = min([lst, newlst, vpgr_lst], key=calc_distance)
+    #   return best_lst
+
+    # 104h36m 256
+    # 104h45m 512/400 1984-2012
+    if vgpr0 > 300:
+      vpgr_lst = block_reorder2(lst)
+      vgpr2 = calc_distance(vpgr_lst)
+      print(f"vgpr 1: {vgpr0} => {vgpr} => {vgpr2} {len(lst)}")
+      return vpgr_lst
+    # method get 1999ms
+    if 1 and vgpr>256 and vgpr > vgpr0:
+    #if vgpr>vgpr0:
+      # print("use old lst")
+      vpgr_lst = block_reorder2(lst)
+      vgpr2 = calc_distance(vpgr_lst)
+      # if vgpr2 < vgpr0:
+      print(f"vgpr 1: {vgpr0} => {vgpr} => {vgpr2} {len(lst)}")
+      return vpgr_lst
+    #   print(f"vgpr 1: {vgpr0} => {vgpr} {len(lst)}")
+    #   print(f"vgpr1 use {et:6.2f} ms")
+      #   print("use old lst")
+      #   return lst
+  # print(f"use {(et:=(time.perf_counter()-st))*1000:6.2f} ms")
+  return newlst
+
+def block_reorder2(lst: List[UOp]) -> List[UOp]:
+  in_this_block = set(lst)
+  # u: 依赖u的UOp列表，u的儿子们
+  local_children: defaultdict[UOp, list[UOp]] = defaultdict(list)
+  # u 还有几个“爸爸”没执行完。
+  in_degree:dict[UOp, int] = {u: 0 for u in lst}
+  # --- 步骤 1: 预计算和图构建 ---
+  for u in lst:
+    for s in u.src:
+      if s in in_this_block:
+        local_children[s].append(u)
+        in_degree[u] += 1
+  # u: 依赖u的UOp列表长度
+  usage_count: Dict[UOp, int] = {u: len(local_children.get(u, [])) for u in lst}
+  depth: Dict[UOp, int] = {}
+  for u in reversed(lst):
+    depth[u] = 1 + max([depth.get(c, 0) for c in local_children[u]], default=0)
+  # 添加原始位置作为唯一的 tie-breaker
+  original_pos: Dict[UOp, int] = {u: i for i, u in enumerate(lst)}
+  original_pos: Dict[UOp, int] = {u: i for i, u in enumerate(lst)}
+  # for i, u in enumerate(lst):
+  #   if u.op is Ops.LOAD: original_pos[u] -= 1000 
+  #   if u.op is Ops.BARRIER: original_pos[u] -= 1500 
+  # --- 步骤 2: 列表调度算法 ---
+  ready_heap: List[tuple[tuple, UOp]] = []
+  # 初始化就绪队列
+  for u in lst:
+    if in_degree[u] == 0:
+      # 使用静态信息进行初始评分，并加入 tie-breaker
+      score = (-depth[u], original_pos[u])
+      heapq.heappush(ready_heap, (score, u))
+  newlst: List[UOp] = []
+  while ready_heap:
+    _, u = heapq.heappop(ready_heap)
+    newlst.append(u)
+    # 在调度 u 之后，更新其源操作数的 `usage_count`
+    for s in u.src:
+      if s in in_this_block:
+        # `usage_count` 字典中可能没有所有 uops，特别是那些没有子节点的
+        if s in usage_count:
+          usage_count[s] -= 1
+    # 更新其子节点的入度，并将新就绪的指令加入队列
+    for v in local_children[u]:
+      in_degree[v] -= 1
+      if in_degree[v] == 0:
+        # 动态计算一个更准确的分数
+        # releases_regs 的含义是：“如果我现在调度指令 v，那么 v 将会释放多少个当前正被占用的寄存器？”
+        # 即目前已经被调度的一些uops只剩下这一个儿子，这个儿子消费之后它们可以释放了
+        releases_regs = sum(1 for s in v.src if s in in_this_block and usage_count.get(s, 0) == 1)
+        # future_usage: 后面还有几个消费者
+        future_usage = len(local_children.get(v, []))
+        # 最终分数: (负的释放数, 未来使用数, 负的深度, 原始位置)
+        # `original_pos[v]` 作为最终的、确保唯一的 tie-breaker，避免比较 UOp 对象
+        score = (-releases_regs, future_usage, -depth[v], original_pos[v])
+        heapq.heappush(ready_heap, (score, v))
+  assert len(newlst) == len(lst), f"Length mismatch: {len(newlst)} != {len(lst)}"
   return newlst
 
 # ***** basic block *****
