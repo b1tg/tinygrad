@@ -74,9 +74,9 @@ class OnnxParser:
   def __init__(self, inp: Union[Tensor, str, pathlib.Path, bytes], load_external_data: bool=True):
     self.file_path: Union[pathlib.Path, None] = None
     self.load_external_data = load_external_data
+    self.cpu = isinstance(inp, bytes)
     if isinstance(inp, bytes):
       self.tensor = inp
-      self.cpu = True
     elif not isinstance(inp, Tensor):
       self.file_path = pathlib.Path(inp)
       self.tensor = Tensor(self.file_path)
