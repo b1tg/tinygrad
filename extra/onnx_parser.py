@@ -1,7 +1,7 @@
 # https://github.com/onnx/onnx/blob/main/onnx/onnx.proto3
 
 import os, pathlib, struct
-from io import BufferedReader
+from io import BufferedReader, BytesIO
 from typing import Tuple, Union
 from types import SimpleNamespace
 from tinygrad.nn.state import TensorIO
@@ -55,7 +55,7 @@ PB_INFOS = {
   "TypeProtoTensor": {1: ("elem_type", PBType.INT), 2: ("shape", PBType.SUB, False, ("TensorShapeProto", lambda: {"dim": []}))},
 }
 
-def onnx_load(fn: Union[Tensor, str, pathlib.Path], load_external_data: bool=True):
+def onnx_load(fn: Union[Tensor, str, pathlib.Path, bytes], load_external_data: bool=True):
   parser = OnnxParser(fn, load_external_data)
   onnx_model = parser.parse()
   model = dict_to_namespace(onnx_model)
@@ -71,10 +71,13 @@ def dict_to_namespace(d):
   return d
 
 class OnnxParser:
-  def __init__(self, inp: Union[Tensor, str, pathlib.Path], load_external_data: bool=True):
+  def __init__(self, inp: Union[Tensor, str, pathlib.Path, bytes], load_external_data: bool=True):
     self.file_path: Union[pathlib.Path, None] = None
     self.load_external_data = load_external_data
-    if not isinstance(inp, Tensor):
+    if isinstance(inp, bytes):
+      self.tensor = inp
+      self.cpu = True
+    elif not isinstance(inp, Tensor):
       self.file_path = pathlib.Path(inp)
       self.tensor = Tensor(self.file_path)
     else: self.tensor = inp
@@ -95,7 +98,7 @@ class OnnxParser:
       self.registered_handles[pb_name] = res
 
   def parse(self):
-    reader = BufferedReader(TensorIO(self.tensor))
+    reader = BufferedReader(TensorIO(self.tensor) if not self.cpu else BytesIO(self.tensor))
     return self._parse_message(reader, "ModelProto", lambda: {"opset_import": [], "domain": None, "graph": None})
 
   def decode_varint(self, reader: BufferedReader) -> int:
@@ -131,9 +134,10 @@ class OnnxParser:
     if message_field_handlers_name == "TensorProto" and self.load_external_data and obj.get("data_location", 0) == 1: self._parse_external_data(obj)
     return obj
 
-  def _handle_delimited(self, reader:BufferedReader, use_tensor=False) -> Tuple[bytes, Tensor]:
+  def _handle_delimited(self, reader:BufferedReader, use_tensor=False, cpu=False) -> Tuple[bytes, Tensor]:
     str_len = self.decode_varint(reader)
-    if not use_tensor: return reader.read(str_len)
+    if not use_tensor or cpu: return reader.read(str_len)
+    if isinstance(reader.raw, BytesIO): return Tensor(reader.read(str_len))
     res = reader.raw._tensor[reader.tell():(reader.tell()+str_len)]
     reader.seek(str_len, os.SEEK_CUR)
     return res
@@ -175,10 +179,10 @@ class OnnxParser:
 
   def _handle_sub_message(self, obj, key_name, reader, wire_type, parser_func=None, repeated=False):
     if wire_type != WIRETYPE_LENGTH_DELIMITED: raise ValueError(f"Expected length-delimited for sub-message field '{key_name}'")
-    value = self._handle_delimited(reader, use_tensor=True)
-    if isinstance(parser_func, str): sub_obj = self._parse_message(BufferedReader(TensorIO(value)), parser_func)
-    elif isinstance(parser_func, tuple): sub_obj = self._parse_message(BufferedReader(TensorIO(value)), parser_func[0], parser_func[1])
-    else: sub_obj = parser_func(BufferedReader(TensorIO(value)))
+    value = self._handle_delimited(reader, use_tensor=True, cpu=self.cpu)
+    if isinstance(parser_func, str): sub_obj = self._parse_message(BufferedReader(BytesIO(value) if self.cpu else TensorIO(value)), parser_func)
+    elif isinstance(parser_func, tuple): sub_obj = self._parse_message(BufferedReader(BytesIO(value) if self.cpu else TensorIO(value)), parser_func[0], parser_func[1])
+    else: sub_obj = parser_func(BufferedReader(BytesIO(value) if self.cpu else TensorIO(value)))
     gen_result(obj, key_name, sub_obj, repeated)
 
   def _parse_external_data(self, obj):
