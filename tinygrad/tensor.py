@@ -4274,8 +4274,8 @@ def _metadata_wrapper(fn: Callable[P, T]) -> Callable[P, T]:
 
       caller = f"{caller_module}:{caller_lineno}::{caller_func}"
     else: caller = ""
-
-    token = _METADATA.set(Metadata(name=fn.__name__, caller=caller))
+    m = Metadata(name=fn.__name__, caller=caller)
+    token = _METADATA.set(m)
     ret = fn(*args, **kwargs)
     _METADATA.reset(token)
     return ret
