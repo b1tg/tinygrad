@@ -1,6 +1,7 @@
 from __future__ import annotations
 import sys, argparse
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv
+# import time
 
 class SimpleTokenizer:
   def __init__(self, vocab: list[str]):
@@ -140,7 +141,7 @@ class Transformer:
     v_start_pos = UOp.variable("start_pos", 1, self.max_context-1)
     start_pos = 0
     t = Tensor([tokens[start_pos:]], dtype="int32")
-    self.forward_jit.reset()  # TODO: why is this required? root cause the issue and make it not be needed
+    # self.forward_jit.reset()  # TODO: why is this required? root cause the issue and make it not be needed
     while len(tokens) < self.max_context:
       t = self(t, v_start_pos.bind(start_pos) if getenv("SYM", 1) and start_pos != 0 and t.shape[-1] == 1 else start_pos)
       next_id = int(t.item())
@@ -172,11 +173,17 @@ if __name__ == "__main__":
   ids: list[int] = [bos_id]
   while 1:
     start_pos = len(ids) - 1
+    # st = time.perf_counter()
     try:
       ids += tok.role("user") + tok.encode(input('>>> ')) + [eos_id] + tok.role("assistant")
     except EOFError:
       break
+    # print(f"cost: {(time.perf_counter()-st)*1e6:9.2f}")
+    # st = time.perf_counter()
+    # sys.stdout.flush()
     for next_id in model.generate(ids, start_pos):
       sys.stdout.write(tok.decode([next_id]) if next_id != eos_id else "\n\n")
       sys.stdout.flush()
       if next_id == eos_id: break
+
+    # print(f"gen cost: {(time.perf_counter()-st)*1e6:9.2f}")
