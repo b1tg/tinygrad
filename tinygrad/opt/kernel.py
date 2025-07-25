@@ -454,7 +454,6 @@ class Kernel:
         # NOTE: if CONST got masked after applying opts, we create a new VALID
         if op.op is Ops.CONST and any(v.mask is not None for v in st.views): return op.view(st).valid()
         # otherwise we just replace the VIEW source
-        st = st.reshape(tuple(x for x in st.shape if not (isinstance(x, int) and x == 1)))
         return ret.replace(src=(ret.src[0].replace(arg=st),)+ret.src[1:])
       if op.op is Ops.SINK:
         # NOTE: should group_for_reduces be added to the local_dims?
