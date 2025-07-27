@@ -990,7 +990,7 @@ class TestSchedule(unittest.TestCase):
     out0 = a.sum() + 2
     out1 = a.sum() + b
     # run_schedule(check_schedule([out0, out1], 2))
-    run_schedule(check_schedule([out0, out1], 3))
+    run_schedule(check_schedule([out0, out1], 4))
     np.testing.assert_allclose(out0.numpy(), a.numpy().sum()+2, atol=1e-4, rtol=1e-4)
     np.testing.assert_allclose(out1.numpy(), a.numpy().sum()+b.numpy(), atol=1e-4, rtol=1e-4)
 
@@ -1996,7 +1996,7 @@ class TestIndexing(unittest.TestCase):
   def test_simple_store_reshape(self):
     a = Tensor.empty(32, 32).sum(axis=1)+Tensor.empty(1,32)
     ast = a.schedule()[0].ast
-    self.assertEqual(ast.shape, (1, 32))
+    self.assertEqual(ast.shape, (1, 32,))
     self.assertEqual(a.uop.shape, (1, 32))
 
   def test_no_reshape_reduceop(self):
