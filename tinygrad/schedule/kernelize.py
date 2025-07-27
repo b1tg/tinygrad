@@ -44,11 +44,7 @@ def split_reduceop(reduce:UOp, x:UOp):
   splitted = x.reshape(splitted_shape).permute(tuple([d for d in range(len(splitted_shape)) if d!=dim_to_split]+[dim_to_split]))
   if DEBUG >= 3: print(f"split {divisor}: {x.shape} -> {splitted.shape} -> {reduce.shape}")
   # reduce original axes, then split
-  try:
-    # hack for test/test_randomness.py TestRandomness.test_randn_finite
-    return splitted.r(*reduce.arg).r(reduce.arg[0], (len(reduce.shape),)).reshape(reduce.shape)
-  except Exception:
-    return None
+  return splitted.r(*reduce.arg).r(reduce.arg[0], (len(reduce.shape),)).reshape(reduce.shape)
 
 def copy_reorder_view(copy:UOp, view:UOp, base:UOp):
   if prod(view.shape) < prod(base.shape): return view.contiguous().copy_to_device(copy.device)
@@ -84,8 +80,7 @@ sym = symbolic_simple+PatternMatcher([
   (UPat(Ops.CONTIGUOUS, name="root", src=(UPat(Ops.VIEW, name="view", src=(UPat(Ops.BUFFER, name="buf"),)),)),
    lambda root,view,buf: view if view.st.contiguous and view.size == buf.size else None),
   # contiguous/buffer/copy/assign is already contiguous
-  # # TODO: hack for test/test_multitensor.py TestMultiTensor.test_matmul_shard_none
-  # (UPat(Ops.CONTIGUOUS, name="root", src=(UPat((Ops.CONTIGUOUS, Ops.BUFFER, Ops.COPY, Ops.ASSIGN)),)), lambda root: root.src[0]),
+  (UPat(Ops.CONTIGUOUS, name="root", src=(UPat((Ops.CONTIGUOUS, Ops.BUFFER, Ops.ASSIGN)),)), lambda root: root.src[0]),
   # substitute BITCAST/CONTIGUOUS with BUFFER_VIEW on DISK
   (UPat((Ops.BITCAST, Ops.CONTIGUOUS), src=(UPat.var("x"),), name="t"), lambda x,t: UOp(Ops.BUFFER_VIEW, t.dtype, (x.base,),
     (t.size, x.st.views[0].offset)).reshape(t.shape) if isinstance(x.device, str) and x.device.startswith("DISK") else None),
@@ -196,8 +191,6 @@ view_left = merge_views+PatternMatcher([
   # view before elementwise and buffer ops
   (UPat(Ops.VIEW, src=(UPat({*GroupOp.ALU, Ops.CAST, Ops.BITCAST, Ops.BIND, Ops.LOAD, Ops.STORE, Ops.VALID}, name="e"),), name="view"),
    lambda e,view: e.replace(src=tuple(s.view(view.st) for s in e.src))),
-  # if there's ones added after reduce, put this before the reduce
-  # (UPat(Ops.VIEW, src=(UPat(Ops.REDUCE_AXIS, src=(UPat.var("src"),), name="r"),), name="view"), reduce_push_add_ones),
 ])
 
 def apply_swizzle(u:UOp) -> UOp: return graph_rewrite(u, view_left, name="Sub View Left")
