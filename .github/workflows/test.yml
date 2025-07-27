@@ -48,6 +48,8 @@ jobs:
       - name: tc
         run: PYTHONPATH=. DEBUG=5 python3 test/test_ops.py TestOps.test_gemm
       - name: tc1
-        run: PYTHONPATH=. DEBUG=5 CUDA=0 NV=1 PTX=1 SHOULD_USE_TC=1 HALF=1 python3 extra/gemm/simple_matmul.py | tee matmul_ptx.txt
+        run: PYTHONPATH=. DEBUG=5 CUDA=0 NV=1 PTX=1 SHOULD_USE_TC=1 HALF=0 python3 extra/gemm/simple_matmul.py
+      - name: tc2
+        run: PYTHONPATH=. DEBUG=5 CUDA=0 PTX=1 ALLOW_TF32=1 NV=1 python3 test/test_linearizer.py TestLinearizer.test_tensor_cores TestLinearizer.test_tensor_cores_padded TestLinearizer.test_tensor_cores_padded_uops
       - name: Run process replay tests
         uses: ./.github/actions/process-replay
