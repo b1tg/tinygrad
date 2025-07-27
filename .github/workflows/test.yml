@@ -47,5 +47,7 @@ jobs:
         # run: python -m pytest -n=auto test/ --ignore=test/models --ignore=test/unit --ignore test/test_gc.py --ignore test/test_multitensor.py --durations=20
       - name: tc
         run: PYTHONPATH=. DEBUG=5 python3 test/test_ops.py TestOps.test_gemm
+      - name: tc1
+        run: PYTHONPATH=. DEBUG=5 CUDA=0 NV=1 PTX=1 SHOULD_USE_TC=1 HALF=1 python3 extra/gemm/simple_matmul.py | tee matmul_ptx.txt
       - name: Run process replay tests
         uses: ./.github/actions/process-replay
