@@ -75,7 +75,7 @@ class Kernel:
     # add a shapetracker to the end to track the full shape, with 0 strides so it can merge
     full_shape = ast.full_shape
     self.sts.append(ShapeTracker.from_shape(full_shape, (0,)*len(full_shape)))
-
+    # self.sts = [st.reshape(st.shape + (1,) * (len(full_shape) - len(st.shape))) for st in self.sts]
     # parameters for optimization
     self.tensor_core: TensorCore|None = None
     self.tensor_core_opts: TensorCoreOptions|None = None
@@ -448,6 +448,7 @@ class Kernel:
       ret = op.replace(src=tuple(fixup_ast(x) for x in op.src)) # noqa: F821
       if op.op in GroupOp.Buffer and op in self.bufs:
         st = self.sts[self.bufs.index(op)]
+        # st = st.reshape(tuple([x for x in st.shape if resolve(x != 1)]))
         # replace the VIEW source
         return ret.replace(src=(ret.src[0].replace(arg=st),)+ret.src[1:])
       if op.op is Ops.SINK:

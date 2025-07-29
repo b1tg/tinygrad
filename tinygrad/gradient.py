@@ -5,7 +5,9 @@ from tinygrad.uop.ops import UOp, PatternMatcher, UPat, Ops, all_metadata
 from tinygrad.helpers import argsort
 
 def reduce_gradient(ctx:UOp, ret:UOp):
-  def to_inp_shape(x): return x.reshape(x.shape+(1,)*(len(ret.src[0].shape)-len(x.shape))).expand(ret.src[0].shape)
+  def to_inp_shape(x):
+    # print(f"to_inp_shape: {x.shape=} => reshape: {x.shape+(1,)*(len(ret.src[0].shape)-len(x.shape))} => expand: {ret.src[0].shape}")
+    return x.reshape(x.shape+(1,)*(len(ret.src[0].shape)-len(x.shape))).expand(ret.src[0].shape)
   if ret.arg[0] == Ops.ADD: return (to_inp_shape(ctx),)
   if ret.arg[0] == Ops.MAX:
     max_is_1s = ret.src[0].ne(to_inp_shape(ret)).ne(ret.src[0].const_like(1).cast(dtypes.bool)).cast(ctx.dtype)
@@ -40,7 +42,9 @@ pm_gradient = PatternMatcher([
   (UPat(Ops.FLIP, name="ret"), lambda ctx, ret: (ctx.flip(ret.arg),)),
   # TODO: this cast can be removed by putting the casts around the EXPAND
   (UPat(Ops.EXPAND, name="ret"), lambda ctx, ret:
-    (ctx.cast(sum_acc_dtype(ctx.dtype)).r(Ops.ADD, tuple(i for i,(si,so) in enumerate(zip(ret.src[0].shape, ret.arg)) if si!=so)).cast(ctx.dtype),)),
+    # after this test/test_ops.py pass, for example: python test/test_ops.py TestOps.test_var_zero_in_axis
+    (ctx.cast(sum_acc_dtype(ctx.dtype)).r( Ops.ADD, tuple(i for i,(si,so) in enumerate(zip(ret.src[0].shape, ret.arg)) if si!=so)).cast(
+      ctx.dtype).reshape(ret.src[0].shape),)),
   (UPat(Ops.MULTI, name="ret"), lambda ctx, ret: ctx.shard(ret.device, ret.axis).src),
   # there's no gradient for bitcast
   (UPat(Ops.BITCAST), lambda ctx: (None,)),

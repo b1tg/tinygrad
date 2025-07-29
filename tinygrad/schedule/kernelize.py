@@ -3,7 +3,7 @@ from tinygrad.uop.ops import UOp, Ops, GroupOp, PatternMatcher, UPat, graph_rewr
 from tinygrad.uop.ops import track_rewrites, _substitute
 from tinygrad.uop.spec import type_verify, tensor_uop_spec
 from tinygrad.uop.symbolic import symbolic_simple
-from tinygrad.helpers import Metadata, all_int, all_same, colored, prod, dedup, unwrap, getenv, pluralize, FUSE_ARANGE, DEBUG, SPLIT_REDUCEOP
+from tinygrad.helpers import Metadata, all_int, all_same, colored, prod, dedup, unwrap, getenv, pluralize, FUSE_ARANGE, SPLIT_REDUCEOP
 from tinygrad.dtype import ImageDType, dtypes
 from tinygrad.schedule.multi import multi_pm
 from tinygrad.shape.shapetracker import ShapeTracker
@@ -27,7 +27,7 @@ def simplify_stride0_reduce(reduce:UOp, x:UOp):
     case Ops.ADD: return ret*prshape
     case Ops.MUL: return ret.pow(prshape)
     case Ops.MAX: return ret # NOTE: Ops.MAX is passthrough
-
+# REDUCE_AXIS->x
 def split_reduceop(reduce:UOp, x:UOp):
   if not SPLIT_REDUCEOP or not all_int(x.shape) or (prod(x.shape)//prod(reduce.shape))<getenv("REDUCEOP_SPLIT_THRESHOLD", 32768): return None
   # if there are few globals, make some reduces into globals by splitting into two kernels
@@ -41,9 +41,16 @@ def split_reduceop(reduce:UOp, x:UOp):
   dim_to_split, divisor = split_candidates[0]
   splitted_shape = x.shape[:dim_to_split]+(divisor,)+(x.shape[dim_to_split]//divisor,)+x.shape[dim_to_split+1:]
   splitted = x.reshape(splitted_shape).permute(tuple([d for d in range(len(splitted_shape)) if d!=dim_to_split]+[dim_to_split]))
-  if DEBUG >= 3: print(f"split {divisor}: {x.shape} -> {splitted.shape} -> {reduce.shape}")
+  print(f"split {divisor}: {x.shape} -> {splitted.shape} -> {reduce.shape=}, {reduce.arg=}")
   # reduce original axes, then split
-  return splitted.r(*reduce.arg).r(reduce.arg[0], (len(reduce.shape),)).reshape(reduce.shape)
+  ret = splitted.r(*reduce.arg, permute=True)
+  print(f"0 {ret.shape=}")
+  ret = ret.r(reduce.arg[0], (len(ret.shape)-1,), permute=True)
+  print(f"1 {ret.shape=}")
+  ret = ret.reshape(ret.shape)
+  print(f"2 {ret.shape=}")
+  return ret
+  # return splitted.r(*reduce.arg, permute=False).r(reduce.arg[0], (len(reduce.shape),), permute=False).reshape(reduce.shape)
 
 def copy_reorder_view(copy:UOp, view:UOp, base:UOp):
   if prod(view.shape) < prod(base.shape): return view.contiguous().copy_to_device(copy.device)
@@ -219,10 +226,17 @@ def swizzle_reduceop(r:UOp, src:UOp, view:UOp, fuse=False):
   else: red = UOp(Ops.REDUCE_AXIS, r.dtype, (swizzled_input,), (r.arg[0], new_axis))
   return red.reshape(view.shape)
 
+# reduce/view/src
 def reduceop_view_right(src:UOp, v:UOp, r:UOp):
   assert unwrap(v.st).contiguous and v.size == src.size, f"can't compute new axis for {src.shape} -> {r.shape}"
   new_axis = [i for i,(s,u) in enumerate(zip(src.shape, r.shape)) if s != u]
-  return src.r(r.arg[0], tuple(new_axis)).reshape(r.shape)
+  # print(f"reduceop_view_right: {src.shape=} {r.shape=}, {new_axis=}")
+  # src.shape=(3, 2, 1) r.shape=(3, 1, 1), new_axis=[1]
+
+  # if all(resolve(src.shape[x] == 1) for x in new_axis):
+  # if all(x==1 for x in new_axis):
+    # return src.r(r.arg[0], tuple()).reshape(r.shape)
+  return src.r(r.arg[0], tuple(new_axis), permute=False).reshape(r.shape)
 
 def elementwise_view_right(root:UOp):
   if not (swizzles:=[x for x in root.src if x.op is Ops.VIEW and x.base.op not in ALWAYS_CONTIGUOUS]): return None

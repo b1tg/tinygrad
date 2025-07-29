@@ -60,7 +60,14 @@ def helper_test_op(shps, torch_fxn, tinygrad_fxn=None, atol=1e-6, rtol=1e-3, gra
 
     st = time.monotonic()
     # NOTE: we now have to recompute the forward pass since we realized it
-    tiny_grads = tinygrad_fxn(*tst).sum().gradient(*tst)
+    # tiny_grads = tinygrad_fxn(*tst).sum().gradient(*tst)
+    tiny_grads0_ = tinygrad_fxn(*tst)
+    print(f"{tiny_grads0_.shape=}")
+    tiny_grads0 = tiny_grads0_.sum()
+    # tiny_grads0 = tinygrad_fxn(*tst).sum()
+    # print(f"{tiny_grads0.shape=}")
+    tiny_grads = tiny_grads0.gradient(*tst)
+    # print(f"{tiny_grads.shape=}")
     Tensor.realize(*tiny_grads)
     tinygrad_fbp = time.monotonic() - st
 

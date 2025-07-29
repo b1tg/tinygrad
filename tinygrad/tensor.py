@@ -926,7 +926,8 @@ class Tensor(MathTrait):
     print(dy.tolist())  # dz/dy
     ```
     """
-    assert gradient is not None or self.shape == tuple(), "when no gradient is provided, backward must be called on a scalar tensor"
+    # print(f"{self=} {self.shape=}")
+    assert gradient is not None or self.shape == tuple(), f"when no gradient is provided, backward must be called on a scalar tensor {self.shape=}"
     if not (self.is_floating_point() and all(t.is_floating_point() for t in targets)): raise RuntimeError("only float Tensors have gradient")
     if gradient is None: gradient = Tensor(1.0, dtype=self.dtype, device=self.device, requires_grad=False)
     target_uops = [x.uop for x in targets]
@@ -1686,7 +1687,7 @@ class Tensor(MathTrait):
     axis = tuple(self._resolve_dim(x) for x in (range(self.ndim) if axis is None else make_tuple(axis, 1)))
     if self.ndim == 0: axis = ()
     ret = self._apply_uop(UOp.r, op=op, axis=axis)
-    return ret if keepdim else ret.reshape(tuple(s for i,s in enumerate(self.shape) if i not in axis))
+    return ret if not keepdim else ret.reshape(tuple([s if i not in axis else 1 for i,s in enumerate(self.shape)]))
 
   def sum(self, axis:int|Sequence[int]|None=None, keepdim=False, dtype:DTypeLike|None=None) -> Tensor:
     """
