@@ -45,11 +45,12 @@ def split_reduceop(reduce:UOp, x:UOp):
   # reduce original axes, then split
   # ret = splitted.r(*reduce.arg)
   # return ret.r(reduce.arg[0], (len(ret.shape)-1,)).reshape(ret.shape)
-  ret = splitted.r(*reduce.arg, permute=True)
+  # return splitted.r(*reduce.arg).r(reduce.arg[0], (len(reduce.shape),)).reshape(reduce.shape)
+  ret = splitted.r(*reduce.arg).reshape(tuple([s if i not in reduce.arg[1] else 1 for i,s in enumerate(splitted.shape)]))
   # print(f"0 {ret.shape=}")
-  ret = ret.r(reduce.arg[0], (len(ret.shape)-1,), permute=True)
+  ret = ret.r(reduce.arg[0], (len(reduce.shape),)) #.reshape(tuple([s if i not in reduce.arg[1] else 1 for i,s in enumerate(ret.shape)]))
   # print(f"1 {ret.shape=}")
-  ret = ret.reshape(ret.shape)
+  ret = ret.reshape(reduce.shape)
   # print(f"2 {ret.shape=}")
   return ret
 def copy_reorder_view(copy:UOp, view:UOp, base:UOp):
