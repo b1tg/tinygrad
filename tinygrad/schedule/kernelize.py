@@ -43,8 +43,15 @@ def split_reduceop(reduce:UOp, x:UOp):
   splitted = x.reshape(splitted_shape).permute(tuple([d for d in range(len(splitted_shape)) if d!=dim_to_split]+[dim_to_split]))
   if DEBUG >= 3: print(f"split {divisor}: {x.shape} -> {splitted.shape} -> {reduce.shape}")
   # reduce original axes, then split
-  return splitted.r(*reduce.arg).r(reduce.arg[0], (len(reduce.shape),)).reshape(reduce.shape)
-
+  # ret = splitted.r(*reduce.arg)
+  # return ret.r(reduce.arg[0], (len(ret.shape)-1,)).reshape(ret.shape)
+  ret = splitted.r(*reduce.arg, permute=True)
+  # print(f"0 {ret.shape=}")
+  ret = ret.r(reduce.arg[0], (len(ret.shape)-1,), permute=True)
+  # print(f"1 {ret.shape=}")
+  ret = ret.reshape(ret.shape)
+  # print(f"2 {ret.shape=}")
+  return ret
 def copy_reorder_view(copy:UOp, view:UOp, base:UOp):
   if prod(view.shape) < prod(base.shape): return view.contiguous().copy_to_device(copy.device)
   return base.copy_to_device(copy.device).view(view.arg)
@@ -222,7 +229,7 @@ def swizzle_reduceop(r:UOp, src:UOp, view:UOp, fuse=False):
 def reduceop_view_right(src:UOp, v:UOp, r:UOp):
   assert unwrap(v.st).contiguous and v.size == src.size, f"can't compute new axis for {src.shape} -> {r.shape}"
   new_axis = [i for i,(s,u) in enumerate(zip(src.shape, r.shape)) if s != u]
-  return src.r(r.arg[0], tuple(new_axis)).reshape(r.shape)
+  return src.r(r.arg[0], tuple(new_axis), permute=False).reshape(r.shape)
 
 def elementwise_view_right(root:UOp):
   if not (swizzles:=[x for x in root.src if x.op is Ops.VIEW and x.base.op not in ALWAYS_CONTIGUOUS]): return None
