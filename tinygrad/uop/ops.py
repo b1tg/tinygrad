@@ -260,10 +260,8 @@ class UOp(MathTrait, metaclass=UOpMetaClass):
     old_axis = axis
     axis = tuple(sorted([x for x in axis if resolve(self.shape[x] != 1)]))
     if len(axis) == 0:
-      if axis != old_axis:
-        ret = self.reshape(tuple(x for i,x in enumerate(self.shape) if i not in old_axis))
-        return ret
-      else: return self
+      if axis == old_axis: return self
+      return self.reshape(tuple(x for i,x in enumerate(self.shape) if i not in old_axis))
     # move any non reduce axis before the first reduce axis
     move_early, rest = partition(range(axis[0], len(self.shape)), lambda i: i not in axis and resolve(self.shape[i] != 1))
     permaxis = tuple(range(axis[0])) + tuple(move_early) + tuple(rest)
@@ -271,8 +269,7 @@ class UOp(MathTrait, metaclass=UOpMetaClass):
     new_axis = tuple([x for x in range(axis[0]+len(move_early), len(self.shape)) if resolve(ret.shape[x] != 1)])
     assert len(axis) == len(new_axis)
     ret = UOp(Ops.REDUCE_AXIS, self.dtype, (ret,), (op, new_axis))
-    ret = ret.reshape(tuple(x for i,x in enumerate(self.shape) if i not in old_axis))
-    return ret
+    return ret.reshape(tuple(x for i,x in enumerate(self.shape) if i not in old_axis))
   def reduce(self, *src:UOp, **kwargs): return UOp(Ops.REDUCE, kwargs.pop('dtype', self.dtype), src=(self,)+src, **kwargs)
   def contiguous(self): return self.alu(Ops.CONTIGUOUS)
   def contiguous_backward(self): return self.alu(Ops.CONTIGUOUS_BACKWARD)

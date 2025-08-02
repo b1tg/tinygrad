@@ -43,12 +43,10 @@ def split_reduceop(reduce:UOp, x:UOp):
   splitted = x.reshape(splitted_shape).permute(tuple([d for d in range(len(splitted_shape)) if d!=dim_to_split]+[dim_to_split]))
   if DEBUG >= 3: print(f"split {divisor}: {x.shape} -> {splitted.shape} -> {reduce.shape}")
   # reduce original axes, then split
-  axis1 = tuple(sorted([x for x in reduce.arg[1] if resolve(splitted.shape[x] != 1)]))
-  ret = splitted.r(*reduce.arg).reshape(tuple([s if i not in axis1 else 1 for i,s in enumerate(splitted.shape)]))
-  axis2 = tuple(sorted([x for x in (len(reduce.shape),) if resolve(ret.shape[x] != 1)]))
-  ret = ret.r(reduce.arg[0], (len(reduce.shape),)).reshape(tuple([s if i not in axis2 else 1 for i,s in enumerate(ret.shape)]))
-  ret = ret.reshape(reduce.shape)
-  return ret
+  ret = splitted.r(*reduce.arg).reshape(tuple([s if i not in reduce.arg[1] else 1 for i,s in enumerate(splitted.shape)]))
+  ret = ret.r(reduce.arg[0], (len(reduce.shape),)).reshape(tuple([s if i not in (len(reduce.shape),) else 1 for i,s in enumerate(ret.shape)]))
+  return ret.reshape(reduce.shape)
+
 def copy_reorder_view(copy:UOp, view:UOp, base:UOp):
   if prod(view.shape) < prod(base.shape): return view.contiguous().copy_to_device(copy.device)
   return base.copy_to_device(copy.device).view(view.arg)
