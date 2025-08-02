@@ -45,10 +45,13 @@ def split_reduceop(reduce:UOp, x:UOp):
   # reduce original axes, then split
   # ret = splitted.r(*reduce.arg)
   # return ret.r(reduce.arg[0], (len(ret.shape)-1,)).reshape(ret.shape)
-  # return splitted.r(*reduce.arg).r(reduce.arg[0], (len(reduce.shape),)).reshape(reduce.shape)
-  ret = splitted.r(*reduce.arg).reshape(tuple([s if i not in reduce.arg[1] else 1 for i,s in enumerate(splitted.shape)]))
+  # return splitted.r1(*reduce.arg).r1(reduce.arg[0], (len(reduce.shape),)).reshape(reduce.shape)
+
+  axis1 = tuple(sorted([x for x in reduce.arg[1] if resolve(splitted.shape[x] != 1)]))
+  ret = splitted.r(*reduce.arg).reshape(tuple([s if i not in axis1 else 1 for i,s in enumerate(splitted.shape)]))
   # print(f"0 {ret.shape=}")
-  ret = ret.r(reduce.arg[0], (len(reduce.shape),)) #.reshape(tuple([s if i not in reduce.arg[1] else 1 for i,s in enumerate(ret.shape)]))
+  axis2 = tuple(sorted([x for x in (len(reduce.shape),) if resolve(ret.shape[x] != 1)]))
+  ret = ret.r(reduce.arg[0], (len(reduce.shape),)).reshape(tuple([s if i not in axis2 else 1 for i,s in enumerate(ret.shape)]))
   # print(f"1 {ret.shape=}")
   ret = ret.reshape(reduce.shape)
   # print(f"2 {ret.shape=}")
@@ -231,7 +234,8 @@ def reduceop_view_right(src:UOp, v:UOp, r:UOp):
   assert unwrap(v.st).contiguous and v.size == src.size, f"can't compute new axis for {src.shape} -> {r.shape}"
   new_axis = [i for i,(s,u) in enumerate(zip(src.shape, r.shape)) if s != u]
   return src.r(r.arg[0], tuple(new_axis), permute=False).reshape(r.shape)
-
+  #return src.r(r.arg[0], tuple(new_axis), permute=False).reshape(tuple([x if i not in tuple(new_axis)
+  # else 1 for i,x in enumerate(src.r.shape)])).reshape(r.shape)
 def elementwise_view_right(root:UOp):
   if not (swizzles:=[x for x in root.src if x.op is Ops.VIEW and x.base.op not in ALWAYS_CONTIGUOUS]): return None
   assert all_same([x.base.size for x in swizzles]), f"swizzle inputs must have the same size {swizzles}"
