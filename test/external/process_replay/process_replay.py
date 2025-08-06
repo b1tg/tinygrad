@@ -21,7 +21,7 @@ except ImportError as e:
 # internal
 PAGE_SIZE = getenv("PAGE_SIZE", 100)
 REF = os.getenv("GITHUB_REF_NAME", "")
-MAX_DIFF_PCT = getenv("PROCESS_REPLAY_MAX_DIFF_PCT", 20)
+MAX_DIFF_PCT = getenv("PROCESS_REPLAY_MAX_DIFF_PCT", 1000)
 TABLE_NAME = f"process_replay_{VERSION}"
 os.environ["CAPTURE_PROCESS_REPLAY"] = "0"
 early_stop = multiprocessing.Event()
