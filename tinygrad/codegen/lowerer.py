@@ -38,15 +38,19 @@ def subblock(ctx: IndexContext, full_new_idx: list[UOp], src: UOp):
   ctx.start = lc.start
   return graph_rewrite(src, pm_lowerer, lc, name="subblock", bottom_up=True)
 
+def shape_with_ones(shape, axis: tuple[int, ...]):
+  for i in sorted(axis):
+    shape = shape[:i] +(1,) + shape[i:]
+  return shape
+
 def lower_reduce_axis(ctx: IndexContext, x: UOp):
-  src_shape = x.src[0].shape1
+  src_shape = x.src[0].shape
+  # TestSchedule.test_indexing_scalars need this, why
+  if len(src_shape) < len(ctx.axis_types):
+    src_shape = shape_with_ones(src_shape, x.src[0].reduced)
   new_idxs = shape_to_idx(src_shape, ctx.axis_types, ctx.start)
   full_new_idx = list(ctx.idxs)
-  # TODO: hack TestIdxUpcast.test_symfold
-  for a in x.axis_arg:
-    if a >= len(full_new_idx)-1:
-      full_new_idx.extend([new_idxs[a]]*(a-len(full_new_idx)+1))
-    full_new_idx[a] = new_idxs[a]
+  for a in x.axis_arg: full_new_idx[a] = new_idxs[a]
 
   ret = subblock(ctx, full_new_idx, x.src[0])
 
@@ -61,12 +65,14 @@ def lower_reduce_axis(ctx: IndexContext, x: UOp):
 def lower_store(ctx: IndexContext, x: UOp, buf: UOp):
   # TODO: reenable after REDUCE_AXIS is fixed
   #assert x.src[1].shape == x.src[0].shape, f"shape mismatch on store {x.src[1].shape} != {x.src[0].shape}"
+  src_shape = x.src[0].shape
+  src_shape = src_shape + (1,) * (len(x.full_shape)-len(src_shape))
 
-  new_idxs = shape_to_idx(x.src[0].shape, ctx.axis_types, ctx.start)
+  new_idxs = shape_to_idx(src_shape, ctx.axis_types, ctx.start)
   idx, valid = x.st_arg.to_indexed_uops(new_idxs)
   used_idxs = [x for x in UOp.sink(idx, valid).toposort() if x in new_idxs]
   real_new_idxs = []
-  for i in range(len(x.src[0].shape)):
+  for i in range(len(src_shape)):
     if new_idxs[i] in used_idxs or len(ctx.idxs) <= i: real_new_idxs.append(new_idxs[i])
     else: real_new_idxs.append(ctx.idxs[i])
 
@@ -84,7 +90,9 @@ def lower_store(ctx: IndexContext, x: UOp, buf: UOp):
 
 def fixup_wmma(ctx:IndexContext, x:UOp):
   if x.tag is not None: return None
-  new_idxs = shape_to_idx(x.src[0].shape1, ctx.axis_types, ctx.start)
+  src_shape = x.src[0].shape
+  src_shape = shape_with_ones(src_shape, x.src[0].reduced)
+  new_idxs = shape_to_idx(src_shape, ctx.axis_types, ctx.start)
   full_new_idx = list(ctx.idxs)
   for a in x.arg[-1]: full_new_idx[a] = new_idxs[a]
 
