@@ -39,8 +39,7 @@ def subblock(ctx: IndexContext, full_new_idx: list[UOp], src: UOp):
   return graph_rewrite(src, pm_lowerer, lc, name="subblock", bottom_up=True)
 
 def shape_with_ones(shape, axis: tuple[int, ...]):
-  for i in sorted(axis):
-    shape = shape[:i] +(1,) + shape[i:]
+  for i in sorted(axis): shape = shape[:i] + (1,) + shape[i:]
   return shape
 
 def lower_reduce_axis(ctx: IndexContext, x: UOp):

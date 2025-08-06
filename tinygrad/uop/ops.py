@@ -136,7 +136,7 @@ class UOp(MathTrait, metaclass=UOpMetaClass):
 
   @functools.cached_property
   def reduced(self) -> tuple[int, ...]:
-   return tuple((set(self.axis_arg) if self.op in (Ops.REDUCE_AXIS, Ops.WMMA) else set()).union(*(x.reduced for x in self.src)))
+    return tuple((set(self.axis_arg) if self.op in (Ops.REDUCE_AXIS, Ops.WMMA) else set()).union(*(x.reduced for x in self.src)))
 
   @functools.cached_property
   def st(self) -> ShapeTracker|None:
