@@ -140,6 +140,12 @@ class UOp(MathTrait, metaclass=UOpMetaClass):
     return tuple((set(self.axis_arg) if self.op in (Ops.REDUCE_AXIS, Ops.WMMA) else set()).union(
       *(x.reduced for x in self.src if x.op not in GroupOp.Movement and x.op != Ops.VIEW)))
 
+  @property
+  def shape_with_ones(self) -> tuple[sint, ...]:
+    shape = self.shape
+    for i in sorted(self.reduced): shape = shape[:i] + (1,) + shape[i:]
+    return shape
+
   @functools.cached_property
   def st(self) -> ShapeTracker|None:
     if self.op in GroupOp.Block or self.op is Ops.INDEX: return None
