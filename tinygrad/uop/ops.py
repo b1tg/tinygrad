@@ -136,7 +136,9 @@ class UOp(MathTrait, metaclass=UOpMetaClass):
 
   @functools.cached_property
   def reduced(self) -> tuple[int, ...]:
-    return tuple((set(self.axis_arg) if self.op in (Ops.REDUCE_AXIS, Ops.WMMA) else set()).union(*(x.reduced for x in self.src)))
+    # TestLinearizer.test_tensor_cores_unroll_casted_phi Ops.REDUCE_AXIS reduced=(1, 2) self.axis_arg=(2,)
+    return tuple((set(self.axis_arg) if self.op in (Ops.REDUCE_AXIS, Ops.WMMA) else set()).union(
+      *(x.reduced for x in self.src if x.op not in GroupOp.Movement and x.op != Ops.VIEW)))
 
   @functools.cached_property
   def st(self) -> ShapeTracker|None:
@@ -170,7 +172,7 @@ class UOp(MathTrait, metaclass=UOpMetaClass):
       case Ops.BITCAST:
         shape = src_sts[0].shape
         if self.dtype.itemsize != (input_sz:=self.src[0].dtype.itemsize): shape = shape[:-1]+((shape[-1]*input_sz) // self.dtype.itemsize,)
-      case Ops.REDUCE_AXIS | Ops.WMMA: shape = src_sts[0].reduce(self.axis_arg)
+      case Ops.REDUCE_AXIS | Ops.WMMA: shape = src_sts[0].reduce(self.reduced)
       case _: shape = src_sts[0].shape
     return ShapeTracker.from_shape(shape)
 
