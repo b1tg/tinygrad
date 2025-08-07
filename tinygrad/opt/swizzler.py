@@ -22,13 +22,13 @@ merge_views = PatternMatcher([
 
 def reduce_push_add_ones(src:UOp, r:UOp, view:UOp):
   # contiguous, expand, and the same with ones removed
-  if unwrap(view.st).contiguous and len(r.full_shape) < len(view.shape) and r.full_shape != () and \
-      tuple(x for x in r.full_shape if resolve(x != 1)) == tuple(x for x in view.shape if resolve(x != 1)):
+  if unwrap(view.st).contiguous and len(r.shape) < len(view.shape) and \
+      tuple(x for x in r.shape if resolve(x != 1)) == tuple(x for x in view.shape if resolve(x != 1)):
     new_shape: list[sint] = []
     new_reduce_axis = []
-    if (contraction:=get_contraction_with_reduce(view.shape, r.full_shape, r.arg[1])) is None: return None
+    if (contraction:=get_contraction_with_reduce(view.shape_with_ones, r.shape_with_ones, r.arg[1])) is None: return None
     for i,pairs in enumerate(contraction):
-      new_shape_chunk = [view.shape[p] for p in pairs]
+      new_shape_chunk = [view.shape_with_ones[p] for p in pairs]
       if i in r.arg[1]:
         # if this is a reduce axis, we need a 1 in the view here to put it
         assert len(new_shape_chunk) > 0
@@ -37,7 +37,7 @@ def reduce_push_add_ones(src:UOp, r:UOp, view:UOp):
       else:
         # otherwise, pass through the new_shape_chunk
         new_shape += new_shape_chunk
-    ret = r.replace(src=(src.reshape(tuple(new_shape)),), arg=(r.arg[0], tuple(new_reduce_axis))+r.arg[2:])
+    ret = r.replace(src=(src.reshape(tuple(new_shape)),), arg=(r.arg[0], tuple(new_reduce_axis))+r.arg[2:]).reshape(view.shape)
     assert ret.shape == view.shape, f"shape mismatch on reduce_push_add_ones, {ret.shape} != {view.shape}"
     return ret
   return None
