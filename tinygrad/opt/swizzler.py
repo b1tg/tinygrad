@@ -60,10 +60,6 @@ def apply_swizzle(u:UOp) -> UOp: return graph_rewrite(u, view_left, name="Sub Vi
 
 # change reduceop axes and input ShapeTrackers, view gets replaced with a reshape.
 def swizzle_reduceop(r:UOp, src:UOp, view:UOp, fuse=False):
-  # contiguous and same size can push to children
-  # if there's a reduce child, shapes match with ones removed
-  # arg[2] = True is fuse marker
-  if unwrap(view.st).contiguous and view.shape == r.full_shape and (not (len(r.arg) == 3 and r.arg[2])): return None
   if isinstance(r.dtype, ImageDType): return None
   # swizzle the input
   input_st = ShapeTracker.from_shape(src.shape)
