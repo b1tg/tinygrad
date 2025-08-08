@@ -21,7 +21,7 @@ except ImportError as e:
 # internal
 PAGE_SIZE = getenv("PAGE_SIZE", 100)
 REF = os.getenv("GITHUB_REF_NAME", "")
-MAX_DIFF_PCT = getenv("PROCESS_REPLAY_MAX_DIFF_PCT", 1000)
+MAX_DIFF_PCT = getenv("PROCESS_REPLAY_MAX_DIFF_PCT", 20)
 TABLE_NAME = f"process_replay_{VERSION}"
 os.environ["CAPTURE_PROCESS_REPLAY"] = "0"
 early_stop = multiprocessing.Event()
@@ -77,7 +77,6 @@ def diff(offset:int, fxns:dict[str, Callable[..., tuple|None]]) -> None:
     name, loc = "", ""
     try:
       name, args, kwargs, ctx_vals, loc, ret = pickle.loads(row[0])
-      if name != "get_kernelize_map": continue
       ctx_vars = {k:v.value for k,v in ctx_vals.items() if k != "DEBUG" and (var:=ContextVar._cache.get(k)) is not None and var.value != v.value}
       if (replayer:=fxns.get(name)) is None: continue
       with Context(**ctx_vars):

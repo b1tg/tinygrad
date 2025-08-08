@@ -136,12 +136,11 @@ class UOp(MathTrait, metaclass=UOpMetaClass):
 
   @functools.cached_property
   def reduced(self) -> tuple[int, ...]:
-    # TestLinearizer.test_tensor_cores_unroll_casted_phi Ops.REDUCE_AXIS reduced=(1, 2) self.axis_arg=(2,)
     return tuple((set(self.axis_arg) if self.op in (Ops.REDUCE_AXIS, Ops.WMMA) else set()).union(
       *(x.reduced for x in self.src if x.op not in GroupOp.Movement and x.op != Ops.VIEW)))
 
-  @property
-  def shape_with_ones(self) -> tuple[sint, ...]:
+  @functools.cached_property
+  def shape_with_reduced(self) -> tuple[sint, ...]:
     shape = self.shape
     for i in sorted(self.reduced): shape = shape[:i] + (1,) + shape[i:]
     return shape
@@ -171,7 +170,6 @@ class UOp(MathTrait, metaclass=UOpMetaClass):
 
     # otherwise we get the shape from sources
     if not (src_sts := [x.st for x in self.src if x.st is not None]): return None
-    # TODO: hack for TestDSPCache.test_cache_speed
     # assert all_same([x.shape for x in src_sts]), f"UOp sources must have the same shape {self} {[x.shape for x in src_sts]}"
     match self.op:
       case Ops.MULTI: shape = tuple(self.src[0].shape[a]*len(self.device) if a == self.axis else s for a,s in enumerate(self.src[0].shape))
@@ -358,7 +356,6 @@ class UOp(MathTrait, metaclass=UOpMetaClass):
 
   def _mop(self, op:Ops, arg) -> UOp:
     ret = UOp(op, self.dtype, (self,), arg)
-    # for master spec compatibility
     if self.op not in (Ops.REDUCE_AXIS, Ops.WMMA) and self.st == ret.st: return self  # ignore NOOPs, also check ret.st
     return ret
 
