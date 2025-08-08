@@ -22,13 +22,13 @@ merge_views = PatternMatcher([
 
 def reduce_push_add_ones(src:UOp, r:UOp, view:UOp):
   # contiguous, expand, and the same with ones removed
-  if unwrap(view.st).contiguous and len(r.shape) < len(view.shape) and \
+  if unwrap(view.st).contiguous and len(r.shape_with_ones) < len(view.shape) and \
       tuple(x for x in r.shape if resolve(x != 1)) == tuple(x for x in view.shape if resolve(x != 1)):
     new_shape: list[sint] = []
     new_reduce_axis = []
-    if (contraction:=get_contraction_with_reduce(view.shape_with_ones, r.shape_with_ones, r.arg[1])) is None: return None
+    if (contraction:=get_contraction_with_reduce(view.shape, r.shape_with_ones, r.arg[1])) is None: return None
     for i,pairs in enumerate(contraction):
-      new_shape_chunk = [view.shape_with_ones[p] for p in pairs]
+      new_shape_chunk = [view.shape[p] for p in pairs]
       if i in r.arg[1]:
         # if this is a reduce axis, we need a 1 in the view here to put it
         assert len(new_shape_chunk) > 0
