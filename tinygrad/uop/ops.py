@@ -141,9 +141,8 @@ class UOp(MathTrait, metaclass=UOpMetaClass):
 
   @functools.cached_property
   def shape_with_reduced(self) -> tuple[sint, ...]:
-    shape = self.shape
-    for i in sorted(self.reduced): shape = shape[:i] + (1,) + shape[i:]
-    return shape
+    assert self.st is not None, f"{self.op} doesn't have a shape"
+    return unwrap(self.st).shape_with_reduced(self.reduced)
 
   @functools.cached_property
   def st(self) -> ShapeTracker|None:
@@ -170,7 +169,7 @@ class UOp(MathTrait, metaclass=UOpMetaClass):
 
     # otherwise we get the shape from sources
     if not (src_sts := [x.st for x in self.src if x.st is not None]): return None
-    # assert all_same([x.shape for x in src_sts]), f"UOp sources must have the same shape {self} {[x.shape for x in src_sts]}"
+    assert all_same([x.shape for x in src_sts]), f"UOp sources must have the same shape {self} {[x.shape for x in src_sts]}"
     match self.op:
       case Ops.MULTI: shape = tuple(self.src[0].shape[a]*len(self.device) if a == self.axis else s for a,s in enumerate(self.src[0].shape))
       case Ops.BITCAST:

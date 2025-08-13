@@ -452,6 +452,7 @@ class Kernel:
       ret = op.replace(src=tuple(fixup_ast(x) for x in op.src)) # noqa: F821
       if op.op in GroupOp.Buffer and op in self.bufs:
         st = self.sts[self.bufs.index(op)]
+        st = st.reshape(tuple(x for x in st.shape if resolve(x != 1)))
         # replace the VIEW source
         return ret.replace(src=(ret.src[0].replace(arg=st),)+ret.src[1:])
       if op.op is Ops.SINK:

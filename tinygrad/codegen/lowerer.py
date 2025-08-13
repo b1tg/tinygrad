@@ -13,6 +13,7 @@ class IndexContext:
   axis_types: tuple[AxisType, ...]
   idxs: list[UOp]
   start: int = 0
+  reduced: tuple[int, ...] = tuple()
 
 def shape_to_idx(s, axis_types, start=0):
   # indexes
@@ -29,12 +30,12 @@ def shape_to_idx(s, axis_types, start=0):
 def get_index(ast:UOp) -> IndexContext:
   axis_types = ast.arg.axis_types if isinstance(ast.arg, KernelInfo) else ()
   if len(ast.full_shape) != len(axis_types): axis_types = (AxisType.LOOP,)*len(ast.full_shape)
-  return IndexContext(axis_types, [], 0)
+  return IndexContext(axis_types, [], 0, tuple())
 
 # ***** lowering (given index) *****
 
 def subblock(ctx: IndexContext, full_new_idx: list[UOp], src: UOp):
-  lc = IndexContext(ctx.axis_types, full_new_idx, ctx.start+1000)
+  lc = IndexContext(ctx.axis_types, full_new_idx, ctx.start+1000, src.reduced)
   ctx.start = lc.start
   return graph_rewrite(src, pm_lowerer, lc, name="subblock", bottom_up=True)
 
@@ -103,8 +104,8 @@ pm_lowerer = PatternMatcher([
   # consts and loads
   (UPat(Ops.VIEW, src=(UPat((Ops.CONST, Ops.DEFINE_VAR), name="c"),), name="view"),
    lambda ctx,view,c: c if all(x.mask is None for x in view.arg.views) else view.arg.to_indexed_uops(ctx.idxs)[1].where(c, c.const_like(0))),
-  (UPat(Ops.LOAD, src=(UPat.var("buf").view(),), allow_any_len=True, name="x"),
-   lambda ctx,buf,x: UOp(Ops.LOAD, x.dtype, (buf.index(*x.st_arg.to_indexed_uops(ctx.idxs)),)+x.src[1:])),
+  (UPat(Ops.LOAD, src=(UPat.var("buf").view(),), allow_any_len=True, name="x"), lambda ctx,buf,x: UOp(Ops.LOAD, x.dtype,
+   (buf.index(*x.st_arg.reshape(x.st_arg.shape_with_reduced(ctx.reduced)).to_indexed_uops(ctx.idxs)),)+x.src[1:])),
 
   # reduce/view_const
   (UPat(Ops.REDUCE_AXIS, name="x"), lower_reduce_axis),
