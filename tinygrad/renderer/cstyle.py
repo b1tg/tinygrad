@@ -2,7 +2,7 @@ from typing import Literal, Callable, cast
 import os, math, sys
 from collections import defaultdict, Counter
 from tinygrad.codegen.opt import tc
-from tinygrad.uop.ops import GroupOp, Ops, UOp, PatternMatcher, UPat
+from tinygrad.uop.ops import GroupOp, Ops, UOp, PatternMatcher, UPat, print_uops
 from tinygrad.helpers import strip_parens, getenv, prod, dedup, AMX
 from tinygrad.dtype import ImageDType, dtypes, DType, PtrDType, AddrSpace, truncate
 from tinygrad.renderer import Renderer
@@ -110,6 +110,8 @@ class CStyleLanguage(Renderer):
   extra_matcher = extra_pm
 
   def render_kernel(self, function_name:str, kernel:list[str], bufs:list[tuple[str,tuple[DType,bool]]], uops:list[UOp], prefix=None) -> str:
+
+    print_uops(uops)
     tmp = "const sampler_t smp = CLK_NORMALIZED_COORDS_FALSE | CLK_ADDRESS_CLAMP | CLK_FILTER_NEAREST;\n" if any(isinstance(dtype, ImageDType) for _,(dtype,_) in bufs) else ""  # noqa: E501
     buftypes = [(name, self.render_dtype(dtype, mutable)+self.buffer_suffix if isinstance(dtype, (ImageDType, PtrDType)) else
                 self.arg_int_prefix if dtype == dtypes.int else None) for name,(dtype,mutable) in bufs]

@@ -3,7 +3,7 @@ import math, struct, sys
 from tinygrad.codegen.opt import tc
 from tinygrad.renderer import Renderer
 from tinygrad.renderer.cstyle import AMDRenderer
-from tinygrad.uop.ops import UOp, PatternMatcher, UPat, Ops, GroupOp
+from tinygrad.uop.ops import UOp, PatternMatcher, UPat, Ops, GroupOp, print_uops 
 from tinygrad.dtype import dtypes, DType, PtrDType, truncate
 from tinygrad.helpers import prod, AMX
 
@@ -51,6 +51,29 @@ def render_wmma_amd(ctx, wmma: UOp, arch: str) -> str:
   if arch.split(":")[0] in {"gfx942", "gfx950"}:
     return f"  {ctx[wmma]} = call {ldt(wmma.dtype)} @llvm.amdgcn.mfma.{dt_map[wmma.src[-1].dtype.scalar()]}" + \
            f".16x16x16{dt_map[wmma.src[0].dtype.scalar()]}(" + ", ".join([f"{ldt(w.dtype)} {ctx[w]}" for w in wmma.src]) + ", i32 0, i32 0, i32 0)"
+  
+  # Handle the case where we need to convert between <8 x half> and <16 x half>
+  # This is similar to the C-style wrapper function for non-float output types
+  if (wmma.dtype.scalar() == dtypes.half and wmma.dtype.count == 8 and 
+      wmma.src[2].dtype.scalar() == dtypes.half and wmma.src[2].dtype.count == 8):
+    # Convert <8 x half> to <16 x half> by interleaving with zeros
+    c_expanded = f"{ctx[wmma]}_c_expanded"
+    c_interleaved = f"{ctx[wmma]}_c_interleaved"
+    wmma_result = f"{ctx[wmma]}_result"
+    
+    # Create the conversion sequence
+    conversion = f"""
+  ; Convert <8 x half> to <16 x half> by interleaving with zeros
+  {c_expanded} = shufflevector <8 x half> {ctx[wmma.src[2]]}, <8 x half> zeroinitializer, <16 x i32> <i32 0, i32 8, i32 1, i32 9, i32 2, i32 10, i32 3, i32 11, i32 4, i32 12, i32 5, i32 13, i32 6, i32 14, i32 7, i32 15>
+  
+  ; Call WMMA with <16 x half> accumulator
+  {wmma_result} = call <16 x half> @llvm.amdgcn.wmma.{dt_map[wmma.src[-1].dtype.scalar()]}.16x16x16.{dt_map[wmma.src[0].dtype.scalar()]}(<16 x half> {ctx[wmma.src[0]]}, <16 x half> {ctx[wmma.src[1]]}, <16 x half> {c_expanded}, i1 false)
+  
+  ; Extract every other element to get <8 x half> result
+  {ctx[wmma]} = shufflevector <16 x half> {wmma_result}, <16 x half> undef, <8 x i32> <i32 0, i32 2, i32 4, i32 6, i32 8, i32 10, i32 12, i32 14>"""
+    
+    return conversion
+  
   # https://github.com/llvm/llvm-project/blob/main/llvm/test/CodeGen/AMDGPU/GlobalISel/llvm.amdgcn.wmma_32.ll
   # example: %wmma0 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x16.f16(<16 x half> %v99,<16 x half> %v100,<8 x float> %v101)
   return f"  {ctx[wmma]} = call {ldt(wmma.dtype)} @llvm.amdgcn.wmma.{dt_map[wmma.src[-1].dtype.scalar()]}.16x16x16." + \
@@ -163,6 +186,7 @@ class LLVMRenderer(Renderer):
                      f"  {r[u]}_ptr_amx{i} = ptrtoint {ldt(dtype.ptr())} {r[u]}_amx{i} to i64"]
 
     name = "test"
+    print_uops(uops)
     for u in uops:
       if u.op is Ops.NOOP: continue
       if u.op is Ops.SINK:
@@ -206,10 +230,10 @@ class AMDLLVMRenderer(LLVMRenderer):
   string_rewrite = PatternMatcher([
     (UPat(Ops.SPECIAL, name="x"), lambda ctx, x: f"  {ctx[x]} = " + f"{ code_for_workitem[x.arg[0][0]](x.arg[0][-1])}; "),
     (UPat(Ops.BARRIER), lambda ctx: barrier),
-    (UPat(Ops.CAST, name="x", dtype=dtypes.half.vec(16), src=UPat.var("y", dtypes.half.vec(8))), lambda ctx, x, y: f"  {ctx[x]} = shufflevector "\
-      f"<8 x half> {ctx[y]}, <8 x half> zeroinitializer, <16 x i32> <{', '.join([f'i32 {i}, i32 {j}' for i, j in zip(range(0, 8), range(8, 16))])}>"),
-    (UPat(Ops.CAST, name="x", dtype=dtypes.half.vec(8), src=UPat.var("y", dtypes.half.vec(16))), lambda ctx, x, y:
-      f"  {ctx[x]}= shufflevector <16 x half> {ctx[y]}, <16 x half> undef, <8 x i32> <{', '.join([f'i32 {x}' for x in range(0, 16, 2)])}>"),
+    # (UPat(Ops.CAST, name="x", dtype=dtypes.half.vec(16), src=UPat.var("y", dtypes.half.vec(8))), lambda ctx, x, y: f"  {ctx[x]} = shufflevector "\
+    #   f"<8 x half> {ctx[y]}, <8 x half> zeroinitializer, <16 x i32> <{', '.join([f'i32 {i}, i32 {j}' for i, j in zip(range(0, 8), range(8, 16))])}>"),
+    # (UPat(Ops.CAST, name="x", dtype=dtypes.half.vec(8), src=UPat.var("y", dtypes.half.vec(16))), lambda ctx, x, y:
+    #   f"  {ctx[x]}= shufflevector <16 x half> {ctx[y]}, <16 x half> undef, <8 x i32> <{', '.join([f'i32 {x}' for x in range(0, 16, 2)])}>"),
   ]) + base_rewrite
   extra_matcher = LLVMRenderer.extra_matcher
   def _render_footer(self, uops: list[UOp]) -> str:
@@ -223,12 +247,14 @@ class AMDLLVMRenderer(LLVMRenderer):
     self.tensor_cores = AMDRenderer.get_tensor_cores(arch)
     self.string_rewrite += PatternMatcher([(UPat(Ops.WMMA, name="wmma"), lambda ctx, wmma, arch=arch: render_wmma_amd(ctx, wmma, arch))])
     if self.arch.split(":")[0] == "gfx1100":
-      self.extra_matcher += PatternMatcher([
-        (UPat(Ops.WMMA, name="x", dtype=dtypes.half.vec(8)),
-          lambda x: UOp(Ops.WMMA, dtypes.half.vec(16), (x.src[0], x.src[1], x.src[2].cast(dtypes.half.vec(16))), (*x.arg,)).cast(dtypes.half.vec(8))),
-        (UPat(Ops.WMMA, name="x"), lambda x: UOp(Ops.WMMA, x.dtype, (x.src[0].bitcast(dtypes.uint16.vec(16)), x.src[1].bitcast(dtypes.uint16.vec(16)),
-          x.src[2]), x.arg) if x.src[0].dtype == dtypes.bfloat16.vec(16) else None),
-      ])
+      # Disable the WMMA pattern matcher that produces extra CAST operations
+      # self.extra_matcher += PatternMatcher([
+      #   (UPat(Ops.WMMA, name="x", dtype=dtypes.half.vec(8)),
+      #     lambda x: UOp(Ops.WMMA, dtypes.half.vec(16), (x.src[0], x.src[1], x.src[2].cast(dtypes.half.vec(16))), (*x.arg,)).cast(dtypes.half.vec(8))),
+      #   (UPat(Ops.WMMA, name="x"), lambda x: UOp(Ops.WMMA, x.dtype, (x.src[0].bitcast(dtypes.uint16.vec(16)), x.src[1].bitcast(dtypes.uint16.vec(16)),
+      #     x.src[2]), x.arg) if x.src[0].dtype == dtypes.bfloat16.vec(16) else None),
+      # ])
+      pass
     if self.arch.split(":")[0] == "gfx1201":
       self.extra_matcher += PatternMatcher([
         (UPat(Ops.WMMA, name="x", dtype=dtypes.bfloat16.vec(8)), lambda x: UOp(Ops.WMMA, dtypes.uint16.vec(8),
