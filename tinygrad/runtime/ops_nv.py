@@ -523,6 +523,7 @@ class NVDevice(HCQCompiled[HCQSignal]):
 
     # FIXME: no idea how to convert this for blackwells
     self.arch: str = "sm_120" if self.sm_version==0xa04 else f"sm_{(self.sm_version>>8)&0xff}{(val>>4) if (val:=self.sm_version&0xff) > 0xf else val}"
+    self.arch = "sm_50"
     self.sass_version = ((self.sm_version & 0xf00) >> 4) | (self.sm_version & 0xf)
     print(f"== NVDevice: {self.arch=}, {self.sm_version=}, {self.sass_version=}")
 
