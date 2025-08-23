@@ -12,6 +12,7 @@ on:
   push:
     branches:
       - master
+      - nv_24
   pull_request:
   workflow_dispatch:
 
@@ -21,7 +22,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        backend: [ptx, nv]
+        backend: [nv]
 
     name: Linux (${{ matrix.backend }})
     runs-on: ubuntu-24.04
@@ -37,6 +38,10 @@ jobs:
           deps: testing_minimal
           cuda: 'true'
           ocelot: 'true'
+      - name: test
+        run: |
+          nvcc  --list-gpu-arch
+          nvcc  --list-gpu-code
       - name: Set env
         run: printf "${{ matrix.backend == 'PTX' && 'FORWARD_ONLY=1\nJIT=1\nOPT=2\nCUDA=1\nPTX=1\nMOCKGPU=1' || matrix.backend == 'nv' && 'NV=1\nMOCKGPU=1\nFORWARD_ONLY=1' }}" >> $GITHUB_ENV
       - name: Check Device.DEFAULT and print some source
