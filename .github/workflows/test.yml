@@ -21,7 +21,7 @@ jobs:
 
   testmetal2:
     name: MacOS (unit)
-    runs-on: macos-14
+    runs-on: macos-13
     timeout-minutes: 20
     env:
       IGNORE_OOB: 0
