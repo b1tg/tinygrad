@@ -1,12 +1,13 @@
 import unittest, operator, math
 from tinygrad import Tensor, dtypes, Device
-from tinygrad.dtype import DType
+from tinygrad.dtype import DType, fp8_to_float
 from tinygrad.helpers import CI, getenv
 from tinygrad.tensor import _to_np_dtype
 from tinygrad.device import is_dtype_supported
 import numpy as np
 import pytest
-from hypothesis import given, strategies as strat, settings, HealthCheck
+import ml_dtypes
+from hypothesis import given, strategies as strat, settings, HealthCheck, assume
 
 pytestmark = pytest.mark.filterwarnings("ignore")
 
@@ -39,11 +40,27 @@ if (getenv("MOCKGPU") and Device.DEFAULT in {"NV", "CUDA"}) or Device.DEFAULT ==
   unary_operations.remove((Tensor.sin, np.sin))
   unary_operations.remove((Tensor.cos, np.cos))
 
+# https://lambda.ai/blog/nvidia-hopper-h100-and-fp8-support
+fp8e4m3_samples = list(map(lambda b: np.uint8(b).view(ml_dtypes.float8_e4m3fn).item(),
+  [0, 1, 7, 8, 0x2b, 0x37, 0x38, 0x39, 0x3c, 0x45, 0x77, 0x7e, 0x7f, 0x80, 0xc0, 0xff]))
+fp8e4m3_samples1 = list(map(lambda b: fp8_to_float(b, dtypes.fp8e4m3),
+  [0, 1, 7, 8, 0x2b, 0x37, 0x38, 0x39, 0x3c, 0x45, 0x77, 0x7e, 0x7f, 0x80, 0xc0, 0xff]))
+fp8e5m2_samples = list(map(lambda b: np.uint8(b).view(ml_dtypes.float8_e5m2).item(),
+  [0, 1, 3, 4, 0x18, 0x35, 0x37, 0x38, 0x39, 0x3a, 0x42, 0x5f, 0x7b, 0x80, 0xc0]))
+print("= fp8e4m3_samples: ", fp8e4m3_samples)
+print("= fp8e4m3_samples1: ", fp8e4m3_samples1)
+print("= fp8e5m2_samples: ", fp8e5m2_samples)
 class ht:
   float64 = strat.floats(width=64, allow_subnormal=False)
   float32 = strat.floats(width=32, allow_subnormal=False)
   float16 = strat.floats(width=16, allow_subnormal=False)
   bfloat16 = strat.floats(width=16, allow_subnormal=False)
+  fp8e4m3 = strat.sampled_from([0.0, 0.1, 0.5, 1.0, -0.1, -0.5, -1.0])
+  fp8e5m2 = strat.sampled_from([0.0, 0.1, 0.5, 1.0, -0.1, -0.5, -1.0])
+  # fp8e4m3 = strat.sampled_from(fp8e4m3_samples).filter(math.isfinite)
+  # fp8e5m2 = strat.sampled_from(fp8e5m2_samples).filter(math.isfinite)
+  # fp8e4m3 = strat.integers(0, 255).map(lambda b: np.uint8(b).view(ml_dtypes.float8_e4m3fn).item()).filter(math.isfinite)
+  # fp8e5m2 = strat.integers(0, 255).map(lambda b: np.uint8(b).view(ml_dtypes.float8_e5m2).item()).filter(math.isfinite)
   uint8 = strat.integers(0, 255)
   uint16 = strat.integers(0, 65535)
   uint32 = strat.integers(0, 2**32-1)
@@ -63,7 +80,7 @@ def universal_test(a, b, dtype, op):
   tensor_value = (op[0](ta, tb)).numpy()
   numpy_value = op[1](ta.numpy(), tb.numpy())
   if dtype in dtypes.floats:
-    atol, rtol = {dtypes.bfloat16:(1e-3, 1e-2)}.get(dtype, (1e-10, 1e-7))
+    atol, rtol = {dtypes.bfloat16:(1e-3, 1e-2), dtypes.fp8e5m2:(0.5, 1e-2), dtypes.fp8e4m3:(0.5, 1e-2)}.get(dtype, (1e-10, 1e-7))
     np.testing.assert_allclose(tensor_value, numpy_value, atol=atol, rtol=rtol)
   else: np.testing.assert_equal(tensor_value, numpy_value)
 
@@ -76,7 +93,8 @@ def universal_test_unary(a, dtype, op):
   tensor_value = out.numpy()
   numpy_value = op[1](ta.numpy())
   if dtype in dtypes.floats:
-    atol, rtol = {dtypes.float16:(1e-3, 1e-2), dtypes.bfloat16:(1e-3, 1e-2)}.get(dtype, (1e-6, 1e-5))
+    atol, rtol = {dtypes.float16:(1e-3, 1e-2), dtypes.fp8e5m2:(0.5, 1e-2), dtypes.fp8e4m3:(0.5, 1e-2),
+                  dtypes.bfloat16:(1e-3, 1e-2)}.get(dtype, (1e-6, 1e-5))
     np.testing.assert_allclose(tensor_value, numpy_value, atol=atol, rtol=rtol)
   else: np.testing.assert_equal(tensor_value, numpy_value)
 
@@ -110,6 +128,26 @@ class TestDTypeALU(unittest.TestCase):
   @unittest.skipUnless(is_dtype_supported(dtypes.bfloat16), f"no bfloat16 on {Device.DEFAULT}")
   @given(ht.bfloat16, ht.bfloat16, strat.sampled_from(binary_operations))
   def test_bfloat16(self, a, b, op): universal_test(a, b, dtypes.bfloat16, op)
+
+  @unittest.skipUnless(is_dtype_supported(dtypes.fp8e4m3, Device.DEFAULT), f"no fp8e4m3 on {Device.DEFAULT}")
+  @given(ht.fp8e4m3, ht.fp8e4m3, strat.sampled_from(binary_operations))
+  def test_fp8e4m3(self, a, b, op): universal_test(a, b, dtypes.fp8e4m3, op)
+
+  @unittest.skipUnless(is_dtype_supported(dtypes.fp8e5m2, Device.DEFAULT), f"no fp8e5m2 on {Device.DEFAULT}")
+  @given(ht.fp8e5m2, ht.fp8e5m2, strat.sampled_from(binary_operations))
+  def test_fp8e5m2(self, a, b, op): universal_test(a, b, dtypes.fp8e5m2, op)
+
+  @unittest.skipUnless(is_dtype_supported(dtypes.fp8e4m3, Device.DEFAULT), f"no fp8e4m3 on {Device.DEFAULT}")
+  @given(ht.fp8e4m3, strat.sampled_from(unary_operations))
+  def test_fp8e4m3_unary(self, a, op):
+    print(f"test_fp8e4m3_unary: {a=}, {op=}")
+    if (op[1] == np.reciprocal or op[1] == np.log): assume(a != 0.0) # reciprocal(0) and log(0) are undefined
+    universal_test_unary(a, dtypes.fp8e4m3, op)
+
+  @unittest.skipUnless(is_dtype_supported(dtypes.fp8e5m2, Device.DEFAULT), f"no fp8e5m2 on {Device.DEFAULT}")
+  @given(ht.fp8e5m2, strat.sampled_from(unary_operations))
+  def test_fp8e5m2_unary(self, a, op):
+    if (op[1] == np.reciprocal or op[1] == np.log): assume(a != 0.0) # reciprocal(0) and log(0) are undefined
 
   @given(ht.float32, strat.sampled_from(unary_operations))
   def test_float32_unary(self, a, op): universal_test_unary(a, dtypes.float32, op)

@@ -40,6 +40,7 @@ def _test_to_np(a:Tensor, np_dtype, target):
 def _test_op(fxn, target_dtype:DType, target):
   _assert_eq(fxn(), target_dtype, target)
 def _test_cast(a:Tensor, target_dtype:DType):
+  if target_dtype in dtypes.fp8s: raise unittest.SkipTest("1. how to cast when overflow 2. _to_np_dtype give np.float64")
   if a.is_floating_point() and dtypes.is_unsigned(target_dtype):
     # converting negative float to unsigned integer is undefined
     a = a.abs()
@@ -49,6 +50,7 @@ def _test_cast(a:Tensor, target_dtype:DType):
 
   _test_op(lambda: a.cast(target_dtype), target_dtype, list(a.numpy().astype(_to_np_dtype(target_dtype))))
 def _test_bitcast(a:Tensor, target_dtype:DType, target=None):
+  if target_dtype in dtypes.fp8s: raise unittest.SkipTest("no test for fp8s bitcast yet")
   if getenv("PTX") and a.dtype == dtypes.int8 and target_dtype.itemsize != a.dtype.itemsize:
     raise unittest.SkipTest("shape changing bitcast of int8 broken on PTX")
   expected = torch.tensor(a.tolist(), dtype=_to_torch_storage_type(a.dtype)).view(_to_torch_dtype(target_dtype))
@@ -244,6 +246,31 @@ class TestBFloat16DTypeCast(unittest.TestCase):
     converted = random_values.cast(dtypes.bfloat16).cast(dtypes.float32)
     np.testing.assert_allclose(converted.numpy(), random_values.cast(dtypes.float32).numpy(), rtol=1e-2, atol=1e-3)
 
+class TestFp8sDType(unittest.TestCase):
+  def _float_to_fp8_conversion_test(self, dtype, input_values, expected_values):
+    test_tensor = Tensor(input_values).cast(dtype).realize()
+    back_to_float32 = test_tensor.cast(dtypes.float32)
+    np.testing.assert_equal(tuple(back_to_float32.numpy().tolist()), expected_values)
+
+  @unittest.skipUnless(is_dtype_supported(dtypes.fp8e4m3), "fp8e4m3 not supported")
+  def test_float_to_fp8e4m3_conversion(self):
+    self._float_to_fp8_conversion_test(dtypes.fp8e4m3,
+          [10000000.0, -1.0, 402.0, -300.0, -10000000.0, 20.0, 1.4123, 0.0, math.inf, math.nan],
+          [448.0, -1.0, 416.0, -288.0, -448.0, 20.0, 1.375, 0.0, 448.0, math.nan])
+
+  @unittest.skipUnless(is_dtype_supported(dtypes.fp8e5m2), "fp8e5m2 not supported")
+  def test_float_to_fp8e5m2_conversion(self):
+    self._float_to_fp8_conversion_test(dtypes.fp8e5m2,
+          [10000000.0, -1.0, 402.0, -300.0, -10000000.0, 20.0, 1.4123, 0.0, math.inf, math.nan],
+          [57344.0, -1, 384, -320, -57344.0, 20, 1.5, 0.0, 57344.0, math.nan])
+
+  @unittest.skipUnless(is_dtype_supported(dtypes.fp8e4m3) and is_dtype_supported(dtypes.fp8e5m2), "fp8s not supported")
+  def test_fp8e4m3_plus_fp8e5m2_output_dtype(self):
+    a = Tensor([1.0, 2.0, 3.0], dtype=dtypes.fp8e4m3)
+    b = Tensor([1.0, 2.0, 3.0], dtype=dtypes.fp8e5m2)
+    result = a + b
+    self.assertEqual(result.dtype, dtypes.half)
+
 class TestHalfDType(TestDType): DTYPE = dtypes.half
 
 class TestFloatDType(TestDType):
@@ -303,6 +330,8 @@ class TestBitCast(unittest.TestCase):
   def test_shape_change_bitcast(self, dt1, dt2):
     # NOTE: this has to be assume to prevent hypothesis from skipping all samples
     assume(not (getenv("PTX") and dt1 == dtypes.int8)) # TODO: bitcasting int8 fails in PTX
+    assume(dt1 not in dtypes.fp8s and dt2 not in dtypes.fp8s) # no test for fp8 bitcast yet
+
     data = rand_for_dtype(dt1, 32).reshape(2, 2, 8)
     expected = torch.tensor(data.tolist(), dtype=_to_torch_storage_type(dt1)).view(_to_torch_dtype(dt2))
     _test_op(lambda: Tensor(data, dtype=dt1).bitcast(dt2), dt2, expected.tolist())
@@ -347,6 +376,7 @@ class TestBoolDType(TestDType): DTYPE = dtypes.bool
 
 @unittest.skipUnless(is_dtype_supported(dtypes.bfloat16), f"no bfloat16 on {Device.DEFAULT}")
 class TestBFloat16Type(TestDType): DTYPE = dtypes.bfloat16
+class TestFp8e4m3(TestDType): DTYPE = dtypes.fp8e4m3
 
 class TestPtrDType(unittest.TestCase):
   def test_vec_double(self):
@@ -420,6 +450,33 @@ class TestDtypeUsage(unittest.TestCase):
         t = Tensor([[1, 2], [3, 4]], dtype=d)
         (t*t).max().item()
 
+class TestOpsFp8s(unittest.TestCase):
+  def _fp8_tc_numpy_matmul(self, A, B, dtype):
+    M, K = A.shape
+    K2, N = B.shape
+    assert K == K2, "Shape mismatch"
+
+    C = np.zeros((M, N), dtype=dtype)
+    for i in range(M):
+        for j in range(N):
+            acc = np.float32(0.0)
+            for k in range(K):
+                acc += A[i, k] * B[k, j]
+            C[i, j] = acc
+    return C
+
+  def _compare_to_numpy_gemm(self, shp_a, shp_b, dtype, np_dtype):
+    print(f"{dtype=}, {np_dtype=}")
+    a = Tensor.rand(shp_a, dtype=dtype)
+    b = Tensor.rand(shp_b, dtype=dtype)
+    np_a = a.numpy().astype(np_dtype)
+    np_b = b.numpy().astype(np_dtype)
+    np.testing.assert_equal(self._fp8_tc_numpy_matmul(np_a, np_b, np_dtype), a.matmul(b).numpy())
+
+  @unittest.skipUnless(is_dtype_supported(dtypes.fp8e4m3, Device.DEFAULT), f"no fp8e4m3 on {Device.DEFAULT}")
+  def test_gemm_fp8e4m3(self): self._compare_to_numpy_gemm((64, 64), (64, 64), dtypes.fp8e4m3, ml_dtypes.float8_e4m3fn)
+  @unittest.skipUnless(is_dtype_supported(dtypes.fp8e5m2, Device.DEFAULT), f"no fp8e5m2 on {Device.DEFAULT}")
+  def test_gemm_fp8e5m2(self): self._compare_to_numpy_gemm((64, 64), (64, 64), dtypes.fp8e5m2, ml_dtypes.float8_e5m2)
 @unittest.skipUnless(is_dtype_supported(dtypes.bfloat16), f"no bfloat16 on {Device.DEFAULT}")
 class TestOpsBFloat16(unittest.TestCase):
   def test_cast(self):
