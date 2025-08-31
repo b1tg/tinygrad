@@ -87,7 +87,18 @@ cuda_8168_f16 = [TensorCore(dims=(8,16,8), threads=32, elements_per_thread=(4,2,
 cuda_8168_tf32 = [TensorCore(dims=(8,16,8), threads=32, elements_per_thread=(4,2,4), dtype_in=dtypes.float, dtype_out=dtypes.float, opts=cuda_tc_opts,
   swizzle=((('r0', 'r1', 'l2', 'l3', 'l4'), ('u1', 'r2'), ('l0', 'l1', 'u0')),
            (('r0', 'r1', 'u0', 'l0', 'l1'), ('u1', 'r2'), ('l2', 'l3', 'l4'))))]
+# old version
+  # tc_81632_f8 = [TensorCore(dims=(8,16,32), threads=32, elements_per_thread=(16,8,4), dtype_in=di, dtype_out=do, opts=cuda_tc_opts,
+  #   swizzle=(((7,8,2,3,4),(0,1,10,5,6,11,9)), ((7,8,10,0,1),(2,3,4,11,5,6,9))))
+  #   for di,do in [(dtypes.fp8e4m3,dtypes.float),(dtypes.fp8e5m2,dtypes.float)]]
+cuda_81632_f8 = [TensorCore(dims=(8,16,32), threads=32, elements_per_thread=(16,8,4), dtype_in=di, dtype_out=do, opts=cuda_tc_opts,
+  swizzle=((('r1', 'r2', 'l2', 'l3', 'l4'), ('u1', 'r3'), ('l0', 'l1', 'u0', 'r0', 'r4')),
+           (('r1', 'r2', 'u0', 'l0', 'l1'), ('r0', 'r3'), ('l2', 'l3', 'l4', 'u1', 'r4'))))
+  for di,do in [(dtypes.fp8e4m3,dtypes.float), (dtypes.fp8e5m2,dtypes.float)]]
+
 cuda_sm80: list[TensorCore] = cuda_81616 + cuda_8168_f16
+# fp8 tensor cores are available on newer architectures
+cuda_sm89: list[TensorCore] = cuda_sm80 + cuda_81632_f8
 if getenv("ALLOW_TF32", 0): cuda_sm80 += cuda_8168_tf32
 cuda_sm75: list[TensorCore] = cuda_8168_f16
 

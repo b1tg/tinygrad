@@ -186,10 +186,10 @@ class PythonProgram:
               def b_elem(x, col, k, goff): return x[k//4][goff + k%4 + col*4]
               ul[i] = wmma_helper(32, 8, 4, 2, 4, a_elem, b_elem, c_map)
 
-            # elif arg[1] == (8,16,32):
-            #   def a_elem(x, k, row, goff): return x[k%4 + (k//16)*8 + (row//8)*4][goff + (k//4)%4 + (row%8)*4]
-            #   def b_elem(x, col, k, goff): return x[k%4 + (k//16)*4][goff + (k//4)%4  + col*4]
-            #   ul[i] = wmma_helper(32, 32, 16, 8, 4, a_elem, b_elem, c_map)
+            elif arg[1] == (8,16,32):
+              def a_elem(x, k, row, goff): return x[k%4 + (k//16)*8 + (row//8)*4][goff + (k//4)%4 + (row%8)*4]
+              def b_elem(x, col, k, goff): return x[k%4 + (k//16)*4][goff + (k//4)%4  + col*4]
+              ul[i] = wmma_helper(32, 32, 16, 8, 4, a_elem, b_elem, c_map)
 
             else: raise NotImplementedError(f"unimplemented tensor core {arg}")
           elif device == "INTEL":
