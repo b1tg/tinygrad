@@ -5,7 +5,7 @@ from tinygrad import Tensor, dtypes, Device
 from tinygrad.uop.ops import UOp, Ops
 from tinygrad.tensor import _to_np_dtype
 from tinygrad.engine.realize import Runner
-from tinygrad.dtype import DType
+from tinygrad.dtype import DType, fp8_to_float
 from tinygrad.nn.state import get_parameters
 from tinygrad.helpers import T, CI
 from tinygrad.codegen import full_rewrite
@@ -36,6 +36,8 @@ def rand_for_dtype(dt:DType, size:int):
     return np.random.randint(-100, 100, size=size, dtype=_to_np_dtype(dt))
   elif dt == dtypes.bool:
     return np.random.choice([True, False], size=size)
+  elif dt in dtypes.fp8s:
+    return np.array(list(map(lambda x: fp8_to_float(int(x), dt), np.random.randint(0, 255, size=size, dtype=np.uint8))), dtype=np.float32)
   return np.random.uniform(-10, 10, size=size).astype(_to_np_dtype(dt))
 
 def timeit(fxn:Callable[..., T], *args, **kwargs) -> tuple[T, float]:
