@@ -1,13 +1,20 @@
 import numpy as np
 from tinygrad import dtypes, Tensor
 from tinygrad.helpers import getenv, get_single_element
-from tinygrad.dtype import _to_np_dtype
+from tinygrad.dtype import _to_np_dtype 
 from tinygrad.codegen.opt import OptOps
 from tinygrad.engine.realize import lower_schedule
 
-dtype_in = dtypes.half if getenv("HALF") else dtypes.bfloat16 if getenv("BFLOAT16") else dtypes.float
-acc_dtype = dtypes.half if getenv("ACC_HALF") else dtypes.bfloat16 if getenv("ACC_BFLOAT16") else None
-if getenv("INT"):  dtype_in, acc_dtype = dtypes.int8, dtypes.int32
+from tinygrad.runtime.ops_python import from_storage_scalar
+# Device.DEFAULT = "AMD:1"
+# dtype_in = dtypes.half if getenv("HALF") else dtypes.bfloat16 if getenv("BFLOAT16") else dtypes.float
+# acc_dtype = dtypes.half if getenv("ACC_HALF") else dtypes.bfloat16 if getenv("ACC_BFLOAT16") else None
+# if getenv("INT"):  dtype_in, acc_dtype = dtypes.int8, dtypes.int32
+dtype_in = (dtypes.half if getenv("HALF") else dtypes.bfloat16 if getenv("BFLOAT16") else
+            dtypes.fp8e4m3 if getenv("FP8E4M3") else dtypes.fp8e5m2 if getenv("FP8E5M2") else dtypes.float)
+acc_dtype = (dtypes.half if getenv("ACC_HALF") else dtypes.bfloat16 if getenv("ACC_BFLOAT16") else
+            dtypes.fp8e4m3 if getenv("ACC_FP8E4M3") else dtypes.fp8e5m2 if getenv("ACC_FP8E5M2") else None)
+if getenv("INT"): dtype_in = dtypes.int8acc_dtype = dtypes.int32
 if getenv("UINT"): dtype_in, acc_dtype = dtypes.uint8, dtypes.int32
 
 N = getenv("N", 4096)
@@ -21,14 +28,20 @@ INT_HIGH = getenv("INT_HIGH", 10)
 
 if __name__ == "__main__":
   def init_matrix(rows, cols):
-    rng = np.random.default_rng()
+    rng = np.random.default_rng(seed=0x12)
     # NOTE: numpy does not support bfloat16
     if (np_dtype := _to_np_dtype(dtype_in)) is None: np_dtype = np.float32
     if dtype_in in dtypes.ints:
       return Tensor(rng.integers(INT_LOW, INT_HIGH, (rows, cols), dtype=np_dtype)).realize()
-    return Tensor(rng.random((rows, cols), dtype=np.float32).astype(np_dtype)-0.5).cast(dtype_in).realize()
+    # return Tensor(rng.random((rows, cols), dtype=np.float32).astype(np_dtype)-0.5).cast(dtype_in).realize()
+    # from_storage_scalar(a, dtypes.fp8e4m3)
+    return Tensor(rng.integers(0, 3, (rows, cols), dtype=np.uint8)).cast(dtype_in).realize()
+    # return Tensor.ones()
+
 
   a, b = init_matrix(M, K), init_matrix(K, N)
+  print("init_matrix:", a.numpy(), b.numpy(), a.dtype, b.dtype)
+  # exit(0)
   for i in range(CNT):
     if i > 0 and getenv("RAND", 0) != 0:
       a, b = init_matrix(M, K), init_matrix(K, N)
@@ -42,6 +55,8 @@ if __name__ == "__main__":
 
   ref = a.numpy().astype(np.float32) @ b.numpy().astype(np.float32)
   res = c.numpy()
+  print("ref: ", ref)
+  print("res: ", res)
   try:
     np.testing.assert_allclose(res, ref, rtol=RTOL, atol=ATOL)
   except AssertionError as e:

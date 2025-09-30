@@ -41,6 +41,7 @@ class TensorCore: # D = A * B + C, A is (M x K), B is (K x N), C and D are (M x 
   def __post_init__(self):
     # all axes have size 2, <local> <reduce> <upcast> is the order
     local_axes, upcast_axes, reduce_axes = len(self.get_local_axes()), len(self.get_upcast_axes()), len(self.get_reduce_axes())
+    print(f"{local_axes=}, {upcast_axes=}, {reduce_axes=}")
     assert self.dims[0] * self.dims[1] == 2**(local_axes + upcast_axes), \
       f"N({self.dims[0]}) x M({self.dims[1]}) != local({2**local_axes}) x upcast({2**upcast_axes}) with opts({self.opts})"
     assert 2**local_axes == self.threads, f"{self.threads} threads construct the warp but found {2**local_axes} in {self.opts}"
@@ -53,8 +54,8 @@ class TensorCore: # D = A * B + C, A is (M x K), B is (K x N), C and D are (M x 
     # check swizzle
     assert len(self.swizzle[0]) == 3 and len(self.swizzle[1]) == 3, "swizzle has wrong part count"
     assert len(self.swizzle[0][0]) == len(self.swizzle[1][0]) == local_axes, "local swizzle size is wrong"
-    assert len(self.swizzle[0][1]) == len(self.swizzle[1][1]) == upcast_axes, "upcast swizzle size is wrong"
-    assert len(self.swizzle[0][2]) == len(self.swizzle[1][2]) == reduce_axes, "reduce swizzle size is wrong"
+    assert len(self.swizzle[0][1]) == len(self.swizzle[1][1]) == upcast_axes, f"upcast swizzle size is wrong: {len(self.swizzle[0][1])} == {len(self.swizzle[1][1])} {upcast_axes=}"
+    assert len(self.swizzle[0][2]) == len(self.swizzle[1][2]) == reduce_axes, f"reduce swizzle size is wrong: {len(self.swizzle[0][2])} == {len(self.swizzle[1][2])} == {reduce_axes}"
     assert all(len(s) == local_axes+upcast_axes+reduce_axes for s in self._remaps()), "remaps are the wrong size"
     # check elements_per_thread
     un, ln = 0, 0
@@ -110,7 +111,24 @@ amd_cdna = [TensorCore(dims=(16,16,16), threads=64, elements_per_thread=(4,4,4),
   opts=("l0","l0","l0","l0","u1","u1","l1","l1"),
   swizzle=((('u0', 'u1', 'l4', 'l5', 'r2', 'r3'), ('r0', 'r1'), ('l0', 'l1', 'l2', 'l3')),
            (('l0', 'l1', 'l2', 'l3', 'r2', 'r3'), ('r0', 'r1'), ('l4', 'l5', 'u0', 'u1'))))
-  for di,do in [(dtypes.half,dtypes.float),(dtypes.bfloat16,dtypes.float)]]
+  for di,do in [(dtypes.half, dtypes.float), (dtypes.fp8e4m3, dtypes.float),(dtypes.bfloat16,dtypes.float)]]
+
+# assert len(self.swizzle[0][2]) == len(self.swizzle[1][2]) == reduce_axes
+
+amd_cdna_fp8 = [TensorCore(dims=(16,16,32), threads=64, elements_per_thread=(8,8,4), dtype_in=di, dtype_out=do,
+  # l* need 6 (2**6=64)
+  # u* need 3 ?
+  # local_axes + upcast_axes == 8 (2**8 == 256 =16*16)
+  # opts=("l0","l0","l0","l0","u1","u1","l1","l1"), # 16*16, need 8 opts here; thread=64，need 2**6 L
+  #     (local_swizzle, upcast_swizzle, reduce_swizzle)
+  # len: local_axes     upcast_axes     reduce_axes
+  # swizzle=((('u0', 'u1', 'l4', 'l5', 'r2', 'r3'), ('r0', 'r1', 'u0'), ('l0', 'l1', 'l2', 'l3', 'l4')),
+  #          (('l0', 'l1', 'l2', 'l3', 'r2', 'r3'), ('r0', 'r1', 'u0'), ('l4', 'l5', 'u0', 'u1', 'u2'))))
+  opts=("l0","l0","l0","l0","u1","u1","l1","l1"),
+  # Swizzle is updated for K=32 (5 reduce axes) by adding 'r4'. This doubles the elements from A and B per thread compared to K=16.
+  swizzle=((('u0', 'u1', 'l4', 'l5', 'r2', 'r3'), ('r0', 'r1'), ('l0', 'l1', 'l2', 'l3', 'r4')),
+           (('l0', 'l1', 'l2', 'l3', 'r2', 'r3'), ('r0', 'r1'), ('l4', 'l5', 'u0', 'u1', 'r4'))))
+  for di,do in [(dtypes.fp8e4m3, dtypes.float)]]
 
 # ***** Apple Metal *****
 

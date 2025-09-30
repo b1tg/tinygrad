@@ -141,6 +141,7 @@ class PythonProgram:
           first_src_dtype = self.uops[idp[0]][1]
           assert isinstance(first_src_dtype, DType) # mypy
           dims, dtype_in, device, threads = arg[1], first_src_dtype.scalar(), arg[4], arg[5]
+          print("PYTHON call ", dims, dtype_in, device, threads)
           # TODO: refactor these to a shared TensorCoreLayout in kernel.py
           if device == "METAL":
             # A (2 elements on 32 threads): row major
@@ -148,11 +149,19 @@ class PythonProgram:
             # (i, j), C, D (2 elements on 32 threads): row major same as A/B
             def c_map(lane, elem): return (elem + ((lane%2)*2) + ((lane//8)%2)*4, ((lane//2)%4) + (lane//16)*4)
             ul[i] = wmma_helper(32, 8, 2, 2, 2, a_b_elem, a_b_elem, c_map)
+          elif device == "AMD" and threads == 64 and dims == (16, 16, 32):
+            pass
+            1/0
           elif device == "AMD" and threads == 64:
             def a_elem(x, k, row, goff): return x[k%4][goff + (k//4)*16 + row]
             def b_elem(x, col, k, goff): return a_elem(x, k, col, goff) # pylint: disable=arguments-out-of-order
             def c_map(lane, elem): return (lane%16, (lane//16)*4 + elem)
             ul[i] = wmma_helper(64, 16, 4, 4, 4, a_elem, b_elem, c_map)
+
+            # elif arg[1] == (8,16,32):
+            #   def a_elem(x, k, row, goff): return x[k%4 + (k//16)*8 + (row//8)*4][goff + (k//4)%4 + (row%8)*4]
+            #   def b_elem(x, col, k, goff): return x[k%4 + (k//16)*4][goff + (k//4)%4  + col*4]
+            #   ul[i] = wmma_helper(32, 32, 16, 8, 4, a_elem, b_elem, c_map)
           elif device == "AMD" and len(inp[0]) == 8: # RDNA4
             def a_elem(x, k, row, goff): return x[k - [0, 4, 4, 8][k//4]][goff + row + [0, 16, 0, 16][k//4]]
             def b_elem(x, col, k, goff): return a_elem(x, k, col, goff)
