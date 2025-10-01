@@ -61,6 +61,7 @@ earliest_rewrites = PatternMatcher([
 
   # contiguous/buffer/copy/assign is already contiguous
   #(UPat(Ops.CONTIGUOUS, name="root", src=(UPat((Ops.CONTIGUOUS, Ops.BUFFER, Ops.COPY, Ops.ASSIGN)),)), lambda root: root.src[0]),
+  (UPat(Ops.CONTIGUOUS, name="root", src=(UPat((Ops.BUFFER,)),)), lambda root: root.src[0]),
 ])
 
 # *****************
