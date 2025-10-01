@@ -16,6 +16,13 @@ ALWAYS_CONTIGUOUS: set[Ops] = {Ops.CONTIGUOUS, Ops.ASSIGN, Ops.COPY, Ops.BUFFER,
                      Ops.CONST, Ops.BIND, Ops.DEVICE, Ops.MSELECT, Ops.MSTACK, Ops.DEFINE_GLOBAL,
                      Ops.DEFINE_LOCAL, Ops.DEFINE_REG, Ops.LOAD, Ops.KERNEL}
 
+def find_permutes(a:UOp, b:UOp, assign:UOp):
+  if not (permutes:=[s for s in b.toposort(gate=lambda s:s.op not in ALWAYS_CONTIGUOUS)
+                     if s.op in GroupOp.Movement and s.op not in {Ops.RESHAPE, Ops.EXPAND, Ops.PAD, Ops.SHRINK}]): return
+  target = a.base
+  for p in permutes:
+    if any(s is target for s in p.toposort(gate=lambda s:s.op not in ALWAYS_CONTIGUOUS-{Ops.BUFFER})): return assign.replace(src=(a, b.contiguous()))
+
 earliest_rewrites = PatternMatcher([
   # just removing it works...
   (UPat((Ops.DETACH, Ops.CONTIGUOUS_BACKWARD, Ops.FUSE), name="x"), lambda x: x.src[0]),
@@ -46,9 +53,8 @@ earliest_rewrites = PatternMatcher([
    lambda x,target,assign: x.f(Ops.CONTIGUOUS, tag=assign.tag) if ((t:=target.base).op is not Ops.BUFFER and \
        not (t.op is Ops.MSTACK and all(s.op is Ops.BUFFER for s in t.src))) else None),
 
-  # realize before assign if input permutes the target buffer
-  (UPat(Ops.ASSIGN, src=(UPat.var("a"), UPat.var("b")), name="assign"), lambda a,b,assign: assign.replace(src=(a, b.contiguous())) \
-      if any(x.base is a.base and x is not a for x in b.toposort(gate=lambda x:x.op not in ALWAYS_CONTIGUOUS)) else None),
+   # realize before assign if input permutes the target buffer
+   (UPat(Ops.ASSIGN, src=(UPat.var("a"), UPat.var("b")), name="assign"), find_permutes),
 
   # copy only to different device
   (UPat(Ops.COPY, src=(UPat.var("x"), UPat()), name="copy"), lambda x,copy: x.f(Ops.NOOP, tag=copy.tag) if x.device == copy.device else None),
@@ -68,12 +74,14 @@ def realize_parents(ctx:dict[UOp, None], rb:UOp) -> None:
 
 def realize_assign(ctx:dict[UOp, None], a:UOp) -> None:
   if a.src[1].op not in ALWAYS_CONTIGUOUS: ctx[a.src[1]] = None
+  # if it's a kernel, we don't realize it
+  if a.src[1].op is not Ops.KERNEL: ctx[a] = None
 
 do_realize = PatternMatcher([
   # always realize SINK parents
   (UPat(Ops.SINK, name="s"), lambda ctx,s: ctx.update((x.base, None) for x in s.src if x.base.op not in ALWAYS_CONTIGUOUS)),
   # always realize ASSIGN/COPY/BUFFER_VIEW/CONTIGUOUS
-  (UPat({Ops.ASSIGN, Ops.COPY, Ops.BUFFER_VIEW, Ops.CONTIGUOUS}, name="tr"), realize),
+  (UPat({Ops.COPY, Ops.BUFFER_VIEW, Ops.CONTIGUOUS}, name="tr"), realize),
   # realize parents of COPY, MSELECT, MSTACK
   (UPat((Ops.COPY, Ops.MSELECT, Ops.MSTACK), name="rb"), realize_parents),
   # realize input to assign (might be optimized out)
@@ -99,7 +107,7 @@ def extract_children(ctx:ChildrenContext, x:UOp):
     non_sink_children = [u for u in v if u.op is not Ops.SINK]
     if len(non_sink_children) <= 1: continue
     # NOTE: this gate shouldn't be here
-    if any(x.op is Ops.REDUCE_AXIS for x in k.toposort()) and any(x.op in {Ops.BUFFER, Ops.CONTIGUOUS} for x in k.toposort()):
+    if k.op_in_parents(Ops.REDUCE_AXIS) and k.op_in_parents(Ops.BUFFER, Ops.CONTIGUOUS):
       ctx.children[k] = non_sink_children
 
 def mark_children(ctx:ChildrenContext, x:UOp):
@@ -125,7 +133,8 @@ class RangeifyContext:
 
   # create ranges
   range_idx: Iterator[int] = field(default_factory=itertools.count)
-  def new_range(self, s:sint, axistype:AxisType=AxisType.LOOP): return UOp.range(s, next(self.range_idx), axistype)
+  def new_range(self, s:sint, axistype:AxisType=AxisType.LOOP):
+    return UOp.range(s, next(self.range_idx), axistype) if resolve(s!=1) else UOp.const(dtypes.index, 0)
 
 def map_reshape(idx:UOp, r:UOp):
   acc = 1
@@ -360,14 +369,15 @@ def cleanup_dead_axes(b:UOp):
   for s,rng in zip(b.shape, b.src[1:]):
     # skip for symbolic. TODO: fix this
     if rng.op is Ops.RANGE and rng.src[0].op is not Ops.CONST: return None
-    if rng not in b.src[0].sparents and rng.op is Ops.RANGE:
+    # CONSTs are already dead axes
+    if rng.op is Ops.CONST or (rng.op is Ops.RANGE and rng not in b.src[0].sparents):
       reshape.append(1)
       hit = True
     else:
       reshape.append(s)
       new_rng.append(rng)
   if hit:
-    # move the tag to the expand
+    # move the tag to the expand. NOTE: this expand tag might not survive
     return b.replace(src=b.src[0:1]+tuple(new_rng), tag=None).reshape(tuple(reshape)).expand(b.shape).replace(tag=b.tag)
 
 # if a buffer is being stored just for permutes or something, remove it
@@ -375,7 +385,7 @@ def cleanup_dead_axes(b:UOp):
 def remove_bufferize(src:UOp, buf:UOp, idx:UOp):
   # see if we can't do it, should this ever hit?
   assert len(buf.src) == len(idx.src), "index on wrong bufferize"
-  assert all(x.op is Ops.RANGE for x in buf.src[1:])
+  assert all(x.op in {Ops.RANGE, Ops.CONST} for x in buf.src[1:])
 
   # if it's user contiguous, we never remove it
   if src.op in ALWAYS_RUN_OPS: return None
@@ -405,7 +415,8 @@ def remove_bufferize(src:UOp, buf:UOp, idx:UOp):
 
   # if it makes it here, the bufferize is removed
   # this is the ranges replaced
-  return src.substitute(dict(zip(buf.src[1:], idx.src[1:])))
+  # NOTE: if buf src is a const, we don't replace it
+  return src.substitute({k:v for k,v in zip(buf.src[1:], idx.src[1:]) if k.op is not Ops.CONST})
 
 def pre_bufferize(b:UOp, x:UOp, copy:UOp):
   nb = b.replace(src=(b.src[0].contiguous(),)+b.src[1:])
@@ -513,8 +524,8 @@ def bufferize_to_store(x:UOp):
     ret = buf.reshape(shape).index(*rngs, dtype=sdtype).store(x.src[0], *rngs, dtype=x.dtype)
     ret = ret.forced_reshape(shape)
     # TODO: is this right? what if it's offset
-    if any(r.src[0].op is not Ops.RANGE for r in rngs):
-      sym_shape = tuple([ssimplify(r.src[0]) for r in rngs])
+    if any(r.op is Ops.RANGE and r.src[0].op is not Ops.CONST for r in rngs):
+      sym_shape = tuple([ssimplify(r.src[0]) if r.op is not Ops.CONST else 1 for r in rngs])
       ret = ret.shrink(tuple([(0,x) for x in sym_shape]))
     return ret.replace(tag=x.tag)
 
