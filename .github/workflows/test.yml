@@ -645,8 +645,10 @@ jobs:
       run: DEBUG=2 DSP=1 python test/test_tiny.py
     - name: Test transcendentals
       run: CC=clang-20 DEBUG=2 DSP=1 python test/test_transcendental.py TestTranscendentalVectorized
-    - name: Test quantize onnx
-      run: DEBUG=2 DSP=1 python3 test/test_quantize_onnx.py
+    - name: Test quantize onnx (RANGEIFY=0)
+      run: RANGEIFY=0 DEBUG=2 DSP=1 python3 test/test_quantize_onnx.py
+    - name: Test quantize onnx (RANGEIFY=1)
+      run: RANGEIFY=1 DEBUG=2 DSP=1 python3 test/test_quantize_onnx.py
 
   testwebgpu:
     name: Linux (WebGPU)

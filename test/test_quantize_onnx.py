@@ -94,8 +94,7 @@ class TestQuantizeOnnx(unittest.TestCase):
     X = Tensor(np.random.uniform(0, 255, size=(1, 32, 128, 128)).astype(np.uint8))
     W = Tensor(np.random.uniform(0, 255, size=(64, 32, 1, 1)).astype(np.uint8))
     out = X.conv2d(W, dtype=X.dtype)
-    # rangeify merges axis in a different order
-    opts = [Opt(op=OptOps.UPCAST, axis=0 if RANGEIFY else 1, arg=128), Opt(op=OptOps.UNROLL, axis=0, arg=4)]
+    opts = [Opt(op=OptOps.UPCAST, axis=1, arg=128), Opt(op=OptOps.UNROLL, axis=0, arg=4)]
     sexec(out, opts)
 
   def test_prequant_gemm(self):
