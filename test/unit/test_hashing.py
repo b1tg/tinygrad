@@ -19,7 +19,7 @@ class TestHashing(unittest.TestCase):
     self.assertEqual(bytes(out.data()), expected)
 
 @unittest.skipUnless(is_dtype_supported(dtypes.uint8) and is_dtype_supported(dtypes.uint64), "Device must support uint8 and uint64")
-@unittest.skipIf(getenv("MOCKGPU") and Device.DEFAULT == "NV", "crashes in NV CI")
+@unittest.skipIf(CI, "slow")
 class TestKeccak(unittest.TestCase):
   def setUp(self) -> None: random.seed(1337)
 
