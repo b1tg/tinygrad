@@ -106,6 +106,46 @@ class Int8Embedding:
     arange, idx, vals = self.arange.expand(big_shp), idx.reshape(idx.shape+(1, 1)).expand(big_shp), (self.weight.cast(self.scale.dtype).T*self.scale).T
     return (arange == idx).mul(vals).sum(-2, dtype=vals.dtype)
 
+class FP8Linear:
+  def __init__(self, in_features, out_features, bias=False):
+    assert bias == False
+    self.weight = Tensor.ones(out_features, in_features, dtype=dtypes.fp8e4m3)
+    self.scale = Tensor.ones(out_features, dtype=dtypes.half)
+
+  def __call__(self, x):
+    return x.dot(self.weight.cast(dtype=self.scale.dtype).T*self.scale)
+
+  @staticmethod
+  def quantize(tensors, device, scale_dtype=dtypes.float16, quantize_embeds=False):
+    new_tensors = {}
+    for name,v in tensors.items():
+      if "feed_forward" in name or "attention.w" in name or (quantize_embeds and "tok_embeddings.weight" in name):
+        assert "weight" in name, name
+        v = v.cast(scale_dtype)
+        # Normalize to [-1, 1] range for best FP8 precision (not [-448, 448])
+        scale = v.abs().max(axis=1)
+        fp8_weight = (v.T/scale).T.cast(dtype=dtypes.fp8e4m3)
+        new_tensors[name] = fp8_weight
+        new_tensors[name.replace('weight', 'scale')] = scale
+        if isinstance(device, tuple):
+          new_tensors[name].shard_(device, axis=-1)
+          new_tensors[name.replace('weight', 'scale')].shard_(device, axis=None)
+      else:
+        new_tensors[name] = v
+    if quantize_embeds: new_tensors.update({"output.weight": new_tensors["tok_embeddings.weight"], "output.scale": new_tensors["tok_embeddings.scale"]})
+    return new_tensors
+
+class FP8Embedding:
+  def __init__(self, vocab_size:int, embed_size:int):
+    self.vocab_sz, self.embed_sz = vocab_size, embed_size
+    self.weight, self.scale = Tensor.ones(vocab_size, embed_size, dtype=dtypes.fp8e4m3), Tensor.ones(vocab_size, dtype=dtypes.half)
+
+  def __call__(self, idx:Tensor) -> Tensor:
+    if not hasattr(self, 'arange'): self.arange = Tensor.arange(self.vocab_sz, requires_grad=False, device=self.weight.device).unsqueeze(-1)
+    big_shp = idx.shape+(self.vocab_sz, self.embed_sz)
+    arange, idx, vals = self.arange.expand(big_shp), idx.reshape(idx.shape+(1, 1)).expand(big_shp), (self.weight.cast(self.scale.dtype).T*self.scale).T
+    return (arange == idx).mul(vals).sum(-2, dtype=vals.dtype)
+
 def NF4Linear(block_size):
   _CODE = [
     -1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453, -0.28444138169288635, -0.18477343022823334, -0.09105003625154495, 0.0,
@@ -166,6 +206,7 @@ MODEL_PARAMS = {
 def build_transformer(model_path: Path, model_size="8B", quantize=None, scale_dtype=dtypes.float16, device=None, max_context=8192, load_weights=True):
   # build model
   if quantize == "int8": linear, embedding, quantize_embeds = Int8Linear, Int8Embedding, True
+  elif quantize == "fp8": linear, embedding, quantize_embeds = FP8Linear, FP8Embedding, True
   elif quantize == "nf4": linear, embedding, quantize_embeds = NF4Linear(64), nn.Embedding, False
   else: linear, embedding, quantize_embeds = nn.Linear, nn.Embedding, False
   model = Transformer(**MODEL_PARAMS[model_size]["args"], linear=linear, embedding=embedding, max_context=max_context, jit=True)
@@ -242,7 +283,7 @@ if __name__ == "__main__":
   parser.add_argument("--model", type=Path, help="Model path")
   parser.add_argument("--size", choices=["1B", "8B", "70B", "405B"], default="1B", help="Model size")
   parser.add_argument("--shard", type=int, default=1, help="Shard the model across multiple devices")
-  parser.add_argument("--quantize", choices=["int8", "nf4", "float16"], help="Quantization method")
+  parser.add_argument("--quantize", choices=["int8", "fp8", "nf4", "float16"], help="Quantization method")
   parser.add_argument("--no_api", action="store_true", help="Disable the api and run a cli test interface")
   parser.add_argument("--host", type=str, default="0.0.0.0", help="Web server bind address")
   parser.add_argument("--port", type=int, default=7776, help="Web server port")

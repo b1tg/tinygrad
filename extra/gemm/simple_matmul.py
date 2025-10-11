@@ -5,8 +5,10 @@ from tinygrad.dtype import _to_np_dtype
 from tinygrad.codegen.opt import OptOps
 from tinygrad.engine.realize import lower_schedule
 
-dtype_in = dtypes.half if getenv("HALF") else dtypes.bfloat16 if getenv("BFLOAT16") else dtypes.float
-acc_dtype = dtypes.half if getenv("ACC_HALF") else dtypes.bfloat16 if getenv("ACC_BFLOAT16") else None
+dtype_in = (dtypes.half if getenv("HALF") else dtypes.bfloat16 if getenv("BFLOAT16") else
+            dtypes.fp8e4m3 if getenv("FP8E4M3") else dtypes.fp8e5m2 if getenv("FP8E5M2") else dtypes.float)
+acc_dtype = (dtypes.half if getenv("ACC_HALF") else dtypes.bfloat16 if getenv("ACC_BFLOAT16") else
+            dtypes.fp8e4m3 if getenv("ACC_FP8E4M3") else dtypes.fp8e5m2 if getenv("ACC_FP8E5M2") else None)
 if getenv("INT"):  dtype_in, acc_dtype = dtypes.int8, dtypes.int32
 if getenv("UINT"): dtype_in, acc_dtype = dtypes.uint8, dtypes.int32
 
@@ -16,6 +18,17 @@ K = getenv("K", N)
 CNT = getenv("CNT", 10)
 ATOL = getenv("ATOL", 1e-4)
 RTOL = getenv("RTOL", 3e-2)
+if dtype_in is dtypes.fp8e5m2:
+  ATOL = 1.0
+  RTOL = 5e-1
+if dtype_in is dtypes.fp8e4m3:
+  ATOL = getenv("ATOL", 1e-1)
+  RTOL = getenv("RTOL", 1e-1)
+
+if dtype_in is dtypes.bfloat16:
+  ATOL = getenv("ATOL", 1e-2)
+  RTOL = getenv("RTOL", 1e-2)
+
 INT_LOW = getenv("INT_LOW", 0)
 INT_HIGH = getenv("INT_HIGH", 10)
 
@@ -37,11 +50,23 @@ if __name__ == "__main__":
   if getenv("SHOULD_USE_TC"):
     sched = a.matmul(b, dtype=acc_dtype).schedule()
     lowered = list(lower_schedule(sched))
-    ei = get_single_element(lowered)[1]
-    assert any(opt.op is OptOps.TC for opt in ei.prg.p.applied_opts), f"TC not triggered, {ei.prg.p.applied_opts}"
-
+    if dtype_in in dtypes.fp8s:
+      ei = lowered[-1][1]
+      assert any(opt.op is OptOps.TC for opt in ei.prg.p.applied_opts), f"TC not triggered, {ei.prg.p.applied_opts}"
+      for i,ei in enumerate(lowered):
+        ei = ei[1]
+        if any(opt.op is OptOps.TC for opt in ei.prg.p.applied_opts):
+          print(f"TC ok {i=}")
+    else:
+      ei = get_single_element(lowered)[1]
+      assert any(opt.op is OptOps.TC for opt in ei.prg.p.applied_opts), f"TC not triggered, {ei.prg.p.applied_opts}"
+    print("--- tc check end ---")
+  # print(a.shape)
+  # print(b.shape)
   ref = a.numpy().astype(np.float32) @ b.numpy().astype(np.float32)
   res = c.numpy()
+  # print(f"{ref=}")
+  # print(f"{res=}")
   try:
     np.testing.assert_allclose(res, ref, rtol=RTOL, atol=ATOL)
   except AssertionError as e:
