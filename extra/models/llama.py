@@ -209,9 +209,16 @@ def convert_from_huggingface(weights:dict[str, Tensor], n_layers: int, n_heads: 
     **{f"model.layers.{l}.input_layernorm.weight": f"layers.{l}.attention_norm.weight" for l in range(n_layers)},
     **{f"model.layers.{l}.self_attn.{x}_norm.weight": f"layers.{l}.attention.{x}_norm.weight" for x in ["q", "k"] for l in range(n_layers)},
     **{f"model.layers.{l}.self_attn.{x}_proj.weight": f"layers.{l}.attention.w{x}.weight" for x in ["q", "k", "v", "o"] for l in range(n_layers)},
+    **{f"model.layers.{l}.self_attn.{x}_proj.input_scale": f"layers.{l}.attention.w{x}.input_scale" for x in ["q", "k", "v", "o"] for l in range(n_layers)},
+    **{f"model.layers.{l}.self_attn.{x}_proj.weight_scale": f"layers.{l}.attention.w{x}.weight_scale" for x in ["q", "k", "v", "o"] for l in range(n_layers)},
+
+    **{f"model.layers.{l}.self_attn.{x}_proj.{x}_scale": f"layers.{l}.attention.w{x}.{x}_scale" for x in ["q", "k", "v"] for l in range(n_layers)},
     **{f"model.layers.{l}.self_attn.{x}_proj.bias": f"layers.{l}.attention.w{x}.bias" for x in ["q", "k", "v", "o"] for l in range(n_layers)},
     **{f"model.layers.{l}.post_attention_layernorm.weight": f"layers.{l}.ffn_norm.weight" for l in range(n_layers)},
     **{f"model.layers.{l}.mlp.{x}_proj.weight": f"layers.{l}.feed_forward.w{y}.weight" for x, y in {"gate": "1", "down": "2", "up": "3"}.items() for l in range(n_layers)},
+    # model.layers.0.mlp.down_proj.input_scale
+    **{f"model.layers.{l}.mlp.{x}_proj.input_scale": f"layers.{l}.feed_forward.w{y}.input_scale" for x, y in {"gate": "1", "down": "2", "up": "3"}.items() for l in range(n_layers)},
+    **{f"model.layers.{l}.mlp.{x}_proj.weight_scale": f"layers.{l}.feed_forward.w{y}.weight_scale" for x, y in {"gate": "1", "down": "2", "up": "3"}.items() for l in range(n_layers)},
     **{f"model.layers.{l}.mlp.gate.weight": f"layers.{l}.feed_forward.gate.weight" for l in range(n_layers)},
     "model.norm.weight": "norm.weight",
     "lm_head.weight": "output.weight",
@@ -221,7 +228,7 @@ def convert_from_huggingface(weights:dict[str, Tensor], n_layers: int, n_heads: 
   for k, v in weights.items():
     if ".rotary_emb." in k: continue
     v = v.to(Device.DEFAULT)
-    if "model.layers" in k:
+    if "model.layers" in k and "scale" not in k:
       if ("q_proj" in k or "q_norm" in k) and permute_layers: v = permute(v, n_heads)
       elif ("k_proj" in k or "k_norm" in k) and permute_layers: v = permute(v, n_kv_heads)
     if '.mlp.experts.' in k:
