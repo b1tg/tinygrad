@@ -333,7 +333,7 @@ def is_dtype_supported(dtype:DType, device:str|None=None) -> bool:
     return device in {"AMD", "PYTHON", "NULL"}
   if dtype in dtypes.fp8s:
     if device in {"CUDA", "NV"}: return not CI and not getenv(f"{device}_PTX") and not getenv("NV_NAK")
-    if device == "AMD": return not CI and AMD_LLVM > 0 and getenv("AMD_FP8", 0)
+    if device == "AMD": return not CI and AMD_LLVM > 0 and getattr(Device["AMD"], "target") == (9,5,0)
     return device in {"PYTHON", "NULL"}
   if device == "WEBGPU": return dtype in [dtypes.bool, dtypes.char, dtypes.uchar, dtypes.short,
                                           dtypes.ushort, dtypes.float, dtypes.int32, dtypes.uint32, dtypes.half]
