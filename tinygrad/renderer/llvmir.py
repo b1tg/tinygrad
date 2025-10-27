@@ -127,36 +127,22 @@ base_rewrite = PatternMatcher([
 
 non_native_dtypes = (dtypes.bfloat16, *dtypes.fp8s)
 
-ir_f32_to_fp8 = """
-define i8 @f32_to_fp8(float %val, i1 %is_bf8) {
-entry:
-  %ival = bitcast float %val to i32
-  %exp = and i32 %ival, 2139095040        ; 0x7F800000
-  %is_special = icmp eq i32 %exp, 2139095040
-  br i1 %is_special, label %select_clip, label %clip
-clip:
-  br i1 %is_bf8, label %bf8_clip, label %fp8_clip
-bf8_clip:
-  %clamped_bf8 = call float @llvm.amdgcn.fmed3.f32(float %val, float 57344.0, float -57344.0)
-  br label %select_clip
-fp8_clip:
-  %clamped_fp8 = call float @llvm.amdgcn.fmed3.f32(float %val, float 448.0, float -448.0)
-  br label %select_clip
-select_clip:
-  %phi_val = phi float [ %val, %entry ], [ %clamped_bf8, %bf8_clip ], [ %clamped_fp8, %fp8_clip ]
-  br i1 %is_bf8, label %do_bf8, label %do_fp8
-do_bf8:
-  %packed_bf8 = call i32 @llvm.amdgcn.cvt.pk.bf8.f32(float %phi_val, float %phi_val, i32 0, i1 false)
-  br label %exit
-do_fp8:
-  %packed_fp8 = call i32 @llvm.amdgcn.cvt.pk.fp8.f32(float %phi_val, float %phi_val, i32 0, i1 false)
-  br label %exit
-exit:
-  %packed = phi i32 [ %packed_bf8, %do_bf8 ], [ %packed_fp8, %do_fp8 ]
-  %trunc = trunc i32 %packed to i8
-  ret i8 %trunc
-}
-"""
+ir_f32_to_fp8 = """ define i8 @f32_to_fp8(float %v, i1 %b){
+  %i=bitcast float %v to i32
+  %a=and i32 %i,2139095040
+  %s=icmp eq i32 %a,2139095040
+  %r=select i1 %b,float 57344.0,float 448.0
+  %nr=fneg float %r
+  %m=call float @llvm.amdgcn.fmed3.f32(float %v,float %r,float %nr)
+  %f=select i1 %s,float %v,float %m
+  br i1 %b, label %B, label %F
+B: %pb=call i32 @llvm.amdgcn.cvt.pk.bf8.f32(float %f,float %f,i32 0,i1 false)
+  br label %X
+F: %pf=call i32 @llvm.amdgcn.cvt.pk.fp8.f32(float %f,float %f,i32 0,i1 false)
+  br label %X
+X: %p=phi i32 [%pb,%B],[%pf,%F]
+  %t=trunc i32 %p to i8
+  ret i8 %t }"""
 
 class LLVMRenderer(Renderer):
   device = "CPU"
