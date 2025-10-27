@@ -1,13 +1,15 @@
 from __future__ import annotations
 from typing import cast, ClassVar
 import os, ctypes, struct, hashlib, functools, importlib, mmap, errno, array, contextlib, sys, weakref, itertools
+
+from tinygrad.dtype import DType, dtypes
 assert sys.platform != 'win32'
 from dataclasses import dataclass
 from tinygrad.runtime.support.hcq import HCQCompiled, HCQAllocator, HCQBuffer, HWQueue, CLikeArgsState, HCQSignal, HCQProgram, FileIOInterface
 from tinygrad.runtime.support.hcq import MMIOInterface, BumpAllocator
 from tinygrad.uop.ops import sint
 from tinygrad.device import Compiled, DMAFdRef, BufferSpec, CompilerPairT
-from tinygrad.helpers import getenv, round_up, data64_le, DEBUG, PROFILE, ProfileEvent, suppress_finalizing, lo32, hi32, colored
+from tinygrad.helpers import AMD_LLVM, CI, getenv, round_up, data64_le, DEBUG, PROFILE, ProfileEvent, suppress_finalizing, lo32, hi32, colored
 from tinygrad.renderer.cstyle import AMDRenderer
 from tinygrad.renderer.llvmir import AMDLLVMRenderer
 from tinygrad.runtime.autogen import kfd, hsa, pci, sqtt
@@ -450,13 +452,20 @@ class AMDProgram(HCQProgram):
     self.dev, self.name, self.lib = dev, name, lib
 
     image, sections, relocs = elf_loader(self.lib)
+    # with open(f"target/{name}.bin", "wb") as f:
+    #   f.write(lib)
 
     rodata_entry = next((sh.header.sh_addr for sh in sections if sh.name == ".rodata"), -1)
     assert rodata_entry >= 0, ".rodata section not found"
+    text_entry = next((sh.header.sh_addr for sh in sections if sh.name == ".text"), -1)
+    text_relo = next((sh.header.sh_addr for sh in sections if sh.name == ".rela.text"), -1)
 
     for apply_image_offset, rel_sym_offset, typ, addent in relocs:
       if typ == 5: image[apply_image_offset:apply_image_offset+8] = struct.pack('<q', rel_sym_offset - apply_image_offset + addent) # R_AMDGPU_REL64
-      else: raise RuntimeError(f"unknown AMD reloc {typ}")
+      else:
+        with open(f"bug{name}.bin", "wb") as f:
+          f.write(lib)
+        raise RuntimeError(f"unknown AMD reloc {typ} in bug{name}.bin")
 
     self.lib_gpu = self.dev.allocator.alloc(round_up(image.nbytes, 0x1000), buf_spec:=BufferSpec(nolru=True))
     self.dev.allocator._copyin(self.lib_gpu, image)
@@ -749,12 +758,17 @@ class USBIface(PCIIface):
 class AMDDevice(HCQCompiled):
   def is_am(self) -> bool: return isinstance(self.iface, (PCIIface, USBIface))
   def is_usb(self) -> bool: return isinstance(self.iface, USBIface)
-
+  def is_dtype_supported(self, dtype: DType) -> bool:
+    if dtype == dtypes.bfloat16: return True
+    if dtype in dtypes.fp8s:
+      return AMD_LLVM > 0 and not CI and self.arch in {"gfx950", "gfx942", "gfx1200", "gfx1201"}
+    return False
   def __init__(self, device:str=""):
     self.device_id = int(device.split(":")[1]) if ":" in device else 0
     self.iface = self._select_iface(KFDIface, PCIIface, USBIface)
     self.target:tuple[int, ...] = ((trgt:=self.iface.props['gfx_target_version']) // 10000, (trgt // 100) % 100, trgt % 100)
     self.arch = "gfx%d%x%x" % self.target
+    # print(self.arch)
     if self.target < (9,4,2) or self.target >= (13,0,0): raise RuntimeError(f"Unsupported arch: {self.arch}")
     if DEBUG >= 1: print(f"AMDDevice: opening {self.device_id} with target {self.target} arch {self.arch}")
 

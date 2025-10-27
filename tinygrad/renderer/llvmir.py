@@ -48,13 +48,18 @@ def render_wmma_amx(ctx, wmma: UOp) -> str:
       f'  {ctx[wmma]} = load {ldt(wmma.dtype)}, ptr {ctx[wmma]}_amx2, align {wmma.dtype.itemsize}'])
 
 def render_wmma_amd(ctx, wmma: UOp, cdna=False) -> str:
+  # v_mfma_scale_f32_16x16x128_f8f6f4
+  #   %result = call <4 x float> @llvm.amdgcn.mfma.scale.f32.16x16x128.f8f6f4.v8i32.v8i32(<8 x i32> %arg0, <8 x i32> %arg1, <4 x float> %arg2,
   dt_map = {dtypes.half: "f16", dtypes.float: "f32", dtypes.ushort: "bf16.1k" if cdna else "bf16", dtypes.bfloat16: "bf16.1k" if cdna else "bf16",
             dtypes.fp8e4m3: ".fp8.fp8", dtypes.fp8e5m2: ".bf8.bf8"}
   # https://github.com/llvm/llvm-project/blob/main/clang/test/CodeGenOpenCL/builtins-amdgcn-mfma.cl
   if cdna:
     N,M,K = wmma.arg[1]
-    return f"  {ctx[wmma]} = call {ldt(wmma.dtype)} @llvm.amdgcn.mfma.{dt_map[wmma.src[-1].dtype.scalar()]}" + \
-           f".{N}x{M}x{K}{dt_map[wmma.arg[2]]}(" + ", ".join([f"{ldt(w.dtype)} {ctx[w]}" for w in wmma.src]) + ", i32 0, i32 0, i32 0)"
+    if K== 128:
+      dt_map[dtypes.fp8e4m3] = ".f8f6f4.v8i32.v8i32"
+      dt_map[dtypes.fp8e5m2] = ".f8f6f4.v8i32.v8i32"
+    return f"  {ctx[wmma]} = call {ldt(wmma.dtype)} @llvm.amdgcn.mfma.scale.{dt_map[wmma.src[-1].dtype.scalar()]}" + \
+           f".{N}x{M}x{K}{dt_map[wmma.arg[2]]}(" + ", ".join([f"{ldt(w.dtype)} {ctx[w]}" for w in wmma.src]) + ", i32 0, i32 0, i32 0, i32 1065353216, i32 0, i32 1065353216 )"
   # https://github.com/llvm/llvm-project/blob/main/llvm/test/CodeGen/AMDGPU/GlobalISel/llvm.amdgcn.wmma_32.ll
   # example: %wmma0 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x16.f16(<16 x half> %v99,<16 x half> %v100,<8 x float> %v101)
   return f"  {ctx[wmma]} = call {ldt(wmma.dtype)} @llvm.amdgcn.wmma.{dt_map[wmma.src[-1].dtype.scalar()]}.16x16x16." + \
@@ -127,7 +132,7 @@ base_rewrite = PatternMatcher([
 non_native_dtypes = (dtypes.bfloat16, *dtypes.fp8s)
 
 ir_f32_to_fp8 = """
-define i8 @f32_to_fp8(float %val, i1 %is_bf8) {
+define i8 @f32_to_fp8(float %val, i1 %is_bf8) alwaysinline{
 entry:
   %ival = bitcast float %val to i32
   %exp = and i32 %ival, 2139095040        ; 0x7F800000
@@ -144,11 +149,22 @@ fp8_clip:
 select_clip:
   %phi_val = phi float [ %val, %entry ], [ %clamped_bf8, %bf8_clip ], [ %clamped_fp8, %fp8_clip ]
   br i1 %is_bf8, label %do_bf8, label %do_fp8
+  ; declare i32 @llvm.amdgcn.cvt.pk.bf8.f32(float, float, i32, i1)
+  ; declare <2 x i16> @llvm.amdgcn.cvt.scalef32.pk.bf8.f32(<2 x i16>, float, float, float, i1)
 do_bf8:
   %packed_bf8 = call i32 @llvm.amdgcn.cvt.pk.bf8.f32(float %phi_val, float %phi_val, i32 0, i1 false)
   br label %exit
 do_fp8:
-  %packed_fp8 = call i32 @llvm.amdgcn.cvt.pk.fp8.f32(float %phi_val, float %phi_val, i32 0, i1 false)
+  ; %packed_fp8 = call i32 @llvm.amdgcn.cvt.pk.fp8.f32(float %phi_val, float %phi_val, i32 0, i1 false)
+  %zero_v2i16_fp8 = insertelement <2 x i16> undef, i16 0, i32 0
+  %zero_v2i16_fp8_f = insertelement <2 x i16> %zero_v2i16_fp8, i16 0, i32 1
+  %packed_vec_fp8 = call <2 x i16> @llvm.amdgcn.cvt.scalef32.pk.fp8.f32(
+                        <2 x i16> %zero_v2i16_fp8_f,
+                        float %phi_val,
+                        float %phi_val,
+                        float 1.0,
+                        i1 false)
+  %packed_fp8 = bitcast <2 x i16> %packed_vec_fp8 to i32
   br label %exit
 exit:
   %packed = phi i32 [ %packed_bf8, %do_bf8 ], [ %packed_fp8, %do_fp8 ]
@@ -293,6 +309,10 @@ class AMDLLVMRenderer(LLVMRenderer):
         (UPat(Ops.WMMA, name="x", dtype=dtypes.float.vec(4)),
           lambda x: UOp(Ops.WMMA, dtypes.float.vec(4), (x.src[0].bitcast(dtypes.uint64), x.src[1].bitcast(dtypes.uint64),
             x.src[2]), (*x.arg,)) if x.src[0].dtype in (dtypes.fp8e4m3.vec(8), dtypes.fp8e5m2.vec(8)) else None),
+        #   %result = call <4 x float> @llvm.amdgcn.mfma.scale.f32.16x16x128.f8f6f4.v8i32.v8i32(<8 x i32> %arg0, <8 x i32> %arg1, <4 x float> %arg2,
+        (UPat(Ops.WMMA, name="x", dtype=dtypes.float.vec(4)),
+          lambda x: UOp(Ops.WMMA, dtypes.float.vec(4), (x.src[0].bitcast(dtypes.uint32.vec(8)), x.src[1].bitcast(dtypes.uint32.vec(8)),
+            x.src[2]), (*x.arg,)) if x.src[0].dtype in (dtypes.fp8e4m3.vec(32), dtypes.fp8e5m2.vec(32)) else None),
       ])
     if self.arch.split(":")[0] == "gfx1100":
       self.extra_matcher += PatternMatcher([

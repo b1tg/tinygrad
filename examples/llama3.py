@@ -64,6 +64,7 @@ def load(fn:str):
   elif fn.endswith(".safetensors"):
     return safe_load(fn)
   else:
+    print(f"torch_load {fn}")
     return torch_load(fn)
 
 # **** quantized linears ****
@@ -106,6 +107,235 @@ class Int8Embedding:
     arange, idx, vals = self.arange.expand(big_shp), idx.reshape(idx.shape+(1, 1)).expand(big_shp), (self.weight.cast(self.scale.dtype).T*self.scale).T
     return (arange == idx).mul(vals).sum(-2, dtype=vals.dtype)
 
+class FP8Linear0:
+  def __init__(self, in_features, out_features, bias=False, q=False, k=False, v=False):
+    assert bias == False
+    self.weight = Tensor.ones(out_features, in_features, dtype=dtypes.fp8e4m3)
+    self.weight_scale = Tensor.ones((), dtype=dtypes.float32)
+    self.input_scale = Tensor.ones((), dtype=dtypes.float32)
+
+    self.q_scale = Tensor.ones((), dtype=dtypes.float32)
+    self.k_scale = Tensor.ones((), dtype=dtypes.float32)
+    self.v_scale = Tensor.ones((), dtype=dtypes.float32)
+
+    self.q = q
+    self.k = k
+    self.v = v
+
+  def __call__(self, x):
+    old_type = x.dtype
+    res = x.dot(self.weight.T.cast(dtypes.float32) * self.weight_scale)
+    return res.cast(old_type)
+class FP8Linear:
+  def __init__(self, in_features, out_features, bias=False, q=False, k=False, v=False):
+    assert bias == False
+    self.weight = Tensor.ones(out_features, in_features, dtype=dtypes.fp8e4m3)
+    self.weight_scale = Tensor.ones((), dtype=dtypes.float32)
+    self.input_scale = Tensor.ones((), dtype=dtypes.float32)
+
+    self.q_scale = Tensor.ones((), dtype=dtypes.float32)
+    self.k_scale = Tensor.ones((), dtype=dtypes.float32)
+    self.v_scale = Tensor.ones((), dtype=dtypes.float32)
+
+    self.q = q
+    self.k = k
+    self.v = v
+  def quantize_to_fp8(self, x, scale):
+    # FP8 E4M3 的范围  
+    fp8_max = 448.0  # torch.finfo(torch.float8_e4m3fn).max  
+    fp8_min = -448.0  
+    fp8_max = 448.0  
+    # fp8_min = -224.0
+    # fp8_max = 224.0
+    # scale = x.abs().max(axis=1)
+    # fp8_weight = (x.T/scale).T.cast(dtype=dtypes.fp8e4m3)
+    # return fp8_weight, scale
+    # x = x.cast('float32')
+      
+    # 1. 计算 absmax  
+    # x_max = x.abs().max()  
+    # 2. 计算 scale = x_max / fp8_max  
+    # scale = x_max / fp8_max  
+    # 1. 除以 scale  
+    # x_scaled = x / x_max  
+    x_scaled = x.cast(dtypes.float32) / scale  
+    # 2. Clamp 到 FP8 范围  
+    x_clamped = x_scaled.clip(fp8_min, fp8_max)  
+    # x_clamped = x_scaled
+    # 3. 转换为 FP8 (如果 tinygrad 支持 fp8 dtype)  
+    # 否则保持 float32,在 GEMM 时再处理  
+    x_fp8 = x_clamped.cast(dtypes.fp8e4m3)  # 或保持 float32  
+    return x_fp8, scale
+
+  def __call__(self, x):
+    old_type = x.dtype
+    # print(f"{x.numpy()=}")
+    # res = x.dot(self.weight.T.cast(dtypes.float32) * self.weight_scale)
+    # print(f"input: {x.numpy()}")
+
+    # print(f"{self.weight_scale.numpy()=}, {self.input_scale.numpy()=}")
+    # self.weight_scale.numpy()=array(0.00166539, dtype=float32), self.input_scale.numpy()=array(0.0186942, dtype=float32)
+    # x = x / self.input_scale
+    # return x.dot(self.weight.cast(dtype=self.weight_scale.dtype).T*self.weight_scale)
+    # res = (x.cast(dtypes.float32)/self.input_scale).cast(dtypes.fp8e4m3).dot(self.weight.T).cast(dtypes.float32) * self.input_scale * self.weight_scale
+    res, s = self.quantize_to_fp8(x, self.input_scale)
+    # print(f"input q: {res.numpy()}")
+    # self.weight.shape=(4096, 4096) res.shape=(1, 1, 4096)
+    print(f"weight q: {self.weight.shape=} {res.shape=} {self.weight.numpy()=} {self.weight.float().numpy()=} ({self.weight.cast(dtypes.float32).sum().numpy()=}) ")
+    res1 = res.dot(self.weight.T).cast(dtypes.float32) *s  * self.weight_scale
+
+    res0 = res.cast(dtypes.float32).dot(self.weight.T.cast(dtypes.float32)) *s  * self.weight_scale
+    print(f"res1: {res1.numpy()}")
+    print(f"res0: {res0.numpy()}")
+    1/0
+    # 1/0
+    # if self.q: res = res * self.q_scale
+    # if self.k: res = res * self.k_scale
+    # if self.v: res = res * self.v_scale
+    # assert res.dtype == old_type
+    return res.cast(old_type)
+
+  @staticmethod
+  def quantize(tensors, device, scale_dtype=dtypes.float32, quantize_embeds=False):
+    new_tensors = {}
+    for name,v in tensors.items():
+      if "feed_forward" in name or "attention.w" in name or (quantize_embeds and "tok_embeddings.weight" in name):
+        assert "weight" in name, name
+        v = v.cast(scale_dtype)
+        # Normalize to [-1, 1] range for best FP8 precision (not [-448, 448])
+        scale = v.abs().max(axis=1)
+        fp8_weight = (v.T/scale).T.cast(dtype=dtypes.fp8e4m3)
+        new_tensors[name] = fp8_weight
+        new_tensors[name.replace('weight', 'scale')] = scale
+        if isinstance(device, tuple):
+          new_tensors[name].shard_(device, axis=-1)
+          new_tensors[name.replace('weight', 'scale')].shard_(device, axis=None)
+      else:
+        new_tensors[name] = v
+    if quantize_embeds: new_tensors.update({"output.weight": new_tensors["tok_embeddings.weight"], "output.scale": new_tensors["tok_embeddings.scale"]})
+    return new_tensors
+class FP8FeedForward:
+  def __init__(self, dim:int, hidden_dim:int, linear=FP8Linear):
+    self.w1 = FP8Linear(dim, hidden_dim, bias=False)
+    self.w2 = FP8Linear(hidden_dim, dim, bias=False)
+    self.w3 = FP8Linear(dim, hidden_dim, bias=False) # the gate in Gated Linear Unit
+
+  def __call__(self, x:Tensor) -> Tensor:
+    w1 = self.w1(x).silu()
+    w3 = self.w3(x.contiguous_backward())  # this fixes a strange fusion that makes tensor cores miss
+    return self.w2(w1 * w3)
+class FP8Embedding:
+  def __init__(self, vocab_size:int, embed_size:int):
+    self.vocab_sz, self.embed_sz = vocab_size, embed_size
+    self.weight, self.scale = Tensor.ones(vocab_size, embed_size, dtype=dtypes.fp8e4m3), Tensor.ones(vocab_size, dtype=dtypes.half)
+
+  def __call__(self, idx:Tensor) -> Tensor:
+    if not hasattr(self, 'arange'): self.arange = Tensor.arange(self.vocab_sz, requires_grad=False, device=self.weight.device).unsqueeze(-1)
+    big_shp = idx.shape+(self.vocab_sz, self.embed_sz)
+    arange, idx, vals = self.arange.expand(big_shp), idx.reshape(idx.shape+(1, 1)).expand(big_shp), (self.weight.cast(self.scale.dtype).T*self.scale).T
+    return (arange == idx).mul(vals).sum(-2, dtype=vals.dtype)
+
+# **** NEW: Block Scaled FP8 Linear ****
+class BlockScaledFP8Linear:
+  def __init__(self, in_features, out_features, bias=False, block_size=128):
+    print(f"BlockScaledFP8Linear: {in_features=}, {out_features=}")
+    assert bias == False
+    self.block_size = block_size
+    # The weight is stored in FP8 format
+    self.weight = Tensor.ones(out_features, in_features, dtype=dtypes.fp8e4m3)
+    # The scale is now a 2D tensor, with one scale per block
+    self.block_scale = Tensor.ones(out_features, in_features // block_size, dtype=dtypes.float16)
+
+  def __call__(self, x):
+    # To perform the matrix multiplication, we first need to dequantize the weight.
+    # We do this by repeating the block_scale to match the weight's dimensions.
+    # For example, if weight is (O, I) and block_scale is (O, I/B), repeat_interleave
+    # will expand block_scale to (O, I).
+    full_scale = self.block_scale.repeat_interleave(self.block_size, dim=-1)
+    dequant_weight = self.weight.cast(self.block_scale.dtype) * full_scale
+    return x.dot(dequant_weight.T)
+
+  @staticmethod
+  def quantize(tensors, device, scale_dtype=dtypes.float16, quantize_embeds=False, block_size=128):
+    new_tensors = {}
+    # with open("a.json", "w") as f:
+    #   import json
+    #   json.dump(list(tensors.keys()), f)
+    for name, v in tensors.items():
+      # if "feed_forward" in name or "attention.wq" in name or (quantize_embeds and "tok_embeddings.weight" in name):
+      if "feed_forward" in name or "attention.wq" in name or  "attention.wv" in name or (quantize_embeds and "tok_embeddings.weight" in name):
+      # if "attention.wq" in name or "attention.wv" in name or (quantize_embeds and "tok_embeddings.weight" in name):
+        assert "weight" in name, name
+        v = v.cast(scale_dtype)
+        out_features, in_features = v.shape
+        
+        # Ensure the in_features is divisible by block_size for clean reshaping
+        assert in_features % block_size == 0, f"Input feature size {in_features} must be divisible by block_size {block_size} for tensor {name}"
+        
+        # Reshape the weight matrix into blocks: (out_features, num_blocks, block_size)
+        reshaped_v = v.reshape(out_features, -1, block_size)
+        
+        # Calculate the max absolute value for each block. This is our block scale.
+        # The scale has shape (out_features, num_blocks)
+        scale = reshaped_v.abs().max(axis=-1)
+        
+        # Normalize each block by its corresponding scale
+        normalized_v = reshaped_v / scale.unsqueeze(-1)
+        
+        # Cast the normalized values to FP8
+        fp8_weight = normalized_v.cast(dtype=dtypes.fp8e4m3)
+        
+        # Store the quantized weight and the block scales
+        new_tensors[name] = fp8_weight.reshape(v.shape)
+        new_tensors[name.replace('weight', 'block_scale')] = scale
+        
+        if isinstance(device, tuple):
+          new_tensors[name].shard_(device, axis=-1)
+          new_tensors[name.replace('weight', 'block_scale')].shard_(device, axis=None)
+      else:
+        new_tensors[name] = v
+    
+    if quantize_embeds:
+      new_tensors.update({"output.weight": new_tensors["tok_embeddings.weight"], "output.block_scale": new_tensors["tok_embeddings.block_scale"]})
+    return new_tensors
+
+# **** NEW: Block Scaled FP8 Embedding ****
+# class BlockScaledFP8Embedding:
+#   def __init__(self, vocab_size:int, embed_size:int, block_size=128):
+#     self.vocab_sz, self.embed_sz = vocab_size, embed_size
+#     self.block_size = block_size
+#     self.weight = Tensor.ones(vocab_size, embed_size, dtype=dtypes.fp8e4m3)
+#     self.block_scale = Tensor.ones(vocab_size, embed_size // block_size, dtype=dtypes.float16)
+
+#   def __call__(self, idx:Tensor) -> Tensor:
+#     if not hasattr(self, 'arange'): self.arange = Tensor.arange(self.vocab_sz, requires_grad=False, device=self.weight.device).unsqueeze(-1)
+#     big_shp = idx.shape+(self.vocab_sz, self.embed_sz)
+#     arange, idx = self.arange.expand(big_shp), idx.reshape(idx.shape+(1, 1)).expand(big_shp)
+    
+#     # Dequantize the weight before the lookup
+#     full_scale = self.block_scale.repeat_interleave(self.block_size, dim=-1)
+#     vals = (self.weight.cast(self.block_scale.dtype) * full_scale).T
+    
+#     return (arange == idx).mul(vals).sum(-2, dtype=vals.dtype)
+# **** CORRECTED: Block Scaled FP8 Embedding ****
+class BlockScaledFP8Embedding:
+  def __init__(self, vocab_size:int, embed_size:int, block_size=128):
+    self.vocab_sz, self.embed_sz = vocab_size, embed_size
+    self.block_size = block_size
+    self.weight = Tensor.ones(vocab_size, embed_size, dtype=dtypes.fp8e4m3)
+    self.block_scale = Tensor.ones(vocab_size, embed_size // block_size, dtype=dtypes.float16)
+
+  def __call__(self, idx:Tensor) -> Tensor:
+    if not hasattr(self, 'arange'): self.arange = Tensor.arange(self.vocab_sz, requires_grad=False, device=self.weight.device).unsqueeze(-1)
+    big_shp = idx.shape+(self.vocab_sz, self.embed_sz)
+    arange, idx = self.arange.expand(big_shp), idx.reshape(idx.shape+(1, 1)).expand(big_shp)
+    
+    # Dequantize the weight before the lookup
+    full_scale = self.block_scale.repeat_interleave(self.block_size, dim=-1)
+    # FIX: Removed the incorrect transpose here. vals should have shape (vocab_size, embed_size)
+    vals = self.weight.cast(self.block_scale.dtype) * full_scale
+    
+    return (arange == idx).mul(vals).sum(-2, dtype=vals.dtype)
 def NF4Linear(block_size):
   _CODE = [
     -1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453, -0.28444138169288635, -0.18477343022823334, -0.09105003625154495, 0.0,
@@ -166,9 +396,21 @@ MODEL_PARAMS = {
 def build_transformer(model_path: Path, model_size="8B", quantize=None, scale_dtype=dtypes.float16, device=None, max_context=8192, load_weights=True):
   # build model
   if quantize == "int8": linear, embedding, quantize_embeds = Int8Linear, Int8Embedding, True
+  elif quantize == "fp8": linear, embedding, quantize_embeds = FP8Linear, nn.Embedding, False
   elif quantize == "nf4": linear, embedding, quantize_embeds = NF4Linear(64), nn.Embedding, False
+  # **** MODIFICATION: Add new block scaled quantization option ****
+  elif quantize == "fp8_block_scaled":
+    # We choose a default block size of 128. This can be made a parameter if needed.
+    # Block size should ideally be a divisor of the model's hidden dimensions (e.g., 4096 for 8B model).
+    block_size = 128
+    # block_size = 256
+    # Use partial application to set the block_size for the classes
+    linear = lambda in_features, out_features, bias=False: BlockScaledFP8Linear(in_features, out_features, bias, block_size)
+    embedding = lambda vocab_size, embed_size: BlockScaledFP8Embedding(vocab_size, embed_size, block_size)
+    quantize_embeds = True
   else: linear, embedding, quantize_embeds = nn.Linear, nn.Embedding, False
-  model = Transformer(**MODEL_PARAMS[model_size]["args"], linear=linear, embedding=embedding, max_context=max_context, jit=True)
+  
+  model = Transformer(**MODEL_PARAMS[model_size]["args"], linear=FP8Linear, feed_forward=FP8FeedForward, embedding=embedding, max_context=max_context, jit=True, linear_ff=FP8Linear)
 
   if not load_weights: return model
 
@@ -190,13 +432,19 @@ def build_transformer(model_path: Path, model_size="8B", quantize=None, scale_dt
       # quantize
       if quantize == "float16": weights = {k:v.cast(quantize).contiguous() for k,v in weights.items()}
       elif quantize is not None:
-        weights = linear.quantize(weights, device, scale_dtype, quantize_embeds)
+        # **** MODIFICATION: Pass block_size to the quantize method ****
+        if quantize == "fp8_block_scaled":
+          weights = BlockScaledFP8Linear.quantize(weights, device, scale_dtype, quantize_embeds, block_size=128)
+        else:
+          pass
+          # weights = linear.quantize(weights, device, scale_dtype, quantize_embeds)
         for _,v in weights.items(): v.realize()
 
       # shard
       if isinstance(device, tuple):
         for k,v in nn.state.get_state_dict(model).items():
-          if 'scale' in k: v.shard_(device, axis=None)  # from quantized
+          # **** MODIFICATION: Handle sharding for 'block_scale' ****
+          if 'scale' in k or 'block_scale' in k: v.shard_(device, axis=None)  # from quantized
           elif '.attention.' in k: v.shard_(device, axis=-1)
           elif '.feed_forward.w1.' in k: v.shard_(device, axis=0)
           elif '.feed_forward.w3.' in k: v.shard_(device, axis=0)
@@ -242,7 +490,8 @@ if __name__ == "__main__":
   parser.add_argument("--model", type=Path, help="Model path")
   parser.add_argument("--size", choices=["1B", "8B", "70B", "405B"], default="1B", help="Model size")
   parser.add_argument("--shard", type=int, default=1, help="Shard the model across multiple devices")
-  parser.add_argument("--quantize", choices=["int8", "nf4", "float16"], help="Quantization method")
+  # **** MODIFICATION: Add 'fp8_block_scaled' to choices ****
+  parser.add_argument("--quantize", choices=["int8", "fp8", "fp8_block_scaled", "nf4", "float16"], help="Quantization method")
   parser.add_argument("--no_api", action="store_true", help="Disable the api and run a cli test interface")
   parser.add_argument("--host", type=str, default="0.0.0.0", help="Web server bind address")
   parser.add_argument("--port", type=int, default=7776, help="Web server port")
@@ -259,13 +508,20 @@ if __name__ == "__main__":
     if args.size == "1B":
       fetch("https://huggingface.co/bofenghuang/Meta-Llama-3-8B/resolve/main/original/tokenizer.model", "tokenizer.model", subdir="llama3-1b-instruct")
       args.model = fetch("https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q6_K.gguf", "Llama-3.2-1B-Instruct-Q6_K.gguf", subdir="llama3-1b-instruct")
-    elif args.size == "8B":
+    elif args.size == "8B1":
       fetch("https://huggingface.co/bofenghuang/Meta-Llama-3-8B/resolve/main/original/tokenizer.model", "tokenizer.model", subdir="llama3-8b-sfr")
       fetch("https://huggingface.co/TriAiExperiments/SFR-Iterative-DPO-LLaMA-3-8B-R/resolve/main/model-00001-of-00004.safetensors", "model-00001-of-00004.safetensors", subdir="llama3-8b-sfr")
       fetch("https://huggingface.co/TriAiExperiments/SFR-Iterative-DPO-LLaMA-3-8B-R/resolve/main/model-00002-of-00004.safetensors", "model-00002-of-00004.safetensors", subdir="llama3-8b-sfr")
       fetch("https://huggingface.co/TriAiExperiments/SFR-Iterative-DPO-LLaMA-3-8B-R/resolve/main/model-00003-of-00004.safetensors", "model-00003-of-00004.safetensors", subdir="llama3-8b-sfr")
       fetch("https://huggingface.co/TriAiExperiments/SFR-Iterative-DPO-LLaMA-3-8B-R/resolve/main/model-00004-of-00004.safetensors", "model-00004-of-00004.safetensors", subdir="llama3-8b-sfr")
       args.model = fetch("https://huggingface.co/TriAiExperiments/SFR-Iterative-DPO-LLaMA-3-8B-R/raw/main/model.safetensors.index.json", "model.safetensors.index.json", subdir="llama3-8b-sfr")
+    elif args.size == "8B":
+      name = "nvidia/Llama-3.1-8B-Instruct-FP8" 
+      # name = "RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8" 
+      fetch("https://huggingface.co/bofenghuang/Meta-Llama-3-8B/resolve/main/original/tokenizer.model", "tokenizer.model", subdir=f"{name.split('/')[-1]}")
+      fetch(f"https://huggingface.co/{name}/resolve/main/model-00001-of-00002.safetensors", "model-00001-of-00002.safetensors", subdir=f"{name.split('/')[-1]}")
+      fetch(f"https://huggingface.co/{name}/resolve/main/model-00002-of-00002.safetensors", "model-00002-of-00002.safetensors", subdir=f"{name.split('/')[-1]}")
+      args.model = fetch(f"https://huggingface.co/{name}/resolve/main/model.safetensors.index.json", "model.safetensors.index.json", subdir=f"{name.split('/')[-1]}")
     elif args.size == "70B":
       subdir = "DeepSeek-R1-Distill-Llama-70B"
       args.model = fetch("https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Llama-70B/resolve/main/model.safetensors.index.json?download=true", "model.safetensors.index.json", subdir=subdir)
@@ -284,7 +540,7 @@ if __name__ == "__main__":
   def encode_role(role: str):
     return [tokenizer.special_tokens["<|start_header_id|>"]] + tokenizer.encode(role) + [tokenizer.special_tokens["<|end_header_id|>"]] + tokenizer.encode("\n\n")
   def encode_message(role: str, content: str):
-    return encode_role(role) + tokenizer.encode(content.strip()) + [tokenizer.special_tokens["<|eot_id|>"]]
+    return tokenizer.encode(content.strip()) + [tokenizer.special_tokens["<|eot_id|>"]]
 
   device = tuple(f"{Device.DEFAULT}:{i}" for i in range(args.shard)) if args.shard > 1 else Device.DEFAULT
   model = build_transformer(args.model, model_size=args.size, quantize=args.quantize, device=device)
@@ -430,7 +686,8 @@ if __name__ == "__main__":
 
     app.run(host=args.host, port=args.port, debug=args.debug)
   elif args.benchmark:
-    toks = [tokenizer.bos_id] + encode_message("user", "Hello.") + encode_role("assistant")
+    toks = [tokenizer.bos_id] + encode_message("user", "Hello.") #+ encode_role("assistant")
+    print(toks)
 
     start_pos = prefill(model, toks[:-1])
     last_tok = toks[-1]

@@ -41,9 +41,9 @@ class Attention:
     self.n_rep = self.n_heads // self.n_kv_heads
     self.max_context = max_context
 
-    self.wq = linear(dim, self.n_heads * self.head_dim, bias=False)
-    self.wk = linear(dim, self.n_kv_heads * self.head_dim, bias=False)
-    self.wv = linear(dim, self.n_kv_heads * self.head_dim, bias=False)
+    self.wq = linear(dim, self.n_heads * self.head_dim, bias=False, q=True)
+    self.wk = linear(dim, self.n_kv_heads * self.head_dim, bias=False, k=True)
+    self.wv = linear(dim, self.n_kv_heads * self.head_dim, bias=False, v=True)
     self.wo = linear(self.n_heads * self.head_dim, dim, bias=False)
 
     self.q_norm = nn.RMSNorm(dim, qk_norm) if qk_norm is not None else None
@@ -105,9 +105,9 @@ class FeedForward:
 
 class TransformerBlock:
   def __init__(self, dim:int, hidden_dim:int, n_heads:int, n_kv_heads:int, norm_eps:float, max_context:int, linear=nn.Linear,
-               feed_forward=FeedForward, qk_norm=None):
+               feed_forward=FeedForward, qk_norm=None, linear_ff=nn.Linear):
     self.attention = Attention(dim, n_heads, n_kv_heads, max_context, linear, qk_norm)
-    self.feed_forward = feed_forward(dim, hidden_dim, linear)
+    self.feed_forward = feed_forward(dim, hidden_dim, linear_ff)
     self.attention_norm = nn.RMSNorm(dim, norm_eps)
     self.ffn_norm = nn.RMSNorm(dim, norm_eps)
 
@@ -168,9 +168,9 @@ def sample(logits: Tensor, temp: float, k: int, p: float, af: float, ap: float):
 
 class Transformer:
   def __init__(self, dim:int, hidden_dim:int, n_heads:int, n_layers:int, norm_eps:float, vocab_size, linear=nn.Linear, embedding=nn.Embedding,
-               n_kv_heads=None, rope_theta=10000, max_context=1024, jit=True, feed_forward=FeedForward, qk_norm=None, disable_kv_cache=False):
+               n_kv_heads=None, rope_theta=10000, max_context=1024, jit=True, feed_forward=FeedForward, qk_norm=None, disable_kv_cache=False, linear_ff=nn.Linear):
     self.layers = [TransformerBlock(dim, hidden_dim, n_heads, n_kv_heads, norm_eps, 0 if disable_kv_cache else max_context,
-                                    linear, feed_forward=feed_forward, qk_norm=qk_norm) for _ in range(n_layers)]
+                                    linear, feed_forward=feed_forward, qk_norm=qk_norm,linear_ff=linear_ff) for _ in range(n_layers)]
     self.norm = nn.RMSNorm(dim, norm_eps)
     self.tok_embeddings = embedding(vocab_size, dim)
     self.output = nn.Linear(dim, vocab_size, bias=False) if embedding == nn.Embedding else linear(dim, vocab_size, bias=False)
@@ -209,9 +209,16 @@ def convert_from_huggingface(weights:dict[str, Tensor], n_layers: int, n_heads: 
     **{f"model.layers.{l}.input_layernorm.weight": f"layers.{l}.attention_norm.weight" for l in range(n_layers)},
     **{f"model.layers.{l}.self_attn.{x}_norm.weight": f"layers.{l}.attention.{x}_norm.weight" for x in ["q", "k"] for l in range(n_layers)},
     **{f"model.layers.{l}.self_attn.{x}_proj.weight": f"layers.{l}.attention.w{x}.weight" for x in ["q", "k", "v", "o"] for l in range(n_layers)},
+    **{f"model.layers.{l}.self_attn.{x}_proj.input_scale": f"layers.{l}.attention.w{x}.input_scale" for x in ["q", "k", "v", "o"] for l in range(n_layers)},
+    **{f"model.layers.{l}.self_attn.{x}_proj.weight_scale": f"layers.{l}.attention.w{x}.weight_scale" for x in ["q", "k", "v", "o"] for l in range(n_layers)},
+
+    **{f"model.layers.{l}.self_attn.{x}_proj.{x}_scale": f"layers.{l}.attention.w{x}.{x}_scale" for x in ["q", "k", "v"] for l in range(n_layers)},
     **{f"model.layers.{l}.self_attn.{x}_proj.bias": f"layers.{l}.attention.w{x}.bias" for x in ["q", "k", "v", "o"] for l in range(n_layers)},
     **{f"model.layers.{l}.post_attention_layernorm.weight": f"layers.{l}.ffn_norm.weight" for l in range(n_layers)},
     **{f"model.layers.{l}.mlp.{x}_proj.weight": f"layers.{l}.feed_forward.w{y}.weight" for x, y in {"gate": "1", "down": "2", "up": "3"}.items() for l in range(n_layers)},
+    # model.layers.0.mlp.down_proj.input_scale
+    **{f"model.layers.{l}.mlp.{x}_proj.input_scale": f"layers.{l}.feed_forward.w{y}.input_scale" for x, y in {"gate": "1", "down": "2", "up": "3"}.items() for l in range(n_layers)},
+    **{f"model.layers.{l}.mlp.{x}_proj.weight_scale": f"layers.{l}.feed_forward.w{y}.weight_scale" for x, y in {"gate": "1", "down": "2", "up": "3"}.items() for l in range(n_layers)},
     **{f"model.layers.{l}.mlp.gate.weight": f"layers.{l}.feed_forward.gate.weight" for l in range(n_layers)},
     "model.norm.weight": "norm.weight",
     "lm_head.weight": "output.weight",
@@ -221,7 +228,7 @@ def convert_from_huggingface(weights:dict[str, Tensor], n_layers: int, n_heads: 
   for k, v in weights.items():
     if ".rotary_emb." in k: continue
     v = v.to(Device.DEFAULT)
-    if "model.layers" in k:
+    if "model.layers" in k and "scale" not in k:
       if ("q_proj" in k or "q_norm" in k) and permute_layers: v = permute(v, n_heads)
       elif ("k_proj" in k or "k_norm" in k) and permute_layers: v = permute(v, n_kv_heads)
     if '.mlp.experts.' in k:

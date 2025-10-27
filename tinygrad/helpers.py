@@ -314,7 +314,7 @@ def diskcache(func:Callable[..., T]):
 
 def _ensure_downloads_dir() -> pathlib.Path:
   # if we are on a tinybox, use the raid array
-  if pathlib.Path("/etc/tinybox-release").is_file():
+  if 0 and pathlib.Path("/etc/tinybox-release").is_file():
     # try creating dir with sudo
     if not (downloads_dir := pathlib.Path("/raid/downloads")).exists():
       subprocess.run(["sudo", "mkdir", "-p", downloads_dir], check=True)

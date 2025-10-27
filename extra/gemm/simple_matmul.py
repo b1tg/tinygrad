@@ -30,7 +30,7 @@ if __name__ == "__main__":
     if (np_dtype := _to_np_dtype(dtype_in)) is None: np_dtype = np.float32
     if dtype_in in dtypes.ints:
       return Tensor(rng.integers(INT_LOW, INT_HIGH, (rows, cols), dtype=np_dtype)).realize()
-    return Tensor(rng.random((rows, cols), dtype=np.float32).astype(np_dtype)-0.5).cast(dtype_in).realize()
+    return (Tensor(rng.random((rows, cols), dtype=np.float32).astype(np_dtype)-0.5)).cast(dtype_in).realize()
 
   a, b = init_matrix(M, K), init_matrix(K, N)
   for i in range(CNT):
@@ -45,7 +45,9 @@ if __name__ == "__main__":
     assert any(opt.op is OptOps.TC for opt in ei.prg.p.applied_opts), f"TC not triggered, {ei.prg.p.applied_opts}"
 
   ref = a.numpy().astype(np.float32) @ b.numpy().astype(np.float32)
-  res = c.numpy()
+  res = (c*1).numpy()
+  print("ref: ", ref)
+  print("res: ", res)
   try:
     np.testing.assert_allclose(res, ref, rtol=RTOL, atol=ATOL)
   except AssertionError as e:

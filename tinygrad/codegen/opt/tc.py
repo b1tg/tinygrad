@@ -4,6 +4,7 @@ from tinygrad.dtype import DType, dtypes
 from tinygrad.helpers import getenv
 
 @dataclass(frozen=True)
+# N, M, K
 class TensorCore: # D = A * B + C, A is (M x K), B is (K x N), C and D are (M x N)
   dims: tuple[int,int,int] # N, M, K
   threads: int # number of threads that construct the warp
@@ -18,9 +19,16 @@ class TensorCore: # D = A * B + C, A is (M x K), B is (K x N), C and D are (M x 
   def _remaps(self) -> list[dict[str, str]]:
     local_axes, upcast_axes, reduce_axes = len(self.get_local_axes()), len(self.get_upcast_axes()), len(self.get_reduce_axes())
     fwd_st = [f"l{i}" for i in range(local_axes)] + [f"u{i}" for i in range(upcast_axes)] + [f"r{i}" for i in range(reduce_axes)]
-    return [dict(zip(fwd_st, sum(s, ()))) for s in self.swizzle]
+    ret = [dict(zip(fwd_st, sum(s, ()))) for s in self.swizzle]
+    if 0 and self.dims[2] == 128:
+      print(f"fwd_st: {fwd_st}")
+      print(f"ret: {ret}")
+    return ret
   def permutes_for_shape_str(self, shape_str:list[str]) -> tuple[tuple[int, ...], tuple[int, ...]]:
     ret = [[shape_str.index(remap[ss]) if ss in remap else i for i,ss in enumerate(shape_str)] for remap in self._remaps()]
+    if 0 and self.dims[2] == 128:
+      print(f"shape_str: {shape_str}")
+      print(f"permutes_for_shape_str: {ret}")
     return tuple(ret[0]), tuple(ret[1])
   @functools.cache  # pylint: disable=method-cache-max-size-none
   def base_shape_str(self) -> list[str]:
@@ -54,7 +62,7 @@ class TensorCore: # D = A * B + C, A is (M x K), B is (K x N), C and D are (M x 
     assert len(self.swizzle[0]) == 3 and len(self.swizzle[1]) == 3, "swizzle has wrong part count"
     assert len(self.swizzle[0][0]) == len(self.swizzle[1][0]) == local_axes, "local swizzle size is wrong"
     assert len(self.swizzle[0][1]) == len(self.swizzle[1][1]) == upcast_axes, "upcast swizzle size is wrong"
-    assert len(self.swizzle[0][2]) == len(self.swizzle[1][2]) == reduce_axes, "reduce swizzle size is wrong"
+    assert len(self.swizzle[0][2]) == len(self.swizzle[1][2]) == reduce_axes, f"reduce swizzle size is wrong, {reduce_axes=}"
     assert all(len(s) == local_axes+upcast_axes+reduce_axes for s in self._remaps()), "remaps are the wrong size"
     # check elements_per_thread
     un, ln = 0, 0
@@ -105,18 +113,60 @@ amd_rdna4 = [TensorCore(dims=(16,16,16), threads=32, elements_per_thread=(8,8,8)
            (('l0', 'l1', 'l2', 'l3', 'r2'), ('r0', 'r1', 'r3'), ('l4', 'u0', 'u1', 'u2'))))
   for di,do in [(dtypes.half,dtypes.float),(dtypes.half,dtypes.half),(dtypes.bfloat16,dtypes.float),(dtypes.bfloat16,dtypes.bfloat16)]]
 
+# __builtin_amdgcn_mfma_f32_16x16x32_fp8_fp8
 amd_cdna_fp8 = [TensorCore(dims=(16,16,32), threads=64, elements_per_thread=(8,8,4), dtype_in=di, dtype_out=do,
   opts=("l0","l0","l0","l0","u1","u1","l1","l1"),
   swizzle=((('u0','u1','l4','l5','r3','r4'), ('r0','r1'), ('l0','l1','l2','l3','r2')),
            (('l0','l1','l2','l3','r3','r4'), ('r0','r1'), ('l4','l5','u0','u1','r2'))))
   for di,do in [(dtypes.fp8e5m2, dtypes.float), (dtypes.fp8e4m3, dtypes.float)]]
 
+# K_L = K / (64 / (M * B))
+# K_L =16 / (64 / (16 *1)) = 4 which is the number of consecutive values of K that each lane holds in its registers.
+# A[b,i,k] = k % 4 of lane i + 16*(k/4)        ; k % K_L and i + M * (b + 1 * (k / K_L))
+# B[b,k,j] = k % 4 of lane j + 16*(k/4)        ; k % K_L and j + N * (b + 1 * (k / K_L))
 # https://gpuopen.com/learn/amd-lab-notes/amd-lab-notes-matrix-cores-readme
+# H = 4
+# B_I = ceil(64 / (N * M / H)) = 64/ (16*16/4) =1
+# M_I = (64 / BI) / N = 4
+# G = M / (H * M_I) = 16/(4*4) =1
+# C[b,i,j] = (i % H) + H * (i/(H * M_I) + G * (b / B_I)) on lane j + N * ((i / H) % M_I + M_I * (b % B_I))
+#            (i % 4) + 4 * (i/16) on lane j + 16 * ((i/4)%4)
 amd_cdna = [TensorCore(dims=(16,16,16), threads=64, elements_per_thread=(4,4,4), dtype_in=di, dtype_out=do,
   opts=("l0","l0","l0","l0","u1","u1","l1","l1"),
   swizzle=((('u0', 'u1', 'l4', 'l5', 'r2', 'r3'), ('r0', 'r1'), ('l0', 'l1', 'l2', 'l3')),
            (('l0', 'l1', 'l2', 'l3', 'r2', 'r3'), ('r0', 'r1'), ('l4', 'l5', 'u0', 'u1'))))
   for di,do in [(dtypes.half,dtypes.float),(dtypes.bfloat16,dtypes.float)]] + amd_cdna_fp8
+
+# K_L = 32/ (64/16) = 8
+# only cdna4
+amd_cdna = [TensorCore(dims=(16,16,32), threads=64, elements_per_thread=(8,8,4), dtype_in=di, dtype_out=do,
+  opts=("l0","l0","l0","l0","u1","u1","l1","l1"),
+  swizzle=((('u0','u1','l4','l5','r3','r4'), ('r0','r1'), ('l0','l1','l2','l3','r2')),
+           (('l0','l1','l2','l3','r3','r4'), ('r0','r1'), ('l4','l5','u0','u1','r2'))))
+  for di,do in [(dtypes.half,dtypes.float),(dtypes.bfloat16,dtypes.float)]]
+
+# 16x16x128.f8f6f4
+# https://github.com/ROCm/rocm-amdgpu-bench/blob/main/kernels.cpp#L159
+# __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4
+# __builtin_amdgcn_mfma_scale_f32_32x32x64_f8f6f4
+# k_L = 128 / (64 / (16*1)) = 32
+# A[i,k] = k % 32 of lane i + 16*(k/32)        ; k % K_L and i + M * (b + 1 * (k / K_L))
+# B[k,j] = k % 32 of lane j + 16*(k/32)        ; k % K_L and j + N * (b + 1 * (k / K_L))
+# A[3][123]  = 27 of lane 51
+amd_cdna = [TensorCore(dims=(16,16,128), threads=64, elements_per_thread=(32,32,4), dtype_in=di, dtype_out=do,
+  opts=("l0","l0","l0","l0","u1","u1","l1","l1"),
+  # l0 l1 l2 l3 l4 l5 r0 r1 r2 r3 r4 r5 r6 u0 u1
+  #  (local_swizzle6, upcast_swizzle, reduce_swizzle7)
+  # local=6  bcz thread=64
+  # reduce=7 bcz K=128
+  # upcast=2 bcz M*N/thread=4(say can't be localized, so upcasted)
+  swizzle=((('u0','u1','l4','l5','r5','r6'), ('r0','r1'), ('l0','l1','l2','l3','r2','r3','r4')),
+           (('l0','l1','l2','l3','r5','r6'), ('r0','r1'), ('l4','l5','u0','u1','r2', 'r3','r4'))))
+  # ['l0', 'l1', 'l2', 'l3', 'u0', 'u1', 'l4', 'l5', 'r0', 'r1', 'r2', 'r3', 'r4', 'r5', 'r6']
+  # swizzle=((('l0','l1','l2','l3','u0','u1'), ('r5','r6'), ('l4', 'l5', 'r0', 'r1', 'r2', 'r3', 'r4')),
+  #          (('l0','l1','l2','l3','u0','u1'), ('r5','r6'), ('l4', 'l5', 'r0', 'r1', 'r2', 'r3', 'r4'))))
+  for di,do in [(dtypes.fp8e5m2, dtypes.float), (dtypes.fp8e4m3, dtypes.float)]]
+
 
 # ***** Apple Metal *****
 

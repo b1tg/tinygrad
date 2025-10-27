@@ -34,5 +34,21 @@ class TestElfLoader(unittest.TestCase):
     with self.assertRaisesRegex(RuntimeError, 'powf'): elf_loader(obj)
     elf_loader(obj, link_libs=['m'])
 
+  def test_a(self):
+    with open("bugr_88_4_64_4_2_2_4_4_8_2_2_2.bin", "rb") as f:
+      obj = f.read()
+      image, sections, relocs = elf_loader(obj)
+      print(image, [sh.name for sh in sections], relocs)
+      for sh in sections:
+        if sh.name == ".rela.text":
+          print(sh)
+
+      rodata_entry = next((sh.header.sh_addr for sh in sections if sh.name == ".rodata"), -1)
+    with open("target/r_64_16_64_4_2_2_4_4_32_2_2_2.bin", "rb") as f:
+      obj = f.read()
+      image, sections, relocs = elf_loader(obj)
+      print(image, [sh.name for sh in sections], relocs)
+
+
 if __name__ == '__main__':
   unittest.main()

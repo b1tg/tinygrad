@@ -75,7 +75,7 @@ def uops_to_dtypes(uops:list[UOp]) -> list[DType]: return dedup(u.dtype for u in
 
 # (name, dims, dtype_in, dtype_out, device, threads, upcast_axes, reduce_axes)
 def wmma_args(uops:list[UOp]):
-  return dedup((uop.arg[0], uop.arg[1], uop.src[0].dtype.scalar(), uop.dtype.scalar(), *(uop.arg[4:8])) for uop in uops if uop.op is Ops.WMMA)
+  return dedup((uop.arg[0], uop.arg[1], uop.arg[2], uop.dtype.scalar(), *(uop.arg[4:8])) for uop in uops if uop.op is Ops.WMMA)
 
 class CStyleLanguage(Renderer):
   kernel_typedef: str = "void"
@@ -334,6 +334,7 @@ class MetalRenderer(CStyleLanguage):
     return super().render_kernel(function_name, kernel, bufs, uops, prefix)
 
 _nms = "xyzwabcdefghijkl"
+_nms = [f'x{i}' for i in range(0,32)]
 
 class CUDARenderer(CStyleLanguage):
   device = "CUDA"
@@ -403,6 +404,7 @@ def cast_float_to_bf16(x: UOp) -> UOp:
   x = (-x & 0x7f800000).where(x + ((x >> 16) & 1) + 0x7fff, (x & 0xffff).where((x | 0x10000), x))
   return (x >> 16).cast(dtypes.ushort).bitcast(dtypes.bfloat16)
 
+SCALE = 0
 class AMDRenderer(CStyleLanguage):
   device = "AMD"
   shared_max = 65536
@@ -417,7 +419,12 @@ class AMDRenderer(CStyleLanguage):
     self.tensor_cores = self.get_tensor_cores(arch)
     if self.tensor_cores == tc.amd_cdna:
       self.string_rewrite = PatternMatcher([
-        (UPat(Ops.WMMA, name="x"), lambda ctx,x: f"__{x.arg[0]}({ctx[x.src[0]]}, {ctx[x.src[1]]}, {ctx[x.src[2]]}, 0, 0, 0)")]) + base_rewrite
+        (UPat(Ops.WMMA, name="x"), lambda ctx,x: f"__{x.arg[0]}({ctx[x.src[0]]}, {ctx[x.src[1]]}, {ctx[x.src[2]]}, 0, 0, 0{',0,0,0' if 1 else ''})"),
+        (UPat(Ops.CAST, dtypes.fp8s, (UPat.var("y", dtypes.float),), name="x",), lambda ctx,x, y: f"f32_to_fp8{'_scale' if SCALE else ''}({ctx[x.src[0]]}, {'1' if x.dtype == dtypes.fp8e5m2 else '0'})"),
+        # __builtin_amdgcn_cvt_scalef32_f32_fp8(val.i32val, scale, 0);
+        (UPat(Ops.CAST, dtypes.float, (UPat.var("y", dtypes.fp8s),), name="x",), lambda ctx,x, y:
+          f"__builtin_amdgcn_cvt{'_scalef32' if SCALE else ''}_f32_{'fp8' if y.dtype == dtypes.fp8e4m3 else 'bf8'}((unsigned int){ctx[x.src[0]]}{', 1.0' if SCALE else ''}, 0)"),
+      ]) + base_rewrite
   def __reduce__(self): return self.__class__, (self.arch,)
 
   # language options
@@ -443,7 +450,7 @@ class AMDRenderer(CStyleLanguage):
   barrier = '__builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup");' + '__builtin_amdgcn_s_barrier();' + \
             '__builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup");'
   float4 = "make_float4"
-  type_map = {dtypes.bfloat16: "hip_bfloat16"}
+  type_map = {dtypes.bfloat16: "hip_bfloat16", dtypes.fp8e4m3: "hip_fp8", dtypes.fp8e5m2: "hip_bf8"}
   extra_matcher = PatternMatcher([
     # cast bfloat16 alus to float
     (UPat(Ops.WHERE, src=(UPat.var("b"), UPat.var("x", dtype=dtypes.bfloat16), UPat.var("y", dtype=dtypes.bfloat16))),
@@ -452,11 +459,18 @@ class AMDRenderer(CStyleLanguage):
       lambda x: UOp(x.op, dtypes.float, tuple(vv.cast(dtypes.float) for vv in x.src), x.arg).cast(dtypes.bfloat16)),
     (UPat(GroupOp.ALU, dtypes.bool, name="alu", src=(UPat.var("x", dtype=dtypes.bfloat16), UPat.var("y", dtype=dtypes.bfloat16))),
       lambda alu,x,y: UOp(alu.op, dtypes.bool, (x.cast(dtypes.float), y.cast(dtypes.float)), alu.arg)),
+    # (UPat(Ops.CAST, name="x", src=(UPat.var("y", dtypes.fp8s),)),
+    #   lambda x,y: y.cast(dtypes.float).cast(x.dtype) if x.dtype!=dtypes.float else None),
+    # (UPat(Ops.CAST, dtypes.fp8s, (UPat.var("x"),), name="y"),
+    #   lambda x,y: x.cast(dtypes.float).cast(y.dtype) if x.dtype!=dtypes.float else None),
     # add float intermediate casting for bfloat16
     (UPat(Ops.CAST, name="x", src=(UPat.var("y", dtypes.bfloat16),)),
       lambda x,y: y.cast(dtypes.float).cast(x.dtype) if x.dtype!=dtypes.float else None),
     (UPat(Ops.CAST, dtypes.bfloat16, (UPat.var("x"),)),
       lambda x: x.cast(dtypes.float).cast(dtypes.bfloat16) if x.dtype!=dtypes.float else None),
+    (UPat(Ops.WMMA, name="x", dtype=dtypes.float.vec(4)),
+      lambda x: UOp(Ops.WMMA, dtypes.float.vec(4), (x.src[0].bitcast(dtypes.uint64), x.src[1].bitcast(dtypes.uint64),
+        x.src[2]), (*x.arg,)) if x.src[0].dtype in (dtypes.fp8e4m3.vec(8), dtypes.fp8e5m2.vec(8)) else None),
     # bfloat16 casting
     (UPat.cvar('x', dtypes.bfloat16), lambda x: cast_float_to_bf16(UOp.const(dtypes.float, x.arg))),
     (UPat(Ops.CAST, dtypes.float, (UPat.var("x", dtypes.bfloat16),)),
@@ -470,14 +484,35 @@ class AMDRenderer(CStyleLanguage):
 
   def render_kernel(self, function_name, kernel, bufs, uops, prefix=None) -> str:
     prefix = ["#define INFINITY (__builtin_inff())","#define NAN (__builtin_nanf(\"\"))","typedef long unsigned int size_t;","#define half _Float16"]
-    type_map = { dtypes.bfloat16: "bf16", dtypes.float: "f32", dtypes.half: "f16" }
+    type_map = { dtypes.bfloat16: "bf16", dtypes.float: "f32", dtypes.half: "f16", dtypes.fp8e4m3: "_fp8_fp8", dtypes.fp8e5m2: "_bf8_bf8"}
     used_dtypes = uops_to_dtypes(uops)
     if any(dt.scalar() == dtypes.bfloat16 for dt in used_dtypes): prefix.append("typedef unsigned short hip_bfloat16;")
+    if any(dt.scalar() == dtypes.fp8e4m3 for dt in used_dtypes): prefix.append("typedef unsigned char hip_fp8;")
+    if any(dt.scalar() == dtypes.fp8e5m2 for dt in used_dtypes): prefix.append("typedef unsigned char hip_bf8;")
+    if any(dt.scalar() in dtypes.fp8s for dt in used_dtypes):
+      prefix.append("""static inline __attribute__((device)) unsigned char f32_to_fp8(float v, int is_bf8) {
+  v = (((*(unsigned*)&v)&0x7F800000)!=0x7F800000)?__builtin_amdgcn_fmed3f(v,is_bf8?57344.0f:448.0f,is_bf8?-57344.0f:-448.0f) : v;
+  return (unsigned char)(is_bf8?__builtin_amdgcn_cvt_pk_bf8_f32(v,v,0,false):__builtin_amdgcn_cvt_pk_fp8_f32(v,v,0,false));\n}""")
+      prefix.append("""typedef short int16_2 __attribute__((ext_vector_type(2)));
+  static inline __attribute__((device)) unsigned char f32_to_fp8_scale(float v, int is_bf8) {
+  v = (((*(unsigned*)&v)&0x7F800000)!=0x7F800000)?__builtin_amdgcn_fmed3f(v,is_bf8?57344.0f:448.0f,is_bf8?-57344.0f:-448.0f) : v;
+  int16_2 z = {0, 0};
+  z = (is_bf8?__builtin_amdgcn_cvt_scalef32_pk_bf8_f32(z,v,v,1.0,false):__builtin_amdgcn_cvt_scalef32_pk_fp8_f32(z, v,v,1.0,false));
+  return (unsigned char)z[0];\n}""")
+
     prefix += [self.render_vector_prefix(dt) for dt in used_dtypes if dt.count > 1]
 
-    for name, _, dtype_in, dtype_out, _, _, _, _ in wmma_args(uops): # TODO: handle TCs f32_bf16 and bf16_bf16 w/ wrapper
+    for name, (N, M, K), dtype_in, dtype_out, _, _, _, _ in wmma_args(uops): # TODO: handle TCs f32_bf16 and bf16_bf16 w/ wrapper
       if self.tensor_cores == tc.amd_cdna:
-        prefix.append(f"#define __{name} __builtin_amdgcn_mfma_f32_16x16x16{'f16' if dtype_in == dtypes.half else 'bf16_1k'}")
+        type_map = {**type_map, dtypes.bfloat16: "bf16_1k", dtypes.half: "_f16"}
+        scale = False
+        if K == 128:
+          type_map = {**type_map, dtypes.fp8e4m3: "_f8f6f4"}
+          scale = True
+          global SCALE
+          # SCALE = 1
+        prefix.append(f"#define __{name} __builtin_amdgcn_mfma_{'scale_' if scale else ''}f32_{N}x{M}x{K}{type_map[dtype_in]}")
+        # __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4
       # #define __WMMA_16_16_16_half_half __builtin_amdgcn_wmma_f16_16x16x16_f16_w32_gfx12
       elif self.tensor_cores == tc.amd_rdna4:
         prefix.append(f"#define __{name} __builtin_amdgcn_wmma_{type_map[dtype_out]}_16x16x16_{type_map[dtype_in]}_w32_gfx12")

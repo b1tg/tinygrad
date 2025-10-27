@@ -31,7 +31,7 @@ class TensorIO(io.RawIOBase, BinaryIO):
   def writelines(self, lines: Iterable[Any]): raise io.UnsupportedOperation("TensorIO.writelines not supported")
 
 safe_dtypes = {"BOOL":dtypes.bool, "I8":dtypes.int8, "U8":dtypes.uint8, "I16":dtypes.int16, "U16":dtypes.uint16, "I32":dtypes.int, "U32":dtypes.uint,
-               "I64":dtypes.int64, "U64":dtypes.uint64, "F16":dtypes.float16, "BF16":dtypes.bfloat16, "F32":dtypes.float32, "F64":dtypes.float64}
+               "I64":dtypes.int64, "U64":dtypes.uint64, "F16":dtypes.float16, "BF16":dtypes.bfloat16, "F32":dtypes.float32, "F64":dtypes.float64, "F8_E4M3":dtypes.fp8e4m3}
 inverse_safe_dtypes = {v:k for k,v in safe_dtypes.items()}
 
 def accept_filename(func: Callable[[Tensor], T]) -> Callable[[Tensor|str|pathlib.Path], T]:
@@ -143,13 +143,14 @@ def load_state_dict(model, state_dict:dict[str, Tensor], strict=True, verbose=Tr
   with Timing("loaded weights in ",
               lambda et_ns: f", {(B:=(GlobalCounters.mem_used-start_mem_used))/1e9:.2f} GB loaded at {B/et_ns:.2f} GB/s", enabled=verbose):
     model_state_dict = get_state_dict(model)
-    if DEBUG >= 1 and len(state_dict) > len(model_state_dict):
+    if DEBUG >= 0 and len(state_dict) > len(model_state_dict):
       print("WARNING: unused weights in state_dict", sorted(list(state_dict.keys() - model_state_dict.keys())))
     for k,v in (t := tqdm(model_state_dict.items(), disable=CI or not verbose)):
       t.desc = f"ram used: {GlobalCounters.mem_used/1e9:5.2f} GB, {k:50s}: "
       if k not in state_dict and not strict:
         if DEBUG >= 1: print(f"WARNING: not loading {k}")
         continue
+      # if k.endswith(".scale"): continue
       if v.shape != state_dict[k].shape:
         raise ValueError(f'Shape mismatch in layer `{k}`: Expected shape {v.shape}, but found {state_dict[k].shape} in state dict.')
       if isinstance(v.device, tuple):

@@ -2659,6 +2659,16 @@ class Tensor(MathTrait):
     x = x.reshape(*x.shape[0:-1], *[1]*min(dx-1, dw-1, 1), x.shape[-1])
     w = w.reshape(*w.shape[0:-2], *[1]*min(dx-1, dw-1, 1), *w.shape[axis_w:]).transpose(-1, axis_w)
     return (x*w).sum(-1, dtype=dtype).cast(least_upper_dtype(x.dtype, w.dtype) if dtype is None else dtype)
+  def _scaled_mm(self, x:Tensor, w:Tensor, scale_a:Tensor, scale_b:Tensor, out_dtype=dtypes.float16) -> Tensor:
+    # dequantize and scale inputs, then perform matmul with explicit accumulation dtype
+    # a = x.cast(out_dtype) if x.dtype != out_dtype else x
+    # b = w.cast(out_dtype) if w.dtype != out_dtype else w
+    # if scale_a is not None: a = a * scale_a
+    # wb = b.T
+    # if scale_b is not None: wb = wb * scale_b
+    # return a.dot(wb, dtype=out_dtype)
+    res = x.cast(out_dtype).dot(w.cast(out_dtype), out_dtype).cast(out_dtype) * scale_a * scale_b
+    return res
 
   def matmul(self, x:Tensor, reverse=False, dtype:DTypeLike|None=None) -> Tensor:
     """

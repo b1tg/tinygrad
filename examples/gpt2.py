@@ -11,11 +11,60 @@ from extra.bench_log import BenchEvent, WallTimeEvent
 
 MAX_CONTEXT = getenv("MAX_CONTEXT", 128)
 HALF = getenv("HALF")
+  # def __init__(self, in_features:int, out_features:int, bias=True):
+  #   bound = 1 / math.sqrt(in_features)
+  #   self.weight = Tensor.uniform(out_features, in_features, low=-bound, high=bound)
+  #   self.bias = Tensor.uniform(out_features, low=-bound, high=bound) if bias else None
 
+  # def __call__(self, x:Tensor) -> Tensor: return x.linear(self.weight.transpose(), self.bias)
+class FP8Linear:
+  def __init__(self, in_features, out_features, bias=False):
+    # assert bias == False
+    self.weight = Tensor.ones(out_features, in_features, dtype=dtypes.fp8e4m3)
+    self.scale = Tensor.ones(out_features, dtype=dtypes.half)
+    self.bias = Tensor.ones(out_features, dtype=dtypes.half) if bias else None
+
+  def __call__(self, x):
+    # print(self.weight.numpy(), self.weight.dtype)
+    # print(self.scale.numpy())
+    # 1/0
+    x = x.dot(self.weight.cast(dtype=self.scale.dtype).T*self.scale)
+    return x.add(self.bias) if self.bias is not None else x
+
+  @staticmethod
+  def quantize(tensors, device=None, scale_dtype=dtypes.float16, quantize_embeds=False):
+    new_tensors = {}
+    for name,v in tensors.items():
+      print(name)
+      # if "feed_forward" in name or "attention.w" in name or (quantize_embeds and "tok_embeddings.weight" in name):
+      if (  "c_attn." in name ) and "weight" in name:
+
+        scale = 0.1
+        fp8_weight = v
+        # assert "weight" in name, name
+        # v = v.cast(scale_dtype)
+        scale = v.abs().max(axis=1)
+        fp8_weight = (v.T/scale).T.cast(dtype=dtypes.fp8e4m3)
+        new_tensors[name] = fp8_weight
+        # assert fp8_weight.shape == v.shape
+        # print(f"{scale.to("CPU").realize().numpy()}, {scale.shape=}")
+        new_tensors[name.replace('weight', 'scale')] = scale
+        # if isinstance(device, tuple):
+        #   new_tensors[name].shard_(device, axis=-1)
+        #   new_tensors[name.replace('weight', 'scale')].shard_(device, axis=None)
+      else:
+        new_tensors[name] = v
+    # if quantize_embeds: 
+    # new_tensors.update({"lm_head.weight": new_tensors["lm_head.weight"], })
+    # new_tensors.update({"lm_head.scale": new_tensors["lm_head.scale"], })
+    return new_tensors
+Linear0 = Linear
+Linear = FP8Linear
+assert Linear0 != Linear
 class Attention:
   def __init__(self, dim, n_heads):
     self.c_attn = Linear(dim, 3*dim, bias=True)
-    self.c_proj = Linear(dim, dim, bias=True)
+    self.c_proj = Linear0(dim, dim, bias=True)
     self.n_heads = n_heads
     self.dim = dim
     self.head_dim = dim // n_heads
@@ -49,8 +98,8 @@ class Attention:
 
 class FeedForward:
   def __init__(self, dim, hidden_dim):
-    self.c_fc = Linear(dim, hidden_dim, bias=True)
-    self.c_proj = Linear(hidden_dim, dim, bias=True)
+    self.c_fc = Linear0(dim, hidden_dim, bias=True)
+    self.c_proj = Linear0(hidden_dim, dim, bias=True)
 
   def __call__(self, x:Tensor) -> Tensor:
     return self.c_proj(self.c_fc(x).gelu())
@@ -73,7 +122,7 @@ class Transformer:
     self.wpe = Embedding(max_seq_len, dim)
     self.h = [TransformerBlock(dim, n_heads, norm_eps) for _ in range(n_layers)]
     self.ln_f = LayerNorm(dim, norm_eps)
-    self.lm_head = Linear(dim, vocab_size, bias=False)
+    self.lm_head = Linear0(dim, vocab_size, bias=False)
     self.forward_jit = TinyJit(self.forward)
 
   def forward(self, tokens:Union[Tensor,UOp], start_pos:Variable, temperature:float=0.0):
@@ -137,6 +186,8 @@ class GPT2:
         weights[k] = weights[k].T
     # lm head and wte are tied
     weights['lm_head.weight'] = weights['wte.weight']
+    weights = FP8Linear.quantize(weights)
+    for _,v in weights.items(): v.realize()
 
     with WallTimeEvent(BenchEvent.LOAD_WEIGHTS):
       load_state_dict(model, weights)

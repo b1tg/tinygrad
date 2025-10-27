@@ -1,11 +1,12 @@
 #!/bin/bash
 set -e  # Exit on any error
 set -o pipefail  # Make pipeline fail if any command fails
-
-export PYTHONPATH="." AMD=1
+# export WANDB=1
+export PYTHONPATH="." AMD=1 AMD_LLVM=0
 export MODEL="bert"
 export SUBMISSION_PLATFORM="tinybox_8xMI300X"
 export DEFAULT_FLOAT="HALF" GPUS=8 BS=1024 EVAL_BS=1024
+# export DEFAULT_FLOAT="FP8E5M2" GPUS=8 BS=1024 EVAL_BS=1024
 
 # similar to https://github.com/mlcommons/training_results_v3.1/blob/d06288b2bd675a9d88e0e6181f5bb5626b71ec19/Quanta_Cloud_Technology/results/D54U-3U/bert/result_1.txt#L54
 export OPT_BASE_LEARNING_RATE=0.0011 OPT_LAMB_BETA_1=0.60466 OPT_LAMB_BETA_2=0.85437 DECAY=0.1
@@ -27,4 +28,4 @@ LOGFILE="bert_8xMI300x_${DATETIME}_${SEED}.log"
 BENCHMARK=10 INITMLPERF=1 BERT_LAYERS=2 python3 examples/mlperf/model_train.py | tee $LOGFILE
 
 # run
-PARALLEL=0 RUNMLPERF=1 python3 examples/mlperf/model_train.py | tee -a $LOGFILE
+PARALLEL=0 RUNMLPERF=0 python3 examples/mlperf/model_train.py 2>&1 | tee -a $LOGFILE
