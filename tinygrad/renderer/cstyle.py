@@ -87,7 +87,7 @@ def create_non_native_float_pats(dts:tuple[DType, ...], casting:bool=True):
   return patterns
 
 def uops_to_dtypes(uops:list[UOp]) -> list[DType]: return dedup(u.dtype for u in uops if not isinstance(u.dtype, (ImageDType, PtrDType)))
-def uops_to_dtypes1(uops:list[UOp]) -> list[(UOp, DType)]: return dedup((u.op, u.dtype, u.arg[0] if u.op is Ops.SPECIAL else "") for u in uops
+def uops_to_dtypes1(uops:list[UOp]): return dedup((u.op, u.dtype, u.arg) for u in uops
                                                                         if not isinstance(u.dtype, (ImageDType, PtrDType)))
 
 # (name, dims, dtype_in, dtype_out, device, threads, upcast_axes, reduce_axes)
@@ -496,14 +496,11 @@ class AMDRenderer(CStyleLanguage):
     prefix = []
     type_map = { dtypes.bfloat16: "bf16", dtypes.float: "f32", dtypes.half: "f16", dtypes.fp8e4m3: "_fp8_fp8", dtypes.fp8e5m2: "_bf8_bf8" }
     used_dtypes = uops_to_dtypes(uops)
-    used_dtypes1 = uops_to_dtypes1(uops)
-    for op, dt, arg in used_dtypes1:
+    for op, dt, arg in uops_to_dtypes1(uops):
+      if op == Ops.CONST: prefix.append("#define INFINITY (__builtin_inff())") if math.isinf(arg) else prefix.append("#define NAN (__builtin_nanf(\"\"))") if math.isnan(arg) else None
+      if dt.scalar() == dtypes.bfloat16: prefix.append("typedef unsigned short hip_bfloat16;")
+      if dt.scalar() == dtypes.half: prefix.append("#define half _Float16")
       if de := self.create_typedef(op, dt, arg=arg): prefix.append(de)
-    for u in uops:
-      if u.op == Ops.CONST and math.isinf(u.arg): prefix.append("#define INFINITY (__builtin_inff())")
-      if u.op == Ops.CONST and math.isnan(u.arg): prefix.append("#define NAN (__builtin_nanf(\"\"))")
-    if any(dt.scalar() == dtypes.bfloat16 for dt in used_dtypes): prefix.append("typedef unsigned short hip_bfloat16;")
-    if any(dt.scalar() == dtypes.half for dt in used_dtypes): prefix.append("#define half _Float16")
     if any(dt.scalar() in dtypes.fp8s for dt in used_dtypes):
       prefix += ["typedef unsigned char hip_bf8;", "typedef unsigned char hip_fp8;"]
       prefix.append("""static inline __attribute__((device)) unsigned char f32_to_fp8(float v, int is_bf8) {
