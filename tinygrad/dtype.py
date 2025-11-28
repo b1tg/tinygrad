@@ -284,7 +284,93 @@ def float_to_fp8(x: float, dtype: DType) -> int:
 
   res |= sign
   return int(res)
+def float_to_fp8(x: float, dtype: DType) -> int:
+  assert dtype in dtypes.fp8s, "Only for fp8s"
+  
+  # 1. 早期处理特殊值 (Early Exit)
+  # FNUZ: NaN -> 0x80. Inf -> Saturate to Max (0x7F/0xFF) *OR* 0x80 depending on strictness.
+  # PyTorch behavior: Inf becomes NaN (0x80) for FNUZ usually, or saturates.
+  # Let's align with PyTorch's `item()` behavior which often matches hardware:
+  # However, strictly standard FNUZ maps Inf to NaN (0x80) because it has no Inf representation.
+  if dtype == dtypes.fp8e4m3:
+    if math.isnan(x) or math.isinf(x): return 0x80
 
+  # # OCP E4M3: Inf/NaN handling
+  # if dtype == dtypes.fp8e4m3 and not math.isfinite(x): 
+  #   return 0x7f if math.copysign(1, x) > 0 else 0xff
+  
+  if dtype == dtypes.fp8e5m2 and math.isinf(x): 
+    return 0x7c if math.copysign(1, x) > 0 else 0xfc
+
+  # 2. 参数配置
+  config = {
+      # dtypes.fp8e4m3: {
+      #     "EXP_BIAS": 7, "SIGNIFICAND_BITS": 4, "MANTISSA_MASK": 0x7, 
+      #     "MINDENORM_O2": 0x3F50000000000000, "OVERFLOW_THRESHOLD": 0x407D000000000000, 
+      #     "MAXNORM": 0x7E, "MINNORM": 0x3F90000000000000, "INF_VALUE": 0x7F
+      # },
+      dtypes.fp8e5m2: {
+          "EXP_BIAS": 15, "SIGNIFICAND_BITS": 3, "MANTISSA_MASK": 0x3, 
+          "MINDENORM_O2": 0x3EE0000000000000, "OVERFLOW_THRESHOLD": 0x40EE000000000000 - 1, 
+          "MAXNORM": 0x7B, "MINNORM": 0x3F10000000000000, "INF_VALUE": 0x7E
+      },
+      # FNUZ Config
+      dtypes.fp8e4m3: {
+          "EXP_BIAS": 8,                  
+          "SIGNIFICAND_BITS": 4,          
+          "MANTISSA_MASK": 0x7,           
+          "MINDENORM_O2": 0x3F40000000000000,   # 2**-11
+          "OVERFLOW_THRESHOLD": 0x406F000000000000, # 248.0
+          "MAXNORM": 0x7F,                # Max Finite (240.0)
+          "MINNORM": 0x3F80000000000000,  # 2**-7
+          "INF_VALUE": 0x80               # Defines what explicit overflow usually maps to
+      }
+  }[dtype]
+
+  xbits, = struct.unpack('Q', struct.pack('d', x))
+  FP8_DP_HALF_ULP = 1 << (53 - config["SIGNIFICAND_BITS"] - 1)
+  sign = ((xbits >> 63) & 1) << 7
+  exp = (((xbits >> 52) & 0x7FF) - 1023 + config["EXP_BIAS"])
+  mantissa = (xbits >> (53 - config["SIGNIFICAND_BITS"])) & config["MANTISSA_MASK"]
+  absx = xbits & 0x7FFFFFFFFFFFFFFF
+
+  if absx <= config["MINDENORM_O2"]: 
+    res = 0
+  elif absx > 0x7FF0000000000000: # Handle IEEE NaN/Inf inputs that passed early checks
+    res = 0x7F if 0 else (0x80 if dtype == dtypes.fp8e4m3 else 0x7E | mantissa)
+  elif absx > config["OVERFLOW_THRESHOLD"]: 
+    # Critical Fix for FNUZ: 
+    # > 248.0 rounds to "256", which is unrepresentable. 
+    # PyTorch/Hardware behavior is to return NaN (0x80), not saturate to 240.
+    if dtype == dtypes.fp8e4m3:
+      return 0x80
+    else:
+      res = config["MAXNORM"]
+  elif absx >= config["MINNORM"]:
+    res = ((exp << (config["SIGNIFICAND_BITS"] - 1)) | mantissa)
+    round_bits = xbits & ((FP8_DP_HALF_ULP << 1) - 1)
+    if (round_bits > FP8_DP_HALF_ULP) or (round_bits == FP8_DP_HALF_ULP and (mantissa & 1)): 
+      res = res + 1
+  else:
+    shift = 1 - exp
+    mantissa |= 1 << (config["SIGNIFICAND_BITS"] - 1)
+    res = (mantissa >> shift)
+    round_bits = (xbits | (1 << (53 - 1))) & ((FP8_DP_HALF_ULP << (shift + 1)) - 1)
+    if (round_bits > (FP8_DP_HALF_ULP << shift)) or (round_bits == (FP8_DP_HALF_ULP << shift) and (res & 1)):
+      res = res + 1
+
+  # 3. 符号位处理与 FNUZ 修正
+  # 如果结果下溢为0，FNUZ必须清除符号位（不允许 -0，即 0x80 是 NaN）
+  if dtype == dtypes.fp8e4m3 and res == 0:
+    sign = 0
+
+  res |= sign
+
+  # 如果计算过程中的舍入导致结果变成了 0x80 (例如 248.0 向上舍入到 256)，
+  # 在 FNUZ 中这就是 NaN。上面的逻辑应该已经处理了大部分溢出，
+  # 但如果是舍入导致的进位溢出，这里自然保留 0x80 也是正确的 (NaN)。
+  
+  return int(res)
 def fp8_to_float(x: int, dtype: DType) -> float:
   assert dtype in dtypes.fp8s, "Only for fp8s"
   ur = x << 8
@@ -312,7 +398,66 @@ def fp8_to_float(x: int, dtype: DType) -> float:
   half_bytes = struct.pack('<H', ur)
   float32_val = struct.unpack('e', half_bytes)[0]
   return float(float32_val)
+def fp8_to_float(x: int, dtype: DType) -> float:
+  assert dtype in dtypes.fp8s, "Only for fp8s"
+  ur = x << 8
 
+  if dtype == dtypes.fp8e5m2 and (ur & 0x7FFF) > 0x7C00: 
+    ur = 0x7FFF
+  elif 0:
+    sign = ur & 0x8000
+    exponent = ((ur & 0x7800) >> 1) + 0x2000 # OCP bias diff is 8 (0x2000)
+    mantissa = (ur & 0x0700) >> 1
+    absx = x & 0x7F
+    if absx == 0x7F: 
+      ur = 0x7FFF # NaN
+    elif exponent == 0x2000: # Subnormal
+      if mantissa != 0:
+        mantissa <<= 1
+        while (mantissa & 0x0400) == 0:
+          mantissa <<= 1
+          exponent -= 0x0400
+        mantissa &= 0x03FF
+      else:
+        exponent = 0
+      ur = (sign | exponent) | mantissa
+    else:
+      ur = (sign | exponent) | mantissa
+      
+  elif dtype == dtypes.fp8e4m3:
+    # FNUZ 规范处理
+    # 1. 检查 NaN: 0x80 是唯一的 NaN
+    if x == 0x80:
+      ur = 0x7FFF
+    else:
+      # 2. 符号位: FNUZ 没有 -0，但普通负数依然存在
+      sign = ur & 0x8000
+      
+      # 3. 指数处理:
+      # FP16 bias = 15, E4M3FNUZ bias = 8. 差值 = 7.
+      # 7 << 10 = 0x1C00.
+      exponent = ((ur & 0x7800) >> 1) + 0x1C00
+      mantissa = (ur & 0x0700) >> 1
+
+      # 4. 处理非规格化数 (Subnormals) 和 零
+      # 如果原始指数为0，加偏移后 exponent 会等于 0x1C00
+      if exponent == 0x1C00:
+        if mantissa == 0:
+          exponent = 0 # 这是零 (0x00)
+        else:
+          # FNUZ 的 subnormal 在 FP16 范围内通常是 normalized 的
+          # 我们需要将尾数左移直到最高位为1（借用 subnormal 转 normal 的逻辑）
+          mantissa <<= 1
+          while (mantissa & 0x0400) == 0:
+            mantissa <<= 1
+            exponent -= 0x0400
+          mantissa &= 0x03FF
+      
+      ur = (sign | exponent) | mantissa
+
+  half_bytes = struct.pack('<H', ur)
+  float32_val = struct.unpack('e', half_bytes)[0]
+  return float(float32_val)
 truncate: dict[DType, Callable] = {dtypes.bool: bool,
   dtypes.float16: float_to_fp16, dtypes.bfloat16: lambda x: float_to_bf16(float(x)),
   **{fp8: (lambda x, dtype=fp8: fp8_to_float(float_to_fp8(x, dtype), dtype)) for fp8 in dtypes.fp8s},

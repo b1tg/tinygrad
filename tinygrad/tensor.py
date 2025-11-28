@@ -1595,6 +1595,8 @@ class Tensor(OpMixin):
     ```
     """
     return self._reduce(Ops.MAX, axis, keepdim)
+  def max1(self, axis:int|Sequence[int]|None=None, keepdim=False) -> Tensor:
+    return self._reduce(Ops.MAX1, axis, keepdim)
 
   def _inverse(self) -> Tensor: return -self if self.is_floating_point() else ~self if dtypes.is_int(self.dtype) else self.logical_not()
 
@@ -2975,7 +2977,8 @@ class Tensor(OpMixin):
     ```
     """
     return ((self > 0) == ((b := self.trunc() / 2.0).trunc() == b)).where((self - 0.5).ceil(), (self + 0.5).floor())
-
+  def nround(self: Tensor) -> Tensor:
+    return self._apply_uop(UOp.nround)
   def isinf(self:Tensor, detect_positive:bool=True, detect_negative:bool=True) -> Tensor:
     """
     Checks the tensor element-wise to return True where the element is infinity, otherwise returns False

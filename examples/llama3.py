@@ -146,8 +146,8 @@ def NF4Linear(block_size):
   return _NF4Linear
 
 def quantize_to_fp8(x: Tensor, dtype=dtypes.fp8e4m3):
-  fp8_min = -448.0 if dtype == dtypes.fp8e4m3 else -57344.0
-  fp8_max = 448.0 if dtype == dtypes.fp8e4m3 else 57344.0
+  fp8_min = -240.0 if dtype == dtypes.fp8e4m3 else -57344.0
+  fp8_max = 240.0 if dtype == dtypes.fp8e4m3 else 57344.0
   scale = fp8_max / x.abs().max()
   x_scl_sat = (x * scale).clamp(fp8_min, fp8_max)
   return x_scl_sat.cast(dtype), scale.float().reciprocal()

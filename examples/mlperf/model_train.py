@@ -1051,7 +1051,7 @@ def train_bert():
   if WANDB:
     import wandb
     wandb_args = {"id": wandb_id, "resume": "must"} if (wandb_id := getenv("WANDB_RESUME", "")) else {}
-    wandb.init(config=config, **wandb_args, project="MLPerf-BERT")
+    wandb.init(config=config, **wandb_args, project="bert")
 
   # ** init model **
 

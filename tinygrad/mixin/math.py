@@ -274,6 +274,9 @@ class MathMixin:
 
   def pow(self, x: Self | ConstType):
     return self.alu(Ops.POW, self.ufix(x))
+  
+  def nround(self): 
+    return self.alu(Ops.NROUND)
 
   def __pow__(self, x: Self | ConstType):
     return self.pow(x)
