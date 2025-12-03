@@ -51,6 +51,8 @@ class ht:
 ht.bfloat16 = ht.uint16
 ht.fp8e4m3 = ht.uint8
 ht.fp8e5m2 = ht.uint8
+ht.fp8e4m3fnuz = ht.uint8
+ht.fp8e5m2fnuz = ht.uint8
 
 def universal_test(a, b, dtype, op):
   if not isinstance(op, tuple): op = (op, op)
@@ -60,9 +62,14 @@ def universal_test(a, b, dtype, op):
   ta, tb = Tensor([a], dtype=dtype), Tensor([b], dtype=dtype)
   tensor_value = (op[0](ta, tb)).numpy()
   numpy_value = op[1](ta.numpy(), tb.numpy())
+  print(f"{numpy_value=}")
   if dtype in dtypes.fp8s: numpy_value = truncate[dtype](numpy_value)
+  print(f"fp8: {numpy_value=}")
   if dtype in dtypes.floats:
-    atol, rtol = {dtypes.bfloat16:(1e-3, 1e-2), dtypes.fp8e4m3:(1e-1, 1e-1), dtypes.fp8e5m2:(1.0, 5e-1)}.get(dtype, (1e-10, 1e-7))
+    atol, rtol = {
+      dtypes.bfloat16:(1e-3, 1e-2), dtypes.fp8e4m3:(1e-1, 1e-1), dtypes.fp8e5m2:(1.0, 5e-1),
+      dtypes.fp8e4m3fnuz:(1e-1, 1e-1), dtypes.fp8e5m2fnuz:(1.0, 5e-1)
+    }.get(dtype, (1e-10, 1e-7))
     np.testing.assert_allclose(tensor_value, numpy_value, atol=atol, rtol=rtol)
   else: np.testing.assert_equal(tensor_value, numpy_value)
 
@@ -81,7 +88,9 @@ def universal_test_unary(a, dtype, op):
     numpy_value = truncate[dtype](numpy_value)
   if dtype in dtypes.floats:
     atol, rtol = { dtypes.float16:(1e-3, 1e-2), dtypes.bfloat16:(1e-3, 2e-2),
-      dtypes.fp8e4m3:(1e-1, 1e-1), dtypes.fp8e5m2: (1.0, 5e-1)}.get(dtype, (1e-6, 1e-5))
+      dtypes.fp8e4m3:(1e-1, 1e-1), dtypes.fp8e5m2: (1.0, 5e-1),
+      dtypes.fp8e4m3fnuz:(1e-1, 1e-1), dtypes.fp8e5m2fnuz: (1.0, 5e-1)
+      }.get(dtype, (1e-6, 1e-5))
     np.testing.assert_allclose(tensor_value, numpy_value, atol=atol, rtol=rtol)
   else: np.testing.assert_equal(tensor_value, numpy_value)
 
@@ -125,10 +134,20 @@ class TestDTypeALU(unittest.TestCase):
   def test_fp8e4m3(self, a, b, op):
     universal_test(from_storage_scalar(a, dtypes.fp8e4m3), from_storage_scalar(b, dtypes.fp8e4m3), dtypes.fp8e4m3, op)
 
+  @unittest.skipUnless(is_dtype_supported(dtypes.fp8e4m3fnuz), f"no fp8e4m3fnuz on {Device.DEFAULT}")
+  @given(ht.fp8e4m3fnuz, ht.fp8e4m3fnuz, strat.sampled_from(binary_operations))
+  def test_fp8e4m3fnuz(self, a, b, op):
+    universal_test(from_storage_scalar(a, dtypes.fp8e4m3fnuz), from_storage_scalar(b, dtypes.fp8e4m3fnuz), dtypes.fp8e4m3fnuz, op)
+
   @unittest.skipUnless(is_dtype_supported(dtypes.fp8e5m2), f"no fp8e5m2 on {Device.DEFAULT}")
   @given(ht.fp8e5m2, ht.fp8e5m2, strat.sampled_from(binary_operations))
   def test_fp8e5m2(self, a, b, op):
     universal_test(from_storage_scalar(a, dtypes.fp8e5m2), from_storage_scalar(b, dtypes.fp8e5m2), dtypes.fp8e5m2, op)
+
+  @unittest.skipUnless(is_dtype_supported(dtypes.fp8e5m2fnuz), f"no fp8e5m2fnuz on {Device.DEFAULT}")
+  @given(ht.fp8e5m2fnuz, ht.fp8e5m2fnuz, strat.sampled_from(binary_operations))
+  def test_fp8e5m2fnuz(self, a, b, op):
+    universal_test(from_storage_scalar(a, dtypes.fp8e5m2fnuz), from_storage_scalar(b, dtypes.fp8e5m2fnuz), dtypes.fp8e5m2fnuz, op)
 
   @given(ht.float32, strat.sampled_from(unary_operations))
   def test_float32_unary(self, a, op): universal_test_unary(a, dtypes.float32, op)
@@ -147,12 +166,23 @@ class TestDTypeALU(unittest.TestCase):
     if op[1] == np.reciprocal: assume(from_storage_scalar(a, dtype=dtypes.fp8e4m3) != 0.0)
     universal_test_unary(from_storage_scalar(a, dtype=dtypes.fp8e4m3), dtypes.fp8e4m3, op)
 
+  @unittest.skipUnless(is_dtype_supported(dtypes.fp8e4m3fnuz), f"no fp8e4m3fnuz on {Device.DEFAULT}")
+  @given(ht.fp8e4m3fnuz, strat.sampled_from(unary_operations))
+  def test_fp8e4m3fnuz_unary(self, a, op):
+    if op[1] == np.reciprocal: assume(from_storage_scalar(a, dtype=dtypes.fp8e4m3fnuz) != 0.0)
+    universal_test_unary(from_storage_scalar(a, dtype=dtypes.fp8e4m3fnuz), dtypes.fp8e4m3fnuz, op)
+
   @unittest.skipUnless(is_dtype_supported(dtypes.fp8e5m2), f"no fp8e5m2 on {Device.DEFAULT}")
   @given(ht.fp8e5m2, strat.sampled_from(unary_operations))
   def test_fp8e5m2_unary(self, a, op):
     if op[1] == np.reciprocal: assume(from_storage_scalar(a, dtype=dtypes.fp8e5m2) != 0.0)
     universal_test_unary(from_storage_scalar(a, dtype=dtypes.fp8e5m2), dtypes.fp8e5m2, op)
 
+  @unittest.skipUnless(is_dtype_supported(dtypes.fp8e5m2fnuz), f"no fp8e5m2fnuz on {Device.DEFAULT}")
+  @given(ht.fp8e5m2fnuz, strat.sampled_from(unary_operations))
+  def test_fp8e5m2fnuz_unary(self, a, op):
+    if op[1] == np.reciprocal: assume(from_storage_scalar(a, dtype=dtypes.fp8e5m2fnuz) != 0.0)
+    universal_test_unary(from_storage_scalar(a, dtype=dtypes.fp8e5m2fnuz), dtypes.fp8e5m2fnuz, op)
   @given(ht.uint8, ht.uint8, strat.sampled_from(integer_binary_operations))
   def test_uint8(self, a, b, op): universal_test(a, b, dtypes.uint8, op)
 
