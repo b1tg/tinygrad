@@ -447,9 +447,8 @@ class AMDRenderer(CStyleLanguage):
         (UPat(Ops.WMMA, name="x"), lambda ctx,x: f"__{x.arg[0]}({ctx[x.src[0]]}, {ctx[x.src[1]]}, {ctx[x.src[2]]}, 0, 0, 0)"),
         (UPat(Ops.CAST, dtypes.fp8s, (UPat.var("y", dtypes.float),), name="x",),
           lambda ctx,x, y: f"f32_to_fp8({ctx[x.src[0]]}, {'1' if x.dtype in (dtypes.fp8e5m2, dtypes.fp8e5m2fnuz) else '0'})"),
-        (UPat(Ops.CAST, dtypes.float, (UPat.var("y", dtypes.fp8s),), name="x",),
-          lambda ctx,x, y: f"__builtin_amdgcn_cvt_f32_{'bf8' if y.dtype in (dtypes.fp8e5m2, dtypes.fp8e5m2fnuz)
-                                                       else 'fp8'}((unsigned int){ctx[x.src[0]]}, 0)"),
+        (UPat(Ops.CAST, dtypes.float, (UPat.var("y", dtypes.fp8s),), name="x",), lambda ctx,x, y:
+          f"__builtin_amdgcn_cvt_f32_{'bf8' if y.dtype in (dtypes.fp8e5m2, dtypes.fp8e5m2fnuz) else 'fp8'}((unsigned int){ctx[x.src[0]]}, 0)"),
       ]) + base_rewrite
   def __reduce__(self): return self.__class__, (self.arch,)
 
