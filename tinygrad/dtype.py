@@ -274,25 +274,7 @@ def float_to_fp8(x: float, dtype: DType) -> int:
   if (rem > half) or (rem == half and (res & 1)): res += 1 # RNE
   if C[3] and res == 0: s = 0 # Enforce positive zero for fnuz
   return int(res | s)
-def float_to_fp8(x: float, dtype) -> int:
-  # C: 0:Bias, 1:SigBits, 2:MaxNorm, 3:IsUZ, 4:OverflowThr, 5:InfVal, 6:NaNVal
-  C = {dtypes.fp8e4m3: (7, 4, 0x7E, 0, 0x407D000000000000, 0x7F, 0x7F), dtypes.fp8e4m3fnuz: (8, 4, 0x7F, 1, 0x406F000000000000, 0x80, 0x80),
-    dtypes.fp8e5m2: (15, 3, 0x7B, 0, 0x40EE000000000000 - 1, 0x7C, 0x7E), dtypes.fp8e5m2fnuz: (16, 3, 0x7F, 1, 0x40EE000000000000, 0x80, 0x80)}[dtype]
-  u = struct.unpack('Q', struct.pack('d', x))[0]
-  s, abs_u = (u >> 63) << 7, u & 0x7FFFFFFFFFFFFFFF
-  if abs_u > C[4]: # 包含 Inf/NaN 和数值溢出
-    if C[3]: return 0x80 # FNUZ 全是 NaN
-    if abs_u >= 0x7FF0000000000000: return (C[6] if abs_u > 0x7FF0000000000000 else C[5]) | s
-    return C[2] | s # 饱和为 MaxNorm
-  exp = (abs_u >> 52) - 1023 + C[0]
-  shift = 53 - C[1] + (1 - exp if exp < 1 else 0) # 合并 Subnormal 逻辑
-  val = (abs_u & 0xFFFFFFFFFFFFF) | (0 if exp >= 1 else 1 << 52)
-  res = (exp << (C[1]-1)) if exp >= 1 else 0
-  res += val >> shift
-  mask = (1 << shift) - 1
-  res += (val & mask) + (mask >> 1) + (res & 1) >> shift
-  if C[3] and res == 0: s = 0 # FNUZ 正零修正
-  return int(res | s)
+
 def fp8_to_float(x: int, dtype: DType) -> float:
   # Config: 0:ExpBits, 1:ManBits, 2:Bias, 3:IsUZ
   C = {dtypes.fp8e4m3: (4, 3, 7, 0), dtypes.fp8e4m3fnuz: (4, 3, 8, 1), dtypes.fp8e5m2: (5, 2, 15, 0), dtypes.fp8e5m2fnuz: (5, 2, 16, 1)}[dtype]

@@ -428,6 +428,8 @@ def cast_float_to_bf16(x: UOp) -> UOp:
   x = (-x & 0x7f800000).where(x + ((x >> 16) & 1) + 0x7fff, (x & 0xffff).where((x | 0x10000), x))
   return (x >> 16).cast(dtypes.ushort).bitcast(dtypes.bfloat16)
 
+def fp8_index(dtype: DType): return (dtypes.fp8e4m3, dtypes.fp8e5m2, dtypes.fp8e4m3fnuz, dtypes.fp8e5m2fnuz).index(dtype.scalar()) % 2
+
 class AMDRenderer(CStyleLanguage):
   device = "AMD"
   shared_max = 65536
@@ -446,9 +448,9 @@ class AMDRenderer(CStyleLanguage):
       self.string_rewrite = PatternMatcher([
         (UPat(Ops.WMMA, name="x"), lambda ctx,x: f"__{x.arg[0]}({ctx[x.src[0]]}, {ctx[x.src[1]]}, {ctx[x.src[2]]}, 0, 0, 0)"),
         (UPat(Ops.CAST, dtypes.fp8s, (UPat.var("y", dtypes.float),), name="x",),
-          lambda ctx,x, y: f"f32_to_fp8({ctx[x.src[0]]}, {'1' if x.dtype in (dtypes.fp8e5m2, dtypes.fp8e5m2fnuz) else '0'})"),
+          lambda ctx,x, y: f"__builtin_amdgcn_cvt_pk_{('fp8', 'bf8')[fp8_index(x.dtype)]}_f32({ctx[x.src[0]]},{ctx[x.src[0]]},0,false)"),
         (UPat(Ops.CAST, dtypes.float, (UPat.var("y", dtypes.fp8s),), name="x",), lambda ctx,x, y:
-          f"__builtin_amdgcn_cvt_f32_{'bf8' if y.dtype in (dtypes.fp8e5m2, dtypes.fp8e5m2fnuz) else 'fp8'}((unsigned int){ctx[x.src[0]]}, 0)"),
+          f"__builtin_amdgcn_cvt_f32_{('fp8', 'bf8')[fp8_index(y.dtype)]}((unsigned int){ctx[x.src[0]]}, 0)"),
       ]) + base_rewrite
   def __reduce__(self): return self.__class__, (self.arch,)
 
@@ -473,8 +475,7 @@ class AMDRenderer(CStyleLanguage):
   extra_matcher = create_non_native_float_pats((dtypes.bfloat16, *dtypes.fp8s)) + PatternMatcher([
     (UPat(Ops.WMMA, name="x", dtype=dtypes.float.vec(4)),
       lambda x: UOp(Ops.WMMA, x.dtype, (x.src[0].bitcast(dtypes.uint64), x.src[1].bitcast(dtypes.uint64),
-        x.src[2]), (*x.arg,)) if x.src[0].dtype in (dtypes.fp8e4m3.vec(8), dtypes.fp8e5m2.vec(8),
-                                                    dtypes.fp8e4m3fnuz.vec(8), dtypes.fp8e5m2fnuz.vec(8)) else None),
+        x.src[2]), (*x.arg,)) if (dt:=x.src[0].dtype).scalar() in dtypes.fp8s and dt.size == 8 else None),
     # bfloat16 casting
     (UPat.cvar('x', dtypes.bfloat16), lambda x: cast_float_to_bf16(UOp.const(dtypes.float, x.arg))),
     (UPat(Ops.CAST, dtypes.float, (UPat.var("x", dtypes.bfloat16),)),
@@ -503,11 +504,6 @@ class AMDRenderer(CStyleLanguage):
     if any(dt.scalar() == dtypes.half for dt in used_dtypes): prefix.append("#define half _Float16")
     if any(dt.scalar() in dtypes.fp8s for dt in used_dtypes):
       prefix += ["typedef unsigned char hip_bf8;", "typedef unsigned char hip_fp8;"]
-      prefix.append("""static inline __attribute__((device)) unsigned char f32_to_fp8(float v, int is_bf8) {
-  v=((is_bf8==0)&&(v>=248.0 || v<=-248.0))?__builtin_nanf(""):v;
-  v=((is_bf8==1)&&(v>=61440.0 || v<=-61440.0))?__builtin_nanf(""):v;
-  v = (((*(unsigned*)&v)&0x7F800000)!=0x7F800000)?__builtin_amdgcn_fmed3f(v,is_bf8?57344.0f:240.0f,is_bf8?-57344.0f:-240.0f) : v;
-  return (unsigned char)(is_bf8?__builtin_amdgcn_cvt_pk_bf8_f32(v,v,0,false):__builtin_amdgcn_cvt_pk_fp8_f32(v,v,0,false));\n}""")
     prefix += [f'extern "C" __attribute__((device{f", {atr}" if atr else ""})) {dto} {meth}({dti});' for meth,dti,dto,atr in ockl+ocml]
     prefix += [self.render_vector_prefix(dt) for dt in used_dtypes if dt.count > 1]
 
