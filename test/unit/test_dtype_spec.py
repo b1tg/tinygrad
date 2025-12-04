@@ -16,7 +16,7 @@ dtype_floats = [dt for dt in core_dtypes if dtypes.is_float(dt) and is_dtype_sup
 
 FP8E4M3_MAX = 448.0
 FP8E5M2_MAX = 57344.0
-FP8E4M3FNUZ_MAX = 248.0
+FP8E4M3FNUZ_MAX = 240.0
 FP8E5M2FNUZ_MAX = 57344.0
 
 def _assert_eq(tensor:Tensor, target_dtype:DType, target, tol_target_dtype:float=1e-7):

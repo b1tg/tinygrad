@@ -254,40 +254,46 @@ def float_to_bf16(x):
   u = (u + 0x7FFF + ((u >> 16) & 1)) & 0xFFFF0000
   return struct.unpack('f', struct.pack('I', u))[0]
 
-def float_to_fp8(x: float, dtype: DType) -> int:
-  # Config: 0:Bias, 1:SigBits, 2:MaxNorm, 3:IsUZ, 4:OverflowThr, 5:InfVal, 6:NaNVal
-  C = {dtypes.fp8e4m3: (7, 4, 0x7E, 0, 0x407D000000000000, 0x7F, 0x7F), dtypes.fp8e4m3fnuz: (8, 4, 0x7F, 1, 0x406F000000000000, 0x80, 0x80),
-    dtypes.fp8e5m2: (15, 3, 0x7B, 0, 0x40EE000000000000-1, 0x7C, 0x7E), dtypes.fp8e5m2fnuz: (16, 3, 0x7F, 1, 0x40EE000000000000, 0x80, 0x80)}[dtype]
+"""
+double: e11m52
+>>> hex(1<<11)
+'0x800'
+>>> hex((1<<11) -1)
+'0x7ff'
+"""
+def float_to_fp8(x: float, dtype: DType, saturation=False) -> int:
+  bias, sig_bits, max_norm, is_uz, overflow_thr, inf_val, nan_val = {
+    dtypes.fp8e4m3: (7, 4, 0x7E, 0, 0x407D000000000000, 0x7F, 0x7F), dtypes.fp8e4m3fnuz: (8, 4, 0x7F, 1, 0x406F000000000000, 0x80, 0x80),
+    dtypes.fp8e5m2: (15, 3, 0x7B, 0, 0x40EE000000000000, 0x7C, 0x7F), dtypes.fp8e5m2fnuz: (16, 3, 0x7F, 1, 0x40EE000000000000, 0x80, 0x80)}[dtype]
   u = struct.unpack('Q', struct.pack('d', x))[0]
   s, abs_u = (u >> 63) << 7, u & 0x7FFFFFFFFFFFFFFF
-  if abs_u >= 0x7FF0000000000000: return 0x80 if C[3] else (C[6] if abs_u > 0x7FF0000000000000 else C[5]) | s
-  if abs_u > C[4]: return 0x80 if C[3] else (C[2] | s) # Overflow saturation
-  exp = (abs_u >> 52) - 1023 + C[0]
-  shift = 53 - C[1] # Bits to discard/round
-  if exp < 1: # Denormal
-    shift += (1 - exp)
-    val, res = (abs_u & 0xFFFFFFFFFFFFF) | (1 << 52), 0
-  else: val, res = abs_u & 0xFFFFFFFFFFFFF, exp << (C[1] - 1) # Normal
+  print("s: ", x, s, hex(abs_u),abs_u >= 0x7FF0000000000000, abs_u > overflow_thr )
+  if abs_u >= 0x7FF0000000000000: return nan_val if is_uz else (nan_val if abs_u > 0x7FF0000000000000 else inf_val) | s
+  if abs_u > overflow_thr: return nan_val if is_uz else (max_norm | s) if saturation else (nan_val if abs_u > 0x7FF0000000000000 else inf_val) | s
+  exp = (abs_u >> 52) - 1023 + bias
+  shift = 53 - sig_bits # Bits to discard/round
+  val, res = abs_u & 0xFFFFFFFFFFFFF, exp << (sig_bits - 1) # Normal
+  if exp < 1: val, res, shift = val | (1 << 52), 0, shift+(1-exp) # Denormal
   mask, half = (1 << shift) - 1, 1 << (shift - 1)
   rem = val & mask
   res += val >> shift
   if (rem > half) or (rem == half and (res & 1)): res += 1 # RNE
-  if C[3] and res == 0: s = 0 # Enforce positive zero for fnuz
+  if is_uz and res == 0: s = 0
   return int(res | s)
 
 def fp8_to_float(x: int, dtype: DType) -> float:
-  # Config: 0:ExpBits, 1:ManBits, 2:Bias, 3:IsUZ
-  C = {dtypes.fp8e4m3: (4, 3, 7, 0), dtypes.fp8e4m3fnuz: (4, 3, 8, 1), dtypes.fp8e5m2: (5, 2, 15, 0), dtypes.fp8e5m2fnuz: (5, 2, 16, 1)}[dtype]
-  if C[3] and x == 0x80: return math.nan
-  if C[3] and x == 0: return 0.0
+  exp_bits, man_bits, bias, is_uz = {
+    dtypes.fp8e4m3: (4, 3, 7, 0), dtypes.fp8e4m3fnuz: (4, 3, 8, 1), dtypes.fp8e5m2: (5, 2, 15, 0), dtypes.fp8e5m2fnuz: (5, 2, 16, 1)}[dtype]
+  if is_uz and x == 0x80: return math.nan
+  if is_uz and x == 0: return 0.0
   sign = (-1)**((x >> 7) & 1)
-  exp = (x >> C[1]) & ((1 << C[0]) - 1)
-  m = x & ((1 << C[1]) - 1)
-  if not C[3]:
+  exp = (x >> man_bits) & ((1 << exp_bits) - 1)
+  m = x & ((1 << man_bits) - 1)
+  if not is_uz:
     if dtype == dtypes.fp8e5m2 and exp == 0b11111: return math.nan if m else math.inf * sign
     if dtype == dtypes.fp8e4m3 and exp == 0b1111 and m == 0b111: return math.nan
-  val = m + (1 << C[1]) if exp else m
-  exp = (exp or 1) - C[2] - C[1]
+  val = m + (1 << man_bits) if exp else m
+  exp = (exp or 1) - bias - man_bits
   return math.ldexp(val, exp) * sign
 
 truncate: dict[DType, Callable] = {dtypes.bool: bool,
