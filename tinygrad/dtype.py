@@ -288,11 +288,11 @@ def fp8_to_float(x: int, dtype: DType) -> float:
   sign = -1 if x & 0x80 else 1
   exp = (x >> man_bits) & ((1 << exp_bits) - 1)
   m = x & ((1 << man_bits) - 1)
-  if dtype == dtypes.fp8e5m2 and exp == 0b11111: return sign * (math.inf if m == 0 else math.nan)
-  if dtype == dtypes.fp8e4m3 and exp == 0b1111 and m == 0b111: return sign * math.nan
+  if dtype == dtypes.fp8e5m2 and exp == 0b11111: return math.copysign(math.inf if m == 0 else math.nan, sign)
+  if dtype == dtypes.fp8e4m3 and exp == 0b1111 and m == 0b111: return math.copysign(math.nan, sign)
   val = m + (1 << man_bits) if exp else m
   exp = (exp or 1) - bias - man_bits
-  return sign * math.ldexp(val, exp)
+  return math.copysign(math.ldexp(val, exp), sign)
 
 truncate: dict[DType, Callable] = {dtypes.bool: bool,
   dtypes.float16: float_to_fp16, dtypes.bfloat16: lambda x: float_to_bf16(float(x)),

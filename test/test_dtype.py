@@ -227,7 +227,7 @@ class TestFp8sConversions(unittest.TestCase):
       np.testing.assert_equal(float_to_fp8(fp8_to_float(x, dtypes.fp8e4m3), dtypes.fp8e4m3), x)
       np.testing.assert_equal(float_to_fp8(fp8_to_float(x, dtypes.fp8e4m3fnuz), dtypes.fp8e4m3fnuz), x)
       np.testing.assert_equal(float_to_fp8(fp8_to_float(x, dtypes.fp8e5m2), dtypes.fp8e5m2),
-                              127 if x in (125, 126, 127) else 0xff if x in (0xfd, 0xfe, 0xff) else x)
+                              127 if x in (125, 126, 127) else 0xff if x in (0xfd, 0xfe,0xff) else x)
       np.testing.assert_equal(float_to_fp8(fp8_to_float(x, dtypes.fp8e5m2fnuz), dtypes.fp8e5m2fnuz), x)
 
   @given(strat.floats(width=32, allow_subnormal=True, allow_nan=True, allow_infinity=True))
