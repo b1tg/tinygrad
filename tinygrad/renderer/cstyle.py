@@ -502,8 +502,7 @@ class AMDRenderer(CStyleLanguage):
       for op, dt in dedup((u.op, u.dtype.scalar()) for u in uops) if op in ocml_ops and dt in (dtypes.half, dtypes.float, dtypes.double)]
     if any(dt.scalar() == dtypes.bfloat16 for dt in used_dtypes): prefix.append("typedef unsigned short hip_bfloat16;")
     if any(dt.scalar() == dtypes.half for dt in used_dtypes): prefix.append("#define half _Float16")
-    if any(dt.scalar() in dtypes.fp8s for dt in used_dtypes):
-      prefix += ["typedef unsigned char hip_bf8;", "typedef unsigned char hip_fp8;"]
+    if any(dt.scalar() in dtypes.fp8s for dt in used_dtypes): prefix += ["typedef unsigned char hip_bf8;", "typedef unsigned char hip_fp8;"]
     prefix += [f'extern "C" __attribute__((device{f", {atr}" if atr else ""})) {dto} {meth}({dti});' for meth,dti,dto,atr in ockl+ocml]
     prefix += [self.render_vector_prefix(dt) for dt in used_dtypes if dt.count > 1]
 

@@ -62,9 +62,7 @@ def universal_test(a, b, dtype, op):
   ta, tb = Tensor([a], dtype=dtype), Tensor([b], dtype=dtype)
   tensor_value = (op[0](ta, tb)).numpy()
   numpy_value = op[1](ta.numpy(), tb.numpy())
-  print(f"{numpy_value=}")
   if dtype in dtypes.fp8s: numpy_value = truncate[dtype](numpy_value)
-  print(f"fp8: {numpy_value=}")
   if dtype in dtypes.floats:
     atol, rtol = {
       dtypes.bfloat16:(1e-3, 1e-2), dtypes.fp8e4m3:(1e-1, 1e-1), dtypes.fp8e5m2:(1.0, 5e-1),

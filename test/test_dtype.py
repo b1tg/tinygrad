@@ -217,11 +217,29 @@ class TestFp8sConversions(unittest.TestCase):
     np.testing.assert_equal(fp8_to_float(x, dtypes.fp8e4m3), torch.tensor(x, dtype=torch.uint8).view(torch.float8_e4m3fn).float().item())
     np.testing.assert_equal(fp8_to_float(x, dtypes.fp8e4m3fnuz), torch.tensor(x, dtype=torch.uint8).view(torch.float8_e4m3fnuz).float().item())
 
+  def test_fp8s_to_float_fuzz(self):
+    for x in range(0, 256):
+      np.testing.assert_equal(fp8_to_float(x, dtypes.fp8e4m3), torch.tensor(x, dtype=torch.uint8).view(torch.float8_e4m3fn).float().item())
+      np.testing.assert_equal(fp8_to_float(x, dtypes.fp8e4m3fnuz), torch.tensor(x, dtype=torch.uint8).view(torch.float8_e4m3fnuz).float().item())
+      np.testing.assert_equal(fp8_to_float(x, dtypes.fp8e5m2), torch.tensor(x, dtype=torch.uint8).view(torch.float8_e5m2).float().item())
+      np.testing.assert_equal(fp8_to_float(x, dtypes.fp8e5m2fnuz), torch.tensor(x, dtype=torch.uint8).view(torch.float8_e5m2fnuz).float().item())
+
+      np.testing.assert_equal(float_to_fp8(fp8_to_float(x, dtypes.fp8e4m3), dtypes.fp8e4m3), x)
+      np.testing.assert_equal(float_to_fp8(fp8_to_float(x, dtypes.fp8e4m3fnuz), dtypes.fp8e4m3fnuz), x)
+      np.testing.assert_equal(float_to_fp8(fp8_to_float(x, dtypes.fp8e5m2), dtypes.fp8e5m2),
+                              127 if x in (125, 126, 127) else 0xff if x in (0xfd, 0xfe, 0xff) else x)
+      np.testing.assert_equal(float_to_fp8(fp8_to_float(x, dtypes.fp8e5m2fnuz), dtypes.fp8e5m2fnuz), x)
+
+  @given(strat.floats(width=32, allow_subnormal=True, allow_nan=True, allow_infinity=True))
+  def test_float_to_fp8s_fuzz(self, x):
+    np.testing.assert_equal(float_to_fp8(x, dtypes.fp8e4m3), torch.tensor(x, dtype=torch.float8_e4m3fn).view(torch.uint8).item())
+    np.testing.assert_equal(float_to_fp8(x, dtypes.fp8e4m3fnuz), torch.tensor(x, dtype=torch.float8_e4m3fnuz).view(torch.uint8).item())
+    np.testing.assert_equal(float_to_fp8(x, dtypes.fp8e5m2), torch.tensor(x, dtype=torch.float8_e5m2).view(torch.uint8).item())
+    np.testing.assert_equal(float_to_fp8(x, dtypes.fp8e5m2fnuz), torch.tensor(x, dtype=torch.float8_e5m2fnuz).view(torch.uint8).item())
+
   @given(strat.integers(min_value=0, max_value=255))
   def test_fp8e5m2_to_float(self, x):
-    print(x,fp8_to_float(x, dtypes.fp8e5m2), torch.tensor(x, dtype=torch.uint8).view(torch.float8_e5m2).float().item() )
     np.testing.assert_equal(fp8_to_float(x, dtypes.fp8e5m2), torch.tensor(x, dtype=torch.uint8).view(torch.float8_e5m2).float().item())
-    print(x,fp8_to_float(x, dtypes.fp8e5m2fnuz), torch.tensor(x, dtype=torch.uint8).view(torch.float8_e5m2fnuz).float().item() )
     np.testing.assert_equal(fp8_to_float(x, dtypes.fp8e5m2fnuz), torch.tensor(x, dtype=torch.uint8).view(torch.float8_e5m2fnuz).float().item())
 
 @unittest.skipUnless(is_dtype_supported(dtypes.bfloat16), "bfloat16 not supported")
@@ -345,10 +363,8 @@ class TestBitCast(unittest.TestCase):
   def test_shape_change_bitcast(self, dt1, dt2):
     data = rand_for_dtype(dt1, 32).reshape(2, 2, 8)
     expected = torch.tensor(data.tolist(), dtype=_to_torch_storage_type(dt1)).view(_to_torch_dtype(dt2))
-    print(f"{dt1=}, {dt2=}, {expected=}")
     if dt2 in dtypes.fp8s:
       expected = torch.tensor(list(map(lambda x: fp8_to_float(x, dt2), expected.view(-1).tolist()))).view_as(expected)
-      print(f"fp8s {expected=}")
     _test_op(lambda: Tensor(data, dtype=dt1).bitcast(dt2), dt2, expected.tolist())
 
   def test_shape_change_bitcast_exceptions(self):

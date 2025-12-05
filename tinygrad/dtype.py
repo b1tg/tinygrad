@@ -267,7 +267,7 @@ def float_to_fp8(x: float, dtype: DType, saturation=False) -> int:
     dtypes.fp8e5m2: (15, 3, 0x7B, 0, 0x40EE000000000000, 0x7C, 0x7F), dtypes.fp8e5m2fnuz: (16, 3, 0x7F, 1, 0x40EE000000000000, 0x80, 0x80)}[dtype]
   u = struct.unpack('Q', struct.pack('d', x))[0]
   s, abs_u = (u >> 63) << 7, u & 0x7FFFFFFFFFFFFFFF
-  print("s: ", x, s, hex(abs_u),abs_u >= 0x7FF0000000000000, abs_u > overflow_thr )
+  # print("s: ", x, s, hex(abs_u),abs_u >= 0x7FF0000000000000, abs_u > overflow_thr )
   if abs_u >= 0x7FF0000000000000: return nan_val if is_uz else (nan_val if abs_u > 0x7FF0000000000000 else inf_val) | s
   if abs_u > overflow_thr: return nan_val if is_uz else (max_norm | s) if saturation else (nan_val if abs_u > 0x7FF0000000000000 else inf_val) | s
   exp = (abs_u >> 52) - 1023 + bias
@@ -285,16 +285,14 @@ def fp8_to_float(x: int, dtype: DType) -> float:
   exp_bits, man_bits, bias, is_uz = {
     dtypes.fp8e4m3: (4, 3, 7, 0), dtypes.fp8e4m3fnuz: (4, 3, 8, 1), dtypes.fp8e5m2: (5, 2, 15, 0), dtypes.fp8e5m2fnuz: (5, 2, 16, 1)}[dtype]
   if is_uz and x == 0x80: return math.nan
-  if is_uz and x == 0: return 0.0
-  sign = (-1)**((x >> 7) & 1)
+  sign = -1 if x & 0x80 else 1
   exp = (x >> man_bits) & ((1 << exp_bits) - 1)
   m = x & ((1 << man_bits) - 1)
-  if not is_uz:
-    if dtype == dtypes.fp8e5m2 and exp == 0b11111: return math.nan if m else math.inf * sign
-    if dtype == dtypes.fp8e4m3 and exp == 0b1111 and m == 0b111: return math.nan
+  if dtype == dtypes.fp8e5m2 and exp == 0b11111: return sign * (math.inf if m == 0 else math.nan)
+  if dtype == dtypes.fp8e4m3 and exp == 0b1111 and m == 0b111: return sign * math.nan
   val = m + (1 << man_bits) if exp else m
   exp = (exp or 1) - bias - man_bits
-  return math.ldexp(val, exp) * sign
+  return sign * math.ldexp(val, exp)
 
 truncate: dict[DType, Callable] = {dtypes.bool: bool,
   dtypes.float16: float_to_fp16, dtypes.bfloat16: lambda x: float_to_bf16(float(x)),
