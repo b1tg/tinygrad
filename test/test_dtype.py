@@ -50,26 +50,13 @@ def _test_cast(a:Tensor, target_dtype:DType):
     a = (a > 65504).where(65504, a)
 
   expected = list(a.numpy().astype(_to_np_dtype(target_dtype)))
-  print(f"{expected=} ")
   if target_dtype in dtypes.fp8s: expected = list(map(lambda x: truncate[target_dtype](x), expected))
-  print(f"fp8: {expected=} {target_dtype=} { a.cast(target_dtype).numpy()=}")
   _test_op(lambda: a.cast(target_dtype), target_dtype, expected)
 def _test_bitcast(a:Tensor, target_dtype:DType, target=None):
   expected = torch.tensor(a.tolist(), dtype=_to_torch_storage_type(a.dtype)).view(_to_torch_dtype(target_dtype)).tolist()
-  print(f"{expected=}")
-  if target_dtype in dtypes.fp8s:
-    expected = list(map(lambda x: fp8_to_float(x, target_dtype), expected))
-    print(f"fp8: {expected=} {target_dtype=}")
+  if target_dtype in dtypes.fp8s: expected = list(map(lambda x: fp8_to_float(x, target_dtype), expected))
   _test_op(lambda: a.bitcast(target_dtype), target_dtype, target or expected)
-# expected=[29, 70, 30, 72, 168, 184, 65, 62, 224, 67, 213, 49, 109, 71, 242, 59]
-# fp8: expected=[0.1015625, 3.5, 0.109375, 4.0, -0.25, -1.0, 2.25, 1.75, -32.0, 2.75, -13.0, 0.5625, 104.0, 3.75, -160.0, 1.375]
-# E          ACTUAL: array([ 5.078125e-02,  1.750000e+00,  5.468750e-02,  2.000000e+00,
-# E                -1.250000e-01, -5.000000e-01,  1.125000e+00,  8.750000e-01,
-# E                -1.600000e+01,  1.375000e+00, -6.500000e+00,  2.812500e-01,...
-# E          DESIRED: array([ 1.015625e-01,  3.500000e+00,  1.093750e-01,  4.000000e+00,
-# E                -2.500000e-01, -1.000000e+00,  2.250000e+00,  1.750000e+00,
-# E                -3.200000e+01,  2.750000e+00, -1.300000e+01,  5.625000e-01,
-# E                 1.040000e+02,  3.750000e+00, -1.600000e+02,  1.375000e+00])
+
 class TestDType(unittest.TestCase):
   DTYPE: Any = None
   DATA: Any = None

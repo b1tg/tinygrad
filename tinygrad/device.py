@@ -375,6 +375,7 @@ def fp8s_by_device(device:str|None=None):
     (9,4,2):(dtypes.fp8e4m3fnuz, dtypes.fp8e5m2fnuz),
     (9,5,0):(dtypes.fp8e4m3, dtypes.fp8e5m2)
   }.get(getattr(Device["AMD"], "target"))
+
 if PROFILE:
   @atexit.register
   def finalize_profile():
