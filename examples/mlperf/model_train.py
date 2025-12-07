@@ -590,6 +590,7 @@ def train_retinanet():
       prev_cookies.append(proc)
       proc, next_proc = next_proc, None  # return old cookie
       i += 1
+      os.environ["TRAIN_STEP"] = str(i)
 
       if i == BENCHMARK:
         assert not math.isnan(loss)
@@ -1018,7 +1019,7 @@ def train_bert():
   if WANDB:
     import wandb
     wandb_args = {"id": wandb_id, "resume": "must"} if (wandb_id := getenv("WANDB_RESUME", "")) else {}
-    wandb.init(config=config, **wandb_args, project="MLPerf-BERT")
+    wandb.init(config=config, **wandb_args, project="bert")
 
   # ** init model **
 
@@ -1036,7 +1037,7 @@ def train_bert():
       p.to_(GPUS)
 
   # ** Log run config **
-  for key, value in config.items(): print(f'HParam: "{key}": {value}')
+  # for key, value in config.items(): print(f'HParam: "{key}": {value}')
 
   # ** Optimizer **
   parameters_no_wd = [v for k, v in get_state_dict(model).items() if "bias" in k or "LayerNorm" in k]
@@ -1103,6 +1104,8 @@ def train_bert():
   if RUNMLPERF:
     if MLLOGGER:
       MLLOGGER.start(key=mllog_constants.EPOCH_START, value=i*GBS, metadata={"epoch_num": i*GBS})
+  
+  print(f"train_steps: {train_steps}")
 
   @TinyJit
   def train_step_bert(input_ids:Tensor, segment_ids:Tensor, attention_mask:Tensor,
@@ -1161,6 +1164,7 @@ def train_bert():
       tqdm.write(
         f"{i:5} {((cl - st)) * 1000.0:7.2f} ms run, {(pt - st) * 1000.0:7.2f} ms python, {(dt - pt) * 1000.0:6.2f} ms fetch data, "
         f"{(cl - dt) * 1000.0:7.2f} ms {device_str}, {loss:5.2f} loss, {lr:.6f} LR, "
+        f"global_norm: {global_norm.item():5.2f}, "
         f"{GlobalCounters.mem_used / 1e9:.2f} GB used, {GlobalCounters.global_ops * 1e-9 / (cl - st):9.2f} GFLOPS")
       if WANDB:
         wandb.log({"lr": lr, "train/loss": loss, "train/global_norm": global_norm.item(), "train/step_time": cl - st,

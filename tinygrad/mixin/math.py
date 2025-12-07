@@ -240,6 +240,8 @@ class MathMixin:
 
   def maximum(self, x: Self | ConstType):
     return self.alu(Ops.MAX, self.ufix(x))
+  def nround(self): 
+    return self.alu(Ops.NROUND)
 
   def minimum(self, x: Self | ConstType):
     return -(-self).maximum(-x)

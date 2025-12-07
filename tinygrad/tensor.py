@@ -15,7 +15,69 @@ from tinygrad.uop.ops import smax, smin, resolve, UOp, Ops, sint, identity_eleme
 from tinygrad.engine.schedule import ScheduleItem, complete_create_schedule_with_vars
 from tinygrad.device import Device, Buffer
 from tinygrad.engine.realize import run_schedule
+from tinygrad.engine.memory import memory_planner
+from tinygrad.engine.schedule import ScheduleItem, create_schedule_with_vars
+from tinygrad.schedule.rangeify import get_rangeify_map
+from tinygrad.schedule.multi import get_multi_map
+# from tinygrad import   dtypes, UOp
+from tinygrad.uop.ops import KernelInfo, AxisType, Ops
+def k_clamp_back(grads:UOp, kernel:UOp):
+  y, x, s = kernel.src
+  return (None, None, None)
+  return (None, Tensor(grads).uop, None)
+  return (None, Tensor.empty_like(Tensor(x)).uop)
+ 
+def k_clamp(y:UOp, x:UOp, s: UOp):
+  y = y.flatten()
+  x = x.flatten()
+  s = s.flatten()
+  i = UOp.range(x.size, 0)
+  x1 = (x[i]*s.index(UOp.const(dtypes.index, 0))).maximum(UOp.const(x.dtype.base, -448.0)).minimum(UOp.const(x.dtype.base, 448.0))
+  return y[i].store(x1).end(i).sink(arg=KernelInfo(name=f"k_clamp{x.size}"))  
 
+def q_abs_max_kernel(y: UOp, x:UOp):
+  B = y.flatten()
+  A = x.flatten()
+  i = UOp.range(A.shape[0], 0, axis_type=AxisType.REDUCE)
+  B = B[0].set(UOp.const(x.dtype.base, 0.0))
+  B = B[0].set(B.after(i)[0].maximum((A[i]<0.0).where(A[i]*UOp.const(x.dtype.base, UOp.const(x.dtype.base, -1.0)), A[i])), end=i)
+  # B = B[0].set(B[0].reciprocal()*448.0)
+  return B.sink(arg=KernelInfo(name=f"custom_sumx_{A.shape[0]}"))
+
+def q_abs_max_kernel_back(grads:UOp, kernel:UOp):
+  y, x = kernel.src
+  # return (None, Tensor.ones_like(Tensor(x)).uop)
+  # return (None, Tensor(grads).uop)
+  return (grads, grads)
+
+from tinygrad.helpers import getenv
+CUSTOM_CLAMP = getenv("CUSTOM_CLAMP", 0)
+CUSTOM_AMAX = getenv("CUSTOM_AMAX", 0)
+# print("== CUSTOM_CLAMP: ", CUSTOM_CLAMP)
+# print("== CUSTOM_AMAX: ", CUSTOM_AMAX)
+def quantize_to_fp8(x: Tensor, axis=None, dtype=dtypes.fp8e4m3):
+  if CUSTOM_AMAX:
+    y = Tensor.empty((), dtype=x.dtype)
+    y = Tensor.custom_kernel(y, x, fxn=q_abs_max_kernel, grad_fxn=q_abs_max_kernel_back)[0]
+    scale = 448. / (y + 1e-8)  
+  # x_abs_max = x.abs().max()
+  else:
+    if axis is None:
+      x_abs_max = x.abs().max()
+    else:
+      x_abs_max = x.abs().max(axis=axis, keepdim=True)
+    # scale = fp8_max / max_val  
+    scale = 448. / (x_abs_max + 1e-8)  
+
+  if CUSTOM_CLAMP:
+    y = Tensor.empty_like(x)
+    y = Tensor.custom_kernel(y, x, scale, fxn=k_clamp, grad_fxn=k_clamp_back)[0]
+    res= y.cast(dtype)
+    return res, scale.float().reciprocal()
+  # ---
+  y = (x * scale).clamp(-448.0, 448.0)
+  res= y.cast(dtype)
+  return res, scale.float().reciprocal()
 # TODO: this should be the only usage of Device
 def canonicalize_device(device:str|None) -> str: return Device.canonicalize(device)
 
@@ -1581,6 +1643,9 @@ class Tensor(OpMixin):
     ```
     """
     return self._reduce(Ops.MAX, axis, keepdim)
+  def max1(self, axis:int|Sequence[int]|None=None, keepdim=False) -> Tensor:
+    return self._reduce(Ops.MAX1, axis, keepdim)
+
 
   def _inverse(self) -> Tensor: return -self if self.is_floating_point() else ~self if dtypes.is_int(self.dtype) else self.logical_not()
 
@@ -2444,7 +2509,8 @@ class Tensor(OpMixin):
     ```
     """
     return self._split_cumalu(axis, Ops.MAX)
-
+  def nround(self: Tensor) -> Tensor:
+    return self._apply_uop(UOp.nround)
   @staticmethod
   def _tri(r:sint, c:sint, diagonal:int=0, device=None, requires_grad:bool|None=None) -> Tensor:
     assert isinstance(r, int) and isinstance(c, int), f"does not support symbolic, getting {r=}, {c=}"
@@ -3723,7 +3789,12 @@ class Tensor(OpMixin):
       value = value.repeat_interleave(self.shape[-3] // value.shape[-3], dim=-3)
 
     q = self
-    qk = q.matmul(key.transpose(-2,-1), dtype=least_upper_dtype(q.dtype, key.dtype, dtypes.float32)) / math.sqrt(q.shape[-1])
+    if 0 and getenv("FP8"):
+      q1, qs = quantize_to_fp8(q)
+      k1, ks = quantize_to_fp8(key)
+      qk = q1.matmul(k1.transpose(-2,-1), dtype=dtypes.float)*qs*ks / math.sqrt(q.shape[-1])
+    else:
+      qk = q.matmul(key.transpose(-2,-1), dtype=least_upper_dtype(q.dtype, key.dtype, dtypes.float32)) / math.sqrt(q.shape[-1])
     # handle attention mask
     if is_causal:
       if attn_mask is not None: raise RuntimeError("cannot set attn_mask when is_causal=True")

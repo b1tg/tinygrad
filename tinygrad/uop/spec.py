@@ -104,7 +104,7 @@ _tensor_spec = PatternMatcher([
   (UPat(Ops.ENCDEC, name="x"), lambda x: len(x.src) >= 2), # state + inbuffer
 
   # REDUCE_AXIS is the reduce in the tensor graph
-  (UPat(Ops.REDUCE_AXIS, name="x"), lambda x: isinstance(x.arg, tuple) and len(x.arg) >= 2 and x.arg[0] in {Ops.ADD, Ops.MUL, Ops.MAX}),
+  (UPat(Ops.REDUCE_AXIS, name="x"), lambda x: isinstance(x.arg, tuple) and len(x.arg) >= 2 and x.arg[0] in {Ops.ADD, Ops.MUL, Ops.MAX, Ops.MAX1}),
 
   # REDUCE with an outerworld range
   (UPat(Ops.REDUCE, src=(UPat(),), allow_any_len=True, name="x"), lambda x: all(y.dtype == dtypes.index for y in x.src[1:])),
@@ -235,7 +235,7 @@ full_spec = PatternMatcher([
   # where on index in rhs position is fine
   (UPat(Ops.WHERE, dtype=dtypes.index, src=(UPat(dtype=dtypes.bool), UPat(), UPat(dtype=dtypes.index))), lambda: True),
   # allow index dtype on a restricted set of UOps
-  (UPat((Ops.ADD, Ops.MUL, Ops.MOD, Ops.IDIV, Ops.MAX,
+  (UPat((Ops.ADD, Ops.MUL, Ops.MOD, Ops.IDIV, Ops.MAX, Ops.MAX1,
          Ops.SPECIAL, Ops.CAST, Ops.RANGE, Ops.VCONST, Ops.VECTORIZE), dtype=dtypes.index), lambda: True),
 
   # while BIND is being casted
