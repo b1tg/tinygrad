@@ -226,8 +226,10 @@ class BertLayer:
 class BertOutput:
   def __init__(self, hidden_size, intermediate_size, hidden_dropout_prob, idx=0):
     # if FP8 and idx in list(range(4,20)):
+    # if FP8 and idx in (6, ):
     # 0..23
-    if FP8 and idx %2 ==0:
+    # if FP8 and idx %2 ==0: # [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22]
+    if 1 and FP8 and idx in [6, 8, 10, 12, 14, 16]: # [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22]
     # if FP8 and (idx%2 == 0 or idx%3 == 0):
     # if FP8:
       self.dense = LinearQ(intermediate_size, hidden_size)
@@ -279,6 +281,7 @@ class BertSelfAttention:
       # if 1 or idx%2==0:
       # if idx not in (0,1, 22, 23):
       if 0:
+      # if idx in [6, 8, 10, 12, 14, 16]:
       # if idx%2==0 and idx not in (0,1, 22, 23):
       # if idx%2==0 and idx: # good
       # if idx >=6:

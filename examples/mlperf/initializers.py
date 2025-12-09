@@ -221,6 +221,7 @@ class FP8LinearBert:
     # return self.kk(x)
     # print(f"{x.shape=}, {self.weight.shape=}")
     # x.shape=(128, 512, 4096), self.weight.shape=(1024, 4096)
+    # x.shape=(1024, 512, 4096), self.weight.shape=(1024, 4096) GPUS=8, BS=1024
     w1, ws = quantize_to_fp8(self.weight)
     x1, s = quantize_to_fp8(x)
     # x1.shape=(192, 512, 1024),w1.T.shape=(1024, 1024)
@@ -263,7 +264,7 @@ def custom_gemm(C:UOp, A:UOp, B:UOp) -> UOp:
 #     if self.bias is not None: y = y + self.bias.cast(y.dtype)
 #     return y.cast(x.dtype)
 
-class FP8LinearBertAA:
+class FP8LinearBert:
   def __init__(self, in_features, out_features, bias=True):
     self.weight = Tensor.empty(out_features, in_features, dtype=dtypes.float32)
     self.bias = Tensor.empty(out_features, dtype=dtypes.float32) if bias else None
@@ -297,6 +298,128 @@ class FP8LinearBertAA:
     if self.bias is not None: y = y + self.bias.cast(y.dtype)
     return y.cast(x.dtype)
 
+
+"""
+
+"""
+def quantize_group(x: Tensor, axis: int):
+    """
+    常规量化：
+    1. 计算 Scale
+    2. 模拟 FP8 (Round + Clamp)
+    3. 返回 Quantized Tensor 和 InvScale
+    """
+    max_val = x.abs().max(axis=axis, keepdim=True)
+    scale = 448.0 / (max_val + 1e-8)
+    # 模拟量化带来的精度损失
+    x_quant = (x * scale).clamp(-448.0, 448.0)
+    return x_quant, 1.0 / scale
+
+# ==========================================
+# 2. Grouped (512粒度) Linear - 无循环版
+# ==========================================
+# class GroupedFP8LinearNoLoop:
+class FP8LinearBert:
+    def __init__(self, in_features, out_features, group_size=128, bias=True):
+        self.in_features = in_features
+        self.out_features = out_features
+        self.group_size = group_size
+        
+        # 检查维度
+        assert in_features % group_size == 0, "In_features 必须能被 group_size 整除"
+        self.num_groups = in_features // group_size
+        
+        # 初始化权重
+        self.weight = Tensor.kaiming_uniform(out_features, in_features)
+        self.bias = Tensor.zeros(out_features) if bias else None
+        
+    def __call__(self, x: Tensor):
+        # x: [Batch, Seq, In] -> [1024, 512, 4096]
+        # w: [Out, In]        -> [1024, 4096]
+        
+        B, S, IN = x.shape
+        OUT = self.out_features
+        G = self.num_groups     # 8
+        BLK = self.group_size   # 512
+        
+        # -----------------------------------------------------------
+        # 第一步：Reshape 成组 (把 4096 拆成 8 x 512)
+        # -----------------------------------------------------------
+        
+        # x: [B, S, 8, 512]
+        x_g = x.reshape(B, S, G, BLK)
+        
+        # w: [Out, 8, 512]
+        w_g = self.weight.reshape(OUT, G, BLK)
+        
+        # -----------------------------------------------------------
+        # 第二步：分组量化 (axis=-1 即对 512 这个维度求 Scale)
+        # -----------------------------------------------------------
+        
+        # x_q: [B, S, 8, 512], x_scale: [B, S, 8, 1]
+        x_q, x_scale = quantize_to_fp8(x_g, axis=-1)
+        
+        # w_q: [Out, 8, 512], w_scale: [Out, 8, 1]
+        w_q, w_scale = quantize_to_fp8(w_g, axis=-1)
+        
+        # -----------------------------------------------------------
+        # 第三步：准备 Batched MatMul (核心技巧)
+        # 目标：利用 Groups 作为 Batch 维度进行并行乘法
+        # -----------------------------------------------------------
+        
+        # 1. 处理 X
+        # 我们把 (B, S) 合并，并将 G 移到最前面
+        # [B, S, G, 512] -> Permute [G, B, S, 512] -> Reshape [G, B*S, 512]
+        x_batch = x_q.permute(2, 0, 1, 3).reshape(G, B*S, BLK)
+        
+        # 2. 处理 W
+        # [Out, G, 512] -> Permute [G, Out, 512] -> 转置最后两维 [G, 512, Out]
+        # 这样才能做矩阵乘法: (..., 512) @ (..., 512, Out)
+        w_batch = w_q.permute(1, 0, 2).transpose(1, 2) # Shape: [G, 512, Out]
+        
+        # -----------------------------------------------------------
+        # 第四步：执行 Batched Matrix Multiplication
+        # -----------------------------------------------------------
+        
+        # Tinygrad/Numpy 会自动广播首位维度 G
+        # [G, B*S, 512] @ [G, 512, Out] -> [G, B*S, Out]
+        # 这里是一次性算出所有组的中间结果 (Int/FP8 模拟)
+        print(f"{x_batch.shape=}, {w_batch.shape=}")
+        print(f"{x_batch.dtype=}, {w_batch.dtype=}")
+        # x_batch.shape=(8, 524288, 512), w_batch.shape=(8, 512, 1024)
+        y_batch_int = x_batch.dot(w_batch, dtype=dtypes.float32)
+        
+        # -----------------------------------------------------------
+        # 第五步：反量化 (Dequantize)
+        # -----------------------------------------------------------
+        
+        # 我们需要把 Scale 也调整成 [G, B*S, Out] 的形状来做点乘
+        
+        # 1. Input Scale: [B, S, 8, 1] -> [8, B*S, 1]
+        x_scale_batch = x_scale.permute(2, 0, 1, 3).reshape(G, B*S, 1)
+        
+        # 2. Weight Scale: [Out, 8, 1] -> [8, Out, 1] -> [8, 1, Out]
+        w_scale_batch = w_scale.permute(1, 0, 2).transpose(1, 2)
+        
+        # 3. Apply Scales
+        # [G, B*S, Out] * [G, B*S, 1] * [8, 1, Out] -> [G, B*S, Out]
+        y_batch_float = y_batch_int * x_scale_batch * w_scale_batch
+        
+        # -----------------------------------------------------------
+        # 第六步：规约 (Sum over Groups) 与 还原形状
+        # -----------------------------------------------------------
+        
+        # 对 G 维度求和 (相当于公式里的 Σ)
+        # [G, B*S, Out] -> [B*S, Out]
+        y_merged = y_batch_float.sum(axis=0)
+        
+        # 还原回 [B, S, Out]
+        y_out = y_merged.reshape(B, S, OUT)
+        
+        if self.bias is not None:
+            y_out = y_out + self.bias
+            
+        return y_out
 class EmbeddingBert(nn.Embedding):
   def __init__(self, vocab_size:int, embed_size:int, std=0.02):
     self.vocab_sz, self.embed_sz = vocab_size, embed_size

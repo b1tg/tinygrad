@@ -6,6 +6,7 @@ export DEFAULT_FLOAT="HALF" GPUS=1 BS=192 EVAL_BS=192
 export DEFAULT_FLOAT="HALF" GPUS=1 BS=128 EVAL_BS=128
 export DEFAULT_FLOAT="HALF" GPUS=1 BS=128 EVAL_BS=128
 export DEFAULT_FLOAT="HALF" GPUS=8 BS=1024 EVAL_BS=1024
+# export DEFAULT_FLOAT="HALF" GPUS=1 BS=192 EVAL_BS=192
 # export DEFAULT_FLOAT="HALF" GPUS=2 BS=192 EVAL_BS=192
 # export DEFAULT_FLOAT="FLOAT" BS=128 EVAL_BS=128
 
@@ -28,16 +29,25 @@ export BASEDIR="/raid/datasets/wiki"
 
 export WANDB=1 PARALLEL=0
 export FP8=1
-export CUSTOM_CLAMP=1
-export CUSTOM_AMAX=1
+export CUSTOM_CLAMP=0
+export CUSTOM_AMAX=0
 # export LOSS_SCALER=512
 # export DEBUG=4
 
-export TRAIN_STEPS=3900 WANDB_NAME="1206 8/1024 mi350"
+export TRAIN_STEPS=3900 
+# export WANDB_NAME="clamp=1/amax=1 (6.18) 8/1024 mi350"
+export WANDB_NAME="clamp=0/amax=0 (6.) 8/1024 mi350"
 # export FP8_EXTRA=1 
 # RUNMLPERF=1 python3 examples/mlperf/model_train.py
-export HCQDEV_WAIT_TIMEOUT_MS=300000
+export HCQDEV_WAIT_TIMEOUT_MS=600000
 # export TRAIN_STEPS=3900
+# WANDB_NAME="clamp=1/amax=1 (6.) 8/1024 mi350" RUNMLPERF=1 python3 examples/mlperf/model_train.py
 export FP8_EXTRA=0 
-RUNMLPERF=1 python3 examples/mlperf/model_train.py
+# WANDB_NAME="clamp=1/amax=1 (6.18) 8/1024 mi350" RUNMLPERF=1 python3 examples/mlperf/model_train.py
+# FP8=0 WANDB_NAME="FP8=0 8/1024 mi350" RUNMLPERF=1 python3 examples/mlperf/model_train.py
 # RUNMLPERF=1 python3 examples/mlperf/model_train.py 2>&1| tee a1.txt
+# WANDB_NAME="FP8=0 1/192 mi350" RUNMLPERF=1 python3 examples/mlperf/model_train.py
+# WANDB_NAME="qk 0/0 axis (%2 6-16) 8/1024 mi350" RUNMLPERF=1 python3 examples/mlperf/model_train.py
+# sleep 120
+# WANDB_NAME="clamp=0/amax=0 axis (%2 6-16) 8/1024 mi350" RUNMLPERF=1 python3 examples/mlperf/model_train.py
+WANDB_NAME="block-512 (%2 6-16) 8/1024 mi350" RUNMLPERF=1 python3 examples/mlperf/model_train.py
