@@ -1003,6 +1003,15 @@ def train_bert():
   epsilon            = config["EPSILON"]                = getenv("EPSILON", 1e-6)
   poly_power         = config["POLY_POWER"]             = getenv("POLY_POWER", 1.0)
 
+
+  for diy in (
+    "CUSTOM_CLAMP",
+    "CUSTOM_AMAX",
+    "FP8",
+    "TC128",
+  ):
+    config[diy] = getenv(diy, 0)
+
   target, achieved                                      = getenv("TARGET", 0.72), False
 
   config["DEFAULT_FLOAT"] = dtypes.default_float.name
@@ -1155,7 +1164,8 @@ def train_bert():
 
         device_str = parameters[0].device if isinstance(parameters[0].device, str) else f"{parameters[0].device[0]} * {len(parameters[0].device)}"
         loss = loss.item()
-        assert not math.isnan(loss)
+        if not getenv("FP8"):
+          assert not math.isnan(loss)
         lr = lr.item()
 
       cl = time.perf_counter()

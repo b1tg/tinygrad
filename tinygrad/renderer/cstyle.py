@@ -1,5 +1,6 @@
 from typing import Literal, Callable, cast
 import os, math, sys
+import re
 from collections import defaultdict, Counter
 from tinygrad.codegen.opt import tc
 from tinygrad.uop.ops import GroupOp, Ops, UOp, PatternMatcher, UPat, range_str, axis_letters
@@ -523,7 +524,18 @@ class AMDRenderer(CStyleLanguage):
   half16 c_frag = {}; half8 d; for (int n = 0; n < 8; n++) { c_frag[n*2] = c[n]; }
   c_frag = __builtin_amdgcn_wmma_f16_16x16x16_f16_w32(a, b, c_frag, false);
   for (int n = 0; n < 8; n++) { d[n] = c_frag[n*2]; } return d;\n}""")
-    return super().render_kernel(function_name, kernel, bufs, uops, prefix)
+    res = super().render_kernel(function_name, kernel, bufs, uops, prefix)
+    # res = re.sub(r"__builtin_amdgcn_cvt_f32_fp8\(\s*\(unsigned int\)\s*f32_to_fp8\(\s*(.*?)\s*,\s*0\s*\)\s*,\s*0\s*\)", r"\1", res)
+    # if "r_132_64_64_4_2_2_4_4_8_2_2_2" in res:
+    #   res = open("dist/r_132_64_64_4_2_2_4_4_32_2n1.c").read()
+    if "mfma" in res:
+      pass
+    # if "r_4_64_64_4_2_2_4_4_512_2_2_2" in p.src:
+    #   with open("dist/mma.c") as f:
+    #     p.src = f.read()
+      # print(res)
+      # print("-----")
+    return res
 
 class NVRenderer(CUDARenderer): device = "NV"
 class HIPRenderer(AMDRenderer): device = "HIP"

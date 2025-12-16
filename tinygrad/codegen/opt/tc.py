@@ -128,7 +128,11 @@ amd_cdna_1616128 = [TensorCore(dims=(16,16,128), threads=64, elements_per_thread
 amd_cdna3 = amd_cdna_161632[:2] + amd_cdna_161616
 
 amd_cdna4 = amd_cdna_161632 + amd_cdna_161616
-# amd_cdna4 = amd_cdna_1616128 + amd_cdna_161632 + amd_cdna_161616
+# amd_cdna4 =  amd_cdna_161616
+from tinygrad.helpers import getenv
+TC128 = getenv("TC128", 0)
+if TC128:
+  amd_cdna4 = amd_cdna_1616128 + amd_cdna_161632 + amd_cdna_161616
 # ***** Apple Metal *****
 
 metal = [TensorCore(dims=(8,8,8), threads=32, elements_per_thread=(2,2,2), dtype_in=di, dtype_out=do,

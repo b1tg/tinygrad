@@ -80,6 +80,16 @@ class CompiledRunner(Runner):
   def __init__(self, p:ProgramSpec, precompiled:bytes|None=None, prg=None):
     if DEBUG >= 3: print(p.applied_opts)
     if DEBUG >= 4: print(p.src)
+
+    if getenv("SHOW") and "mfma" in p.src:
+      pass
+    # if "r_4_64_64_4_2_2_4_4_512_2_2_2" in p.src:
+    #   with open("dist/mma.c") as f:
+    #     p.src = f.read()
+      print(pyrender(p.ast))
+      if getenv("SHOW") > 1:
+        print(p.src)
+      print("-----")
     self.p:ProgramSpec = p
     if precompiled is not None: self.lib = precompiled
     else:

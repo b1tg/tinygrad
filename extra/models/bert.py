@@ -229,7 +229,9 @@ class BertOutput:
     # if FP8 and idx in (6, ):
     # 0..23
     # if FP8 and idx %2 ==0: # [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22]
-    if 1 and FP8 and idx in [6, 8, 10, 12, 14, 16]: # [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22]
+    # if 1 and FP8 and idx in [4, 6, 8, 10, 12, 14, 16, 18]: # [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22]
+    if FP8:
+    # if FP8:
     # if FP8 and (idx%2 == 0 or idx%3 == 0):
     # if FP8:
       self.dense = LinearQ(intermediate_size, hidden_size)
@@ -249,16 +251,25 @@ def gelu(x):
 
 class BertIntermediate:
   def __init__(self, hidden_size, intermediate_size, idx):
+    # BertIntermediate: 1024, 4096
+    # print(f"BertIntermediate: {hidden_size}, {intermediate_size}")
     # if FP8:
-    if FP8 and FP8_EXTRA and idx %2 ==0:
+    # if FP8 and FP8_EXTRA and idx %2 ==0:
+    if FP8>=1:
       self.dense = LinearQ(hidden_size, intermediate_size)
     else:
       self.dense = Linear(hidden_size, intermediate_size)
 
   def __call__(self, hidden_states):
     x = self.dense(hidden_states)
+    # if FP8>=2:
+    #   x = x
     # tinygrad gelu is openai gelu but we need the original bert gelu
-    return gelu(x)
+    ret = gelu(x)
+    # if not Tensor.training: 
+    #   ret = ret.realize()
+    # ret = retd
+    return ret
 
 class BertAttention:
   def __init__(self, hidden_size, num_attention_heads, attention_probs_dropout_prob, hidden_dropout_prob,idx:int):
@@ -280,7 +291,8 @@ class BertSelfAttention:
     if FP8:
       # if 1 or idx%2==0:
       # if idx not in (0,1, 22, 23):
-      if 0:
+      if FP8>=3:
+      # if 1:
       # if idx in [6, 8, 10, 12, 14, 16]:
       # if idx%2==0 and idx not in (0,1, 22, 23):
       # if idx%2==0 and idx: # good
@@ -290,9 +302,11 @@ class BertSelfAttention:
       # if idx%3!=0: # 6009.83 and crash
       # if idx%4!=0: # 6017.81 and don't down
       # if idx not in (0, 23): # 4 and up
+        # print(f"BertSelfAttention: {hidden_size}, {self.all_head_size}")
+        # 1024,1024
         self.query = LinearQ(hidden_size, self.all_head_size)
         self.key = LinearQ(hidden_size, self.all_head_size)
-        self.value = Linear(hidden_size, self.all_head_size)
+        self.value = LinearQ(hidden_size, self.all_head_size)
       else:
         self.query = Linear(hidden_size, self.all_head_size)
         self.key = Linear(hidden_size, self.all_head_size)
@@ -305,9 +319,15 @@ class BertSelfAttention:
     self.dropout = attention_probs_dropout_prob
 
   def __call__(self, hidden_states, attention_mask):
-    mixed_query_layer = self.query(hidden_states)
-    mixed_key_layer = self.key(hidden_states)
-    mixed_value_layer = self.value(hidden_states)
+    if FP8>=1:
+      mixed_query_layer = self.query(hidden_states)
+      mixed_key_layer = self.key(hidden_states)
+      mixed_value_layer = self.value(hidden_states)
+    else:
+      mixed_query_layer = self.query(hidden_states)
+      mixed_key_layer = self.key(hidden_states)
+      mixed_value_layer = self.value(hidden_states)
+
 
     query_layer = self.transpose_for_scores(mixed_query_layer)
     key_layer = self.transpose_for_scores(mixed_key_layer)
@@ -333,15 +353,20 @@ class BertSelfAttention:
 
 class BertSelfOutput:
   def __init__(self, hidden_size, hidden_dropout_prob, idx=0):
-    if FP8 and idx%2==0:
-      self.dense = Linear(hidden_size, hidden_size)
+    # print(f"BertSelfOutput: {hidden_size}, {hidden_size}")
+    # BertSelfOutput: 1024, 1024
+    if 0 and FP8>=1:
+      self.dense = LinearQ(hidden_size, hidden_size)
     else:
       self.dense = Linear(hidden_size, hidden_size)
     self.LayerNorm = LayerNorm(hidden_size, eps=1e-12)
     self.dropout = hidden_dropout_prob
 
   def __call__(self, hidden_states, input_tensor):
-    hidden_states = self.dense(hidden_states)
+    if FP8>=1:
+      hidden_states = self.dense(hidden_states)
+    else:
+      hidden_states = self.dense(hidden_states) 
     hidden_states = hidden_states.dropout(self.dropout)
     hidden_states = self.LayerNorm(hidden_states + input_tensor)
     return hidden_states

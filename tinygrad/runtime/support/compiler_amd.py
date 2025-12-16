@@ -1,6 +1,7 @@
 import ctypes, hashlib, tempfile, subprocess, pathlib
 from tinygrad.helpers import system
 from tinygrad.runtime.autogen import comgr
+import re
 try:
   comgr.amd_comgr_get_version(ctypes.byref(major:=ctypes.c_uint64()), ctypes.byref(minor:=ctypes.c_uint64()))
   if major.value >= 3:
@@ -69,6 +70,7 @@ def compile_hip(prg:str, arch="gfx1100", asm=False) -> bytes:
     status = comgr.amd_comgr_do_action(comgr.AMD_COMGR_ACTION_COMPILE_SOURCE_WITH_DEVICE_LIBS_TO_BC, action_info, data_set_src, data_set_bc)
     if status != 0:
       print(_get_comgr_data(data_set_bc, comgr.AMD_COMGR_DATA_KIND_LOG).decode())
+      print(prg)
       raise RuntimeError("compile failed")
     check(set_options(action_info, b"-O3 -mllvm -amdgpu-internalize-symbols"))
     check(comgr.amd_comgr_do_action(comgr.AMD_COMGR_ACTION_CODEGEN_BC_TO_RELOCATABLE, action_info, data_set_bc, data_set_reloc))
@@ -86,6 +88,7 @@ class HIPCompiler(Compiler):
     self.arch = arch
     super().__init__(f"compile_hip_{self.arch}")
   def compile(self, src:str) -> bytes:
+    # src = re.sub(r"__builtin_amdgcn_cvt_f32_fp8\(\s*\(unsigned int\)\s*f32_to_fp8\(\s*(.*?)\s*,\s*0\s*\)\s*,\s*0\s*\)", r"\1", src)
     try: return compile_hip(src, self.arch, src.split('\n', 1)[0].strip() == '.text')
     except RuntimeError as e: raise CompileError(e) from e
   def disassemble(self, lib:bytes): amdgpu_disassemble(lib)
