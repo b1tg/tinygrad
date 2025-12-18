@@ -329,15 +329,15 @@ def flash_attention(xq, xk, xv, attn_mask:Tensor|None=None, is_causal:bool=False
   else:
     attn_mask = Tensor.zeros((B, 1, N, N), requires_grad=False, device=xq.device, dtype=dtypes.float32)
 
-  attn = Tensor.empty_like(xq)
+  attn = Tensor.empty_like(xq, device=xq.device)
   l_vec = Tensor.empty(B, H, 1, N, requires_grad=False, device=xq.device, dtype=dtypes.float32).detach()
 
   def grad(gradu:UOp, kernel:UOp) -> tuple[None, None, UOp, UOp, UOp, None]:
-    grad = Tensor(gradu)
-    grad_q = Tensor.empty_like(q := Tensor(kernel.src[2]))
-    grad_k = Tensor.empty_like(k := Tensor(kernel.src[3]))
-    grad_v = Tensor.empty_like(v := Tensor(kernel.src[4]))
-    mask = Tensor(kernel.src[5])
+    grad = Tensor(gradu, gradu.device)
+    grad_q = Tensor.empty_like(q := Tensor(kernel.src[2], device=kernel.src[2].device))
+    grad_k = Tensor.empty_like(k := Tensor(kernel.src[3], device=kernel.src[3].device))
+    grad_v = Tensor.empty_like(v := Tensor(kernel.src[4], device=kernel.src[4].device))
+    mask = Tensor(kernel.src[5], kernel.src[5].device)
 
     delta_vec = (grad * attn).sum(-1).transpose(1, 2).unsqueeze(-2).detach()
     print(l_vec.shape, delta_vec.shape, grad.shape, attn.shape, grad_q.shape, grad_k.shape, grad_v.shape)

@@ -45,6 +45,7 @@ pm_gradient = PatternMatcher([
   (UPat(Ops.CUSTOM_KERNEL, name="k"), lambda ctx, k: k.arg.grad_fxn(ctx, k)),
   # there's no gradient for bitcast
   (UPat(Ops.BITCAST), lambda: (None,)),
+    (UPat(Ops.COPY), lambda ctx: (ctx,ctx)),
 ])
 
 def _deepwalk(root:UOp, targets:set[UOp]) -> list[UOp]:
