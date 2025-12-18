@@ -255,13 +255,13 @@ class BertIntermediate:
     # print(f"BertIntermediate: {hidden_size}, {intermediate_size}")
     # if FP8:
     # if FP8 and FP8_EXTRA and idx %2 ==0:
-    if 0 and FP8>=1:
+    if FP8>=1:
       self.dense = LinearQ(hidden_size, intermediate_size)
     else:
       self.dense = Linear(hidden_size, intermediate_size)
 
   def __call__(self, hidden_states):
-    x = self.dense(hidden_states)
+    x = self.dense(hidden_states).contiguous().contiguous_backward()
     # if FP8>=2:
     #   x = x
     # tinygrad gelu is openai gelu but we need the original bert gelu
@@ -320,9 +320,9 @@ class BertSelfAttention:
 
   def __call__(self, hidden_states, attention_mask):
     if FP8>=1:
-      mixed_query_layer = self.query(hidden_states)
-      mixed_key_layer = self.key(hidden_states)
-      mixed_value_layer = self.value(hidden_states)
+      mixed_query_layer = self.query(hidden_states).contiguous().contiguous_backward()
+      mixed_key_layer = self.key(hidden_states).contiguous().contiguous_backward()
+      mixed_value_layer = self.value(hidden_states).contiguous().contiguous_backward()
     else:
       mixed_query_layer = self.query(hidden_states)
       mixed_key_layer = self.key(hidden_states)

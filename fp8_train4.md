@@ -49,5 +49,24 @@ GPUS=2 FP8=1 ok
 
  320 1932.62 ms run,  226.88 ms python,   5.64 ms fetch data, 1700.09 ms AMD * 8,  3.78 loss, 0.001010 LR, global_norm:  0.85, 1418.88 GB used, 593002.33 GFLOPS  
 
-8/1024 GPUS=8 FP8=0 1h55m29s December 11th, 2025 8:44:12 PM
+tinyamd3
+ 1433 2025.62 ms run,  265.42 ms python,   6.47 ms fetch data, 1753.73 ms AMD * 8,  1.40 loss, 0.000696 LR, global_norm:  0.81, 1418.88 GB used, 565735.80 GFLOPS
+ 1434 2022.66 ms run,  265.60 ms python,   6.52 ms fetch data, 1750.53 ms AMD * 8,  1.42 loss, 0.000696 LR, global_norm:  0.79, 1418.88 GB used, 566563.98 GFLOPS
+    3063 2016.81 ms run,  265.87 ms python,   7.44 ms fetch data, 1743.50 ms AMD * 8,  1.34 loss, 0.000236 LR, global_norm:  0.65, 1418.88 GB used, 568206.00 GFLOPS
+    3064 2012.98 ms run,  265.37 ms python,   6.99 ms fetch data, 1740.61 ms AMD * 8,  1.38 loss, 0.000236 LR, global_norm:  0.74, 1418.88 GB used, 569288.34 GFLOPS
+    3065 2014.07 ms run,  265.09 ms python,   6.92 ms fetch data, 1742.06 ms AMD * 8,  1.35 loss, 0.000236 LR, global_norm:  0.62, 1418.88 GB used, 568980.26 GFLOPS
+    eval lm loss: 1.29, eval clsf loss: 0.02, eval lm accuracy: 0.720512,                   eval clsf accuracy: 0.51, avg eval step time: 0.63
+ 79%|███████████████████████████████████████████████████████████████████▌                  | 3066/3900 [2:14:47<28:20,  2.04s/it]Reference Convergence point reached after 3139584 datasamples and 2h14m47.57s.
+ 79%|███████████████████████████████████████████████████████████████████▌                  | 3066/3900 [2:14:47<36:39,  2.64s/it]
+wandb: 
+wandb: 🚀 View run 8/1024 FP8=1 TC128=1 output at: 
+wandb: Find logs at: wandb/run-20251218_025758-ajs7ue27/logs
+
+imm + out
+   80 1868.34 ms run,  258.57 ms python,   5.77 ms fetch data, 1604.00 ms AMD * 8,  4.18 loss, 0.001077 LR, global_norm:  0.73, 1384.51 GB used, 613824.19 GFLOPS                                                                                    
+
+8/1024 GPUS=8 FP8=0 1h55m29s 2025-12-11
  3060 2092.11 ms run,  224.53 ms python,   6.62 ms fetch data, 1860.96 ms AMD * 8,  1.37 loss, 0.000237 LR, global_norm:  0.69, 1492.04 GB used, 548517.55 GFLOPS
+
+FP8=0 8/1024 mi350  3h29m3s  2025-12-08 2773 steps
+ 2773 4341.79 ms run,  226.56 ms python,   6.42 ms fetch data, 4108.81 ms AMD * 8,  1.35 loss, 0.000318 LR, global_norm:  0.70, 1388.96 GB used, 215149.50 GFLOPS
