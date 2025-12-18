@@ -330,12 +330,12 @@ def simplify_valid(valid:UOp) -> UOp|None:
 # ******** phase 3 is the complete symbolic ********
 
 def reduce_mul_chain(r:UOp):
-  if r.arg not in {Ops.ADD, Ops.MAX}: return None
+  if r.arg not in {Ops.ADD, Ops.MAX, Ops.MAX1}: return None
   if r.dtype != r.src[0].dtype: return None
   inside, outside = [], []
   for m in r.src[0].split_uop(Ops.MUL):
     m_parents = m.toposort()
-    if all(r not in m_parents for r in r.src[1:]) and (r.arg != Ops.MAX or m.vmin >= 0): outside.append(m)
+    if all(r not in m_parents for r in r.src[1:]) and (r.arg not in (Ops.MAX, Ops.MAX1) or m.vmin >= 0): outside.append(m)
     else: inside.append(m)
   if len(outside) == 0: return None
   return r.replace(src=(prod(inside) if len(inside) else r.src[0].const_like(1),)+r.src[1:])*prod(outside)

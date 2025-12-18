@@ -15,7 +15,119 @@ from tinygrad.uop.ops import smax, smin, resolve, UOp, Ops, sint, identity_eleme
 from tinygrad.engine.schedule import ScheduleItem, complete_create_schedule_with_vars
 from tinygrad.device import Device, Buffer
 from tinygrad.engine.realize import run_schedule
+from tinygrad.engine.memory import memory_planner
+from tinygrad.engine.schedule import ScheduleItem 
+from tinygrad.schedule.rangeify import get_rangeify_map
+from tinygrad.schedule.multi import get_multi_map
+# from tinygrad import   dtypes, UOp
+from tinygrad.uop.ops import KernelInfo, AxisType, Ops
+def k_clamp_back(grads:UOp, kernel:UOp):
+  y, x, s = kernel.src
+  return (None, Tensor(grads).uop, None) # through
+  return (None, None, None)
+  return (None, Tensor.empty_like(Tensor(x)).uop)
+def k_clamp_back1(grads:UOp, kernel:UOp):
+  # print(f"grads xxx: ", Tensor(grads).numpy())
+  y, x, s = kernel.src
+  # print(f"{y.shape=}, {x.shape=}, {s.shape=}")
+  if y.shape == (4194304,):
+    y = y.reshape((1024, 4096))
+  if x.shape == (4194304,):
+    x = x.reshape((1024, 4096))
+  if x.shape == (268435456,):
+    x = x.reshape((128, 512, 4096))
+  if y.shape == (268435456,):
+    y = y.reshape((128, 512, 4096))
+  ctx = grads
+  y = 448.0
+  ctx1 = (y>x).where(ctx, (x.eq(y)).where(ctx * 1, 0)) 
+  y = -448.0
+  ctx2 = (y<x).where(ctx1, (x.eq(y)).where(ctx1 * 1, 0)) 
+  return (None, ctx2, None)
+  return (None, Tensor(grads).uop, None)
+  return (None, None, None)
+ 
+def k_clamp(y:UOp, x:UOp, s: UOp):
+  y = y.flatten()
+  x = x.flatten()
+  # s = s.flatten()
+  i = UOp.range(x.size, 0)
+  x1 = x[i].maximum(UOp.const(x.dtype.base, -448.0)).minimum(UOp.const(x.dtype.base, 448.0))
+  return y[i].store(x1).end(i).sink(arg=KernelInfo(name=f"k_clamp{x.size}"))  
 
+def q_abs_max_kernel(y: UOp, x:UOp):
+  B = y.flatten()
+  A = x.flatten()
+  i = UOp.range(A.shape[0], 0, axis_type=AxisType.REDUCE)
+  B = B[0].set(UOp.const(x.dtype.base, 0.0))
+  B = B[0].set(B.after(i)[0].maximum((A[i]<0.0).where(A[i]*UOp.const(x.dtype.base, UOp.const(x.dtype.base, -1.0)), A[i])), end=i)
+  B = B[0].set(B[0].reciprocal()*448.0)
+  return B.sink(arg=KernelInfo(name=f"custom_sumx_{A.shape[0]}"))
+def q_abs_max_kernel(y: UOp, x:UOp):
+  # c0 = UOp(Ops.DEFINE_GLOBAL, dtypes.float.ptr(1), (), 0)
+  # c4 = UOp(Ops.DEFINE_GLOBAL, dtypes.float.ptr(7), (), 1)
+  c0 = y
+  c4 = x
+  c6 = UOp.range(x.size, 0, AxisType.REDUCE)
+  c7 = c4.index(c6)
+  c13 = (c7<0.0).where(UOp.const(x.dtype.base, -1.0), UOp.const(x.dtype.base, 1.0))
+  c14 = (c7!=0.0).where(c13, UOp.const(x.dtype.base, 0.0))
+  c15 = c7*c14
+  c20 = 448.0*(c15.reduce(c6, arg=Ops.MAX)+1e-08).reciprocal()
+  c21 = c0.index(UOp.const(dtypes.index, 0), ptr=True).store(c20)
+  ast = c21.sink(arg=KernelInfo(name=f"custom_sumx_{x.shape[0]}"))
+  return ast
+def q_abs_max_kernel_back(grads:UOp, kernel:UOp):
+  y, x = kernel.src
+  return (None, None)
+  return (None, Tensor.zeros_like(Tensor(x)).uop)
+  # return (None, Tensor(grads).uop)
+  return (grads, grads)
+
+from tinygrad.helpers import getenv
+CUSTOM_CLAMP = getenv("CUSTOM_CLAMP", 0)
+CUSTOM_AMAX = getenv("CUSTOM_AMAX", 0)
+PO2 = getenv("PO2", 0)
+FP8 = getenv("FP8", 0)
+# print("== CUSTOM_CLAMP: ", CUSTOM_CLAMP)
+# print("== CUSTOM_AMAX: ", CUSTOM_AMAX)
+def quantize_to_fp8(x: Tensor, axis=None, dtype=dtypes.fp8e4m3):
+  if CUSTOM_AMAX:
+    # y = Tensor.empty((), dtype=x.dtype)
+    # y = Tensor.custom_kernel(y, x, fxn=q_abs_max_kernel, grad_fxn=q_abs_max_kernel_back)[0]
+    # scale = 448. / (y + 1e-8)  
+    x_abs_max = x.abs().max1(axis=axis, keepdim=True)
+    scale = 448. / (x_abs_max + 1e-8)  
+    # scale = y
+  # x_abs_max = x.abs().max()
+  else:
+    if axis is None:
+      x_abs_max = x.abs().max()
+    else:
+      x_abs_max = x.abs().max(axis=axis, keepdim=True)
+    if PO2:
+      target_scale = 448.0 / (x_abs_max + 1e-8)
+      # log_scale = target_scale.log2().floor()
+      scale = target_scale.log2().floor().exp2()
+      # scale = 2.0 ** log_scale
+      # scale = log
+    else:
+      scale = 448. / (x_abs_max + 1e-8)  
+  
+  x = x*scale
+
+  if CUSTOM_CLAMP:
+    # y = Tensor.empty_like(x)
+    # y = Tensor.custom_kernel(y, x, Tensor(1.0), fxn=k_clamp, grad_fxn=k_clamp_back)[0]
+    y = x.nround()
+    res= y.cast(dtype).contiguous()
+    # res = y
+    return res, scale.float().reciprocal().contiguous()
+  # ---
+  # y = (x * scale).clamp(-448.0, 448.0)
+  y = x.clamp(-448.0, 448.0)
+  res= y.cast(dtype).contiguous().contiguous_backward()
+  return res, scale.float().reciprocal().contiguous().contiguous_backward()
 # TODO: this should be the only usage of Device
 def canonicalize_device(device:str|None) -> str: return Device.canonicalize(device)
 
@@ -233,7 +345,14 @@ class Tensor(OpMixin):
 
     This API is alpha and may change.
     """
-    return [Tensor(u) for u in UOp.custom_kernel(*[t.uop for t in (self,)+lst], fxn=fxn, grad_fxn=grad_fxn)]
+    # return [Tensor(u) for u in UOp.custom_kernel(*[t.uop for t in (self,)+lst], fxn=fxn, grad_fxn=grad_fxn)]
+    res = []
+    for u in UOp.custom_kernel(*[t.uop for t in (self,)+lst], fxn=fxn, grad_fxn=grad_fxn):
+      u1 = Tensor(u, device=u.device)
+      # print(f"custom_kernel: {u.device=}, {u.shape=}, {u.axis=}, {u1.uop.axis}")
+      res.append(u1)
+    return res
+    # return [Tensor(u, device=u.device) for u in UOp.custom_kernel(*[t.uop for t in (self,)+lst], fxn=fxn, grad_fxn=grad_fxn)]
 
   def schedule_with_vars(self, *lst:Tensor) -> tuple[list[ScheduleItem], dict[str, int]]:
     """
@@ -1582,6 +1701,9 @@ class Tensor(OpMixin):
     ```
     """
     return self._reduce(Ops.MAX, axis, keepdim)
+  def max1(self, axis:int|Sequence[int]|None=None, keepdim=False) -> Tensor:
+    return self._reduce(Ops.MAX1, axis, keepdim)
+
 
   def _inverse(self) -> Tensor: return -self if self.is_floating_point() else ~self if dtypes.is_int(self.dtype) else self.logical_not()
 
@@ -2445,7 +2567,8 @@ class Tensor(OpMixin):
     ```
     """
     return self._split_cumalu(axis, Ops.MAX)
-
+  def nround(self: Tensor) -> Tensor:
+    return self._apply_uop(UOp.nround)
   @staticmethod
   def _tri(r:sint, c:sint, diagonal:int=0, device=None, requires_grad:bool|None=None) -> Tensor:
     assert isinstance(r, int) and isinstance(c, int), f"does not support symbolic, getting {r=}, {c=}"
@@ -3724,7 +3847,14 @@ class Tensor(OpMixin):
       value = value.repeat_interleave(self.shape[-3] // value.shape[-3], dim=-3)
 
     q = self
-    qk = q.matmul(key.transpose(-2,-1), dtype=least_upper_dtype(q.dtype, key.dtype, dtypes.float32)) / math.sqrt(q.shape[-1])
+    if 0 and getenv("FP8"):
+      q1, qs = quantize_to_fp8(q)
+      k1, ks = quantize_to_fp8(key)
+      print(f"scaled dot, {q1.shape}, {k1.shape}")
+      # scaled dot, (128, 16, 512, 64), (128, 16, 512, 64) 
+      qk = q1.matmul(k1.transpose(-2,-1), dtype=dtypes.float).contiguous().contiguous_backward()*qs*ks / math.sqrt(q.shape[-1])
+    else:
+      qk = q.matmul(key.transpose(-2,-1), dtype=least_upper_dtype(q.dtype, key.dtype, dtypes.float32)) / math.sqrt(q.shape[-1])
     # handle attention mask
     if is_causal:
       if attn_mask is not None: raise RuntimeError("cannot set attn_mask when is_causal=True")

@@ -105,6 +105,7 @@ def get_kernel_actions(s:Scheduler, include_0=True) -> dict[int, Scheduler]:
     try:
       s2.apply_opt(a)
       up, lcl, tc_up = 1, 1, prod(tc.dims)//tc.threads if hasattr(s2, 'tensor_core') and (tc:=s2.tensor_core) else 1
+      # tc_up = 512
       for x,t in zip(s2.full_shape, s2.axis_types):
         if t in (AxisType.UPCAST, AxisType.UNROLL): up *= x
         elif t in (AxisType.WARP, AxisType.LOCAL, AxisType.GROUP_REDUCE): lcl *= x

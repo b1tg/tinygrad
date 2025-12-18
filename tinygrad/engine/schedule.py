@@ -39,6 +39,7 @@ def create_schedule(sched_sink:UOp) -> list[ScheduleItem]:
         elif s.op in {Ops.MSELECT, Ops.MSTACK}:
           for ss in s.src:
             if ss.op is Ops.MSELECT: ss = ss.src[0]
+            if ss.op is Ops.MULTI: ss = ss.src[0].src[0].base
             if ss.op is not Ops.BUFFER:
               assert ss.op is Ops.AFTER, f"ss.op is not AFTER, it's {ss.op}"
               children.setdefault(ss.src[1], []).append(k)
@@ -46,7 +47,7 @@ def create_schedule(sched_sink:UOp) -> list[ScheduleItem]:
         elif s.op in {Ops.BUFFER, Ops.BIND}:
           pass  # a BUFFER is already realized, BINDs are handled in complete_create_schedule_with_vars
         else:
-          raise RuntimeError(f"input to kernel must be AFTER or BUFFER, not {s.op}")
+          raise RuntimeError(f"input to kernel must be AFTER or BUFFER, not {s.op}, {s}")
 
   with cpu_profile(TracingKey("linearize to ScheduleItem")):
     queue: deque[UOp] = deque()

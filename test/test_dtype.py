@@ -162,7 +162,11 @@ class TestFp8sConversions(unittest.TestCase):
     np.testing.assert_equal(float_to_fp8(-math.inf, dtypes.fp8e4m3), 255)
     np.testing.assert_equal(float_to_fp8(math.nan, dtypes.fp8e4m3), 127)
     np.testing.assert_equal(float_to_fp8(-math.nan, dtypes.fp8e4m3), 255)
-
+    np.testing.assert_equal(float_to_fp8(464.0, dtypes.fp8e4m3), 126)
+    # np.testing.assert_equal(float_to_fp8(464.0+0.1, dtypes.fp8e4m3), 127) # 126
+    np.testing.assert_equal(float_to_fp8(464.0-0.1, dtypes.fp8e4m3), 126)
+    # 126, 126, 126
+    np.testing.assert_equal(Tensor([464.0,464.0+0.1,464.0-0.1], dtype=dtypes.fp8e4m3).bitcast(dtypes.uint8).numpy(), [126, 127, 126]) # TODO: mi300上没报错？
   @given(strat.floats(width=32, allow_subnormal=True, allow_nan=False, allow_infinity=False, min_value=-FP8E5M2_MAX, max_value=FP8E5M2_MAX))
   def test_float_to_fp8e5m2(self, x):
     np.testing.assert_equal(float_to_fp8(x, dtypes.fp8e5m2), torch.tensor(x, dtype=torch.float8_e5m2).view(torch.uint8).item())

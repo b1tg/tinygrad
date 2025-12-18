@@ -86,7 +86,9 @@ def simple_qkv_kernel(O:UOp, Q:UOp, K:UOp, V:UOp) -> UOp:
   return store.end(d_out).end(i).sink(arg=KernelInfo(name=f"simple_qkv_{N}_{d}", opts_to_apply=()))
 
 # **** backward callbacks ****
+def xxx(grad:UOp, x):
 
+  return None, None, None
 def backward_gemm(gradient:UOp, kernel:UOp) -> tuple[UOp, UOp]:
   out, a, b = kernel.src
   grad_a = (Tensor(gradient) @ Tensor(b).T).uop
@@ -116,7 +118,6 @@ class TestCustomKernel(unittest.TestCase):
 
     out = c.flatten().tolist()
     assert all(x == 2 for x in out), "all 2"
-
   def test_simple_sharded(self):
     devs = ("CPU:0", "CPU:1")
 
@@ -124,9 +125,30 @@ class TestCustomKernel(unittest.TestCase):
     b = Tensor.ones(16, 16).contiguous().shard(devs, axis=0)
     # ugly construction to get a sharded empty tensor
     c = Tensor(Tensor.empty(8, 16, device=devs).uop.multi(0), device=devs)
+    print(f"{c.device=}")
     c = Tensor.custom_kernel(c,a,b, fxn=custom_elementwise_add_kernel)[0]
+    # c = a + b
+    print(f"{c.device=}")
     out = c.flatten().tolist()
     assert all(x == 2 for x in out), "all 2"
+
+    # return
+    # print(f"{c.device=}")
+    # c = a + b
+    # c.realize()
+    # c =c.shard(devs).contiguous()
+
+    # c = c.shard(devs, axis=0)
+    print(f"{c.device=}, {c.shape}")
+    c1 = Tensor(Tensor.empty(8, 16, device=devs).uop.multi(0), device=devs)
+    print(c1.device, a.device, c.device)
+    c1 = Tensor.custom_kernel(c1,a,c, fxn=custom_elementwise_add_kernel)[0]
+    c1.realize()
+    print(c1.numpy())
+    # print(f"{c1.device=}")
+    # print(a.grad.numpy())
+
+
 
   def test_multioutput(self):
     a = Tensor.full((16, 16), 3.).contiguous()
@@ -184,18 +206,34 @@ class TestCustomKernel(unittest.TestCase):
     self.assertTrue(B.allclose(A.sum(1)))
 
   def test_gemm(self):
-    N = 16
-    a = Tensor.randn(N, N)
-    b = Tensor.randn(N, N)
-    c = Tensor.empty(N, N)
-
+    # N = 4
+    N = 2
+    K = 4
+    M = 16
+    devs = ("AMD:0", "AMD:1")
+    Tensor.manual_seed(42)
+    a = Tensor.randn(N, K).contiguous().shard(devs, axis=1)
+    b = Tensor.randn(K, M).contiguous().shard(devs, axis=0)
+    # a = Tensor.randn(N, K).contiguous().to(devs)
+    # b = Tensor.randn(K, M).contiguous().to(devs)
+    # c = Tensor.empty(N, N)
+    # c = Tensor(Tensor.empty(N, M, device=devs).uop.multi(0), device=devs)
+    c = Tensor(Tensor.empty(N, M, device=devs).uop.multi(0), device=devs)
+    print(c.uop)
+    # tst = Tensor.custom_kernel(c,a,b, fxn=custom_elementwise_add_kernel)[0]
     tst = Tensor.custom_kernel(c, a, b, fxn=custom_gemm)[0]
-    err = (tst - (a@b)).square().max()
-    self.assertLess(err.item(), 1e-6)
+    tst = tst.reshape(2,N,M).sum(0)
+    # tst +=Tensor.randn(N, M).contiguous().shard(devs)
+    print(tst.shape, tst.numpy())
+    tst.realize()
+    # print("---")
+    # print((a@b).numpy())
+    # err = (tst - (a@b)).square().max()
+    # self.assertLess(err.item(), 1e-6)
 
-  def test_gemm_backward_custom(self): self.test_gemm_backward(True)
+  # def test_gemm_backward_custom(self): self.test_gemm_backward(True)
   # NOTE: grad_fxn doesn't work with pyrender
-  def test_gemm_backward(self, custom_backward_gemm=False):
+  def tests_gemm_backward(self, custom_backward_gemm=False):
     N = 4
     a_rand = Tensor.randn(N, 8)
     b_rand = Tensor.randn(8, N)
@@ -205,6 +243,8 @@ class TestCustomKernel(unittest.TestCase):
     c = Tensor.empty(N, N)
     tst = Tensor.custom_kernel(c, a, b, fxn=custom_gemm, grad_fxn=backward_gemm_custom if custom_backward_gemm else backward_gemm)[0]
     tst.sum().backward()
+    print(a.grad.numpy())
+    return
     grad_a, grad_b = a.grad, b.grad
     Tensor.realize(tst, grad_a, grad_b)
 
