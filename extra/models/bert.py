@@ -241,7 +241,7 @@ class BertOutput:
     self.dropout = hidden_dropout_prob
 
   def __call__(self, hidden_states, input_tensor):
-    hidden_states = self.dense(hidden_states)
+    hidden_states = self.dense(hidden_states.contiguous().contiguous_backward()).contiguous().contiguous_backward()
     hidden_states = hidden_states.dropout(self.dropout)
     hidden_states = self.LayerNorm(hidden_states + input_tensor)
     return hidden_states
@@ -265,7 +265,7 @@ class BertIntermediate:
     # if FP8>=2:
     #   x = x
     # tinygrad gelu is openai gelu but we need the original bert gelu
-    ret = gelu(x).contiguous()
+    ret = gelu(x).contiguous().contiguous_backward()
     # if not Tensor.training: 
     #   ret = ret.realize()
     # ret = retd
