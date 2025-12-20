@@ -429,6 +429,8 @@ class FP8LinearBertRow:
     # x_fp8: [Batch, Seq, In] (fp8)
     # x_inv_scale: [Batch, Seq, 1] (float)
     x_fp8, x_inv_scale = quantize_to_fp8(x, axis=-1, dtype=dtypes.fp8e4m3)
+
+    x1, w1 = x_fp8, w_fp8
     
     # 3. 执行 FP8 矩阵乘法
     # [Batch, Seq, In] @ [In, Out] -> [Batch, Seq, Out]
@@ -436,8 +438,27 @@ class FP8LinearBertRow:
     assert x_fp8.dtype in dtypes.fp8s
     assert w_fp8.dtype in dtypes.fp8s
     print(f"{x_fp8.shape=}, {w_fp8.T.shape=}")
-    y = x_fp8.dot(w_fp8.T, dtype=dtypes.float).contiguous().contiguous_backward()* x_inv_scale * w_inv_scale.reshape(1, -1)
-    
+    # y = x_fp8.dot(w_fp8.T, dtype=dtypes.float).contiguous().contiguous_backward()* x_inv_scale * w_inv_scale.reshape(1, -1)
+    devs = GPUS
+    if isinstance(GPUS, tuple) and len(GPUS) > 1:
+      y = Tensor(Tensor.empty((x1.shape[0]//len(GPUS), x1.shape[1], w1.shape[0]), dtype=dtypes.float, device=devs).uop.multi(0), device=devs) # axis=0
+      # y = Tensor(Tensor.empty((x.shape[0], x.shape[1], self.weight.shape[0]), dtype=dtypes.float, device=devs).uop, device=devs) # axis = None
+      # print(f"custom {y.shape=}")
+      # print(x1.device)
+      # print(w1.device)
+      # print(f"{y.device=}, {y.shape=}")
+      # y.requires_grad = True
+      print(y.device, x1.device, w1.device, devs)
+      assert y.device == devs
+      assert x1.device == devs
+      assert w1.device == devs
+      y=Tensor.custom_kernel(y, x1, w1, fxn=custom_linear,grad_fxn=custom_linear_backward_multi)[0]
+    else:
+      y = Tensor.empty((x.shape[0], x.shape[1], self.weight.shape[0]), dtype=dtypes.float)
+      print(f"{x1.shape=}, {w1.shape=}, {x1.uop.axis=}, {w1.uop.axis=}")
+      y=Tensor.custom_kernel(y, x1, w1, fxn=custom_linear,grad_fxn=custom_linear_backward)[0]
+
+    y = y.contiguous() * (x_inv_scale * w_inv_scale.reshape(1, -1)).contiguous()
     # 4. 反量化 (Dequantize)
     # 此时 y 是 [Batch, Seq, Out]
     # x_inv_scale 是 [Batch, Seq, 1]，可以直接广播乘
@@ -572,10 +593,10 @@ class FP8LinearBertBLOCK:
         return y_out
       
 FP8LinearBert = FP8LinearBertBasic
-# if FP8 == 2:
 #   FP8LinearBert = FP8LinearBertBLOCK
 # if FP8 == 3:
-#   FP8LinearBert = FP8LinearBertRow
+if FP8 == 2:
+  FP8LinearBert = FP8LinearBertRow
 
 class EmbeddingBert(nn.Embedding):
   def __init__(self, vocab_size:int, embed_size:int, std=0.02):

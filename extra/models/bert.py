@@ -230,7 +230,7 @@ class BertOutput:
     # 0..23
     # if FP8 and idx %2 ==0: # [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22]
     # if 1 and FP8 and idx in [4, 6, 8, 10, 12, 14, 16, 18]: # [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22]
-    if FP8:
+    if FP8 and (idx not in (0, 23)):
     # if FP8:
     # if FP8 and (idx%2 == 0 or idx%3 == 0):
     # if FP8:
@@ -255,13 +255,14 @@ class BertIntermediate:
     # print(f"BertIntermediate: {hidden_size}, {intermediate_size}")
     # if FP8:
     # if FP8 and FP8_EXTRA and idx %2 ==0:
-    if FP8>=1:
+    # if FP8>=1:
+    if FP8 and (idx not in (0, 23)):
       self.dense = LinearQ(hidden_size, intermediate_size)
     else:
       self.dense = Linear(hidden_size, intermediate_size)
 
   def __call__(self, hidden_states):
-    x = self.dense(hidden_states).contiguous().contiguous_backward()
+    x = self.dense(hidden_states)
     # if FP8>=2:
     #   x = x
     # tinygrad gelu is openai gelu but we need the original bert gelu
@@ -288,10 +289,10 @@ class BertSelfAttention:
     self.all_head_size = self.num_attention_heads * self.attention_head_size
 
     # print("BertSelfAttention", idx)
-    if FP8:
+    if 0 and FP8:
       # if 1 or idx%2==0:
-      # if idx not in (0,1, 22, 23):
-      if FP8>=3:
+      if idx not in (0,23):
+      # if FP8:
       # if 1:
       # if idx in [6, 8, 10, 12, 14, 16]:
       # if idx%2==0 and idx not in (0,1, 22, 23):
@@ -319,14 +320,9 @@ class BertSelfAttention:
     self.dropout = attention_probs_dropout_prob
 
   def __call__(self, hidden_states, attention_mask):
-    if FP8>=1:
-      mixed_query_layer = self.query(hidden_states).contiguous().contiguous_backward()
-      mixed_key_layer = self.key(hidden_states).contiguous().contiguous_backward()
-      mixed_value_layer = self.value(hidden_states).contiguous().contiguous_backward()
-    else:
-      mixed_query_layer = self.query(hidden_states)
-      mixed_key_layer = self.key(hidden_states)
-      mixed_value_layer = self.value(hidden_states)
+    mixed_query_layer = self.query(hidden_states).contiguous().contiguous_backward()
+    mixed_key_layer = self.key(hidden_states).contiguous().contiguous_backward()
+    mixed_value_layer = self.value(hidden_states).contiguous().contiguous_backward()
 
 
     query_layer = self.transpose_for_scores(mixed_query_layer)
@@ -348,7 +344,7 @@ class BertSelfOutput:
   def __init__(self, hidden_size, hidden_dropout_prob, idx=0):
     # print(f"BertSelfOutput: {hidden_size}, {hidden_size}")
     # BertSelfOutput: 1024, 1024
-    if 0 and FP8>=1:
+    if 0 and FP8 and idx not in (0,23):
       self.dense = LinearQ(hidden_size, hidden_size)
     else:
       self.dense = Linear(hidden_size, hidden_size)
@@ -356,10 +352,7 @@ class BertSelfOutput:
     self.dropout = hidden_dropout_prob
 
   def __call__(self, hidden_states, input_tensor):
-    if FP8>=1:
-      hidden_states = self.dense(hidden_states)
-    else:
-      hidden_states = self.dense(hidden_states) 
+    hidden_states = self.dense(hidden_states) 
     hidden_states = hidden_states.dropout(self.dropout)
     hidden_states = self.LayerNorm(hidden_states + input_tensor)
     return hidden_states

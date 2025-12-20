@@ -70,3 +70,47 @@ imm + out
 
 FP8=0 8/1024 mi350  3h29m3s  2025-12-08 2773 steps
  2773 4341.79 ms run,  226.56 ms python,   6.42 ms fetch data, 4108.81 ms AMD * 8,  1.35 loss, 0.000318 LR, global_norm:  0.70, 1388.96 GB used, 215149.50 GFLOPS
+
+
+
+
+
+
+
+TC128=0 8/8
+
+  127 1870.27 ms run,  299.58 ms python,   6.19 ms fetch data, 1564.51 ms AMD * 8,  3.97 loss, 0.001064 LR, global_norm:  0.71, 1307.01 GB used, 589866.24 GFLOPS                                                                                    
+
+
+ 3208 1850.45 ms run,  271.95 ms python,   6.89 ms fetch data, 1571.62 ms AMD * 8,  1.41 loss, 0.000195 LR, global_norm:  0.65, 1338.80 GB used, 596184.32 GFLOPS                                                                                    
+ 3209 1867.34 ms run,  270.66 ms python,   6.71 ms fetch data, 1589.96 ms AMD * 8,  1.42 loss, 0.000195 LR, global_norm:  0.76, 1338.80 GB used, 590792.86 GFLOPS                                                                                    
+ 3210 1853.31 ms run,  271.09 ms python,   6.43 ms fetch data, 1575.79 ms AMD * 8,  1.43 loss, 0.000195 LR, global_norm:  0.67, 1338.80 GB used, 595263.93 GFLOPS                                                                                    
+ 3211 1870.42 ms run,  271.19 ms python,   6.30 ms fetch data, 1592.93 ms AMD * 8,  1.39 loss, 0.000194 LR, global_norm:  0.59, 1338.80 GB used, 589819.90 GFLOPS                                                                                    
+Evaluating: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 10/10 [00:04<00:00,  2.14it/s]
+eval lm loss: 1.29, eval clsf loss: 0.02, eval lm accuracy: 0.720069,                   eval clsf accuracy: 0.49, avg eval step time: 0.46                                                                                                           
+ 82%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████▎                                   | 3212/3900 [1:51:16<21:32,  1.88s/it]Reference Convergence point reached after 3289088 datasamples and 1h51m16.88s.
+ 82%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████▎                                   | 3212/3900 [1:51:16<23:50,  2.08s/it]
+wandb: 
+wandb: 🚀 View run TC128=0 allCON+output+im 8/1024 FP8=1 at: 
+
+row
+  TC128=0
+  124 2030.50 ms run,  257.58 ms python,   5.75 ms fetch data, 1767.17 ms AMD * 8,  3.92 loss, 0.001065 LR, global_norm:  0.88, 1563.11 GB used, 543778.22 GFLOPS                                                                                    
+
+  TC128=1
+   75 1950.86 ms run,  234.41 ms python,   5.64 ms fetch data, 1710.81 ms AMD * 8,  4.02 loss, 0.001079 LR, global_norm:  0.87, 1563.11 GB used, 565976.25 GFLOPS                                                                                    
+
+  only out
+  TC128=1
+     18 2056.62 ms run,  241.16 ms python,   5.68 ms fetch data, 1809.78 ms AMD * 8,  4.15 loss, 0.001095 LR, global_norm:  0.85, 1667.26 GB used, 536922.99 GFLOPS  
+
+    remove other con
+         6 2113.86 ms run,  235.56 ms python,   5.62 ms fetch data, 1872.68 ms AMD * 8,  4.43 loss, 0.001098 LR, global_norm:  2.24, 1738.79 GB used, 540830.71 GFLOPS                                                                                    
+  TC128=0
+      7 1933.77 ms run,  238.88 ms python,   5.38 ms fetch data, 1689.52 ms AMD * 8,  4.18 loss, 0.001098 LR, global_norm:  1.84, 1667.26 GB used, 571033.04 GFLOPS                                                                                                                                                                      
+      remove other con
+      20 2024.18 ms run,  237.61 ms python,   5.27 ms fetch data, 1781.30 ms AMD * 8,  4.37 loss, 0.001094 LR, global_norm:  1.35, 1738.79 GB used, 564792.51 GFLOPS                                                                                    
+
+
+all con + per tensor + not (1,23)
+
