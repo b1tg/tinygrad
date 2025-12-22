@@ -1,7 +1,7 @@
 from typing import cast, Callable
 import time, pprint, random, itertools, math
 from dataclasses import dataclass, replace, field
-from tinygrad.helpers import all_same, colored, DEBUG, GlobalCounters, ansilen, BEAM, NOOPT, all_int, CAPTURING, Metadata, TRACEMETA, TracingKey
+from tinygrad.helpers import all_same, colored, DEBUG, GlobalCounters, ansilen, ansistrip, BEAM, NOOPT, all_int, CAPTURING, Metadata, TRACEMETA, TracingKey
 from tinygrad.helpers import DEVECTORIZE, time_to_str, VALIDATE_WITH_CPU, getenv, cpu_profile, PROFILE, ProfilePointEvent, cpu_events, prod, Context
 from tinygrad.helpers import unwrap
 from tinygrad.uop.ops import Ops, PatternMatcher, UOp, UPat, sym_infer, graph_rewrite, print_uops, track_rewrites, KernelInfo, pyrender
@@ -79,6 +79,16 @@ class CompiledRunner(Runner):
   def __init__(self, p:ProgramSpec, precompiled:bytes|None=None, prg=None):
     if DEBUG >= 3: print(p.applied_opts)
     if DEBUG >= 4: print(p.src)
+
+    if getenv("SHOW") and ("mfma" in p.src or "custom" in p.src or "r_256_16_1024" in p.src):
+      pass
+    # if "r_4_64_64_4_2_2_4_4_512_2_2_2" in p.src:
+    #   with open("dist/mma.c") as f:
+    #     p.src = f.read()
+      print(pyrender(p.ast))
+      if getenv("SHOW") > 1:
+        print(p.src)
+      print("-----")
     self.p:ProgramSpec = p
     if precompiled is not None: self.lib = precompiled
     else:
@@ -227,7 +237,7 @@ class ExecItem:
         mem_str = f"{membw*1e-9:4.0f}|{ldsbw*1e-9:<6.0f} GB/s" if membw < 1e13 and ldsbw < 1e15 else \
           colored(f"{membw*1e-12:4.0f}|{ldsbw*1e-12:<6.0f} TB/s", 'green')
         print(f"{colored(f'*** {self.prg.device[:7]:7s} {GlobalCounters.kernel_count:4d}', header_color)}"+
-          f" {self.prg.display_name+' '*(46-ansilen(self.prg.display_name))} arg {len(bufs):2d} mem {GlobalCounters.mem_used/1e9:6.2f} GB"+
+          f" {ansistrip(self.prg.display_name)+' '*(46-ansilen(self.prg.display_name))} arg {len(bufs):2d} mem {GlobalCounters.mem_used/1e9:6.2f} GB"+
           ("" if et is None else f" tm {ptm}/{GlobalCounters.time_sum_s*1e3:9.2f}ms ({flops_str} {mem_str})")+
           f" {[repr(m) if TRACEMETA >= 2 else str(m) for m in self.metadata] if self.metadata else ''}")
       self.prg.first_run = False

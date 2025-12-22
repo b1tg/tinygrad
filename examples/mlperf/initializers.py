@@ -1,8 +1,9 @@
 import math
 from typing import Union
 
-from tinygrad import Tensor, nn, dtypes
-from tinygrad.helpers import prod, argfix, Context
+from tinygrad import Tensor, nn, dtypes, UOp, Device
+from tinygrad.uop.ops import KernelInfo, AxisType, Ops
+from tinygrad.helpers import prod, argfix, getenv, Context
 from tinygrad.nn.state import get_parameters
 from extra.models.unet import UNetModel
 
@@ -48,6 +49,77 @@ class LinearBert(nn.Linear):
 
   def __call__(self, x:Tensor):
     return x.cast(dtypes.default_float).linear(self.weight.cast(dtypes.default_float).transpose(), self.bias.cast(dtypes.default_float) if self.bias is not None else None)
+
+def k_clamp_back(grads:UOp, kernel:UOp):
+  return (None, grads)
+  return (None, Tensor(grads, grads.device).uop)
+
+def k_clamp(y:UOp, x:UOp):
+  y = y.flatten()
+  x = x.flatten()
+  i = UOp.range(x.size, 0)
+  x1 = x[i].maximum(UOp.const(x.dtype.base, -448.0)).minimum(UOp.const(x.dtype.base, 448.0))
+  return y[i].store(x1).end(i).sink(arg=KernelInfo(name=f"custom_clamp_{x.size}"))  
+
+# GPUS =  tuple(f"{Device.DEFAULT}:{i}" for i in range(getenv("GPUS", 1)))
+if getenv("GPUS", 1) > 1:
+  # GPUS = tuple(f'{Device.DEFAULT}:{i}' if i else f'{Device.DEFAULT}' for i in range(getenv("GPUS", 1)))
+  GPUS = tuple(f"{Device.DEFAULT}:{i}" for i in range(getenv("GPUS", 1)))
+else:
+  GPUS = Device.DEFAULT
+FP8 = getenv("FP8", 0)
+
+def quantize_to_fp8(x: Tensor, axis=None, dtype=dtypes.fp8e4m3):
+  x_abs_max = x.abs().max(axis=axis, keepdim=True).detach()
+  scale = 448. / (x_abs_max + 1e-8)  
+  x = x*scale
+  if x.uop.axis == 0:
+    y = Tensor(Tensor.empty((x.shape[0]//len(GPUS), *x.shape[1:]), device=GPUS, dtype=x.dtype).uop.multi(0), device=GPUS)
+  else:
+    y = Tensor(Tensor.empty((x.shape[0], *x.shape[1:]), device=GPUS, dtype=x.dtype).uop, device=GPUS)
+  y = Tensor.custom_kernel(y, x,  fxn=k_clamp, grad_fxn=k_clamp_back)[0]
+  res = y.cast(dtype).contiguous()
+  return res, scale.float().reciprocal()
+
+def custom_linear(C:UOp, A:UOp, B:UOp) -> UOp:
+  SEQ = A.shape[1]
+  OUT = B.shape[0]
+  IN = B.shape[-1]
+  c2 = UOp.range(SEQ, 2, AxisType.LOOP)
+  c5 = UOp.range(OUT, 3, AxisType.LOOP)
+  c8 = UOp.range(C.size//SEQ//OUT, 1, AxisType.LOOP)
+  c16 = UOp.range(IN, 0, AxisType.REDUCE)
+  c27 = (A.index((c2*IN+c16+c8*IN*SEQ))*B.index((c5*IN+c16))).cast(dtypes.float)
+  c28 = c27.reduce(c16, arg=Ops.ADD)
+  c30 = C.index((c2*OUT+c5+c8*OUT*SEQ), ptr=True).store(c28).end(c8, c2, c5)
+  return c30.sink(arg=KernelInfo(name=f"custom dot {A.shape}x{B.shape}"))
+
+def custom_linear_backward(gradient:UOp, kernel:UOp) -> tuple[UOp, UOp]:
+  out, a, b = kernel.src
+  a2 = Tensor(a, device=a.device).reshape(a.shape[0]*a.shape[1], a.shape[-1])
+  g2 = Tensor(gradient, device=gradient.device).reshape(gradient.shape[0]*gradient.shape[1], gradient.shape[-1])
+  g2, s = quantize_to_fp8(g2) 
+  grad_b = (g2.T.dot(a2,dtype=dtypes.float))*s
+  grad_b = grad_b.cast(dtypes.float)
+  grad_a = (g2.dot(Tensor(b, device=b.device), dtype=dtypes.float)).reshape(a.shape)*s
+  return (None, grad_a.uop, grad_b.uop)
+
+class FP8LinearBert:
+  def __init__(self, in_features, out_features, bias=True):
+    self.weight = Tensor.empty(out_features, in_features, dtype=dtypes.float32)
+    self.bias = Tensor.empty(out_features, dtype=dtypes.float32) if bias else None
+  def __call__(self, x:Tensor):
+    w1, ws = quantize_to_fp8(self.weight)
+    x1, s = quantize_to_fp8(x)
+    if isinstance(GPUS, (tuple, list)) and len(GPUS) > 1:
+      y = Tensor(Tensor.empty((x.shape[0]//len(GPUS), x.shape[1], self.weight.shape[0]), dtype=dtypes.float, device=GPUS).uop.multi(0), device=GPUS)
+      y = Tensor.custom_kernel(y, x1, w1, fxn=custom_linear,grad_fxn=custom_linear_backward)[0]
+    else:
+      y = Tensor.empty((x.shape[0], x.shape[1], self.weight.shape[0]), dtype=dtypes.float)
+      y = Tensor.custom_kernel(y, x1, w1, fxn=custom_linear,grad_fxn=custom_linear_backward)[0]
+    y = (ws * s).contiguous() * y.contiguous()
+    if self.bias is not None: y = y + self.bias.cast(y.dtype)
+    return y.cast(x.dtype)
 
 class EmbeddingBert(nn.Embedding):
   def __init__(self, vocab_size:int, embed_size:int, std=0.02):

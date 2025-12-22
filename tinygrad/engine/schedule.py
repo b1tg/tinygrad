@@ -30,6 +30,7 @@ def create_schedule(sched_sink:UOp) -> tuple[list[ExecItem], UOp]:
         elif s.op in {Ops.MSELECT, Ops.MSTACK}:
           for ss in s.src:
             if ss.op is Ops.MSELECT: ss = ss.src[0]
+            if ss.op is Ops.MULTI: ss = ss.src[0].src[0].base
             if ss.op is not Ops.BUFFER:
               assert ss.op is Ops.AFTER, f"ss.op is not AFTER, it's {ss.op}"
               children.setdefault(ss.src[1], []).append(k)
