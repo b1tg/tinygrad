@@ -84,9 +84,11 @@ def quantize_to_fp8(x: Tensor, axis=None, dtype=dtypes.fp8e4m3):
     # 使用 detach() 替代 max1()
     x_abs_max = x.abs().max(axis=axis, keepdim=True).detach()
     scale = 448. / (x_abs_max + 1e-8)
-    scale = scale
+    # scale = Tensor(1.0, x.device)
     
     x_scaled = x * scale
+    # return x_scaled.cast(dtype).contiguous().contiguous_backward(), scale.float().reciprocal().contiguous().contiguous_backward()
+
     
     # 使用 STE clamp 替代 custom kernel
     x_det = x_scaled.detach()
@@ -111,7 +113,9 @@ def custom_linear(C:UOp, A:UOp, B:UOp) -> UOp:
 
 def custom_linear_backward(gradient:UOp, kernel:UOp) -> tuple[UOp, UOp]:
   out, a, b = kernel.src
-  # print(f"{a.shape=}, {b.shape=}, {gradient.shape=}")
+  print(f"{a.shape=}, {b.shape=}, {gradient.shape=}")
+  print(f"{a.dtype=}, {b.dtype=}, {gradient.dtype=}")
+
   # a.shape=(66, 512, 4096), b.shape=(1024, 4096), gradient.shape=(66, 512, 1024)
   a2 = Tensor(a, device=a.device).reshape(a.shape[0]*a.shape[1], a.shape[-1])
   g2 = Tensor(gradient, device=gradient.device).reshape(gradient.shape[0]*gradient.shape[1], gradient.shape[-1])
@@ -130,11 +134,38 @@ def custom_linear_backward(gradient:UOp, kernel:UOp) -> tuple[UOp, UOp]:
   #   return (None, grad_a.uop, grad_b.uop)
 
 
+def custom_linear_backward(gradient: UOp, kernel: UOp) -> tuple[UOp, UOp]:
+    out, a, b = kernel.src
+    
+    g_tensor = Tensor(gradient, device=gradient.device)
+    a_tensor = Tensor(a, device=a.device)
+    b_tensor = Tensor(b, device=b.device)
+    
+    g_quantized, scale = quantize_to_fp8(g_tensor)
+    
+    # 确保scale是标量
+    scale = scale.reshape(())  # reshape to scalar
+    
+    # grad_a
+    grad_a = ((g_quantized @ b_tensor) * scale).cast(dtypes.float)
+    
+    # grad_b
+    flatten_size = 1
+    for dim in gradient.shape[:-1]:
+        flatten_size *= dim
+    
+    grad_b = ((g_quantized.reshape(flatten_size, -1).T @ 
+               a_tensor.reshape(flatten_size, -1)) * scale).cast(dtypes.float)
+    
+    return (None, grad_a.uop, grad_b.uop)
+
 class FP8LinearBert:
   def __init__(self, in_features, out_features, bias=True):
     self.weight = Tensor.empty(out_features, in_features, dtype=dtypes.float32)
     self.bias = Tensor.empty(out_features, dtype=dtypes.float32) if bias else None
   def __call__(self, x:Tensor):
+    # return x.cast(dtypes.default_float).linear(self.weight.cast(dtypes.default_float).transpose(), self.bias.cast(dtypes.default_float) if self.bias is not None else None)
+
     w1, ws = quantize_to_fp8(self.weight)
     x1, s = quantize_to_fp8(x)
     if isinstance(GPUS, (tuple, list)) and len(GPUS) > 1:
@@ -143,9 +174,9 @@ class FP8LinearBert:
     else:
       y = Tensor.empty((x.shape[0], x.shape[1], self.weight.shape[0]), dtype=dtypes.float)
       y = Tensor.custom_kernel(y, x1, w1, fxn=custom_linear,grad_fxn=custom_linear_backward)[0]
-    # y = x1.dot(w1.T, dtype=dtypes.float)
+    # y = x1.dot(w1.T, dtype=dtypes.float).cast(dtypes.default_float)
     y = (ws * s).contiguous() * y.contiguous()
-    if self.bias is not None: y = y + self.bias.cast(y.dtype)
+    if self.bias is not None: y = y.cast(dtypes.default_float) + self.bias.cast(dtypes.default_float)
     return y.cast(x.dtype)
 
 class EmbeddingBert(nn.Embedding):
