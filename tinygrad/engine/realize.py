@@ -80,7 +80,7 @@ class CompiledRunner(Runner):
     if DEBUG >= 3: print(p.applied_opts)
     if DEBUG >= 4: print(p.src)
 
-    if getenv("SHOW") and ("mfma" in p.src or "custom" in p.src or "r_256_16_1024" in p.src):
+    if getenv("SHOW") and ("mfma" in p.src or "custom" in p.src or "r_32_22_32_3_128_4" in p.src):
       pass
     # if "r_4_64_64_4_2_2_4_4_512_2_2_2" in p.src:
     #   with open("dist/mma.c") as f:

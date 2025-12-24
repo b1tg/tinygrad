@@ -80,7 +80,22 @@ def quantize_to_fp8(x: Tensor, axis=None, dtype=dtypes.fp8e4m3):
   y = Tensor.custom_kernel(y, x,  fxn=k_clamp, grad_fxn=k_clamp_back)[0]
   res = y.cast(dtype).contiguous()
   return res, scale.float().reciprocal()
-
+def quantize_to_fp8(x: Tensor, axis=None, dtype=dtypes.fp8e4m3):
+    # 使用 detach() 替代 max1()
+    x_abs_max = x.abs().max(axis=axis, keepdim=True).detach()
+    scale = 448. / (x_abs_max + 1e-8)
+    scale = scale
+    
+    x_scaled = x * scale
+    
+    # 使用 STE clamp 替代 custom kernel
+    x_det = x_scaled.detach()
+    x_clamped = x_det.maximum(-448.0).minimum(448.0)
+    # x_clamped = x_det.clamp(-448.0, 448.0)
+    x_clamped_ste = x_scaled + (x_clamped - x_det)
+    
+    res = x_clamped_ste.cast(dtype).contiguous().contiguous_backward()
+    return res, scale.float().reciprocal().contiguous().contiguous_backward()
 def custom_linear(C:UOp, A:UOp, B:UOp) -> UOp:
   SEQ = A.shape[1]
   OUT = B.shape[0]
@@ -96,13 +111,24 @@ def custom_linear(C:UOp, A:UOp, B:UOp) -> UOp:
 
 def custom_linear_backward(gradient:UOp, kernel:UOp) -> tuple[UOp, UOp]:
   out, a, b = kernel.src
+  # print(f"{a.shape=}, {b.shape=}, {gradient.shape=}")
+  # a.shape=(66, 512, 4096), b.shape=(1024, 4096), gradient.shape=(66, 512, 1024)
   a2 = Tensor(a, device=a.device).reshape(a.shape[0]*a.shape[1], a.shape[-1])
   g2 = Tensor(gradient, device=gradient.device).reshape(gradient.shape[0]*gradient.shape[1], gradient.shape[-1])
+  # if 1 or g2.shape[-1] < 10240:
   g2, s = quantize_to_fp8(g2) 
-  grad_b = (g2.T.dot(a2,dtype=dtypes.float))*s
+  # print(f"{a2.shape=}, {g2.shape=}, {b.shape=}")
+  grad_b = (g2.T.dot(a2,dtype=dtypes.float)).contiguous()*s
   grad_b = grad_b.cast(dtypes.float)
-  grad_a = (g2.dot(Tensor(b, device=b.device), dtype=dtypes.float)).reshape(a.shape)*s
+  grad_a = (g2.dot(Tensor(b, device=b.device), dtype=dtypes.float)).contiguous().reshape(a.shape)*s
   return (None, grad_a.uop, grad_b.uop)
+  # else:
+  #   # g2,s = g2, 1
+  #   grad_b = (g2.T.dot(a2.cast(dtypes.half)))
+  #   grad_b = grad_b.cast(dtypes.float)
+  #   grad_a = (g2.dot(Tensor(b.cast(dtypes.half), device=b.device))).reshape(a.shape)
+  #   return (None, grad_a.uop, grad_b.uop)
+
 
 class FP8LinearBert:
   def __init__(self, in_features, out_features, bias=True):
@@ -117,6 +143,7 @@ class FP8LinearBert:
     else:
       y = Tensor.empty((x.shape[0], x.shape[1], self.weight.shape[0]), dtype=dtypes.float)
       y = Tensor.custom_kernel(y, x1, w1, fxn=custom_linear,grad_fxn=custom_linear_backward)[0]
+    # y = x1.dot(w1.T, dtype=dtypes.float)
     y = (ws * s).contiguous() * y.contiguous()
     if self.bias is not None: y = y + self.bias.cast(y.dtype)
     return y.cast(x.dtype)

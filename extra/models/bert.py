@@ -151,7 +151,7 @@ class BertPredictionHeadTransform:
     self.LayerNorm = LayerNorm(hidden_size, eps=1e-12)
 
   def __call__(self, hidden_states:Tensor):
-    return self.LayerNorm(gelu(self.dense(hidden_states)))
+    return self.LayerNorm(gelu(self.dense(hidden_states).contiguous().contiguous_backward()))
 
 class BertPooler:
   def __init__(self, hidden_size:int):
@@ -232,7 +232,7 @@ class BertOutput:
     self.dropout = hidden_dropout_prob
 
   def __call__(self, hidden_states, input_tensor):
-    hidden_states = self.dense(hidden_states.contiguous().contiguous_backward()).contiguous().contiguous_backward()
+    hidden_states = self.dense(hidden_states).contiguous().contiguous_backward()
     hidden_states = hidden_states.dropout(self.dropout)
     hidden_states = self.LayerNorm(hidden_states + input_tensor)
     return hidden_states
@@ -242,16 +242,16 @@ def gelu(x):
 
 class BertIntermediate:
   def __init__(self, hidden_size, intermediate_size):
-    if FP8:
+    if 0 and FP8:
       self.dense = QuantLinear(hidden_size, intermediate_size)
     else:
       self.dense = Linear(hidden_size, intermediate_size)
 
   def __call__(self, hidden_states):
-    x = self.dense(hidden_states.contiguous().contiguous_backward()).contiguous().contiguous_backward()
+    x = self.dense(hidden_states).contiguous().contiguous_backward() # better
     # tinygrad gelu is openai gelu but we need the original bert gelu
     # NOTE: contiguous for speed
-    return gelu(x).contiguous()
+    return gelu(x).contiguous().contiguous_backward()
 
 class BertAttention:
   def __init__(self, hidden_size, num_attention_heads, attention_probs_dropout_prob, hidden_dropout_prob):
@@ -276,6 +276,7 @@ class BertSelfAttention:
     self.dropout = attention_probs_dropout_prob
 
   def __call__(self, hidden_states, attention_mask):
+    # print(f"{hidden_states.shape=}")
     mixed_query_layer = self.query(hidden_states)
     mixed_key_layer = self.key(hidden_states)
     mixed_value_layer = self.value(hidden_states)
@@ -302,6 +303,7 @@ class BertSelfOutput:
     self.dropout = hidden_dropout_prob
 
   def __call__(self, hidden_states, input_tensor):
+    # need
     hidden_states = self.dense(hidden_states).contiguous().contiguous_backward()
     hidden_states = hidden_states.dropout(self.dropout)
     hidden_states = self.LayerNorm(hidden_states + input_tensor)

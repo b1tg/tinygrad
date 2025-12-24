@@ -194,9 +194,34 @@ TC128=1
     5  588.50 ms run,   10.81 ms python,   0.57 ms fetch data,  577.13 ms AMD * 2,   nan loss, 0.000145 LR, global_norm:   nan, 44.48 GB used,  56346.96 GFLOPS
 
 
+after tuning 1224
+FP8=0
+    5  538.29 ms run,    8.95 ms python,   0.62 ms fetch data,  528.71 ms AMD * 2,  0.69 loss, 0.000145 LR, global_norm:  0.35, 45.54 GB used,  61390.16 GFLOPS
+    BertOutput -> hidden_states = self.dense(hidden_states.contiguous().contiguous_backward()).contiguous().contiguous_backward() (FP8=1 提升小)
+    5  526.66 ms run,    9.04 ms python,   0.56 ms fetch data,  517.06 ms AMD * 2,  0.69 loss, 0.000145 LR, global_norm:  0.35, 45.50 GB used,  62491.50 GFLOPS
+FP8=1
+    5  559.30 ms run,   11.06 ms python,   0.55 ms fetch data,  547.70 ms AMD * 2,   nan loss, 0.000145 LR, global_norm:   nan, 44.39 GB used,  58948.27 GFLOPS
 
 FP8=0 BENCHMARK=6 BERT_LAYERS=10 BS=66 GPUS=1
     5  972.47 ms run,    3.22 ms python,   0.55 ms fetch data,  968.70 ms AMD,  0.69 loss, 0.000145 LR, global_norm:  0.35, 40.08 GB used,  33182.39 GFLOPS
 
 FP8=1 BENCHMARK=6 BERT_LAYERS=10 BS=66 GPUS=1
     5 1006.01 ms run,    3.56 ms python,   0.66 ms fetch data, 1001.79 ms AMD,   nan loss, 0.000145 LR, global_norm:   nan, 38.97 GB used,  32130.72 GFLOPS
+
+
+after tuning 1224
+FP8=0 BENCHMARK=6 BERT_LAYERS=2 BS=66 GPUS=1
+    5  549.97 ms run,    2.25 ms python,   2.27 ms fetch data,  545.45 ms AMD,   nan loss, 0.000145 LR, global_norm:   nan, 10.39 GB used,  17207.67 GFLOPS
+
+FP8=1 BENCHMARK=6 BERT_LAYERS=2 BS=66 GPUS=1
+    5  545.29 ms run,    1.61 ms python,   0.54 ms fetch data,  543.14 ms AMD,  0.69 loss, 0.000145 LR, global_norm:  0.35, 10.13 GB used,  17335.02 GFLOPS
+
+
+real run
+ FP8=0
+ 1970 1961.33 ms run,  217.43 ms python,   6.16 ms fetch data, 1737.74 ms AMD * 8,  1.41 loss, 0.000544 LR, global_norm:  0.71, 1466.00 GB used, 581481.40 GFLOPS
+
+
+ FP8=1 ste TC128=0
+ 1970 1962.68 ms run,  263.90 ms python,   6.03 ms fetch data, 1692.75 ms AMD * 8,  1.38 loss, 0.000544 LR, global_norm:  0.65, 1417.07 GB used, 582248.38 GFLOPS
+
