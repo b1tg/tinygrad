@@ -232,6 +232,8 @@ out
     9 1979.51 ms run,  235.00 ms python,   5.74 ms fetch data, 1738.77 ms AMD * 8,  4.39 loss, 0.001097 LR, global_norm:  1.89, 1397.10 GB used, 577086.07 GFLOPS                    
    10 1971.80 ms run,  235.95 ms python,   5.51 ms fetch data, 1730.35 ms AMD * 8,  4.37 loss, 0.001097 LR, global_norm:  1.33, 1397.10 GB used, 579342.64 GFLOPS
 
+重启后保持，说明不是硬件问题
+
 out + im (无法复现)
     9 1950.93 ms run,  261.22 ms python,   5.36 ms fetch data, 1684.36 ms AMD * 8,  4.43 loss, 0.001097 LR, global_norm:  1.58, 1385.25 GB used, 586124.64 GFLOPS                                                                                    
    10 1942.69 ms run,  262.38 ms python,   5.45 ms fetch data, 1674.85 ms AMD * 8,  4.27 loss, 0.001097 LR, global_norm:  1.25, 1385.25 GB used, 588611.75 GFLOPS   

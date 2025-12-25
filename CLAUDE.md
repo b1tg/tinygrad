@@ -1,5 +1,9 @@
 # Claude Code Guide for tinygrad
 
+## python path
+
+/home/b1tg/tinygrad/.venv/bin/python
+
 ## Architecture Overview
 
 tinygrad compiles tensor operations into optimized kernels. The pipeline:
