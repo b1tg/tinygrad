@@ -2,12 +2,14 @@ import re, os
 from pathlib import Path
 from tinygrad.tensor import Tensor, cast
 from tinygrad import nn, dtypes
-from tinygrad.helpers import fetch, get_child
+from tinygrad.helpers import fetch, get_child, getenv
 from tinygrad.nn.state import get_parameters
 
+FP8 = getenv("FP8", 0)
 # allow for monkeypatching
 Embedding = nn.Embedding
 Linear = nn.Linear
+QuantLinear = nn.Linear
 LayerNorm = nn.LayerNorm
 
 class BertForQuestionAnswering:
@@ -149,7 +151,7 @@ class BertPredictionHeadTransform:
     self.LayerNorm = LayerNorm(hidden_size, eps=1e-12)
 
   def __call__(self, hidden_states:Tensor):
-    return self.LayerNorm(gelu(self.dense(hidden_states)))
+    return self.LayerNorm(gelu(self.dense(hidden_states).contiguous().contiguous_backward()))
 
 class BertPooler:
   def __init__(self, hidden_size:int):
@@ -216,18 +218,21 @@ class BertLayer:
 
   def __call__(self, hidden_states, attention_mask):
     attention_output = self.attention(hidden_states, attention_mask)
-    intermediate_output = self.intermediate(attention_output)
+    intermediate_output = self.intermediate(attention_output) # Residual
     layer_output = self.output(intermediate_output, attention_output)
     return layer_output
 
 class BertOutput:
   def __init__(self, hidden_size, intermediate_size, hidden_dropout_prob):
-    self.dense = Linear(intermediate_size, hidden_size)
+    if 1 and FP8 & 1 == 1:
+      self.dense = QuantLinear(intermediate_size, hidden_size)
+    else:
+      self.dense = Linear(intermediate_size, hidden_size)
     self.LayerNorm = LayerNorm(hidden_size, eps=1e-12)
     self.dropout = hidden_dropout_prob
 
   def __call__(self, hidden_states, input_tensor):
-    hidden_states = self.dense(hidden_states)
+    hidden_states = self.dense(hidden_states).contiguous().contiguous_backward()
     hidden_states = hidden_states.dropout(self.dropout)
     hidden_states = self.LayerNorm(hidden_states + input_tensor)
     return hidden_states
@@ -237,13 +242,16 @@ def gelu(x):
 
 class BertIntermediate:
   def __init__(self, hidden_size, intermediate_size):
-    self.dense = Linear(hidden_size, intermediate_size)
+    if 1 and FP8 & 0x10 == 0x10:
+      self.dense = QuantLinear(hidden_size, intermediate_size)
+    else:
+      self.dense = Linear(hidden_size, intermediate_size)
 
   def __call__(self, hidden_states):
-    x = self.dense(hidden_states)
+    x = self.dense(hidden_states).contiguous().contiguous_backward() # better
     # tinygrad gelu is openai gelu but we need the original bert gelu
     # NOTE: contiguous for speed
-    return gelu(x).contiguous()
+    return gelu(x).contiguous() # no need contiguous_backward
 
 class BertAttention:
   def __init__(self, hidden_size, num_attention_heads, attention_probs_dropout_prob, hidden_dropout_prob):
@@ -289,12 +297,16 @@ class BertSelfAttention:
 
 class BertSelfOutput:
   def __init__(self, hidden_size, hidden_dropout_prob):
-    self.dense = Linear(hidden_size, hidden_size)
+    if 1 and FP8 & 0x100 == 0x100:
+      self.dense = QuantLinear(hidden_size, hidden_size)
+    else:
+      self.dense = Linear(hidden_size, hidden_size)
     self.LayerNorm = LayerNorm(hidden_size, eps=1e-12)
     self.dropout = hidden_dropout_prob
 
   def __call__(self, hidden_states, input_tensor):
-    hidden_states = self.dense(hidden_states)
+    # need
+    hidden_states = self.dense(hidden_states).contiguous().contiguous_backward()
     hidden_states = hidden_states.dropout(self.dropout)
     hidden_states = self.LayerNorm(hidden_states + input_tensor)
     return hidden_states

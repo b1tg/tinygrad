@@ -212,6 +212,9 @@ def get_mlperf_bert_model():
   from examples.mlperf.initializers import LinearBert, EmbeddingBert, LayerNormBert
 
   bert.Linear = LinearBert
+  if getenv("FP8"):
+    from extra.fp8 import FP8Linear
+    bert.QuantLinear = FP8Linear
   bert.Embedding = EmbeddingBert
   bert.LayerNorm = LayerNormBert
 
