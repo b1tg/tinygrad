@@ -48,7 +48,7 @@ class LinearBert(nn.Linear):
     self.bias = Tensor.zeros(out_features, dtype=dtypes.float32) if bias else None
 
   def __call__(self, x:Tensor):
-    return x.cast(dtypes.default_float).linear(self.weight.cast(dtypes.default_float).transpose(), self.bias.cast(dtypes.default_float) if self.bias is not None else None)
+    return x.cast(dtypes.float16).linear(self.weight.cast(dtypes.float16).transpose(), self.bias.cast(dtypes.float16) if self.bias is not None else None)
 
 def k_clamp_back(grads:UOp, kernel:UOp):
   return (None, grads)
@@ -159,6 +159,8 @@ def custom_linear_backward(gradient: UOp, kernel: UOp) -> tuple[UOp, UOp]:
     
     return (None, grad_a.uop, grad_b.uop)
 
+# DEPRECATED: This implementation will be removed in the future.
+# Use extra.fp8.FP8Linear instead for better shape handling and drop-in compatibility.
 class FP8LinearBert:
   def __init__(self, in_features, out_features, bias=True):
     self.weight = Tensor.empty(out_features, in_features, dtype=dtypes.float32)

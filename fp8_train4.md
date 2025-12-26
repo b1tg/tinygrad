@@ -202,6 +202,44 @@ FP8=0
 FP8=1
     5  559.30 ms run,   11.06 ms python,   0.55 ms fetch data,  547.70 ms AMD * 2,   nan loss, 0.000145 LR, global_norm:   nan, 44.39 GB used,  58948.27 GFLOPS
 
+after tuning 1226
+FP8=0
+    6  525.53 ms run,    8.87 ms python,   0.54 ms fetch data,  516.12 ms AMD * 2,  0.69 loss, 0.000145 LR, global_norm:  0.35, 45.50 GB used,  62625.42 GFLOPS
+FP8=1
+    selfout
+    6  546.38 ms run,   10.50 ms python,   0.63 ms fetch data,  535.25 ms AMD * 2,   nan loss, 0.000145 LR, global_norm:   nan, 44.57 GB used,  60342.09 GFLOPS
+    out
+    6  541.72 ms run,    9.73 ms python,   0.58 ms fetch data,  531.42 ms AMD * 2,   nan loss, 0.000145 LR, global_norm:   nan, 44.69 GB used,  60805.64 GFLOPS    
+    im
+    6  542.92 ms run,    9.66 ms python,   0.55 ms fetch data,  532.72 ms AMD * 2,   nan loss, 0.000145 LR, global_norm:   nan, 45.52 GB used,  60675.99 GFLOPS    
+    out + im
+    6  560.00 ms run,   10.30 ms python,   0.54 ms fetch data,  549.17 ms AMD * 2,   nan loss, 0.000145 LR, global_norm:   nan, 44.57 GB used,  58875.93 GFLOPS
+    out + selfout
+    6  563.16 ms run,   10.40 ms python,   0.55 ms fetch data,  552.22 ms AMD * 2,   nan loss, 0.000145 LR, global_norm:   nan, 43.67 GB used,  58594.31 GFLOPS
+    im + selfout
+    6  565.98 ms run,   10.35 ms python,   0.55 ms fetch data,  555.07 ms AMD * 2,   nan loss, 0.000145 LR, global_norm:   nan, 44.50 GB used,  58307.30 GFLOPS
+    out + im + selfout
+    6  581.70 ms run,   11.09 ms python,   0.55 ms fetch data,  570.05 ms AMD * 2,   nan loss, 0.000145 LR, global_norm:   nan, 43.48 GB used,  56780.70 GFLOPS
+
+  dev_run
+    FP8=0
+    6 1889.73 ms run,  202.80 ms python,   0.70 ms fetch data, 1686.23 ms AMD * 8,  0.69 loss, 0.001098 LR, global_norm:  0.35, 1440.11 GB used, 603514.87 GFLOPS    
+    FP8=1 out im selfout
+    out
+    6 1936.19 ms run,  221.94 ms python,   0.75 ms fetch data, 1713.50 ms AMD * 8,   nan loss, 0.001098 LR, global_norm:   nan, 1397.56 GB used, 590003.17 GFLOPS
+    im
+    6 1898.30 ms run,  210.11 ms python,   0.79 ms fetch data, 1687.41 ms AMD * 8,  0.69 loss, 0.001098 LR, global_norm:  0.35, 1440.11 GB used, 600788.73 GFLOPS
+    out + im
+    6 1934.70 ms run,  220.09 ms python,   0.67 ms fetch data, 1713.94 ms AMD * 8,   nan loss, 0.001098 LR, global_norm:   nan, 1397.56 GB used, 590458.24 GFLOPS
+    selfout
+    6 1894.86 ms run,  205.46 ms python,   0.74 ms fetch data, 1688.66 ms AMD * 8,  0.69 loss, 0.001098 LR, global_norm:  0.35, 1440.11 GB used, 601881.58 GFLOPS
+    selfout + out
+    6 1941.76 ms run,  230.99 ms python,   0.72 ms fetch data, 1710.06 ms AMD * 8,   nan loss, 0.001098 LR, global_norm:   nan, 1397.56 GB used, 588311.20 GFLOPS
+    selfout + im
+    6 1895.21 ms run,  203.70 ms python,   0.79 ms fetch data, 1690.72 ms AMD * 8,  0.69 loss, 0.001098 LR, global_norm:  0.35, 1440.11 GB used, 601769.40 GFLOPS
+    out + selfout + im
+    6 1931.36 ms run,  220.03 ms python,   0.68 ms fetch data, 1710.66 ms AMD * 8,   nan loss, 0.001098 LR, global_norm:   nan, 1397.56 GB used, 591477.72 GFLOPS
+  
 FP8=0 BENCHMARK=6 BERT_LAYERS=10 BS=66 GPUS=1
     5  972.47 ms run,    3.22 ms python,   0.55 ms fetch data,  968.70 ms AMD,  0.69 loss, 0.000145 LR, global_norm:  0.35, 40.08 GB used,  33182.39 GFLOPS
 
@@ -238,3 +276,25 @@ out + im (无法复现)
     9 1950.93 ms run,  261.22 ms python,   5.36 ms fetch data, 1684.36 ms AMD * 8,  4.43 loss, 0.001097 LR, global_norm:  1.58, 1385.25 GB used, 586124.64 GFLOPS                                                                                    
    10 1942.69 ms run,  262.38 ms python,   5.45 ms fetch data, 1674.85 ms AMD * 8,  4.27 loss, 0.001097 LR, global_norm:  1.25, 1385.25 GB used, 588611.75 GFLOPS   
 
+
+after claude
+
+  100 1983.81 ms run,  229.32 ms python,   5.39 ms fetch data, 1749.10 ms AMD * 8,  4.04 loss, 0.001072 LR, global_norm:  0.76, 1397.10 GB used, 575835.48 GFLOPS                               
+  302 1987.11 ms run,  230.07 ms python,   7.65 ms fetch data, 1749.40 ms AMD * 8,  3.88 loss, 0.001015 LR, global_norm:  0.79, 1423.82 GB used, 574879.63 GFLOPS                               
+
+delete cons to make im work
+
+   51 1961.40 ms run,  247.50 ms python,   5.35 ms fetch data, 1708.55 ms AMD * 8,  4.20 loss, 0.001086 LR, global_norm:  0.79, 1493.70 GB used, 583062.60 GFLOPS                               
+
+
+selfout   
+  100 1992.76 ms run,  250.29 ms python,   5.62 ms fetch data, 1736.84 ms AMD * 8,  4.05 loss, 0.001072 LR, global_norm:  0.83, 1401.67 GB used, 572792.97 GFLOPS                               
+  fp8=0 mean time
+  100 1950.72 ms run,  208.58 ms python,   5.87 ms fetch data, 1736.27 ms AMD * 8,  4.07 loss, 0.001072 LR, global_norm:  0.78, 1440.12 GB used, 584646.48 GFLOPS                               
+
+selfout + imm (recusive)
+
+
+  after new quant
+output
+  390 1979.08 ms run,  244.25 ms python,   5.62 ms fetch data, 1729.21 ms AMD * 8,  3.92 loss, 0.000990 LR, global_norm:  0.88, 1418.66 GB used, 577211.80 GFLOPS                               

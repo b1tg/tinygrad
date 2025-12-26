@@ -95,5 +95,7 @@ if __name__=="__main__":
     launchBenchmark("v_mfma_f32_16x16x128_f8f6f4", (3,0,7), accum=True) # fp8
     launchBenchmark("v_mfma_f32_16x16x128_f8f6f4", (3,0,5), accum=True, extra=", cbsz:2 blgp:2") # fp6
     launchBenchmark("v_mfma_f32_16x16x128_f8f6f4", (3,0,3), accum=True, extra=", cbsz:4 blgp:4") # fp4
+    FLOPS_PER_MATMUL = 32*32*64*2
+    launchBenchmark("v_mfma_f32_32x32x64_f8f6f4", (15,0,7), accum=True) # fp8
   else:
     raise RuntimeError(f"arch {DEV.arch} not supported.")

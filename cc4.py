@@ -1,7 +1,7 @@
 import numpy as np
 from tinygrad import Tensor, dtypes, nn
 from tinygrad.helpers import Timing
-from  examples.mlperf.initializers import FP8LinearBert, LinearBert, FP8LinearBertRow, FP8LinearBert
+from  examples.mlperf.initializers import FP8LinearBert, LinearBert,  FP8LinearBert
 
 # ==========================================
 # 1. 模拟 FP8 量化函数 (保持不变)

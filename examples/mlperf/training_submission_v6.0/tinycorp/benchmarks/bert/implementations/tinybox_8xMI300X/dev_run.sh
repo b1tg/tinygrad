@@ -1,6 +1,7 @@
 #!/bin/bash
 
 export PYTHONPATH="." AMD=1 AMD_LLVM=0
+# export PYTHONPATH="." AMD=0 NULL=1
 export MODEL="bert"
 export DEFAULT_FLOAT="HALF" GPUS=1 BS=128 EVAL_BS=128
 export DEFAULT_FLOAT="HALF" GPUS=1 BS=128 EVAL_BS=128
@@ -60,11 +61,22 @@ export FP8_EXTRA=0
 # CUSTOM_CLAMP=1 CUSTOM_AMAX=1 FP8=1 WANDB_NAME="conS FP8=1 8/1024 mi350" RUNMLPERF=1 python3 examples/mlperf/model_train.py
 # FP8=2 WANDB_NAME="conS FP8=2 8/1024 mi350" RUNMLPERF=1 python3 examples/mlperf/model_train.py
 # export HCQ_VISIBLE_DEVICES="6,7" 
-export WANDB=1
+export WANDB=0
+export BENCHMARK=10
+# TC128=1 GPUS=8 BS=1024 EVAL_BS=1024 CUSTOM_CLAMP=1 CUSTOM_AMAX=0 FP8=0 WANDB_NAME="ste out TC128=1" RUNMLPERF=0 python3 examples/mlperf/model_train.py
+# TC128=1 GPUS=8 BS=1024 EVAL_BS=1024 CUSTOM_CLAMP=1 CUSTOM_AMAX=0 FP8=1 WANDB_NAME="ste out TC128=1" RUNMLPERF=0 python3 examples/mlperf/model_train.py
+# TC128=1 GPUS=8 BS=1024 EVAL_BS=1024 CUSTOM_CLAMP=1 CUSTOM_AMAX=0 FP8=2 WANDB_NAME="ste out TC128=1" RUNMLPERF=0 python3 examples/mlperf/model_train.py
+TC128=1 GPUS=8 BS=1024 EVAL_BS=1024 CUSTOM_CLAMP=1 CUSTOM_AMAX=0 FP8=3 WANDB_NAME="ste out TC128=1" RUNMLPERF=0 python3 examples/mlperf/model_train.py
+# TC128=1 GPUS=8 BS=1024 EVAL_BS=1024 CUSTOM_CLAMP=1 CUSTOM_AMAX=0 FP8=4 WANDB_NAME="ste out TC128=1" RUNMLPERF=0 python3 examples/mlperf/model_train.py
+# TC128=1 GPUS=8 BS=1024 EVAL_BS=1024 CUSTOM_CLAMP=1 CUSTOM_AMAX=0 FP8=5 WANDB_NAME="ste out TC128=1" RUNMLPERF=0 python3 examples/mlperf/model_train.py
+# TC128=1 GPUS=8 BS=1024 EVAL_BS=1024 CUSTOM_CLAMP=1 CUSTOM_AMAX=0 FP8=6 WANDB_NAME="FP8=0" RUNMLPERF=0 python3 examples/mlperf/model_train.py
+# TC128=1 GPUS=8 BS=1024 EVAL_BS=1024 CUSTOM_CLAMP=1 CUSTOM_AMAX=0 FP8=6 WANDB_NAME="FP8=6 TC128=1" RUNMLPERF=1 python3 examples/mlperf/model_train.py
+# TC128=1 GPUS=8 BS=1024 EVAL_BS=1024 CUSTOM_CLAMP=1 CUSTOM_AMAX=0 FP8=7 WANDB_NAME="ste out TC128=1" RUNMLPERF=0 python3 examples/mlperf/model_train.py
+
 # TC128=1 GPUS=1 BS=128 EVAL_BS=128 CUSTOM_CLAMP=1 CUSTOM_AMAX=1 FP8=1 WANDB_NAME="1/128 FP8=1 TC128=1 output" RUNMLPERF=1 python3 examples/mlperf/model_train.py
 # TC128=0 GPUS=8 BS=1024 EVAL_BS=1024 CUSTOM_CLAMP=1 CUSTOM_AMAX=0 FP8=0 WANDB_NAME="FP8=0" RUNMLPERF=1 python3 examples/mlperf/model_train.py
-TC128=1 GPUS=8 BS=1024 EVAL_BS=1024 CUSTOM_CLAMP=1 CUSTOM_AMAX=0 FP8=1 WANDB_NAME="ste out TC128=1" RUNMLPERF=1 python3 examples/mlperf/model_train.py
-TC128=0 GPUS=8 BS=1024 EVAL_BS=1024 CUSTOM_CLAMP=1 CUSTOM_AMAX=0 FP8=1 WANDB_NAME="ste out TC128=0" RUNMLPERF=1 python3 examples/mlperf/model_train.py
+# TC128=0 GPUS=8 BS=1024 EVAL_BS=1024 CUSTOM_CLAMP=1 CUSTOM_AMAX=0 FP8=1 WANDB_NAME="ste out TC128=1" RUNMLPERF=1 python3 examples/mlperf/model_train.py
+# TC128=0 GPUS=8 BS=1024 EVAL_BS=1024 CUSTOM_CLAMP=1 CUSTOM_AMAX=0 FP8=1 WANDB_NAME="ste out TC128=0" RUNMLPERF=1 python3 examples/mlperf/model_train.py
 # BEAM_TIMEOUT_SEC=20 BEAM=4 TC128=0 GPUS=8 BS=1024 EVAL_BS=1024 CUSTOM_CLAMP=1 CUSTOM_AMAX=0 FP8=1 WANDB_NAME="4B ste TC128=0" RUNMLPERF=1 python3 examples/mlperf/model_train.py
 # BEAM_TIMEOUT_SEC=20 BEAM=4 TC128=1 GPUS=8 BS=1024 EVAL_BS=1024 CUSTOM_CLAMP=1 CUSTOM_AMAX=0 FP8=1 WANDB_NAME="4B ste TC128=1" RUNMLPERF=1 python3 examples/mlperf/model_train.py
 # TC128=0 GPUS=8 BS=1024 EVAL_BS=1024 CUSTOM_CLAMP=1 CUSTOM_AMAX=1 FP8=1 WANDB_NAME="1-22 TC128=0 allCON+output+im 8/1024 FP8=1" RUNMLPERF=1 python3 examples/mlperf/model_train.py
@@ -105,3 +117,18 @@ TC128=0 GPUS=8 BS=1024 EVAL_BS=1024 CUSTOM_CLAMP=1 CUSTOM_AMAX=0 FP8=1 WANDB_NAM
 
 # relu TC128=0
 # 10 2347.61 ms run,  211.94 ms python,   5.86 ms fetch data, 2129.81 ms AMD * 8,  4.36 loss, 0.001097 LR, global_norm:  1.46, 2054.72 GB used, 494415.73 GFLOPS 
+
+
+
+# UOp(Ops.ASSIGN, dtypes.uint, arg=None, src=(                                         
+#   x0:=UOp(Ops.COPY, dtypes.uint, arg=None, src=(
+#     UOp(Ops.BUFFER, dtypes.uint, arg=1, src=(                                                                             
+#       UOp(Ops.LUNIQUE, dtypes.void, arg=14, src=()),                                                                                                                                                                                                 
+#       UOp(Ops.DEVICE, dtypes.void, arg='PYTHON', src=()),)),                                                                                                                                                                                         
+#     x4:=UOp(Ops.DEVICE, dtypes.void, arg='AMD', src=()),)),                                                               
+#   UOp(Ops.ADD, dtypes.uint, arg=None, src=(                                                                                                                                                                                                          
+#      x0,                                                                                                                  
+#     UOp(Ops.RESHAPE, dtypes.uint, arg=None, src=(                                                                         
+#       UOp(Ops.CONST, dtypes.uint, arg=8388608, src=(                                                                                                                                                                                                 
+#          x4,)),                                                                                                           
+#       UOp(Ops.CONST, dtypes.index, arg=1, src=()),)),)),)) 
