@@ -10,7 +10,8 @@ acc_dtype = (dtypes.half if getenv("ACC_HALF") else dtypes.bfloat16 if getenv("A
             dtypes.fp8e4m3 if getenv("ACC_FP8E4M3") else dtypes.fp8e5m2 if getenv("ACC_FP8E5M2") else None)
 if getenv("INT"):  dtype_in, acc_dtype = dtypes.int8, dtypes.int32
 if getenv("UINT"): dtype_in, acc_dtype = dtypes.uint8, dtypes.int32
-
+# if dtype_in in dtypes.fp8s: 
+acc_dtype = dtypes.float
 N = getenv("N", 4096)
 M = getenv("M", N)
 K = getenv("K", N)

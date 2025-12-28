@@ -1152,6 +1152,11 @@ def train_bert():
           train_data["input_ids"], train_data["segment_ids"], train_data["input_mask"], train_data["masked_lm_positions"], \
           train_data["masked_lm_ids"], train_data["masked_lm_weights"], train_data["next_sentence_labels"])
 
+        # Invalidate FP8 weight caches after optimizer step (if using FP8_CACHED)
+        if getenv("FP8_CACHED"):
+          from extra.fp8 import invalidate_all_fp8_caches
+          invalidate_all_fp8_caches(model)
+
         pt = time.perf_counter()
         next_data = next(train_it)
         dt = time.perf_counter()

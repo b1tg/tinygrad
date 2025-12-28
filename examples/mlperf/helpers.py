@@ -212,9 +212,15 @@ def get_mlperf_bert_model():
   from examples.mlperf.initializers import LinearBert, EmbeddingBert, LayerNormBert
 
   bert.Linear = LinearBert
+  # FP8 quantization integration
   if getenv("FP8"):
     from extra.fp8 import FP8Linear
     bert.QuantLinear = FP8Linear
+    print("Using FP8Linear (no caching)")
+  if getenv("FP8_CACHED"):
+    from extra.fp8 import FP8LinearCached
+    bert.QuantLinear = FP8LinearCached
+    print("Using FP8LinearCached (with weight caching)")
   bert.Embedding = EmbeddingBert
   bert.LayerNorm = LayerNormBert
 

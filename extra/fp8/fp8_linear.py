@@ -133,7 +133,7 @@ def custom_linear_backward(gradient: UOp, kernel: UOp) -> tuple[UOp, UOp]:
 
   return (None, grad_a.uop, grad_b.uop)
 
-def custom_linear_backward(gradient: UOp, kernel: UOp) -> tuple[UOp, UOp]:
+def custom_linear_backward_(gradient: UOp, kernel: UOp) -> tuple[UOp, UOp]:
     out, a, b = kernel.src
     
     g_tensor = Tensor(gradient, device=gradient.device)
