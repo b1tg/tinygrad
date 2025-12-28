@@ -7,21 +7,24 @@ os.environ['FP8'] = '1'
 
 from tinygrad import Tensor, dtypes, Device
 from tinygrad.helpers import getenv, colored
-from examples.mlperf.initializers import FP8LinearBert, LinearBert
+from examples.mlperf.initializers import LinearBert
+from extra.fp8 import quantize_to_fp8, FP8Linear as FP8LinearBert
 
 # BERT-large config
-HIDDEN_SIZE = 16384
-INTERMEDIATE_SIZE = 16384
-BS = 66*2
+HIDDEN_SIZE = 1024
+INTERMEDIATE_SIZE = 4096
+# INTERMEDIATE_SIZE, HIDDEN_SIZE = 1024, 4096
+BS = 128
+# BS = 1024
 SEQ = 512
-BATCH_SEQ = (BS, SEQ)  # 33792
+BATCH_SEQ = (BS, SEQ)
 
 # Warmup and benchmark settings
-WARMUP = 3
-ITERATIONS = 10
+WARMUP = 2
+ITERATIONS = 1
 
 def benchmark_linear(linear_class, input_shape, in_features, out_features, name):
-    """Benchmark a linear layer with given shapes"""
+    """Benchmark a linear layer with given shapes - simulates real training"""
 
     # Create model
     model = linear_class(in_features, out_features, bias=True)
@@ -30,20 +33,32 @@ def benchmark_linear(linear_class, input_shape, in_features, out_features, name)
     model.weight.requires_grad = True
     model.bias.requires_grad = True
 
-    # Create input
+    # Create input - realize it first to avoid lazy eval overhead in timing
     x = Tensor.rand(*input_shape, dtype=dtypes.default_float)
     x.requires_grad = True
+    # x.realize()
+    Device[Device.DEFAULT].synchronize()
 
-    # Warmup
-    print(f"  Warming up {name}...")
+    # Warmup - forward only
+    print(f"  Warming up {name} forward...")
     for _ in range(WARMUP):
         y = model(x)
-        # y.realize()
-        y.sum().backward()
-        # if model.weight.grad is not None:
-        #     model.weight.grad.realize()
-        if x.grad is not None:
-            x.grad.realize()
+        y.realize()
+        Device[Device.DEFAULT].synchronize()
+
+    # Warmup - forward + backward (simulate training step)
+    print(f"  Warming up {name} forward+backward...")
+    for _ in range(WARMUP):
+        y = model(x)
+        loss = y.sum()
+        loss.backward()
+        # In real training, we'd do optimizer step here, but for timing we just realize grads
+        Tensor.realize(loss, model.weight.grad, model.bias.grad, x.grad)
+        Device[Device.DEFAULT].synchronize()
+        # Zero grads after realize (like optimizer.zero_grad())
+        model.weight.grad = None
+        model.bias.grad = None
+        x.grad = None
 
     # Benchmark forward
     print(f"  Benchmarking {name} forward...")
@@ -58,28 +73,23 @@ def benchmark_linear(linear_class, input_shape, in_features, out_features, name)
 
     avg_fwd = sum(times_fwd) / len(times_fwd) * 1000  # ms
 
-    # Benchmark forward + backward
+    # Benchmark forward + backward (simulate training step)
     print(f"  Benchmarking {name} forward+backward...")
     Device[Device.DEFAULT].synchronize()
     times_fwd_bwd = []
     for _ in range(ITERATIONS):
-        # Clear grads
-        model.weight.grad = None
-        model.bias.grad = None
-        x.grad = None
-
         start = time.perf_counter()
         y = model(x)
-        y.realize()
-        y.sum().backward()
-        if model.weight.grad is not None:
-            model.weight.grad.realize()
-        if model.bias.grad is not None:
-            model.bias.grad.realize()
-        if x.grad is not None:
-            x.grad.realize()
+        loss = y.sum()
+        loss.backward()
+        # Realize grads (like optimizer would read them)
+        Tensor.realize(model.weight.grad, x.grad)
         Device[Device.DEFAULT].synchronize()
         times_fwd_bwd.append(time.perf_counter() - start)
+        # Zero grads after timing (like optimizer.zero_grad())
+        model.weight.grad = None
+        # model.bias.grad = None
+        x.grad = None
 
     avg_fwd_bwd = sum(times_fwd_bwd) / len(times_fwd_bwd) * 1000  # ms
 
@@ -141,14 +151,15 @@ def main():
     for shape_name, input_shape, in_features, out_features in test_cases:
         print(f"\n{colored(f'Testing {shape_name}: {input_shape} @ ({in_features}, {out_features})', 'cyan')}")
 
-        # Benchmark FP8Linear
-        print(f"{colored('FP8Linear:', 'yellow')}")
-        print(f"{input_shape=}, {in_features=} {out_features=}")
-        fp8_results = benchmark_linear(FP8LinearBert, input_shape, in_features, out_features, "FP8Linear")
 
         # Benchmark Normal Linear
         print(f"{colored('NormalLinear:', 'yellow')}")
         normal_results = benchmark_linear(LinearBert, input_shape, in_features, out_features, "NormalLinear")
+
+        # Benchmark FP8Linear
+        print(f"{colored('FP8Linear:', 'yellow')}")
+        print(f"{input_shape=}, {in_features=} {out_features=}")
+        fp8_results = benchmark_linear(FP8LinearBert, input_shape, in_features, out_features, "FP8Linear")
 
         # Print comparison
         speedup_fwd, speedup_fwd_bwd = print_results(shape_name, fp8_results, normal_results)

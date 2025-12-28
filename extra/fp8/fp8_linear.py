@@ -32,7 +32,7 @@ from tinygrad.helpers import getenv
 # Quantization Utilities
 # ============================================================================
 
-def quantize_to_fp8(x: Tensor, axis=None, dtype=dtypes.fp8e4m3):
+def quantize_to_fp8(x: Tensor, axis=None, dtype=dtypes.fp8e4m3, power_of_2_scale: bool = False):
   """
   Quantize a tensor to FP8 format using dynamic scaling.
 
@@ -43,6 +43,9 @@ def quantize_to_fp8(x: Tensor, axis=None, dtype=dtypes.fp8e4m3):
       x: Input tensor
       axis: Axis for per-channel quantization (None = per-tensor)
       dtype: FP8 dtype (fp8e4m3 or fp8e5m2)
+      power_of_2_scale: If True, round scale to power of 2 (DeepSeek style).
+                        This enables hardware optimization on AMD RDNA4 and
+                        avoids extra quantization error from non-power-of-2 scales.
 
   Returns:
       Tuple of (quantized_tensor, reciprocal_scale)
@@ -50,7 +53,18 @@ def quantize_to_fp8(x: Tensor, axis=None, dtype=dtypes.fp8e4m3):
   """
   # Compute dynamic scale from absolute maximum
   x_abs_max = x.abs().max(axis=axis, keepdim=True).detach()
-  scale = 448. / (x_abs_max + 1e-8)  # 448 = max value for FP8E4M3
+  raw_scale = 448. / (x_abs_max + 1e-8)  # 448 = max value for FP8E4M3
+
+  if power_of_2_scale:
+    # Round scale to power of 2: scale = 2^floor(log2(raw_scale))
+    # Using floor to ensure we don't exceed 448 after scaling
+    # Use native log2/exp2 for better performance
+    log2_scale = raw_scale.log2()
+    rounded_log2 = log2_scale.floor()
+    scale = rounded_log2.exp2().detach()
+    # scale = 2.0 ** log2_scale
+  else:
+    scale = raw_scale
 
   # Scale input
   x_scaled = x * scale
@@ -108,6 +122,9 @@ def custom_linear_backward(gradient: UOp, kernel: UOp) -> tuple[UOp, UOp]:
               grad_b: gradient w.r.t. weights
   """
   out, a, b = kernel.src
+  # 1/0
+  # custom back: a.shape=(128, 512, 4096),  b.shape=(4096, 1024), gradient.shape=(128, 512, 1024)
+  # print(f"custom back: {a.shape=},  {b.shape=}, {gradient.shape=}")
 
   # Reshape gradient and activations to 2D for matmul
   # gradient: (batch, seq, out_features) -> (batch*seq, out_features)
@@ -122,45 +139,61 @@ def custom_linear_backward(gradient: UOp, kernel: UOp) -> tuple[UOp, UOp]:
   # Quantize gradient to FP8 for bandwidth savings
   g_quantized, scale = quantize_to_fp8(g_2d)
 
-  # Compute weight gradient: grad_b = g.T @ a
-  # (out_features, batch*seq) @ (batch*seq, in_features) = (out_features, in_features)
-  grad_b = (g_quantized.T.dot(a_2d, dtype=dtypes.float)).contiguous() * scale
+  # Compute weight gradient: grad_b = g.T @ a = (a.T @ g).T
+  # Reformulated to get better M dimension for tensor cores
+  # No .contiguous() on a_2d.T - let matmul handle non-contiguous input like NormalLinear does
+  # --- backward: (524288, 4096).T x (524288, 1024)
+  print(f"--- backward: {a_2d.shape}.T x {g_quantized.shape}")
+  grad_b = (a_2d.T.dot(g_quantized, dtype=dtypes.float)).T.contiguous() * scale
   grad_b = grad_b.cast(dtypes.float)
 
   # Compute input gradient: grad_a = g @ b
   # (batch*seq, out_features) @ (out_features, in_features) = (batch*seq, in_features)
   grad_a = (g_quantized.dot(b_tensor, dtype=dtypes.float)).contiguous().reshape(a_tensor.shape) * scale
+  # grad_a = (g_2d.dot(b_tensor, dtype=dtypes.float)).contiguous().reshape(a_tensor.shape)
+
 
   return (None, grad_a.uop, grad_b.uop)
 
-def custom_linear_backward_(gradient: UOp, kernel: UOp) -> tuple[UOp, UOp]:
+def custom_linear_backward_simple(gradient: UOp, kernel: UOp) -> tuple[UOp, UOp]:
+    """
+    Simplified backward pass - no gradient quantization.
+    Returns None to let tinygrad handle backward automatically.
+    """
+    # Return None to indicate "use default backward"
+    # This doesn't work with custom_kernel API, but let's try
+    return None
+
+def custom_linear_backward_noquant(gradient: UOp, kernel: UOp) -> tuple[UOp, UOp]:
+    """
+    Backward pass without gradient quantization - uses FP8 activations/weights directly.
+    This avoids extra quantization kernels in backward.
+    """
     out, a, b = kernel.src
-    
+
     g_tensor = Tensor(gradient, device=gradient.device)
-    a_tensor = Tensor(a, device=a.device)
-    b_tensor = Tensor(b, device=b.device)
-    
-    g_quantized, scale = quantize_to_fp8(g_tensor)
-    scale = scale.reshape(())  # 确保是标量
-    # grad_a: 不涉及reduce，保持维度
-    grad_a = ((g_quantized.dot(b_tensor, dtype=dtypes.float)) * scale).cast(dtypes.float).contiguous()
-    
-    # grad_b: 处理2D和多维输入
+    a_tensor = Tensor(a, device=a.device)  # already FP8
+    b_tensor = Tensor(b, device=b.device)  # already FP8
+
+    # grad_a: g @ b  (gradient flows through to input)
+    # (batch, seq, out_features) @ (out_features, in_features) = (batch, seq, in_features)
+    grad_a = g_tensor.dot(b_tensor, dtype=dtypes.float)
+
+    # grad_b: g.T @ a = (a.T @ g).T  (reformulated for better tensor core M dimension)
+    # Handle 2D and 3D inputs
     if len(g_tensor.shape) == 2:
-        # 2D输入: (batch, out_features) 和 (batch, in_features)
-        g_flat = g_quantized
+        g_flat = g_tensor
         a_flat = a_tensor
     else:
-        # 多维输入: flatten除了最后一维的所有维度
-        # (dim0, dim1, ..., dimN, out_features) -> (dim0*dim1*...*dimN, out_features)
         batch_seq = 1
         for dim in g_tensor.shape[:-1]:
             batch_seq *= dim
-        g_flat = g_quantized.reshape(batch_seq, g_tensor.shape[-1])
+        g_flat = g_tensor.reshape(batch_seq, g_tensor.shape[-1])
         a_flat = a_tensor.reshape(batch_seq, a_tensor.shape[-1])
-    
-    grad_b = ((g_flat.T.dot(a_flat, dtype=dtypes.float)) * scale).cast(dtypes.float).contiguous()
-    
+
+    # (a.T @ g).T gives better M dimension for tensor cores
+    grad_b = (a_flat.T.dot(g_flat, dtype=dtypes.float)).T
+
     return (None, grad_a.uop, grad_b.uop)
 
 class FP8Linear:
@@ -193,9 +226,11 @@ class FP8Linear:
 
   def __init__(self, in_features: int, out_features: int, bias: bool = True,
                use_custom_kernel: bool = True):
+    # 1/0
     self.in_features = in_features
     self.out_features = out_features
     self.use_custom_kernel = use_custom_kernel or getenv("FP8_CUSTOM_KERNEL", 0)
+    print(f"--- {self.use_custom_kernel=}")
 
     self.weight = Tensor.empty(out_features, in_features, dtype=dtypes.float32)
     self.bias = Tensor.empty(out_features, dtype=dtypes.float32) if bias else None
@@ -256,15 +291,15 @@ class FP8Linear:
     else:
       # Use standard matmul (more portable, slightly slower)
       # y = x_fp8 @ w_fp8.T (in float)
-      y = x_fp8.cast(dtypes.float).dot(w_fp8.T.cast(dtypes.float), dtype=dtypes.float)
+      y = x_fp8.dot(w_fp8.T, dtype=dtypes.float)
 
     # Descale output: y_float = y_fp8 * (1/w_scale) * (1/x_scale)
-    # y = (w_scale * x_scale).contiguous() * y.contiguous()
-    y = (y*w_scale * x_scale).contiguous()
+    y = y.contiguous() * (w_scale * x_scale)
+    # y = (y*w_scale * x_scale).contiguous()
 
     # Add bias if present
     if self.bias is not None:
-      y = y.cast(dtypes.default_float) + self.bias.cast(dtypes.default_float)
+      y = y.cast(dtypes.half) + self.bias.cast(dtypes.half)
 
     # Restore original shape
     if original_ndim == 2:
@@ -272,7 +307,7 @@ class FP8Linear:
       y = y.reshape(batch, self.out_features)
 
     # Cast to input dtype and return
-    return y.cast(x.dtype) if original_ndim == 3 else y.cast(dtypes.default_float)
+    return y.cast(x.dtype) if original_ndim == 3 else y.cast(dtypes.half)
 
 
 FP8LinearBert = FP8Linear

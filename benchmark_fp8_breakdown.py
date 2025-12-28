@@ -1,11 +1,21 @@
 #!/usr/bin/env python3
-"""Breakdown FP8 performance: quantization overhead vs matmul speed"""
+"""Breakdown FP8 performance: quantization overhead vs matmul speed
+
+Compare power-of-2 scaling (DeepSeek style) vs arbitrary scaling.
+
+"""
+
+"""
+FP8LinearBertBasic x.shape=(1024, 512, 1024), self.weight.shape=(4096, 1024)
+FP8LinearBertBasic x.shape=(1024, 512, 4096), self.weight.shape=(1024, 4096)
+"""
 
 import time
 from tinygrad import Tensor, dtypes, Device
 from tinygrad.helpers import colored
 # from examples.mlperf.initializers import quantize_to_fp8
 from extra.fp8 import quantize_to_fp8, FP8Linear
+from examples.mlperf.initializers import LinearBert
 
 # 33792= 66 * 512
 # Test shape: (BS*SEQ, hidden) @ (hidden, hidden)
@@ -13,8 +23,25 @@ M, K, N = 33792, 1024, 1024
 M, K, N = 33792, 8192, 8192
 # M, K, N = 1024*512, 2048, 2048
 
+# M, K, N = 33792, 4096, 1024
+# M, K, N = 1024*512, 1024, 4096
+batch_size = 1024
+# batch_size = 128
+
+M, K, N = 1024*512, 1024, 4096
+M, K, N = batch_size*512, 4096, 1024
+
 WARMUP = 3
 ITERATIONS = 20
+
+# Wrapper functions for different scaling methods
+def quantize_pow2(x, axis=None, dtype=dtypes.fp8e4m3):
+  """Power-of-2 scaling (DeepSeek style)"""
+  return quantize_to_fp8(x, axis=axis, dtype=dtype, power_of_2_scale=True)
+
+def quantize_arbitrary(x, axis=None, dtype=dtypes.fp8e4m3):
+  """Arbitrary scaling (original method)"""
+  return quantize_to_fp8(x, axis=axis, dtype=dtype, power_of_2_scale=False)
 
 def benchmark_op(name, fn, *args):
     """Benchmark a single operation"""
@@ -57,19 +84,39 @@ def main():
     x = Tensor.rand(M, K, dtype=dtypes.half, requires_grad=True)
     w = Tensor.rand(N, K, dtype=dtypes.half, requires_grad=True)
 
-    print(f"{colored('Step 1: Quantization overhead', 'yellow')}")
-    # Quantize input
-    t_quant_x = benchmark_op(f"Quantize input {x.shape}", quantize_to_fp8, x)
+    print(f"{colored('Step 1: Quantization overhead comparison', 'yellow')}")
+    print(f"\n  {colored('Power-of-2 scaling (DeepSeek style):', 'cyan')}")
+    # Quantize input - power of 2
+    t_quant_x_pow2 = benchmark_op(f"Quantize input {x.shape} (pow2)", quantize_pow2, x)
+    # Quantize weight - power of 2
+    t_quant_w_pow2 = benchmark_op(f"Quantize weight {w.shape} (pow2)", quantize_pow2, w)
+    total_quant_pow2 = t_quant_x_pow2 + t_quant_w_pow2
+    print(f"  {colored('Total quantization (pow2):', 'cyan')} {total_quant_pow2:.3f} ms")
 
-    # Quantize weight
-    t_quant_w = benchmark_op(f"Quantize weight {w.shape}", quantize_to_fp8, w)
+    print(f"\n  {colored('Arbitrary scaling (original):', 'cyan')}")
+    # Quantize input - arbitrary
+    t_quant_x_arb = benchmark_op(f"Quantize input {x.shape} (arbitrary)", quantize_arbitrary, x)
+    # Quantize weight - arbitrary
+    t_quant_w_arb = benchmark_op(f"Quantize weight {w.shape} (arbitrary)", quantize_arbitrary, w)
+    total_quant_arb = t_quant_x_arb + t_quant_w_arb
+    print(f"  {colored('Total quantization (arbitrary):', 'cyan')} {total_quant_arb:.3f} ms")
 
-    total_quant = t_quant_x + t_quant_w
-    print(f"  {colored('Total quantization overhead:', 'cyan')} {total_quant:.3f} ms\n")
+    # Compare
+    quant_diff = total_quant_pow2 - total_quant_arb
+    quant_ratio = total_quant_pow2 / total_quant_arb if total_quant_arb > 0 else float('inf')
+    color = 'green' if quant_ratio <= 1.05 else 'yellow' if quant_ratio <= 1.2 else 'red'
+    print(f"\n  {colored('Pow2 vs Arbitrary:', color)} {quant_ratio:.3f}x ({'+' if quant_diff > 0 else ''}{quant_diff:.3f} ms)")
 
-    # Pre-quantize for matmul tests
-    x_fp8, x_scale = quantize_to_fp8(x)
-    w_fp8, w_scale = quantize_to_fp8(w)
+    # Use power-of-2 for subsequent tests (default)
+    total_quant = total_quant_pow2
+    t_quant_x = t_quant_x_pow2
+    t_quant_w = t_quant_w_pow2
+
+    # Pre-quantize for matmul tests (using power-of-2 scaling)
+    x_fp8, x_scale = quantize_pow2(x)
+    w_fp8, w_scale = quantize_pow2(w)
+    # x_fp8, x_scale = quantize_arbitrary(x)
+    # w_fp8, w_scale = quantize_arbitrary(w)
 
     print(f"{colored('Step 2: Matmul performance', 'yellow')}")
 
@@ -88,8 +135,13 @@ def main():
     # FP8 matmul with scaling
     def fp8_matmul_scaled():
         y = x_fp8.dot(w_fp8.T, dtype=dtypes.float)
-        return y * x_scale * w_scale
+        return y.contiguous() * x_scale * w_scale
     t_fp8_scaled = benchmark_op("FP8 matmul + scaling", fp8_matmul_scaled)
+    # FP8 matmul with scaling
+    # def fp8_matmul_scaled_0():
+    #     y = x_fp8_0.dot(x_fp8_0.T, dtype=dtypes.float)
+    #     return y * x_scale_0 * w_scale_0
+    # t_fp8_scaled = benchmark_op("FP8 matmul + scaling (arbitary)", fp8_matmul_scaled_0)
     gflops_fp8_scaled = (2 * M * N * K) / (t_fp8_scaled / 1000) / 1e9
 
     print(f"\n  FP16 GFLOPS: {gflops_fp16:.1f}")
@@ -98,13 +150,30 @@ def main():
 
     print(f"{colored('Step 3: Complete FP8Linear operation', 'yellow')}")
 
-    # Full FP8Linear (quantize + matmul + scale)
-    def full_fp8_linear():
-        x1, s_x = quantize_to_fp8(x)
-        w1, s_w = quantize_to_fp8(w)
+    # Full FP8Linear with power-of-2 scaling
+    def full_fp8_linear_pow2():
+        x1, s_x = quantize_pow2(x)
+        w1, s_w = quantize_pow2(w)
         y = x1.dot(w1.T, dtype=dtypes.float)
-        return y * s_x * s_w
-    t_full = benchmark_op("Full FP8Linear (quant + matmul + scale)", full_fp8_linear)
+        return y.contiguous() * s_x * s_w
+    t_full_pow2 = benchmark_op("Full FP8Linear (pow2 scale)", full_fp8_linear_pow2)
+
+    # Full FP8Linear with arbitrary scaling
+    def full_fp8_linear_arb():
+        x1, s_x = quantize_arbitrary(x)
+        w1, s_w = quantize_arbitrary(w)
+        y = x1.dot(w1.T, dtype=dtypes.float)
+        return y.contiguous() * s_x * s_w
+    t_full_arb = benchmark_op("Full FP8Linear (arbitrary scale)", full_fp8_linear_arb)
+
+    # Compare
+    full_diff = t_full_pow2 - t_full_arb
+    full_ratio = t_full_pow2 / t_full_arb if t_full_arb > 0 else float('inf')
+    color = 'green' if full_ratio <= 1.05 else 'yellow' if full_ratio <= 1.2 else 'red'
+    print(f"\n  {colored('Full pow2 vs arbitrary:', color)} {full_ratio:.3f}x ({'+' if full_diff > 0 else ''}{full_diff:.3f} ms)")
+
+    # Use pow2 for subsequent analysis
+    t_full = t_full_pow2
     # return
 
     print(f"\n{colored('='*80, 'blue')}")
@@ -138,13 +207,17 @@ def main():
     print(f"{colored('='*80, 'blue')}\n")
 
     # Reshape to 3D for FP8Linear (batch, seq, features)
-    batch_size = 16
+    # batch_size = 16
     seq_len = M // batch_size
     x_3d = x.reshape(batch_size, seq_len, K)
+    print(f"{x_3d.shape=}")
 
     # Create FP8Linear layer with custom kernel
-    fp8_layer = FP8Linear(K, N, bias=False, use_custom_kernel=True)
-    fp8_layer.weight = w.T  # FP8Linear expects (out_features, in_features)
+    fp8_layer = FP8Linear(K, N, bias=False, use_custom_kernel=False)
+    fp8_layer.weight = w  # FP8Linear expects (out_features, in_features)
+
+    fp16_layer = LinearBert(K, N, bias=False)
+    fp16_layer.weight = w
 
     print(f"{colored('Step 4: Custom kernel forward+backward', 'yellow')}")
 
@@ -157,20 +230,21 @@ def main():
         y = fp8_layer(x_3d_grad)
 
         # Create gradient for backward
-        grad_output = Tensor.ones_like(y)
+        # grad_output = Tensor.ones_like(y)
+        # print(f"{grad_output.shape=}")
 
         # Backward pass (triggers custom_linear_backward)
-        y.backward(grad_output)
+        y.sum().backward()
 
         return y, x_3d_grad.grad, fp8_layer.weight.grad
 
     t_fp8_fwd_bwd = benchmark_op("FP8 custom kernel (fwd+bwd)", fp8_custom_fwd_bwd)
 
     # FP16 baseline forward+backward
-    def fp16_fwd_bwd():
+    def fp16_fwd_bwd_():
         x_3d_grad = x_3d.detach().cast(dtypes.half)
         x_3d_grad.requires_grad = True
-        w_grad = w.T.detach().cast(dtypes.half)
+        w_grad = w.detach().cast(dtypes.half)
         w_grad.requires_grad = True
 
         # Forward: matmul
@@ -178,23 +252,43 @@ def main():
         y = x_3d_grad.dot(w_grad.T, dtype=dtypes.float)
 
         # Backward
-        grad_output = Tensor.ones_like(y)
-        y.backward(grad_output)
+        # grad_output = Tensor.ones_like(y)
+        # y.backward(grad_output)
+        y.sum().backward()
 
         return y, x_3d_grad.grad, w_grad.grad
+    def fp16_fwd_bwd():
+        x_3d_grad = x_3d.detach().cast(dtypes.half)
+        x_3d_grad.requires_grad = True
+
+        # Forward pass with custom kernel
+        y = fp16_layer(x_3d_grad)
+
+        # Create gradient for backward
+        # grad_output = Tensor.empty_like(y)
+        # print(f"{grad_output.shape=}")
+
+        # Backward pass (triggers custom_linear_backward)
+        # y.backward(grad_output)
+        y.sum().backward()
+
+        return y, x_3d_grad.grad, fp16_layer.weight.grad
 
     t_fp16_fwd_bwd = benchmark_op("FP16 baseline (fwd+bwd)", fp16_fwd_bwd)
+    return
 
     print(f"\n{colored('Step 5: Backward pass component breakdown', 'yellow')}")
 
     # Create gradient tensor (output gradient) - 2D for simpler analysis
     grad_out = Tensor.rand(M, N, dtype=dtypes.half)
 
-    # Quantize gradient
-    t_quant_grad = benchmark_op("Quantize gradient", quantize_to_fp8, grad_out)
+    # Quantize gradient - compare both methods
+    t_quant_grad_pow2 = benchmark_op("Quantize gradient (pow2)", quantize_pow2, grad_out)
+    t_quant_grad_arb = benchmark_op("Quantize gradient (arbitrary)", quantize_arbitrary, grad_out)
+    t_quant_grad = t_quant_grad_pow2  # Use pow2 for subsequent tests
 
     # Pre-quantize for component tests
-    grad_fp8, grad_scale = quantize_to_fp8(grad_out)
+    grad_fp8, grad_scale = quantize_pow2(grad_out)
 
     # FP8 backward - input gradient: grad_fp8 @ w_fp8
     def fp8_backward_input():
@@ -281,6 +375,37 @@ def main():
         print(f"    {colored('→ Consider if gradient quantization overhead is acceptable', 'yellow')}")
     else:
         print(f"  ✓ Gradient quantization overhead is acceptable ({bwd_quant_pct:.1f}% of backward)")
+
+    # Summary: Power-of-2 vs Arbitrary scaling
+    print(f"\n{colored('='*80, 'blue')}")
+    print(f"{colored('POWER-OF-2 vs ARBITRARY SCALING SUMMARY', 'blue')}")
+    print(f"{colored('='*80, 'blue')}\n")
+
+    print(f"Quantization time comparison:")
+    print(f"  Input quantization:    pow2={t_quant_x_pow2:.3f}ms, arb={t_quant_x_arb:.3f}ms, diff={t_quant_x_pow2-t_quant_x_arb:+.3f}ms")
+    print(f"  Weight quantization:   pow2={t_quant_w_pow2:.3f}ms, arb={t_quant_w_arb:.3f}ms, diff={t_quant_w_pow2-t_quant_w_arb:+.3f}ms")
+    print(f"  Gradient quantization: pow2={t_quant_grad_pow2:.3f}ms, arb={t_quant_grad_arb:.3f}ms, diff={t_quant_grad_pow2-t_quant_grad_arb:+.3f}ms")
+    print(f"  {'-'*70}")
+    total_pow2 = t_quant_x_pow2 + t_quant_w_pow2 + t_quant_grad_pow2
+    total_arb = t_quant_x_arb + t_quant_w_arb + t_quant_grad_arb
+    print(f"  Total (fwd+bwd quant): pow2={total_pow2:.3f}ms, arb={total_arb:.3f}ms, diff={total_pow2-total_arb:+.3f}ms")
+
+    print(f"\nFull FP8Linear comparison:")
+    print(f"  Forward pass: pow2={t_full_pow2:.3f}ms, arb={t_full_arb:.3f}ms, diff={t_full_pow2-t_full_arb:+.3f}ms")
+
+    # Overall assessment
+    overhead_pct = (total_pow2 - total_arb) / total_arb * 100 if total_arb > 0 else 0
+    color = 'green' if abs(overhead_pct) < 5 else 'yellow' if abs(overhead_pct) < 15 else 'red'
+    print(f"\n{colored('Power-of-2 scaling overhead:', color)} {overhead_pct:+.1f}%")
+
+    print(f"\n{colored('Benefits of power-of-2 scaling:', 'cyan')}")
+    print(f"  ✓ Compatible with AMD RDNA4 block exponent scaling (MFMA_SCALE instructions)")
+    print(f"  ✓ No extra quantization error from non-power-of-2 scales (DeepSeek)")
+    print(f"  ✓ Integer exponent arithmetic is faster on some hardware")
+    if abs(overhead_pct) < 10:
+        print(f"  ✓ Minimal performance overhead ({overhead_pct:+.1f}%)")
+    else:
+        print(f"  ⚠ Noticeable performance overhead ({overhead_pct:+.1f}%) - may need optimization")
 
 if __name__ == "__main__":
     main()
