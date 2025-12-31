@@ -139,8 +139,8 @@ shared_codegen_spec = PatternMatcher([
   (UPat(Ops.AFTER, src=(UPat(GroupOp.Defines|{Ops.AFTER}),), allow_any_len=True), lambda: True),
   (UPat(Ops.GROUP, dtypes.void), lambda: True),
 
-  # WMMA has a <a, b, acc>
-  (UPat(Ops.WMMA, src=(UPat(), UPat(), UPat()), name="x"), lambda x: isinstance(x.arg, tuple) and len(x.arg) == 8),
+  # WMMA has a <a, b, acc> or <a, b, acc, scale_a, scale_b> for scaled FP8 MFMA
+  (UPat(Ops.WMMA, name="x"), lambda x: isinstance(x.arg, tuple) and len(x.arg) == 8 and len(x.src) in (3, 5)),
 
   # VECTORIZE/GEP
   (UPat(Ops.VECTORIZE, name="x"), lambda x: len(x.src)>1 and len(x.src) == x.dtype.vcount and all(x.dtype == y.dtype.vec(len(x.src)) for y in x.src)),

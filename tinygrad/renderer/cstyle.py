@@ -462,9 +462,29 @@ class AMDHIPRenderer(CStyleLanguage):
     self.arch, self.compiler = arch, HIPCompiler(arch)
     self.tensor_cores = self.get_tensor_cores(arch)
     if self.is_cdna(self.arch):
+      # cbsz/blgp encode FP8 format: 0=E4M3, 1=E5M2 (BF8), per CDNA4 ISA
+      def render_wmma_cdna(ctx, x):
+        K = x.arg[1][2]  # K dimension
+        dtype_in = x.arg[2]  # input dtype
+        # cbsz/blgp: 0=E4M3 (fp8e4m3), 1=E5M2 (fp8e5m2)
+        cbsz = 1 if dtype_in == dtypes.fp8e5m2 else 0
+        blgp = cbsz  # same format for A and B
+        if K == 128:
+          # scale MFMA: (A, B, C, cbsz, blgp, opselA, a_scale, opselB, b_scale)
+          # If WMMA has 5 sources, use src[3] and src[4] as scales (converted to E8M0)
+          if len(x.src) == 5:
+            # scales are passed as float, convert to int for E8M0 (HW extracts exponent)
+            scale_a = f"__builtin_bit_cast(int, {ctx[x.src[3]]})"
+            scale_b = f"__builtin_bit_cast(int, {ctx[x.src[4]]})"
+            return f"__{x.arg[0]}({ctx[x.src[0]]}, {ctx[x.src[1]]}, {ctx[x.src[2]]}, {cbsz}, {blgp}, 0, {scale_a}, 0, {scale_b})"
+          else:
+            # no scales provided, use 0 (forces 1.0f scale)
+            return f"__{x.arg[0]}({ctx[x.src[0]]}, {ctx[x.src[1]]}, {ctx[x.src[2]]}, {cbsz}, {blgp}, 0, 0, 0, 0)"
+        else:
+          # non-scale MFMA: (A, B, C, cbsz, blgp, abid)
+          return f"__{x.arg[0]}({ctx[x.src[0]]}, {ctx[x.src[1]]}, {ctx[x.src[2]]}, {cbsz}, {blgp}, 0)"
       self.string_rewrite = PatternMatcher([
-        (UPat(Ops.WMMA, name="x"),
-          lambda ctx,x: f"__{x.arg[0]}({ctx[x.src[0]]}, {ctx[x.src[1]]}, {ctx[x.src[2]]}, 0, 0, 0{',0,0,0' if x.arg[1][2]==128 else ''})"),
+        (UPat(Ops.WMMA, name="x"), render_wmma_cdna),
         (UPat(Ops.CAST, dtypes.fp8s, (UPat.var("y", dtypes.float),), name="x",),
           lambda ctx,x, y: f"f32_to_fp8({ctx[x.src[0]]}, {'1' if x.dtype == dtypes.fp8e5m2 else '0'})"),
         (UPat(Ops.CAST, dtypes.float, (UPat.var("y", dtypes.fp8s),), name="x",),
@@ -490,9 +510,10 @@ class AMDHIPRenderer(CStyleLanguage):
   float4 = "make_float4"
   type_map = {dtypes.bfloat16: "hip_bfloat16", dtypes.fp8e4m3: "hip_fp8", dtypes.fp8e5m2: "hip_bf8"}
   extra_matcher = create_non_native_float_pats((dtypes.bfloat16, *dtypes.fp8s)) + PatternMatcher([
+    # FP8 WMMA: bitcast FP8 vectors to uint64, preserve optional scale sources
     (UPat(Ops.WMMA, name="x", dtype=dtypes.float.vec(4)),
       lambda x: UOp(Ops.WMMA, x.dtype, (x.src[0].bitcast(dtypes.uint64), x.src[1].bitcast(dtypes.uint64),
-        x.src[2]), (*x.arg,)) if x.src[0].dtype in (dtypes.fp8e4m3.vec(8), dtypes.fp8e5m2.vec(8)) else None),
+        x.src[2], *x.src[3:]), (*x.arg,)) if x.src[0].dtype in (dtypes.fp8e4m3.vec(8), dtypes.fp8e5m2.vec(8)) else None),
     # bfloat16 constant casting
     (UPat.cvar('x', dtypes.bfloat16), lambda x: cast_float_to_bf16(UOp.const(dtypes.float, x.arg))),
   ]) + pm_manual_bf16_cast + extra_pm

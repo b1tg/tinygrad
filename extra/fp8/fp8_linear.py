@@ -15,6 +15,21 @@ def quantize_to_fp8(x: Tensor, axis=None, dtype=dtypes.fp8e4m3):
   res = x_clamped_ste.cast(dtype).contiguous()
   return res, scale.float().reciprocal().contiguous()
 
+def quantize_to_fp8_pow2(x: Tensor, axis=None, dtype=dtypes.fp8e4m3):
+  """Quantize using power-of-2 scales for MFMA scale fusion compatibility."""
+  x_abs_max = x.abs().max(axis=axis, keepdim=True).detach()
+  # Use power-of-2 scale: 2^floor(log2(448/x_abs_max))
+  # This ensures the scale can be exactly represented in E8M0 format
+  log2_scale = (448. / (x_abs_max + 1e-8)).log2().floor()
+  scale = (2.0 ** log2_scale)
+  x_scaled = x * scale
+  x_det = x_scaled.detach()
+  x_clamped = x_det.maximum(-448.0).minimum(448.0)
+  x_clamped_ste = x_scaled + (x_clamped - x_det)
+  res = x_clamped_ste.cast(dtype).contiguous()
+  # Return the dequant scale (reciprocal) as float for MFMA scale fusion
+  return res, scale.float().reciprocal().contiguous()
+
 def custom_matmul(output: UOp, inp: UOp, weight: UOp) -> UOp:
   SEQ = inp.shape[1]
   OUT = weight.shape[0]
@@ -27,6 +42,23 @@ def custom_matmul(output: UOp, inp: UOp, weight: UOp) -> UOp:
   reduced = product.reduce(reduce_idx, arg=Ops.ADD)
   store_op = output.index((seq_idx*OUT+out_idx+batch_idx*OUT*SEQ), ptr=True).store(reduced).end(batch_idx, seq_idx, out_idx)
   return store_op.sink(arg=KernelInfo(name=f"custom_matmul_{inp.shape}x{weight.shape}"))
+
+def custom_matmul_scaled(output: UOp, inp: UOp, weight: UOp, inp_scale: UOp, weight_scale: UOp) -> UOp:
+  """FP8 matmul with scale fusion - scales are applied inside the kernel."""
+  SEQ = inp.shape[1]
+  OUT = weight.shape[0]
+  IN = weight.shape[-1]
+  seq_idx = UOp.range(SEQ, 2, AxisType.LOOP)
+  out_idx = UOp.range(OUT, 3, AxisType.LOOP)
+  batch_idx = UOp.range(output.size//SEQ//OUT, 1, AxisType.LOOP)
+  reduce_idx = UOp.range(IN, 0, AxisType.REDUCE)
+  product = (inp.index((seq_idx*IN+reduce_idx+batch_idx*IN*SEQ)) * weight.index((out_idx*IN+reduce_idx))).cast(dtypes.float)
+  reduced = product.reduce(reduce_idx, arg=Ops.ADD)
+  # Apply dequantization scales inside the kernel
+  # inp_scale and weight_scale are scalar tensors (shape ())
+  scaled_result = reduced * inp_scale.index(UOp.const(dtypes.index, 0)) * weight_scale.index(UOp.const(dtypes.index, 0))
+  store_op = output.index((seq_idx*OUT+out_idx+batch_idx*OUT*SEQ), ptr=True).store(scaled_result).end(batch_idx, seq_idx, out_idx)
+  return store_op.sink(arg=KernelInfo(name=f"custom_matmul_scaled_{inp.shape}x{weight.shape}"))
 
 def custom_matmul_backward(gradient: UOp, kernel: UOp) -> tuple[UOp, UOp]:
   _, input_uop, weight_uop = kernel.src
@@ -58,6 +90,56 @@ class FP8Linear:
       y = Tensor.empty((batch, seq, self.weight.shape[0]), dtype=dtypes.float)
     y = Tensor.custom_kernel(y, x_fp8, w_fp8, fxn=custom_matmul, grad_fxn=custom_matmul_backward)[0]
     y = y * w_scale * x_scale
+    if self.bias is not None: y = y + self.bias
+    if original_ndim == 2: y = y.reshape(batch, self.weight.shape[0])
+    return y.cast(x.dtype)
+
+class FP8LinearTC:
+  """FP8Linear using regular tensor matmul (uses tensor cores when available).
+  Uses power-of-2 scales for potential MFMA scale fusion."""
+  def __init__(self, in_features:int, out_features:int, bias:bool=True):
+    self.weight = Tensor.empty(out_features, in_features, dtype=dtypes.float32)
+    self.bias = Tensor.empty(out_features, dtype=dtypes.float32) if bias else None
+
+  def __call__(self, x: Tensor) -> Tensor:
+    original_ndim = len(x.shape)
+    if original_ndim == 2: x = x.reshape(x.shape[0], 1, x.shape[1])
+    # Use power-of-2 scales for MFMA scale fusion compatibility
+    w_fp8, w_scale = quantize_to_fp8_pow2(self.weight)
+    x_fp8, x_scale = quantize_to_fp8_pow2(x)
+    # Use dot with dtype=float to accumulate in float32 (uses WMMA tensor cores)
+    # This avoids FP8 overflow in the output
+    y = x_fp8.dot(w_fp8.T, dtype=dtypes.float)
+    # Apply dequantization scales
+    y = y * w_scale * x_scale
+    if self.bias is not None: y = y + self.bias
+    if original_ndim == 2: y = y.reshape(x.shape[0], self.weight.shape[0])
+    return y.cast(x.dtype)
+
+class FP8LinearScaled:
+  """FP8Linear with scale fusion for AMD CDNA4 MFMA.
+  Uses power-of-2 scales that can be fused into the MFMA instruction.
+  This reduces dequantization overhead by applying scales inside the matmul kernel."""
+  def __init__(self, in_features:int, out_features:int, bias:bool=True):
+    self.weight = Tensor.empty(out_features, in_features, dtype=dtypes.float32)
+    self.bias = Tensor.empty(out_features, dtype=dtypes.float32) if bias else None
+
+  def __call__(self, x: Tensor) -> Tensor:
+    original_ndim = len(x.shape)
+    if original_ndim == 2: x = x.reshape(x.shape[0], 1, x.shape[1])
+    batch, seq, _ = x.shape
+    # Use power-of-2 scales for MFMA scale fusion compatibility
+    w_fp8, w_scale = quantize_to_fp8_pow2(self.weight)
+    x_fp8, x_scale = quantize_to_fp8_pow2(x)
+    # Reshape scales to scalar for kernel
+    w_scale_scalar = w_scale.reshape(())
+    x_scale_scalar = x_scale.reshape(())
+    if isinstance(GPUS, tuple) and len(GPUS) > 1:
+      y = Tensor(Tensor.empty((batch//len(GPUS), seq, self.weight.shape[0]), dtype=dtypes.float, device=GPUS).uop.multi(0), device=GPUS)
+    else:
+      y = Tensor.empty((batch, seq, self.weight.shape[0]), dtype=dtypes.float)
+    # Pass scales into the kernel for fusion
+    y = Tensor.custom_kernel(y, x_fp8, w_fp8, x_scale_scalar, w_scale_scalar, fxn=custom_matmul_scaled)[0]
     if self.bias is not None: y = y + self.bias
     if original_ndim == 2: y = y.reshape(batch, self.weight.shape[0])
     return y.cast(x.dtype)
