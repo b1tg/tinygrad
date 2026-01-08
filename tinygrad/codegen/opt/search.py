@@ -167,9 +167,10 @@ def beam_search(s:Scheduler, rawbufs:list[Buffer], amt:int, allow_test_size=True
           if isinstance(e, RuntimeError): continue
           raise
         timed.append((candidates[i], min(tms)))
+        # timed.append((candidates[i], sum(tms)/len(tms)))
         if BEAM_DEBUG > 1:
           print(f"{time.perf_counter() - st:7.2f}s: {i:5d} {len(unwrap(p.uops)):5d} uops",
-                f"{time_to_str(compile_et, w=12)} compile/{time_to_str(timed[-1][1], w=12)} run",
+                f"{time_to_str(compile_et, w=12)} compile/{time_to_str(timed[-1][1], w=12)} run {p.global_size=} {p.local_size=}",
                 f"      {len(timed):4d}/{len(candidates):4d}         {timed[-1][0].colored_shape()}")
         elif DEBUG >= 2:
           print(f"\r{time.perf_counter() - st:7.2f}s: {time_to_str(timed[-1][1], w=12)}",
