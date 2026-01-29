@@ -1152,6 +1152,7 @@ def train_bert():
       GlobalCounters.reset()
       with WallTimeEvent(BenchEvent.STEP):
         stopped = False
+        total_data_time = 0.0
         for _ in range(grad_acc):
           ist = time.perf_counter()
           try: train_data = next(train_it)
@@ -1159,6 +1160,7 @@ def train_bert():
             stopped = True
             break
           dt = time.perf_counter()
+          total_data_time += dt - ist
           loss = minibatch_bert(
             train_data["input_ids"], train_data["segment_ids"], train_data["input_mask"], train_data["masked_lm_positions"],
             train_data["masked_lm_ids"], train_data["masked_lm_weights"], train_data["next_sentence_labels"])
@@ -1177,8 +1179,8 @@ def train_bert():
       step_time = cl - st
       gbs_time = gt - st
       optim_time = ot - gt
-      data_time = dt - ist
-      dev_time = step_time - data_time * grad_acc
+      data_time = total_data_time / grad_acc  # average data time per minibatch
+      dev_time = step_time - total_data_time
       if BENCHMARK: step_times.append(step_time)
 
       tqdm.write(
