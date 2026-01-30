@@ -410,11 +410,14 @@ class CUDARenderer(CStyleLanguage):
     Ops.SQRT: lambda x,dtype: f"hsqrt({x})" if dtype in (dtypes.half, dtypes.bfloat16) else f"sqrt({x})",
     Ops.RECIPROCAL: lambda x,dtype: f"hrcp({x})" if dtype in (dtypes.half, dtypes.bfloat16) else f"(1/{x})" }
   type_map = {dtypes.bfloat16: "nv_bfloat16", dtypes.fp8e4m3: "__nv_fp8_e4m3", dtypes.fp8e5m2: "__nv_fp8_e5m2"}
-  extra_matcher = create_non_native_float_pats(dtypes.fp8s, casting=False) + PatternMatcher([
+  extra_matcher = create_non_native_float_pats(dtypes.fp8s, casting=True) + PatternMatcher([
     (UPat(Ops.CAST, dtypes.fp8s, UPat.var("x", dtypes.fp8s), name='y'), lambda x,y: x.cast(dtypes.float).cast(y.dtype) if x.dtype!=y.dtype else None),
   ]) + extra_pm
   string_rewrite = PatternMatcher([
     (UPat(Ops.BITCAST, name="x"), lambda ctx,x: f"tg_bitcast<{ctx.render_dtype(x.dtype)}>(({ctx.render_dtype(x.src[0].dtype)})({ctx[x.src[0]]}))"),
+    # fp8 casts use __NV_NOSAT to produce NaN for overflow (fp8e4m3 has no infinity)
+    (UPat(Ops.CAST, dtypes.fp8e4m3, (UPat.var("x", dtypes.float),)), lambda ctx,x: f"__float_to_fp8_e4m3({ctx[x]})"),
+    (UPat(Ops.CAST, dtypes.fp8e5m2, (UPat.var("x", dtypes.float),)), lambda ctx,x: f"__float_to_fp8_e5m2({ctx[x]})"),
   ]) + base_rewrite
 
   def render_vector_prefix(self, dt:DType) -> str:
@@ -427,7 +430,11 @@ class CUDARenderer(CStyleLanguage):
     prefix = ["#define INFINITY (__int_as_float(0x7f800000))", "#define NAN (__int_as_float(0x7fffffff))",
               "template <class T, class F> __device__ __forceinline__ T tg_bitcast(F v) { union U { F f; T t; }; U u; u.f = v; return u.t; }"]
     used_dtypes = uops_to_dtypes(uops)
-    if any(dt.scalar() in dtypes.fp8s for dt in used_dtypes): prefix.append("#include <cuda_fp8.h>")
+    if any(dt.scalar() in dtypes.fp8s for dt in used_dtypes):
+      prefix.append("#include <cuda_fp8.h>")
+      # fp8 cast helpers using __NV_NOSAT to produce NaN for overflow (fp8e4m3 has no infinity)
+      prefix.append("__device__ __nv_fp8_e4m3 __float_to_fp8_e4m3(float x) { __nv_fp8_e4m3 r; r.__x = __nv_cvt_float_to_fp8(x, __NV_NOSAT, __NV_E4M3); return r; }")
+      prefix.append("__device__ __nv_fp8_e5m2 __float_to_fp8_e5m2(float x) { __nv_fp8_e5m2 r; r.__x = __nv_cvt_float_to_fp8(x, __NV_NOSAT, __NV_E5M2); return r; }")
     if any(dt.scalar() == dtypes.half for dt in used_dtypes): prefix.append("#include <cuda_fp16.h>")
     if any(dt.scalar() == dtypes.bfloat16 for dt in used_dtypes): prefix.append("#include <cuda_bf16.h>")
     prefix += [self.render_vector_prefix(dt) for dt in used_dtypes if (dt.count in (4,8) and dt.scalar() in {dtypes.half, dtypes.bfloat16})
