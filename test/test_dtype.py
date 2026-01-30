@@ -48,7 +48,8 @@ def _test_cast(a:Tensor, target_dtype:DType):
     a = a.abs()
 
   expected = list(a.numpy().astype(_to_np_dtype(target_dtype)))
-  if target_dtype in dtypes.fp8s: expected = [truncate[target_dtype](x) for x in expected]
+  if target_dtype == dtypes.fp8e4m3: expected = [torch.tensor(x, dtype=torch.float8_e4m3fn).float().item() for x in expected]
+  elif target_dtype == dtypes.fp8e5m2: expected = [torch.tensor(x, dtype=torch.float8_e5m2).float().item() for x in expected]
   _test_op(lambda: a.cast(target_dtype), target_dtype, expected)
 def _test_bitcast(a:Tensor, target_dtype:DType, target=None):
   expected = torch.tensor(a.tolist(), dtype=_to_torch_storage_type(a.dtype)).view(_to_torch_dtype(target_dtype)).tolist()
