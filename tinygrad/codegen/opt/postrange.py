@@ -230,7 +230,13 @@ class Scheduler:
         raise KernelOptError(f"invalid tensor core choice {tc_select}")
       for tc in tensor_cores:
         if self.ren.device in ("CUDA", "NV") and tc.dtype_in == dtypes.float and not ALLOW_TF32: continue
-        if tc.dtype_in == in0.dtype.scalar() and tc.dtype_in == in1.dtype.scalar() and tc.dtype_out == reduceop.dtype.scalar():
+        # for mixed FP8, look through CAST to find original dtypes (e.g., CAST(half, INDEX(fp8e4m3)))
+        in0_orig = in0.src[0] if in0.op is Ops.CAST and in0.src[0].dtype.scalar() in dtypes.fp8s else in0
+        in1_orig = in1.src[0] if in1.op is Ops.CAST and in1.src[0].dtype.scalar() in dtypes.fp8s else in1
+        # allow mixed FP8 types (e4m3 @ e5m2 or e5m2 @ e4m3) for AMD CDNA tensor cores
+        in0_match = tc.dtype_in == in0_orig.dtype.scalar() or (tc.dtype_in in dtypes.fp8s and in0_orig.dtype.scalar() in dtypes.fp8s)
+        in1_match = tc.dtype_in == in1_orig.dtype.scalar() or (tc.dtype_in in dtypes.fp8s and in1_orig.dtype.scalar() in dtypes.fp8s)
+        if in0_match and in1_match and tc.dtype_out == reduceop.dtype.scalar():
           # tensor cores have three ranges. X, Y, and REDUCE
           in0_ranges = sorted([u for u in in0.ranges if u not in in1.ranges], key=lambda x: x.arg[0], reverse=True)
           in1_ranges = sorted([u for u in in1.ranges if u not in in0.ranges], key=lambda x: x.arg[0], reverse=True)
@@ -282,6 +288,8 @@ class Scheduler:
             tne = [x.replace(tag=1) for x in ne]
             ret = reduceop.substitute(dict(zip(ne, tne)))
             srcs = list((ret.src[0] if ret.src[0].op is not Ops.CAST else ret.src[0].src[0]).src)
+            # for mixed FP8, strip the CAST to half and use original FP8 sources
+            srcs = [s.src[0] if s.op is Ops.CAST and s.src[0].dtype.scalar() in dtypes.fp8s else s for s in srcs]
             srcs = [x.substitute(dict(zip(tne, [ne[i] for i in argsort(p)]))) for x,p in zip(srcs, tc.permutes_for_shape_str(tc.base_shape_str()))]
 
             # get reduce/upcast axes for the tensor cores

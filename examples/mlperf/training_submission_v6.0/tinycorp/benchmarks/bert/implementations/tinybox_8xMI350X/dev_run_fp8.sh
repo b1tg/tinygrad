@@ -2,7 +2,8 @@
 
 export PYTHONPATH="." AMD=1
 export MODEL="bert"
-export DEFAULT_FLOAT="HALF" GPUS=8 BS=1024 EVAL_BS=1024
+# export DEFAULT_FLOAT="HALF" GPUS=8 BS=1024 EVAL_BS=1024
+export DEFAULT_FLOAT="HALF" GPUS=6 BS=768 EVAL_BS=768
 
 # similar to https://github.com/mlcommons/training_results_v3.1/blob/d06288b2bd675a9d88e0e6181f5bb5626b71ec19/Quanta_Cloud_Technology/results/D54U-3U/bert/result_1.txt#L54
 export OPT_BASE_LEARNING_RATE=0.0011 OPT_LAMB_BETA_1=0.60466 OPT_LAMB_BETA_2=0.85437 DECAY=0.1
@@ -17,8 +18,10 @@ export BASEDIR="/raid/datasets/wiki"
 export BEAM_TIMEOUT_SEC=15
 export FP8_TRAIN=1
 # search
-IGNORE_BEAM_CACHE=1 BENCHMARK=10 BERT_LAYERS=2 RUNMLPERF=0 python3 examples/mlperf/model_train.py
+IGNORE_BEAM_CACHE=0 BENCHMARK=10 BERT_LAYERS=2 RUNMLPERF=0 python3 examples/mlperf/model_train.py
 
 export WANDB=1 PARALLEL=0
 
-RUNMLPERF=1 python3 examples/mlperf/model_train.py
+WANDB_NAME="FP8_HYBRID=0" RUNMLPERF=1 python3 examples/mlperf/model_train.py
+
+FP8_HYBRID=1 WANDB_NAME="FP8_HYBRID=1" RUNMLPERF=1 python3 examples/mlperf/model_train.py

@@ -472,8 +472,11 @@ class AMDHIPRenderer(CStyleLanguage):
     self.tensor_cores = self.get_tensor_cores(arch)
     if self.is_cdna(self.arch):
       self.string_rewrite = PatternMatcher([
+        # for K=128 FP8 WMMA, look through BITCAST to find original FP8 dtype for format indices
         (UPat(Ops.WMMA, name="x"), lambda ctx,x: f"__{x.arg[0]}({ctx[x.src[0]]}, {ctx[x.src[1]]}, {ctx[x.src[2]]},"
-          f" {fp8_index(x.src[0].dtype)}, {fp8_index(x.src[0].dtype)}, 0, 0, 0, 0)" if x.arg[1][2] == 128 else None),
+          f" {fp8_index(x.src[0].src[0].dtype if x.src[0].op is Ops.BITCAST else x.src[0].dtype)},"
+          f" {fp8_index(x.src[1].src[0].dtype if x.src[1].op is Ops.BITCAST else x.src[1].dtype)}, 0, 0, 0, 0)"
+          if x.arg[1][2] == 128 else None),
         (UPat(Ops.WMMA, name="x"), lambda ctx,x: f"__{x.arg[0]}({ctx[x.src[0]]}, {ctx[x.src[1]]}, {ctx[x.src[2]]}, 0, 0, 0)"),
         (UPat(Ops.CAST, dtypes.fp8s, (UPat.var("y", dtypes.float),), name="x",),
           lambda ctx,x,y: f"f32_to_fp8({ctx[x.src[0]]}, {fp8_index(x.dtype)})"),
@@ -496,9 +499,11 @@ class AMDHIPRenderer(CStyleLanguage):
   float4 = "make_float4"
   type_map = {dtypes.bfloat16: "hip_bfloat16", dtypes.fp8e4m3: "hip_fp8", dtypes.fp8e5m2: "hip_bf8"}
   extra_matcher = create_non_native_float_pats((dtypes.bfloat16, *dtypes.fp8s)) + PatternMatcher([
+    # bitcast FP8 vec(8) inputs to uint64 for 16x16x32 WMMA (8 FP8 = 64 bits)
     (UPat(Ops.WMMA, name="x", dtype=dtypes.float.vec(4)),
       lambda x: UOp(Ops.WMMA, x.dtype, (x.src[0].bitcast(dtypes.uint64), x.src[1].bitcast(dtypes.uint64),
-        x.src[2]), (*x.arg,)) if x.src[0].dtype in (dtypes.fp8e4m3.vec(8), dtypes.fp8e5m2.vec(8)) else None),
+        x.src[2]), (*x.arg,)) if x.src[0].dtype.scalar() in dtypes.fp8s and x.src[1].dtype.scalar() in dtypes.fp8s
+        and x.src[0].dtype.count == 8 else None),
     # bfloat16 constant casting
     (UPat.cvar('x', dtypes.bfloat16), lambda x: cast_float_to_bf16(UOp.const(dtypes.float, x.arg))),
   ]) + pm_manual_bf16_cast + extra_pm
