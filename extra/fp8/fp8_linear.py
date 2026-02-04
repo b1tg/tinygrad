@@ -2,9 +2,10 @@ from typing import Callable, Any
 from tinygrad import Tensor, dtypes, nn, UOp
 from tinygrad.uop.ops import KernelInfo, AxisType, Ops
 
-def quantize_to_fp8(x: Tensor, dtype=dtypes.fp8e4m3):
-  fp8_min = -448.0 if dtype == dtypes.fp8e4m3 else -57344.0
-  fp8_max = 448.0 if dtype == dtypes.fp8e4m3 else 57344.0
+def quantize_to_fp8(x: Tensor, dtype=dtypes.fp8e4m3, max_val:float|None=None):
+  fp8_max_default = 448.0 if dtype == dtypes.fp8e4m3 else 57344.0
+  fp8_max = max_val if max_val is not None else fp8_max_default
+  fp8_min = -fp8_max
   x_abs_max = x.abs().max().detach()
   scale = fp8_max / (x_abs_max + 1e-8)
   x_scaled = x * scale
@@ -12,7 +13,7 @@ def quantize_to_fp8(x: Tensor, dtype=dtypes.fp8e4m3):
   x_clamped = x_det.clamp(fp8_min, fp8_max)
   x_clamped_ste = x_scaled + (x_clamped - x_det)
   res = x_clamped_ste.cast(dtype)
-  return res, scale.float().reciprocal()
+  return res, scale.cast(x.dtype).reciprocal()
 
 def custom_matmul(output: UOp, inp: UOp, weight: UOp) -> UOp:
   SEQ = inp.shape[1]
@@ -22,7 +23,7 @@ def custom_matmul(output: UOp, inp: UOp, weight: UOp) -> UOp:
   out_idx = UOp.range(OUT, 3, AxisType.LOOP)
   batch_idx = UOp.range(output.size//SEQ//OUT, 1, AxisType.LOOP)
   reduce_idx = UOp.range(IN, 0, AxisType.REDUCE)
-  product = (inp.index((seq_idx*IN+reduce_idx+batch_idx*IN*SEQ)) * weight.index((out_idx*IN+reduce_idx))).cast(dtypes.float)
+  product = (inp.index((seq_idx*IN+reduce_idx+batch_idx*IN*SEQ)) * weight.index((out_idx*IN+reduce_idx))).cast(dtypes.half)
   reduced = product.reduce(reduce_idx, arg=Ops.ADD)
   store_op = output.index((seq_idx*OUT+out_idx+batch_idx*OUT*SEQ), ptr=True).store(reduced).end(batch_idx, seq_idx, out_idx)
   return store_op.sink(arg=KernelInfo(name=f"fp8_matmul_{inp.shape}x{weight.shape}"))
@@ -32,12 +33,21 @@ def custom_matmul_backward(gradient: UOp, kernel: UOp) -> tuple[UOp, UOp]:
   input_tensor = Tensor(input_uop, device=input_uop.device)
   grad_tensor = Tensor(gradient, device=gradient.device)
   weight_tensor = Tensor(weight_uop, device=weight_uop.device)
-  grad_quantized, scale = quantize_to_fp8(grad_tensor)
+  # For half precision accumulation, compute safe max based on reduction dimensions
+  # grad_weight: reduction over batch*seq; grad_input: reduction over out_features
+  batch, seq, out_features = grad_tensor.shape
+  in_features = input_tensor.shape[-1]
+  grad_weight_reduce_dim = batch * seq
+  grad_input_reduce_dim = out_features
+  # Use the larger reduction dimension to be safe for both operations
+  max_reduce_dim = max(grad_weight_reduce_dim, grad_input_reduce_dim)
+  safe_max = (65504 / max_reduce_dim) ** 0.5 * 0.7
+  grad_quantized, scale = quantize_to_fp8(grad_tensor, max_val=safe_max)
   scale_scalar = scale.reshape(())
-  grad_weight = Tensor.einsum("bso,bsi->oi", grad_quantized, input_tensor, dtype=dtypes.float)
+  grad_weight = Tensor.einsum("bso,bsi->oi", grad_quantized, input_tensor, dtype=dtypes.half)
   grad_weight = grad_weight * scale_scalar
   grad_2d = grad_quantized.reshape(grad_tensor.shape[0] * grad_tensor.shape[1], grad_tensor.shape[-1])
-  grad_input = (grad_2d.dot(weight_tensor, dtype=dtypes.float)).contiguous().reshape(input_tensor.shape) * scale
+  grad_input = (grad_2d.dot(weight_tensor, dtype=dtypes.half)).contiguous().reshape(input_tensor.shape) * scale
   return (None, grad_input.uop, grad_weight.uop)
 
 class FP8Linear:
@@ -46,16 +56,21 @@ class FP8Linear:
     self.bias = Tensor.empty(out_features, dtype=dtypes.float32) if bias else None
 
   def __call__(self, x: Tensor) -> Tensor:
+    x = x.cast(dtypes.half)
     original_ndim = len(x.shape)
     if original_ndim == 2: x = x.reshape(x.shape[0], 1, x.shape[1])
-    batch, seq, _ = x.shape
-    w_fp8, w_scale = quantize_to_fp8(self.weight)
-    x_fp8, x_scale = quantize_to_fp8(x)
+    batch, seq, in_features = x.shape
+    # For half precision accumulation, limit fp8 range to avoid overflow
+    # Each product must satisfy: x * w <= half_max / reduction_dim
+    # If x_max = w_max = M, then M^2 <= 65504 / reduction_dim
+    safe_max = (65504 / in_features) ** 0.5 * 0.7  # with safety margin
+    w_fp8, w_scale = quantize_to_fp8(self.weight.cast(dtypes.half), max_val=safe_max)
+    x_fp8, x_scale = quantize_to_fp8(x, max_val=safe_max)
     GPUS = self.weight.device
     if isinstance(GPUS, tuple) and len(GPUS) > 1:
-      y = Tensor(Tensor.empty((batch//len(GPUS), seq, self.weight.shape[0]), dtype=dtypes.float, device=GPUS).uop.multi(0), device=GPUS)
+      y = Tensor(Tensor.empty((batch//len(GPUS), seq, self.weight.shape[0]), dtype=dtypes.half, device=GPUS).uop.multi(0), device=GPUS)
     else:
-      y = Tensor.empty((batch, seq, self.weight.shape[0]), dtype=dtypes.float)
+      y = Tensor.empty((batch, seq, self.weight.shape[0]), dtype=dtypes.half)
     y = Tensor.custom_kernel(y, x_fp8, w_fp8, fxn=custom_matmul, grad_fxn=custom_matmul_backward)[0]
     y = y * w_scale * x_scale
     if self.bias is not None: y = y + self.bias

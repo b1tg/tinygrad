@@ -3,6 +3,7 @@ from tinygrad import dtypes, Tensor
 from tinygrad.helpers import getenv, get_single_element
 from tinygrad.dtype import _to_np_dtype
 from tinygrad.codegen.opt import OptOps
+# Tensor.rand
 
 dtype_in = (dtypes.half if getenv("HALF") else dtypes.bfloat16 if getenv("BFLOAT16") else
             dtypes.fp8e4m3 if getenv("FP8E4M3") else dtypes.fp8e5m2 if getenv("FP8E5M2") else dtypes.float)
@@ -24,7 +25,7 @@ INT_HIGH = getenv("INT_HIGH", 10)
 
 if __name__ == "__main__":
   def init_matrix(rows, cols):
-    rng = np.random.default_rng()
+    rng = np.random.default_rng(42)
     # NOTE: numpy does not support bfloat16
     if (np_dtype := _to_np_dtype(dtype_in)) is None: np_dtype = np.float32
     if dtype_in in dtypes.ints:
@@ -45,6 +46,8 @@ if __name__ == "__main__":
 
   ref = a.numpy().astype(np.float32) @ b.numpy().astype(np.float32)
   res = c.numpy()
+  print("ref:", ref)
+  print("res:", res)
   try:
     np.testing.assert_allclose(res, ref, rtol=RTOL, atol=ATOL)
   except AssertionError as e:

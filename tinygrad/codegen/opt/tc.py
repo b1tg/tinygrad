@@ -82,7 +82,7 @@ cuda_81616 = [TensorCore(dims=(8,16,16), threads=32, elements_per_thread=(8,4,4)
 cuda_81632_f8 = [TensorCore(dims=(8,16,32), threads=32, elements_per_thread=(16,8,4), dtype_in=di, dtype_out=do, opts=cuda_tc_opts,
   swizzle=((('r2', 'r3', 'l2', 'l3', 'l4'), ('u1', 'r4'), ('l0', 'l1', 'u0', 'r0', 'r1')),
            (('r2', 'r3', 'u0', 'l0', 'l1'), ('r1', 'r4'), ('l2', 'l3', 'l4', 'u1', 'r0'))))
-  for di,do in [(dtypes.fp8e4m3,dtypes.float),(dtypes.fp8e5m2,dtypes.float)]]
+  for di,do in [(dtypes.fp8e4m3,dtypes.half),(dtypes.fp8e4m3,dtypes.float),(dtypes.fp8e5m2,dtypes.float)]]
 cuda_8168_f16 = [TensorCore(dims=(8,16,8), threads=32, elements_per_thread=(4,2,4), dtype_in=di, dtype_out=do, opts=cuda_tc_opts,
   swizzle=((('r1', 'r2', 'l2', 'l3', 'l4'), ('r0', 'u1'), ('l0', 'l1', 'u0')),
            (('r1', 'r2', 'u0', 'l0', 'l1'), ('u1', 'r0'), ('l2', 'l3', 'l4'))))
