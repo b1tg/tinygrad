@@ -7,12 +7,22 @@ class TensorCore: # D = A * B + C, A is (M x K), B is (K x N), C and D are (M x 
   dims: tuple[int,int,int] # N, M, K
   threads: int # number of threads that construct the warp
   elements_per_thread: tuple[int, int, int] # elements per-thread to load/store from A/B/C
-  dtype_in: DType # dtype for A and B
+  dtype_in: DType|tuple[DType, DType] # dtype for A and B
   dtype_out: DType # dtype for C and D
   opts: tuple[str, ...] # ordered tuple of "ux" or "lx" specifying kernel opts to perform. "ux" upcasts dim x and "lx" localizes dim x
   # (local_swizzle, upcast_swizzle, reduce_swizzle)
   # l<num> is the num axis of the locals, similar for u<num> and upcasts, r<num> and reduces
   swizzle: tuple[tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]], tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]]
+
+  @property
+  def dtype_in_a(self) -> DType:
+    """Get dtype for A operand (supports both homogeneous and mixed-precision)."""
+    return self.dtype_in[0] if isinstance(self.dtype_in, tuple) else self.dtype_in
+
+  @property
+  def dtype_in_b(self) -> DType:
+    """Get dtype for B operand (supports both homogeneous and mixed-precision)."""
+    return self.dtype_in[1] if isinstance(self.dtype_in, tuple) else self.dtype_in
   @functools.cache  # pylint: disable=method-cache-max-size-none
   def _remaps(self) -> list[dict[str, str]]:
     local_axes, upcast_axes, reduce_axes = len(self.get_local_axes()), len(self.get_upcast_axes()), len(self.get_reduce_axes())
@@ -36,7 +46,9 @@ class TensorCore: # D = A * B + C, A is (M x K), B is (K x N), C and D are (M x 
   def base_upcast_axes(self):
     # this is defined in the swizzle. first we use the upcast axes, then the reduce
     return ([f"r{i}" for i in range(len(self.get_reduce_axes()))] + [f"u{i}" for i in range(len(self.get_upcast_axes()))])[::-1]
-  def __str__(self): return "_".join(["WMMA"] + list(map(str, self.dims)) + [self.dtype_in.name, self.dtype_out.name])
+  def __str__(self):
+    dtype_str = f"{self.dtype_in_a.name}_{self.dtype_in_b.name}" if isinstance(self.dtype_in, tuple) else self.dtype_in.name
+    return "_".join(["WMMA"] + list(map(str, self.dims)) + [dtype_str, self.dtype_out.name])
   def __post_init__(self):
     # all axes have size 2, <local> <reduce> <upcast> is the order
     local_axes, upcast_axes, reduce_axes = len(self.get_local_axes()), len(self.get_upcast_axes()), len(self.get_reduce_axes())
@@ -82,7 +94,8 @@ cuda_81616 = [TensorCore(dims=(8,16,16), threads=32, elements_per_thread=(8,4,4)
 cuda_81632_f8 = [TensorCore(dims=(8,16,32), threads=32, elements_per_thread=(16,8,4), dtype_in=di, dtype_out=do, opts=cuda_tc_opts,
   swizzle=((('r2', 'r3', 'l2', 'l3', 'l4'), ('u1', 'r4'), ('l0', 'l1', 'u0', 'r0', 'r1')),
            (('r2', 'r3', 'u0', 'l0', 'l1'), ('r1', 'r4'), ('l2', 'l3', 'l4', 'u1', 'r0'))))
-  for di,do in [(dtypes.fp8e4m3,dtypes.float),(dtypes.fp8e5m2,dtypes.float)]]
+  for di,do in [(dtypes.fp8e5m2,dtypes.float),(dtypes.fp8e4m3,dtypes.float),
+                ((dtypes.fp8e4m3,dtypes.fp8e5m2),dtypes.float),((dtypes.fp8e5m2,dtypes.fp8e4m3),dtypes.float)]]
 cuda_8168_f16 = [TensorCore(dims=(8,16,8), threads=32, elements_per_thread=(4,2,4), dtype_in=di, dtype_out=do, opts=cuda_tc_opts,
   swizzle=((('r1', 'r2', 'l2', 'l3', 'l4'), ('r0', 'u1'), ('l0', 'l1', 'u0')),
            (('r1', 'r2', 'u0', 'l0', 'l1'), ('u1', 'r0'), ('l2', 'l3', 'l4'))))
@@ -125,7 +138,8 @@ amd_cdna_1616128 = [TensorCore(dims=(16,16,128), threads=64, elements_per_thread
   opts=("l0","l0","l0","l0","u1","u1","l1","l1"),
   swizzle=((('u0', 'u1', 'l4', 'l5', 'r5', 'r6'), ('r0', 'r1'), ('l0', 'l1', 'l2', 'l3', 'r2', 'r3', 'r4')),
            (('l0', 'l1', 'l2', 'l3', 'r5', 'r6'), ('r0', 'r1'), ('l4', 'l5', 'u0', 'u1', 'r2', 'r3', 'r4'))))
-  for di,do in [(dtypes.fp8e5m2,dtypes.float),(dtypes.fp8e4m3,dtypes.float)]]
+  for di,do in [(dtypes.fp8e5m2,dtypes.float),(dtypes.fp8e4m3,dtypes.float),
+                ((dtypes.fp8e4m3,dtypes.fp8e5m2),dtypes.float),((dtypes.fp8e5m2,dtypes.fp8e4m3),dtypes.float)]]
 
 amd_cdna3 = amd_cdna_161632[:2] + amd_cdna_161616
 

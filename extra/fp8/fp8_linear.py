@@ -1,6 +1,7 @@
 from typing import Callable, Any
 from tinygrad import Tensor, dtypes, nn, UOp
 from tinygrad.uop.ops import KernelInfo, AxisType, Ops
+from tinygrad.helpers import getenv
 
 def quantize_to_fp8(x: Tensor, dtype=dtypes.fp8e4m3):
   fp8_min = -448.0 if dtype == dtypes.fp8e4m3 else -57344.0
@@ -32,7 +33,10 @@ def custom_matmul_backward(gradient: UOp, kernel: UOp) -> tuple[UOp, UOp]:
   input_tensor = Tensor(input_uop, device=input_uop.device)
   grad_tensor = Tensor(gradient, device=gradient.device)
   weight_tensor = Tensor(weight_uop, device=weight_uop.device)
-  grad_quantized, scale = quantize_to_fp8(grad_tensor)
+  if getenv("FP8_HYBRID"):
+    grad_quantized, scale = quantize_to_fp8(grad_tensor, dtype=dtypes.fp8e5m2)
+  else:
+    grad_quantized, scale = quantize_to_fp8(grad_tensor)
   scale_scalar = scale.reshape(())
   grad_weight = Tensor.einsum("bso,bsi->oi", grad_quantized, input_tensor, dtype=dtypes.float)
   grad_weight = grad_weight * scale_scalar

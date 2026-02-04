@@ -3191,6 +3191,8 @@ class Tensor(OpMixin):
 
     if match_dtype and x.dtype != y.dtype:
       output_dtype = least_upper_dtype(x.dtype, y.dtype)
+      # mixed fp8 types (e5m2 * e4m3) must use float32 to avoid half overflow
+      if x.dtype in dtypes.fp8s and y.dtype in dtypes.fp8s: output_dtype = dtypes.float
       x, y = x.cast(output_dtype), y.cast(output_dtype)
 
     if reverse: x, y = y, x

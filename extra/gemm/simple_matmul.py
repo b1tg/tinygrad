@@ -11,31 +11,41 @@ acc_dtype = (dtypes.half if getenv("ACC_HALF") else dtypes.bfloat16 if getenv("A
 if getenv("INT"):  dtype_in, acc_dtype = dtypes.int8, dtypes.int32
 if getenv("UINT"): dtype_in, acc_dtype = dtypes.uint8, dtypes.int32
 
+dtype_in_a = dtype_in
+dtype_in_b = dtype_in
+
 N = getenv("N", 4096)
 M = getenv("M", N)
 K = getenv("K", N)
 CNT = getenv("CNT", 10)
 
-atol, rtol = {dtypes.half:{1e-3, 1e-2}, dtypes.bfloat16:(1e-3, 1e-2), dtypes.fp8e4m3:(1e-1, 1e-1), dtypes.fp8e5m2:(1.0, 5e-1)}.get(dtype_in, (1e-4, 3e-2))
+atol, rtol = {dtypes.half:{1e-3, 1e-2}, dtypes.bfloat16:(1e-3, 1e-2), dtypes.fp8e4m3:(1e-1, 1e-1), dtypes.fp8e5m2:(1.0, 5e-1)}.get(dtypes.fp8e5m2 if getenv("FP8_HYBRID") else dtype_in, (1e-4, 3e-2))
+
+if getenv("FP8_HYBRID") == 1: dtype_in_a, dtype_in_b = dtypes.fp8e4m3, dtypes.fp8e5m2
+elif getenv("FP8_HYBRID") == 2: dtype_in_b, dtype_in_b = dtypes.fp8e5m2, dtypes.fp8e4m3
+
 ATOL, RTOL = getenv("ATOL", atol), getenv("RTOL", rtol)
 
 INT_LOW = getenv("INT_LOW", 0)
 INT_HIGH = getenv("INT_HIGH", 10)
 
 if __name__ == "__main__":
-  def init_matrix(rows, cols):
-    rng = np.random.default_rng()
+  def init_matrix(rows, cols, dtype=None):
+    if dtype is None: dtype = dtype_in
+    rng = np.random.default_rng(42)
     # NOTE: numpy does not support bfloat16
-    if (np_dtype := _to_np_dtype(dtype_in)) is None: np_dtype = np.float32
-    if dtype_in in dtypes.ints:
+    if (np_dtype := _to_np_dtype(dtype)) is None: np_dtype = np.float32
+    if dtype in dtypes.ints:
       return Tensor(rng.integers(INT_LOW, INT_HIGH, (rows, cols), dtype=np_dtype)).realize()
-    return Tensor(rng.random((rows, cols), dtype=np.float32).astype(np_dtype)-0.5).cast(dtype_in).realize()
+    return Tensor(rng.random((rows, cols), dtype=np.float32).astype(np_dtype)-0.5).cast(dtype).realize()
 
-  a, b = init_matrix(M, K), init_matrix(K, N)
+  a, b = init_matrix(M, K, dtype_in_a), init_matrix(K, N, dtype_in_b)
   for i in range(CNT):
     if i > 0 and getenv("RAND", 0) != 0:
-      a, b = init_matrix(M, K), init_matrix(K, N)
+      a, b = init_matrix(M, K, dtype_in_a), init_matrix(K, N, dtype_in_b)
     c = a.matmul(b, dtype=acc_dtype).realize()
+
+  print(f"{a.dtype=}, {b.dtype=}, {c.dtype=}, {acc_dtype=}")
 
   if getenv("SHOULD_USE_TC"):
     sched = a.matmul(b, dtype=acc_dtype).schedule()
@@ -45,6 +55,8 @@ if __name__ == "__main__":
 
   ref = a.numpy().astype(np.float32) @ b.numpy().astype(np.float32)
   res = c.numpy()
+  print("ref: ", ref)
+  print("res: ", res)
   try:
     np.testing.assert_allclose(res, ref, rtol=RTOL, atol=ATOL)
   except AssertionError as e:
