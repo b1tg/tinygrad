@@ -9,8 +9,37 @@ from tinygrad.renderer import Renderer
 from tinygrad.codegen.late.devectorizer import no_vectorized_alu
 
 
+def _render_define_reg(ctx, x):
+  # For size-1 registers, don't use array notation to avoid pointer arithmetic overhead
+  if x.dtype.size == 1:
+    return f"{ctx.render_dtype(x.dtype.base)} {ctx[x]};"
+  return f"{ctx.render_dtype(x.dtype.base)} {ctx[x]}[{x.dtype.size}];"
+
+def _render_index_reg(ctx, buf, idx):
+  # For size-1 registers with index 0, use address-of instead of pointer arithmetic
+  if buf.op is Ops.DEFINE_REG and buf.dtype.size == 1 and idx.op is Ops.CONST and idx.arg == 0:
+    return f"(&{ctx[buf]})"
+  return f"({ctx[buf]}+{strip_parens(ctx[idx]) if idx.arg == Ops.ADD else ctx[idx]})"
+
+def _is_scalar_reg_index(bidx):
+  """Check if bidx is an INDEX on a size-1 DEFINE_REG with constant 0 index."""
+  if bidx.op is Ops.INDEX and len(bidx.src) >= 2:
+    buf, idx = bidx.src[0], bidx.src[1]
+    return buf.op is Ops.DEFINE_REG and buf.dtype.size == 1 and idx.op is Ops.CONST and idx.arg == 0
+  return False
+
+def _render_scalar_reg_load(ctx, bidx):
+  """Render LOAD from a scalar register directly without pointer indirection."""
+  buf = bidx.src[0]
+  return ctx[buf]
+
+def _render_scalar_reg_store(ctx, bidx, var):
+  """Render STORE to a scalar register directly without pointer indirection."""
+  buf = bidx.src[0]
+  return f"{ctx[buf]} = {ctx[var]};"
+
 base_rewrite = PatternMatcher([
-  (UPat(Ops.DEFINE_REG, name="x"), lambda ctx,x: f"{ctx.render_dtype(x.dtype.base)} {ctx[x]}[{x.dtype.size}];"),
+  (UPat(Ops.DEFINE_REG, name="x"), _render_define_reg),
   (UPat(Ops.IF, name="x"), lambda ctx,x: f"if ({ctx[x.src[0]]}) {{"),
   (UPat((Ops.ENDIF, Ops.END)), lambda ctx: "}"),
   (UPat(Ops.WMMA, name="x"), lambda ctx,x: f"__{x.arg[0]}({ctx[x.src[0]]}, {ctx[x.src[1]]}, {ctx[x.src[2]]})"),
@@ -44,11 +73,16 @@ base_rewrite = PatternMatcher([
   # default const render
   (UPat(Ops.CONST, name="x"), lambda ctx,x: str(x.arg)),
   # new load/store
-  (UPat(Ops.INDEX, src=(UPat.var("buf"), UPat.var('idx')), allow_any_len=True),
-   lambda ctx,buf,idx: f"({ctx[buf]}+{strip_parens(ctx[idx]) if idx.arg == Ops.ADD else ctx[idx]})"),
+  (UPat(Ops.INDEX, src=(UPat.var("buf"), UPat.var('idx')), allow_any_len=True), _render_index_reg),
   (UPat(Ops.LOAD, src=(UPat(Ops.INDEX, src=(UPat(), UPat(), UPat.var("gate"))).or_casted("bidx"), UPat.var("var"))),
    lambda ctx,bidx,var,gate: f"({ctx[gate]}?*{ctx[bidx]}:{ctx[var]})"),
+  # Special case: LOAD from scalar register (size-1 DEFINE_REG with index 0) - return var directly
+  (UPat(Ops.LOAD, src=(UPat.var('bidx'),)),
+   lambda ctx,bidx: _render_scalar_reg_load(ctx, bidx) if _is_scalar_reg_index(bidx) else None),
   (UPat(Ops.LOAD, src=(UPat.var('bidx'),)), lambda ctx,bidx: f"(*{ctx[bidx]})"),
+  # Special case: STORE to scalar register (size-1 DEFINE_REG with index 0) - use assignment
+  (UPat(Ops.STORE, src=(UPat.var('bidx'), UPat.var("var"))),
+   lambda ctx,bidx,var: _render_scalar_reg_store(ctx, bidx, var) if _is_scalar_reg_index(bidx) else None),
   (UPat(Ops.STORE, src=(UPat.var('bidx'), UPat.var("var"))), lambda ctx,bidx,var: f"*{ctx[bidx]} = {ctx[var]};"),
   # alu/gep
   # TODO: look for left-associative
@@ -414,6 +448,9 @@ class CUDARenderer(CStyleLanguage):
     (UPat(Ops.CAST, dtypes.fp8s, UPat.var("x", dtypes.fp8s), name='y'), lambda x,y: x.cast(dtypes.float).cast(y.dtype) if x.dtype!=y.dtype else None),
   ]) + extra_pm
   string_rewrite = PatternMatcher([
+    # Special case: STORE to scalar register (size-1 DEFINE_REG with index 0) - use direct assignment
+    (UPat(Ops.STORE, src=(UPat.var("bidx"), UPat.var("var"))),
+     lambda ctx,bidx,var: _render_scalar_reg_store(ctx, bidx, var) if _is_scalar_reg_index(bidx) else None),
     (UPat(Ops.STORE, src=(UPat.var("bidx"), UPat.var("var"))),
      lambda ctx,bidx,var: f"*(({ctx.render_dtype(var.dtype)}*){ctx[bidx]}) = {ctx[var]};" if var.dtype.count > 1 else None),
     (UPat(Ops.BITCAST, name="x"), lambda ctx,x: f"tg_bitcast<{ctx.render_dtype(x.dtype)}>(({ctx.render_dtype(x.src[0].dtype)})({ctx[x.src[0]]}))"),
@@ -437,6 +474,7 @@ class CUDARenderer(CStyleLanguage):
       or (dt.count in (2,4,8,16) and dt.scalar() in dtypes.fp8s)]
     if getenv("NV_UOP_LDMATRIX"):
       if "#include <cuda_fp16.h>" not in prefix: prefix.append("#include <cuda_fp16.h>")
+      if dtypes.half.vec(4) not in used_dtypes: prefix.append(self.render_vector_prefix(dtypes.half.vec(4)))
       if dtypes.half.vec(8) not in used_dtypes: prefix.append(self.render_vector_prefix(dtypes.half.vec(8)))
       prefix.append(
         "__device__ __forceinline__ half8 __ldmatrix_a(const half* smem) {\n"
@@ -460,6 +498,17 @@ class CUDARenderer(CStyleLanguage):
         "  return out;\n"
         "}"
       )
+      # Optimized version that directly outputs to two half4 pointers
+      prefix.append(
+        "__device__ __forceinline__ void __ldmatrix_b_elems(half4* lo, half4* hi, const half* smem) {\n"
+        "  unsigned int r0, r1, r2, r3;\n"
+        "  asm volatile(\"ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\"\n"
+        "      : \"=r\"(r0), \"=r\"(r1), \"=r\"(r2), \"=r\"(r3) : \"l\"(__cvta_generic_to_shared(smem)));\n"
+        "  unsigned int *lo_addr = (unsigned int*)lo;\n"
+        "  unsigned int *hi_addr = (unsigned int*)hi;\n"
+        "  lo_addr[0] = r0; lo_addr[1] = r1; hi_addr[0] = r2; hi_addr[1] = r3;\n"
+        "}"
+      )
     dt_map_in = { dtypes.float: "tf32", dtypes.half: "f16", dtypes.bfloat16: "bf16", dtypes.fp8e4m3: "e4m3", dtypes.fp8e5m2: "e5m2" }
     dt_map_out = { dtypes.float: "f32", dtypes.half: "f16" }
     for name, (N, M, K), dtype_in, dtype_out, _, _, upcast_axes, _ in wmma_args(uops):
@@ -469,12 +518,14 @@ class CUDARenderer(CStyleLanguage):
       operands = [f"%{i}" for i in range(sum(n_operands))]
 
       # mma operands => {c}, {a}, {b}, {c}
+      # Use "+f" (float) constraints for accumulator to help compiler with register allocation
+      c_elems = ["x", "y", "z", "w", "a", "b", "c", "d"][:n_operands[2]]
       prefix.append(f"""__device__ {wmma_dtypes[2]} __{name}({wmma_dtypes[0]} a, {wmma_dtypes[1]} b, {wmma_dtypes[2]} c){{
-  int *a_pk = (int *)(&a), *b_pk = (int *)(&b), *c_pk = (int *)(&c);
+  int *a_pk = (int *)(&a), *b_pk = (int *)(&b);
   asm("mma.sync.aligned.m{M}n{N}k{K}.row.col.{dt_map_out[dtype_out]}.{dt_map_in[dtype_in]}.{dt_map_in[dtype_in]}.{dt_map_out[dtype_out]}"
       "{{{", ".join(operands[:n_operands[2]])}}}, {{{", ".join(operands[n_operands[2]:n_operands[2]+n_operands[0]])}}},"
       "{{{", ".join(operands[-n_operands[1]:])}}}, {{{", ".join(operands[:n_operands[2]])}}};"
-    : {", ".join([f'"+r"(c_pk[{i}])' for i in range(n_operands[2])])}
+    : {", ".join([f'"+f"(c.{c_elems[i]})' for i in range(n_operands[2])])}
     : {", ".join([f'"r"(a_pk[{i}])' for i in range(n_operands[0])])}, {", ".join([f'"r"(b_pk[{i}])' for i in range(n_operands[1])])});
   return c;\n}}""")
 

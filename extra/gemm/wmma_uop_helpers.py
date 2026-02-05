@@ -88,6 +88,7 @@ class WmmaUOpBuilder:
     self.commit_counter = 0
     self.wait_counter = 0
     self.barrier_counter = 0
+    self.output_stores: list[UOp] = []  # Track output stores for proper SINK dependencies
 
   def u(self, op_or_uop, *args, **kwargs) -> UOp:
     out = op_or_uop if isinstance(op_or_uop, UOp) else UOp(op_or_uop, *args, **kwargs)
@@ -179,14 +180,12 @@ class WmmaUOpBuilder:
       a_pack = self.u(Ops.CUSTOMI, dtypes.half.vec(8), (smem_ptr_a,), arg="__ldmatrix_a({0})")
       self.u(Ops.STORE, dtypes.void, (self.idx(a_frags[i]), a_pack))
 
-    # ldmatrix loads for B (pairs)
+    # ldmatrix loads for B (pairs) - use optimized intrinsic that directly outputs to half4 pointers
     for pair in range(4):
       smem_ptr_b = self.idx(smem_b, ld_b_offsets[k_idx][pair])
-      b_pack = self.u(Ops.CUSTOMI, dtypes.half.vec(8), (smem_ptr_b,), arg="__ldmatrix_b({0})")
-      b_lo = self.u(b_pack.gep(0).vectorize(b_pack.gep(1), b_pack.gep(2), b_pack.gep(3)))
-      b_hi = self.u(b_pack.gep(4).vectorize(b_pack.gep(5), b_pack.gep(6), b_pack.gep(7)))
-      self.u(Ops.STORE, dtypes.void, (self.idx(b_frags[2*pair]), b_lo))
-      self.u(Ops.STORE, dtypes.void, (self.idx(b_frags[2*pair+1]), b_hi))
+      b_lo_ptr = self.idx(b_frags[2*pair])
+      b_hi_ptr = self.idx(b_frags[2*pair+1])
+      self.u(Ops.CUSTOM, dtypes.void, (b_lo_ptr, b_hi_ptr, smem_ptr_b), arg="__ldmatrix_b_elems({0}, {1}, {2});")
 
     # M_FRAGS x N_FRAGS WMMA ops
     for am in range(variant.M_FRAGS):
@@ -265,7 +264,8 @@ class WmmaUOpBuilder:
           k_off = [0, 1, 8*self.N, 8*self.N + 1][k]
           bn_mult = (bn % 2) + 4 * (bn // 2)
           idx_val = wg_c_off + thread_c_off + am * 32*self.N + k_off + bn_mult*8
-          self.u(Ops.STORE, dtypes.void, (self.idx(c_uop, idx_val), val))
+          store = self.u(Ops.STORE, dtypes.void, (self.idx(c_uop, idx_val), val))
+          self.output_stores.append(store)
 
   def emit_smem_float4_epilogue(self, acc_regs, c_uop, grid_m, grid_n, wg_m, wg_n, wg_threads, threads, smem):
     """Emit smem-based float4 epilogue (max fp32 kernel)."""
@@ -298,7 +298,8 @@ class WmmaUOpBuilder:
         d_val = self.u(Ops.LOAD, dtypes.float.vec(4), (self.idx(d_regs[i]),), tag=f"store_{d_regs_name}_{i}")
         c_scalar_ptr = self.idx(c_uop, global_d_base + row*self.N)
         c_vec_ptr = self.u(c_scalar_ptr.cast(dtypes.float.vec(4).ptr()))
-        self.u(Ops.STORE, dtypes.void, (c_vec_ptr, d_val))
+        store = self.u(Ops.STORE, dtypes.void, (c_vec_ptr, d_val))
+        self.output_stores.append(store)
 
   def emit_smem_half2_epilogue(self, acc_regs, c_uop, grid_m, grid_n, wg_m, wg_n, wg_threads, threads, smem):
     """Emit smem-based half2/half8 epilogue (max fp16 kernel)."""
@@ -331,10 +332,11 @@ class WmmaUOpBuilder:
         row_offsets = [(0, 0), (32, 16 * (W // 8))] if half_idx == 0 else [(8, 0), (40, 16 * (W // 8))]
         for out_row, smem_row in row_offsets:
           val = self.u(Ops.LOAD, dtypes.half.vec(8), (self.idx(smem128_d, smem128_d_read_off + smem_row),), tag=f"epi_{am}_{out_row}_load")
-          self.u(Ops.STORE, dtypes.void, (self.idx(out128_d, out_off_base + out_row * (self.N // 8)), val))
+          store = self.u(Ops.STORE, dtypes.void, (self.idx(out128_d, out_off_base + out_row * (self.N // 8)), val))
+          self.output_stores.append(store)
     self.barrier()
 
-  def build(self) -> list[UOp]:
+  def build(self) -> UOp:
     """Build the complete WMMA kernel UOps."""
     variant = self.variant
     M, N, K = self.M, self.N, self.K
@@ -496,11 +498,9 @@ class WmmaUOpBuilder:
         self.u(Ops.STORE, dtypes.void, (self.idx(a_frags_k0[i]), a_pack))
       for pair in range(4):
         smem_ptr_b = self.idx(smem_b_stages[0], ld_b_offsets[0][pair])
-        b_pack = self.u(Ops.CUSTOMI, dtypes.half.vec(8), (smem_ptr_b,), arg="__ldmatrix_b({0})")
-        b_lo = self.u(b_pack.gep(0).vectorize(b_pack.gep(1), b_pack.gep(2), b_pack.gep(3)))
-        b_hi = self.u(b_pack.gep(4).vectorize(b_pack.gep(5), b_pack.gep(6), b_pack.gep(7)))
-        self.u(Ops.STORE, dtypes.void, (self.idx(b_frags_k0[2*pair]), b_lo))
-        self.u(Ops.STORE, dtypes.void, (self.idx(b_frags_k0[2*pair+1]), b_hi))
+        b_lo_ptr = self.idx(b_frags_k0[2*pair])
+        b_hi_ptr = self.idx(b_frags_k0[2*pair+1])
+        self.u(Ops.CUSTOM, dtypes.void, (b_lo_ptr, b_hi_ptr, smem_ptr_b), arg="__ldmatrix_b_elems({0}, {1}, {2});")
 
       block_k = self.u(Ops.RANGE, dtypes.int, (UOp.const(dtypes.int, num_k_blocks),), (0, AxisType.LOOP))
       phase_k = block_k % 3
@@ -538,11 +538,9 @@ class WmmaUOpBuilder:
         self.u(Ops.STORE, dtypes.void, (self.idx(a_frags_k1[i]), a_pack))
       for pair in range(4):
         smem_ptr_b = self.idx(smem_b_curr, ld_b_offsets[1][pair])
-        b_pack = self.u(Ops.CUSTOMI, dtypes.half.vec(8), (smem_ptr_b,), arg="__ldmatrix_b({0})")
-        b_lo = self.u(b_pack.gep(0).vectorize(b_pack.gep(1), b_pack.gep(2), b_pack.gep(3)))
-        b_hi = self.u(b_pack.gep(4).vectorize(b_pack.gep(5), b_pack.gep(6), b_pack.gep(7)))
-        self.u(Ops.STORE, dtypes.void, (self.idx(b_frags_k1[2*pair]), b_lo))
-        self.u(Ops.STORE, dtypes.void, (self.idx(b_frags_k1[2*pair+1]), b_hi))
+        b_lo_ptr = self.idx(b_frags_k1[2*pair])
+        b_hi_ptr = self.idx(b_frags_k1[2*pair+1])
+        self.u(Ops.CUSTOM, dtypes.void, (b_lo_ptr, b_hi_ptr, smem_ptr_b), arg="__ldmatrix_b_elems({0}, {1}, {2});")
 
       # 2) MMA for K=0 using previously loaded K=0 fragments
       for am in range(variant.M_FRAGS):
@@ -576,11 +574,9 @@ class WmmaUOpBuilder:
         self.u(Ops.STORE, dtypes.void, (self.idx(a_frags_k0[i]), a_pack))
       for pair in range(4):
         smem_ptr_b = self.idx(smem_b_next, ld_b_offsets[0][pair])
-        b_pack = self.u(Ops.CUSTOMI, dtypes.half.vec(8), (smem_ptr_b,), arg="__ldmatrix_b({0})")
-        b_lo = self.u(b_pack.gep(0).vectorize(b_pack.gep(1), b_pack.gep(2), b_pack.gep(3)))
-        b_hi = self.u(b_pack.gep(4).vectorize(b_pack.gep(5), b_pack.gep(6), b_pack.gep(7)))
-        self.u(Ops.STORE, dtypes.void, (self.idx(b_frags_k0[2*pair]), b_lo))
-        self.u(Ops.STORE, dtypes.void, (self.idx(b_frags_k0[2*pair+1]), b_hi))
+        b_lo_ptr = self.idx(b_frags_k0[2*pair])
+        b_hi_ptr = self.idx(b_frags_k0[2*pair+1])
+        self.u(Ops.CUSTOM, dtypes.void, (b_lo_ptr, b_hi_ptr, smem_ptr_b), arg="__ldmatrix_b_elems({0}, {1}, {2});")
 
       # 6) MMA for K=1 using the K=1 fragments loaded at the top of the loop
       for am in range(variant.M_FRAGS):
@@ -606,12 +602,22 @@ class WmmaUOpBuilder:
     else:  # smem_half2
       self.emit_smem_half2_epilogue(acc_regs, c_uop, grid_m, grid_n, wg_m, wg_n, wg_threads, threads, smem)
 
-    self.u(Ops.SINK, dtypes.void, (), arg=KernelInfo(name=f"nv_{variant.name}_uop"))
+    # Create SINK with output stores as dependencies for proper UOp graph
+    sink = self.u(Ops.SINK, dtypes.void, tuple(self.output_stores), arg=KernelInfo(name=f"nv_{variant.name}_uop"))
 
-    return self.uops
+    return sink
 
 
 def build_wmma_uops(M: int, N: int, K: int, variant: WmmaVariant) -> list[UOp]:
-  """Build WMMA GEMM UOps for the given variant."""
+  """Build WMMA GEMM UOps for the given variant. Returns the list of UOps for direct rendering."""
+  builder = WmmaUOpBuilder(M, N, K, variant)
+  builder.build()
+  return builder.uops
+
+def build_wmma_uops_sink(M: int, N: int, K: int, variant: WmmaVariant) -> UOp:
+  """Build WMMA GEMM UOps for the given variant. Returns the sink UOp."""
   builder = WmmaUOpBuilder(M, N, K, variant)
   return builder.build()
+
+# Alias for backward compatibility
+build_wmma_uops_list = build_wmma_uops

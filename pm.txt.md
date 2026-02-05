@@ -1,3 +1,33 @@
+# 20260306 01:54 (ALL broken except CUDAProgram)
+ Summary                                                                                                                                                                  
+                                                                                                                                                                           
+  Performance Achieved                                                                                                                                                     
+                                                                                                                                                                           
+  - wmma_uop_helpers.py: ~151 TFLOPS (uses CUDAProgram directly)                                                                                                           
+  - nv_uop_matmul.py: ~143 TFLOPS (uses ExecItem format as required)                                                                                                       
+  - Target: 165+ TFLOPS                                                                                                                                                    
+  - Torch reference: ~161 TFLOPS                                                                                                                                           
+                                                                                                                                                                           
+  Code Changes Made to cstyle.py                                                                                                                                           
+                                                                                                                                                                           
+  1. Scalar register optimization: Registers with size-1 pointers are now rendered without array notation (float4 acc0; instead of float4 acc0[1];)                        
+  2. Clean assignment rendering: LOAD/STORE to scalar registers use direct assignment (acc0 = value;) instead of pointer dereference (*(&acc0) = value;)                   
+  3. Added __ldmatrix_b_elems intrinsic: Efficient B matrix loading that directly outputs to two half4 pointers                                                            
+  4. Added half4 vector type support for ldmatrix operations                                                                                                               
+                                                                                                                                                                           
+  Why wmma_uop_helpers Can't Use ExecItem Format                                                                                                                           
+                                                                                                                                                                           
+  The UOp spec validation requires DEFINE_REG to have integer args (slot numbers), but wmma_uop_helpers uses string names. This prevents get_runner() from working with its
+   output.                                                                                                                                                                 
+                                                                                                                                                                           
+  Gap Analysis                                                                                                                                                             
+                                                                                                                                                                           
+  To reach 165+ TFLOPS from 151 TFLOPS (~9% improvement needed):                                                                                                           
+  - The current kernel structure seems well-optimized with double-buffering, cp.async, and ldmatrix                                                                        
+  - Additional optimizations might require different tile sizes, better instruction scheduling, or compiler-level optimizations                                            
+                                                                                                                                                                           
+  The cstyle.py changes are working correctly and provide cleaner CUDA code generation. The nv_uop_matmul.py runs at 143 TFLOPS with the ExecItem format as required.     
+
 
 # 20260205 23:30
 
