@@ -414,6 +414,8 @@ class CUDARenderer(CStyleLanguage):
     (UPat(Ops.CAST, dtypes.fp8s, UPat.var("x", dtypes.fp8s), name='y'), lambda x,y: x.cast(dtypes.float).cast(y.dtype) if x.dtype!=y.dtype else None),
   ]) + extra_pm
   string_rewrite = PatternMatcher([
+    (UPat(Ops.STORE, src=(UPat.var("bidx"), UPat.var("var"))),
+     lambda ctx,bidx,var: f"*(({ctx.render_dtype(var.dtype)}*){ctx[bidx]}) = {ctx[var]};" if var.dtype.count > 1 else None),
     (UPat(Ops.BITCAST, name="x"), lambda ctx,x: f"tg_bitcast<{ctx.render_dtype(x.dtype)}>(({ctx.render_dtype(x.src[0].dtype)})({ctx[x.src[0]]}))"),
   ]) + base_rewrite
 
@@ -430,8 +432,34 @@ class CUDARenderer(CStyleLanguage):
     if any(dt.scalar() in dtypes.fp8s for dt in used_dtypes): prefix.append("#include <cuda_fp8.h>")
     if any(dt.scalar() == dtypes.half for dt in used_dtypes): prefix.append("#include <cuda_fp16.h>")
     if any(dt.scalar() == dtypes.bfloat16 for dt in used_dtypes): prefix.append("#include <cuda_bf16.h>")
+    if getenv("NV_UOP_CP_ASYNC") and "#include <cuda_pipeline.h>" not in prefix: prefix.append("#include <cuda_pipeline.h>")
     prefix += [self.render_vector_prefix(dt) for dt in used_dtypes if (dt.count in (4,8) and dt.scalar() in {dtypes.half, dtypes.bfloat16})
       or (dt.count in (2,4,8,16) and dt.scalar() in dtypes.fp8s)]
+    if getenv("NV_UOP_LDMATRIX"):
+      if "#include <cuda_fp16.h>" not in prefix: prefix.append("#include <cuda_fp16.h>")
+      if dtypes.half.vec(8) not in used_dtypes: prefix.append(self.render_vector_prefix(dtypes.half.vec(8)))
+      prefix.append(
+        "__device__ __forceinline__ half8 __ldmatrix_a(const half* smem) {\n"
+        "  unsigned int r0, r1, r2, r3;\n"
+        "  asm(\"ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\"\n"
+        "      : \"=r\"(r0), \"=r\"(r1), \"=r\"(r2), \"=r\"(r3) : \"l\"(__cvta_generic_to_shared(smem)));\n"
+        "  half8 out;\n"
+        "  unsigned int *addr = (unsigned int*)&out;\n"
+        "  addr[0] = r0; addr[1] = r1; addr[2] = r2; addr[3] = r3;\n"
+        "  return out;\n"
+        "}"
+      )
+      prefix.append(
+        "__device__ __forceinline__ half8 __ldmatrix_b(const half* smem) {\n"
+        "  unsigned int r0, r1, r2, r3;\n"
+        "  asm(\"ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\"\n"
+        "      : \"=r\"(r0), \"=r\"(r1), \"=r\"(r2), \"=r\"(r3) : \"l\"(__cvta_generic_to_shared(smem)));\n"
+        "  half8 out;\n"
+        "  unsigned int *addr = (unsigned int*)&out;\n"
+        "  addr[0] = r0; addr[1] = r1; addr[2] = r2; addr[3] = r3;\n"
+        "  return out;\n"
+        "}"
+      )
     dt_map_in = { dtypes.float: "tf32", dtypes.half: "f16", dtypes.bfloat16: "bf16", dtypes.fp8e4m3: "e4m3", dtypes.fp8e5m2: "e5m2" }
     dt_map_out = { dtypes.float: "f32", dtypes.half: "f16" }
     for name, (N, M, K), dtype_in, dtype_out, _, _, upcast_axes, _ in wmma_args(uops):
