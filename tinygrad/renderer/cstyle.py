@@ -100,7 +100,7 @@ pm_manual_bf16_cast = PatternMatcher([
 
 def uops_to_dtypes(uops:list[UOp]) -> list[DType]: return dedup(u.dtype for u in uops if not isinstance(u.dtype, (ImageDType, PtrDType)))
 
-# (name, dims, dtype_in, dtype_out, device, threads, upcast_axes, reduce_axes)
+# (name, dims, (dtype_in_a, dtype_in_b), dtype_out, device, threads, upcast_axes, reduce_axes)
 def wmma_args(uops:list[UOp]):
   return dedup((uop.arg[0], uop.arg[1], uop.arg[2], uop.dtype.scalar(), *(uop.arg[4:8])) for uop in uops if uop.op is Ops.WMMA)
 
@@ -256,7 +256,7 @@ class ClangRenderer(CStyleLanguage):
   def _render_defines(self, uops) -> list[str]:
     prefix = [self.render_vector_prefix(dt) for dt in uops_to_dtypes(uops) if dt.count > 1]
     # https://github.com/corsix/amx
-    for name, (N, M, _), dtype_in, _, _, _, _, _ in wmma_args(uops):
+    for name, (N, M, _), (dtype_in, _), dtype_out, _, _, _, _ in wmma_args(uops):
       prefix += [
         '#define AMX_SET(imm5) __asm("nop\\nnop\\nnop\\n.word (0x201000+(%0<<5)+%1)" : : "i"(17), "i"(imm5) : "memory")',
         '#define AMX(op, gpr, btf) __asm(".word (0x201000+(%0 << 5)+0%1-((0%1>>4)*6))" : : "i"(op), "r"((unsigned long long)(gpr)+(btf)) : "memory")',
@@ -264,7 +264,7 @@ class ClangRenderer(CStyleLanguage):
       # 'static' in C roughly means that function symbol isn't exported. LLVM puts those symbols at the end of object file which allows Clang JIT
       # to just jump at the start of a shellcode without having to deal with symbols or trampolines at all. This is better than having to inline
       # wmma function every time it is called or wasting complexity on a symbol parsing and a memory page on trampoline.
-      out, dt1, dt2 = self.render_dtype(dtype_in.vec(N*N)), self.render_dtype(dtype_in.vec(N)), self.render_dtype(dtype_in.vec(M))
+      out, dt1, dt2 = self.render_dtype(dtype_out.vec(N*N)), self.render_dtype(dtype_in.vec(N)), self.render_dtype(dtype_in.vec(M))
       prefix += [f"""static {out} __{name}({dt1} data1, {dt2} data2, {out} data0){{
   AMX_SET(0);\n  for(int ridx0 = 0; ridx0 < 16; ridx0++){{ AMX(4, (int *)(&data0), 0ull<<62 | (ridx0*4ull)<<56 | ridx0*64ull); }}
   AMX(0, (int *)(&data2), 0ull<<62); AMX(1, (int *)(&data1), 0ull<<62); AMX(12, 0, 0ull);
@@ -331,7 +331,7 @@ class IntelRenderer(OpenCLRenderer):
 
   def render_kernel(self, function_name, kernel, bufs, uops, prefix=None) -> str:
     prefix = []
-    for name, _, dtype_in, dtype_out, _, _, _, _ in wmma_args(uops):
+    for name, _, (dtype_in, _), dtype_out, _, _, _, _ in wmma_args(uops):
       dt_in = ("ushort", "bf16") if dtype_in == dtypes.bfloat16 else (dtype_in.name, "f16")
       prefix.append(f"""{dtype_out.name}8 __{name}({dt_in[0]}16 a, {dt_in[0]}16 b, {dtype_out.name}8 c) {{
     return intel_sub_group_{dt_in[1]}_{dt_in[1]}_matrix_mad_k16(as_int8(a), as_int8(b), c);\n}}""")
@@ -370,7 +370,7 @@ class MetalRenderer(CStyleLanguage):
 
   def render_kernel(self, function_name, kernel, bufs, uops, prefix=None):
     prefix = ["#include <metal_stdlib>","using namespace metal;"]
-    deduped_wmma_args = dedup([(name, dtype_in, dtype_out) for name, _, dtype_in, dtype_out, _, _, _, _ in wmma_args(uops)])
+    deduped_wmma_args = dedup([(name, dtype_in, dtype_out) for name, _, (dtype_in, _), dtype_out, _, _, _, _ in wmma_args(uops)])
     for name, dtype_in, dtype_out in deduped_wmma_args: prefix.append(
   f"""{(dstr_out:=self.render_dtype(dtype_out.vec(2)))} __{name}({(dstr_in:=self.render_dtype(dtype_in.vec(2)))} a, {dstr_in} b, {dstr_out} c){{
   simdgroup_{self.render_dtype(dtype_in)}8x8 mat_a, mat_b; simdgroup_{self.render_dtype(dtype_out)}8x8 mat_c;
@@ -434,23 +434,19 @@ class CUDARenderer(CStyleLanguage):
       or (dt.count in (2,4,8,16) and dt.scalar() in dtypes.fp8s)]
     dt_map_in = { dtypes.float: "tf32", dtypes.half: "f16", dtypes.bfloat16: "bf16", dtypes.fp8e4m3: "e4m3", dtypes.fp8e5m2: "e5m2" }
     dt_map_out = { dtypes.float: "f32", dtypes.half: "f16" }
-    for name, (N, M, K), dtype_in, dtype_out, _, _, upcast_axes, _ in wmma_args(uops):
-      if isinstance(dtype_in, tuple):
-        dtype_in_a, dtype_in_b = dtype_in
-      else:
-        dtype_in_a, dtype_in_b = dtype_in, dtype_in
+    for name, (N, M, K), (dtype_in_a, dtype_in_b), dtype_out, _, _, upcast_axes, _ in wmma_args(uops):
       upcast_sizes = [prod(size for _, size in upcast) for upcast in upcast_axes]
       wmma_dtypes = [self.render_dtype(dtype.vec(size)) for dtype, size in zip([dtype_in_a, dtype_in_b, dtype_out], upcast_sizes)]
       n_operands = [size*dtype.itemsize//4 for dtype, size in zip([dtype_in_a, dtype_in_b, dtype_out], upcast_sizes)] # 4 => CUDA reg size in bytes
       operands = [f"%{i}" for i in range(sum(n_operands))]
-      # print(f"{dtype_in=}")
+      # print(f"{(dtype_in_a, dtype_in_b)=}")
       # print(f"{wmma_dtypes=}")
       # print(f"{n_operands=}")
-# dtype_in=dtypes.fp8e4m3
+# (dtype_in_a, dtype_in_b)=(dtypes.fp8e4m3, dtypes.fp8e4m3)
 # wmma_dtypes=['__nv_fp8_e4m316', '__nv_fp8_e4m38', 'float4']
 # n_operands=[4, 2, 4]
 # ---
-# dtype_in=(dtypes.fp8e4m3, dtypes.fp8e5m2)
+# (dtype_in_a, dtype_in_b)=(dtypes.fp8e4m3, dtypes.fp8e5m2)
 # wmma_dtypes=['__nv_fp8_e4m316', '__nv_fp8_e5m28', 'float4']
 # n_operands=[4, 2, 4]
       # mma operands => {c}, {a}, {b}, {c}
@@ -548,19 +544,19 @@ class AMDHIPRenderer(CStyleLanguage):
     prefix += [f'extern "C" __attribute__((device{f", {atr}" if atr else ""})) {dto} {meth}({dti});' for meth,dti,dto,atr in ockl+ocml]
     prefix += [self.render_vector_prefix(dt) for dt in used_dtypes if dt.count > 1]
 
-    for name, (N, M, K), dtype_in, dtype_out, _, _, _, _ in wmma_args(uops): # TODO: handle TCs f32_bf16 and bf16_bf16 w/ wrapper
+    for name, (N, M, K), (dtype_in_a, dtype_in_b), dtype_out, _, _, _, _ in wmma_args(uops): # TODO: handle TCs f32_bf16 and bf16_bf16 w/ wrapper
       if self.is_cdna(self.arch):
         if (N, M, K) == (16, 16, 16): type_map[dtypes.bfloat16] = 'bf16_1k'
         elif (N, M, K) == (16, 16, 32): type_map = {**type_map, dtypes.bfloat16: "_bf16", dtypes.half: "_f16"}
         elif (N, M, K) == (16, 16, 128):
-          type_map = {**type_map, dtypes.fp8e4m3: "_f8f6f4", dtypes.fp8e5m2: "_f8f6f4",
-                      (dtypes.fp8e4m3, dtypes.fp8e5m2): "_f8f6f4", (dtypes.fp8e5m2, dtypes.fp8e4m3): "_f8f6f4"}
-        prefix.append(f"#define __{name} __builtin_amdgcn_mfma_{'scale_' if K == 128 else ''}f32_{N}x{M}x{K}{type_map[dtype_in]}")
+          type_map = {**type_map, dtypes.fp8e4m3: "_f8f6f4", dtypes.fp8e5m2: "_f8f6f4"}
+        dtype_in_str = "_f8f6f4" if dtype_in_a != dtype_in_b else type_map[dtype_in_a]
+        prefix.append(f"#define __{name} __builtin_amdgcn_mfma_{'scale_' if K == 128 else ''}f32_{N}x{M}x{K}{dtype_in_str}")
       # #define __WMMA_16_16_16_half_half __builtin_amdgcn_wmma_f16_16x16x16_f16_w32_gfx12
       elif self.tensor_cores == tc.amd_rdna4:
-        prefix.append(f"#define __{name} __builtin_amdgcn_wmma_{type_map[dtype_out]}_16x16x16_{type_map[dtype_in]}_w32_gfx12")
+        prefix.append(f"#define __{name} __builtin_amdgcn_wmma_{type_map[dtype_out]}_16x16x16_{type_map[dtype_in_a]}_w32_gfx12")
       elif dtype_out == dtypes.float:
-        prefix.append(f"#define __{name} __builtin_amdgcn_wmma_f32_16x16x16_{'f16' if dtype_in == dtypes.half else 'bf16'}_w32")
+        prefix.append(f"#define __{name} __builtin_amdgcn_wmma_f32_16x16x16_{'f16' if dtype_in_a == dtypes.half else 'bf16'}_w32")
       else: prefix.append(f"static inline __attribute__((device)) half8 __{name}"+"""(half16 a, half16 b, half8 c) {
   half16 c_frag = {}; half8 d; for (int n = 0; n < 8; n++) { c_frag[n*2] = c[n]; }
   c_frag = __builtin_amdgcn_wmma_f16_16x16x16_f16_w32(a, b, c_frag, false);
