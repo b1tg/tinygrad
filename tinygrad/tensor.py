@@ -4070,6 +4070,69 @@ class Tensor(OpMixin):
     ret = ret.reshape(bs, oy, ox, cout).permute(0,3,1,2)
     return ret if bias is None else ret.add(bias.reshape(1, -1, 1, 1))
 
+def _torch_dtype_name(dtype: DType) -> str:
+  if dtype in dtypes.fp8s: return "Float8"
+  return {
+    dtypes.half: "Half", dtypes.bfloat16: "BFloat16", dtypes.float: "Float", dtypes.double: "Double",
+    dtypes.int: "Int", dtypes.long: "Long", dtypes.uint8: "Byte", dtypes.int8: "Char", dtypes.uint16: "UInt16",
+    dtypes.uint32: "UInt32", dtypes.uint64: "UInt64",
+  }.get(dtype, str(dtype))
+
+def _scaled_mm(mat1: Tensor, mat2: Tensor, scale_a: Tensor, scale_b: Tensor, bias: Tensor|None = None, scale_result: Tensor|None = None,
+               out_dtype: DTypeLike|None = None, use_fast_accum: bool = False) -> Tensor:
+  if mat1.ndim != 2: raise RuntimeError("mat1 must be a matrix")
+  if mat2.ndim != 2: raise RuntimeError("mat2 must be a matrix")
+  if mat1.dtype not in dtypes.fp8s: raise RuntimeError(f"Expected mat1 to be Float8 matrix got {_torch_dtype_name(mat1.dtype)}")
+  if mat2.dtype not in dtypes.fp8s: raise RuntimeError(f"Expected mat2 to be Float8 matrix got {_torch_dtype_name(mat2.dtype)}")
+  if mat1.shape[1] != mat2.shape[0]:
+    raise RuntimeError(f"mat1 and mat2 shapes cannot be multiplied ({mat1.shape[0]}x{mat1.shape[1]} and {mat2.shape[0]}x{mat2.shape[1]})")
+  if mat1.device != mat2.device: raise RuntimeError("Expected mat1 and mat2 to be on the same device")
+  if scale_a.device != mat1.device or scale_b.device != mat1.device:
+    raise RuntimeError("Expected scale_a and scale_b to be on the same device as mat1")
+
+  device = mat1.device[0] if isinstance(mat1.device, tuple) else mat1.device
+  cpu_like = device.split(":")[0] in {"CPU", "PYTHON", "NPY", "DISK", "TINYFS"}
+  if cpu_like and (scale_a.numel() != 1 or scale_b.numel() != 1):
+    raise RuntimeError("Now _scaled_mm only supports per-tensor scaling for CPU backend.")
+  if scale_result is not None and cpu_like and (scale_result.numel() != 1 or scale_result.dtype != dtypes.float):
+    raise RuntimeError("scale_result must be a float scalar")
+
+  acc_dtype = dtypes.float if cpu_like or not use_fast_accum else dtypes.half
+  a = mat1.cast(acc_dtype)
+  b = mat2.cast(acc_dtype)
+  acc = a.matmul(b, dtype=acc_dtype)
+
+  if scale_a.numel() == 1 and scale_b.numel() == 1:
+    scale = scale_a.cast(acc_dtype).reshape(()) * scale_b.cast(acc_dtype).reshape(())
+  else:
+    if scale_a.ndim != 2 or scale_b.ndim != 2:
+      raise RuntimeError(
+        "For non-tensorwise scaling, scale tensors must be 2D, but "
+        f"got scale_a.dim()={scale_a.ndim} and scale_b.dim()={scale_b.ndim}"
+      )
+    if scale_a.shape == (mat1.shape[0], 1) and scale_b.shape == (1, mat2.shape[1]):
+      scale = scale_a.cast(acc_dtype) * scale_b.cast(acc_dtype)
+    else:
+      raise RuntimeError(
+        "Invalid scaling configuration. For tensorwise scaling, both scales should be scalar. "
+        f"For rowwise scaling, scale_a should be ({mat1.shape[0]}, 1), scale_b should be (1, {mat2.shape[1]}). "
+        f"Got scale_a.size()=({scale_a.shape[0]}, {scale_a.shape[1]}) "
+        f"and scale_b.size()=({scale_b.shape[0]}, {scale_b.shape[1]})"
+      )
+
+  out = acc * scale
+
+  if bias is not None:
+    if bias.numel() != mat2.shape[1]:
+      raise RuntimeError(f"Bias must be size {mat2.shape[1]} but got {bias.numel()}")
+    out = out + bias
+
+  # scale_result is ignored to match torch CPU behavior
+  _ = scale_result
+
+  out_dt = to_dtype(out_dtype) if out_dtype is not None else mat1.dtype
+  return out.cast(out_dt)
+
 P = ParamSpec("P")
 T = TypeVar("T")
 
