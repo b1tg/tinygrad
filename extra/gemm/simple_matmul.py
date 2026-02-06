@@ -22,7 +22,7 @@ CNT = getenv("CNT", 10)
 atol, rtol = {dtypes.half:{1e-3, 1e-2}, dtypes.bfloat16:(1e-3, 1e-2), dtypes.fp8e4m3:(1e-1, 1e-1), dtypes.fp8e5m2:(1.0, 5e-1)}.get(dtypes.fp8e5m2 if getenv("FP8_HYBRID") else dtype_in, (1e-4, 3e-2))
 
 if getenv("FP8_HYBRID") == 1: dtype_in_a, dtype_in_b = dtypes.fp8e4m3, dtypes.fp8e5m2
-elif getenv("FP8_HYBRID") == 2: dtype_in_b, dtype_in_b = dtypes.fp8e5m2, dtypes.fp8e4m3
+elif getenv("FP8_HYBRID") == 2: dtype_in_a, dtype_in_b = dtypes.fp8e5m2, dtypes.fp8e4m3
 
 ATOL, RTOL = getenv("ATOL", atol), getenv("RTOL", rtol)
 

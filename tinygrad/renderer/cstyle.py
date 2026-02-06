@@ -439,16 +439,6 @@ class CUDARenderer(CStyleLanguage):
       wmma_dtypes = [self.render_dtype(dtype.vec(size)) for dtype, size in zip([dtype_in_a, dtype_in_b, dtype_out], upcast_sizes)]
       n_operands = [size*dtype.itemsize//4 for dtype, size in zip([dtype_in_a, dtype_in_b, dtype_out], upcast_sizes)] # 4 => CUDA reg size in bytes
       operands = [f"%{i}" for i in range(sum(n_operands))]
-      # print(f"{(dtype_in_a, dtype_in_b)=}")
-      # print(f"{wmma_dtypes=}")
-      # print(f"{n_operands=}")
-# (dtype_in_a, dtype_in_b)=(dtypes.fp8e4m3, dtypes.fp8e4m3)
-# wmma_dtypes=['__nv_fp8_e4m316', '__nv_fp8_e4m38', 'float4']
-# n_operands=[4, 2, 4]
-# ---
-# (dtype_in_a, dtype_in_b)=(dtypes.fp8e4m3, dtypes.fp8e5m2)
-# wmma_dtypes=['__nv_fp8_e4m316', '__nv_fp8_e5m28', 'float4']
-# n_operands=[4, 2, 4]
       # mma operands => {c}, {a}, {b}, {c}
       prefix.append(f"""__device__ {wmma_dtypes[2]} __{name}({wmma_dtypes[0]} a, {wmma_dtypes[1]} b, {wmma_dtypes[2]} c){{
   int *a_pk = (int *)(&a), *b_pk = (int *)(&b), *c_pk = (int *)(&c);
