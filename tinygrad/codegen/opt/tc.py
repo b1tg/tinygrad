@@ -14,7 +14,6 @@ class TensorCore: # D = A * B + C, A is (M x K), B is (K x N), C and D are (M x 
   # (local_swizzle, upcast_swizzle, reduce_swizzle)
   # l<num> is the num axis of the locals, similar for u<num> and upcasts, r<num> and reduces
   swizzle: tuple[tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]], tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]]
-
   @functools.cache  # pylint: disable=method-cache-max-size-none
   def _remaps(self) -> list[dict[str, str]]:
     local_axes, upcast_axes, reduce_axes = len(self.get_local_axes()), len(self.get_upcast_axes()), len(self.get_reduce_axes())
