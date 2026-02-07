@@ -37,10 +37,12 @@ def custom_matmul_backward(gradient: UOp, kernel: UOp, hybrid:bool=False) -> tup
   else:
     grad_quantized, scale = quantize_to_fp8(grad_tensor)
   scale_scalar = scale.reshape(())
-  grad_weight = Tensor.einsum("bso,bsi->oi", grad_quantized, input_tensor, dtype=dtypes.float)
+  with Tensor.no_dtype_promote():
+    grad_weight = Tensor.einsum("bso,bsi->oi", grad_quantized, input_tensor, dtype=dtypes.float)
   grad_weight = grad_weight * scale_scalar
   grad_2d = grad_quantized.reshape(grad_tensor.shape[0] * grad_tensor.shape[1], grad_tensor.shape[-1])
-  grad_input = (grad_2d.dot(weight_tensor, dtype=dtypes.float)).contiguous().reshape(input_tensor.shape) * scale
+  with Tensor.no_dtype_promote():
+    grad_input = (grad_2d.dot(weight_tensor, dtype=dtypes.float)).contiguous().reshape(input_tensor.shape) * scale
   return (None, grad_input.uop, grad_weight.uop)
 
 class FP8Linear:

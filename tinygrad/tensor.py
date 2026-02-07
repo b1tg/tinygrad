@@ -3179,6 +3179,12 @@ class Tensor(OpMixin):
 
   # ***** broadcasted elementwise ops *****
 
+  _NO_DTYPE_PROMOTE: ClassVar[bool] = False
+  class no_dtype_promote(ContextDecorator):
+    """Context manager to disable automatic dtype promotion in binary ops (for mixed-precision tensor cores)."""
+    def __enter__(self): Tensor._NO_DTYPE_PROMOTE, self._prev = True, Tensor._NO_DTYPE_PROMOTE
+    def __exit__(self, *args): Tensor._NO_DTYPE_PROMOTE = self._prev
+
   def _broadcasted(self, y:Tensor|ConstType|UOp, reverse:bool=False, match_dtype:bool=True, backward_cast:bool=True) -> tuple[Tensor, Tensor]:
     x: Tensor = self
     if not isinstance(y, Tensor):
@@ -3189,7 +3195,7 @@ class Tensor(OpMixin):
       if isinstance(y, UOp): y = Tensor.from_uop(y, device=x.device)
       else: y = Tensor(dtypes.as_const(y, y_dtype), x.device, y_dtype, requires_grad=False)
 
-    if match_dtype and x.dtype != y.dtype:
+    if match_dtype and x.dtype != y.dtype and not Tensor._NO_DTYPE_PROMOTE:
       output_dtype = least_upper_dtype(x.dtype, y.dtype)
       x, y = x.cast(output_dtype), y.cast(output_dtype)
 
