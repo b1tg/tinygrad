@@ -233,9 +233,9 @@ class Scheduler:
       in0_dtype = in0.src[0].dtype.scalar() if in0.op is Ops.CAST and in0.src and in0.src[0].dtype.scalar() in dtypes.fp8s else in0.dtype.scalar()
       in1_dtype = in1.src[0].dtype.scalar() if in1.op is Ops.CAST and in1.src and in1.src[0].dtype.scalar() in dtypes.fp8s else in1.dtype.scalar()
       for tc in tensor_cores:
-        if self.ren.device in ("CUDA", "NV") and tc.dtype_a == dtypes.float and not ALLOW_TF32: continue
+        if self.ren.device in ("CUDA", "NV") and tc.dtype_in[0] == dtypes.float and not ALLOW_TF32: continue
         # Match tensor core with input dtypes (supports both homogeneous and mixed-precision)
-        if tc.dtype_a == in0_dtype and tc.dtype_b == in1_dtype and tc.dtype_out == reduceop.dtype.scalar():
+        if tc.dtype_in == (in0_dtype, in1_dtype) and tc.dtype_out == reduceop.dtype.scalar():
           # tensor cores have three ranges. X, Y, and REDUCE
           in0_ranges = sorted([u for u in in0.ranges if u not in in1.ranges], key=lambda x: x.arg[0], reverse=True)
           in1_ranges = sorted([u for u in in1.ranges if u not in in0.ranges], key=lambda x: x.arg[0], reverse=True)
@@ -304,7 +304,7 @@ class Scheduler:
             # TODO: remove tc_upcast_axes from the arg
             # do the reduce_axes always disappear? i think they don't
             # they need to be moved into the WMMA srcs
-            wmma_arg = (str(tc), tc.dims, (tc.dtype_a, tc.dtype_b), tc.dtype_out, self.ren.device, tc.threads, tc_upcast_axes, ()) #, tc_reduce_axes)
+            wmma_arg = (str(tc), tc.dims, tc.dtype_in, tc.dtype_out, self.ren.device, tc.threads, tc_upcast_axes, ()) #, tc_reduce_axes)
             wmma = UOp(Ops.WMMA, dtype=tc.dtype_out.vec(tc.elements_per_thread[2]), src=(
               UOp(Ops.CONTRACT, dtype=srcs[0].dtype.vec(tc.elements_per_thread[0]), src=(srcs[0],), arg=tc_upcast_axes[0], tag=1),
               UOp(Ops.CONTRACT, dtype=srcs[1].dtype.vec(tc.elements_per_thread[1]), src=(srcs[1],), arg=tc_upcast_axes[1], tag=1),

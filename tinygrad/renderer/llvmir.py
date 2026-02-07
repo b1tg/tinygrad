@@ -51,11 +51,10 @@ def render_wmma_amd(ctx, wmma: UOp, cdna=False) -> str:
   dt_map = {dtypes.half: "f16", dtypes.float: "f32", dtypes.ushort: "bf16.1k" if cdna else "bf16", dtypes.bfloat16: "bf16.1k" if cdna else "bf16",
             dtypes.fp8e4m3: ".fp8.fp8", dtypes.fp8e5m2: ".bf8.bf8"}
   # https://github.com/llvm/llvm-project/blob/main/clang/test/CodeGenOpenCL/builtins-amdgcn-mfma.cl
-  N,M,K = wmma.arg[1]
-  dtype_in_a, dtype_in_b = wmma.arg[2]
+  (N, M, K), (dtype_a, dtype_b) = wmma.arg[1], wmma.arg[2]
   if cdna:
     if K == 32: dt_map.update({dtypes.half: ".f16", dtypes.bfloat16: ".bf16"})
-    dtype_in = ".f8f6f4" if dtype_in_a != dtype_in_b else dt_map[dtype_in_a]
+    dtype_in = ".f8f6f4" if dtype_a != dtype_b else dt_map[dtype_a]
     return f"  {ctx[wmma]} = call {ldt(wmma.dtype)} @llvm.amdgcn.mfma.{dt_map[wmma.src[-1].dtype.scalar()]}" + \
            f".{N}x{M}x{K}{dtype_in}(" + ", ".join([f"{ldt(w.dtype)} {ctx[w]}" for w in wmma.src]) + ", i32 0, i32 0, i32 0)"
   # https://github.com/llvm/llvm-project/blob/main/llvm/test/CodeGen/AMDGPU/GlobalISel/llvm.amdgcn.wmma_32.ll

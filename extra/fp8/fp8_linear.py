@@ -1,7 +1,6 @@
 from typing import Callable, Any
 from tinygrad import Tensor, dtypes, nn, UOp
 from tinygrad.uop.ops import KernelInfo, AxisType, Ops
-from tinygrad.helpers import getenv
 
 def quantize_to_fp8(x: Tensor, dtype=dtypes.fp8e4m3):
   fp8_min = -448.0 if dtype == dtypes.fp8e4m3 else -57344.0
@@ -28,12 +27,12 @@ def custom_matmul(output: UOp, inp: UOp, weight: UOp) -> UOp:
   store_op = output.index((seq_idx*OUT+out_idx+batch_idx*OUT*SEQ), ptr=True).store(reduced).end(batch_idx, seq_idx, out_idx)
   return store_op.sink(arg=KernelInfo(name=f"fp8_matmul_{inp.shape}x{weight.shape}"))
 
-def custom_matmul_backward(gradient: UOp, kernel: UOp) -> tuple[UOp, UOp]:
+def custom_matmul_backward(gradient: UOp, kernel: UOp, hybrid:bool=False) -> tuple[UOp, UOp]:
   _, input_uop, weight_uop = kernel.src
   input_tensor = Tensor(input_uop, device=input_uop.device)
   grad_tensor = Tensor(gradient, device=gradient.device)
   weight_tensor = Tensor(weight_uop, device=weight_uop.device)
-  if getenv("FP8_HYBRID"):
+  if hybrid:
     grad_quantized, scale = quantize_to_fp8(grad_tensor, dtype=dtypes.fp8e5m2)
   else:
     grad_quantized, scale = quantize_to_fp8(grad_tensor)
@@ -45,9 +44,10 @@ def custom_matmul_backward(gradient: UOp, kernel: UOp) -> tuple[UOp, UOp]:
   return (None, grad_input.uop, grad_weight.uop)
 
 class FP8Linear:
-  def __init__(self, in_features:int, out_features:int, bias:bool=True):
+  def __init__(self, in_features:int, out_features:int, bias:bool=True, hybrid:bool=False):
     self.weight = Tensor.empty(out_features, in_features, dtype=dtypes.float32)
     self.bias = Tensor.empty(out_features, dtype=dtypes.float32) if bias else None
+    self.hybrid = hybrid
 
   def __call__(self, x: Tensor) -> Tensor:
     original_ndim = len(x.shape)
@@ -60,46 +60,48 @@ class FP8Linear:
       y = Tensor(Tensor.empty((batch//len(GPUS), seq, self.weight.shape[0]), dtype=dtypes.float, device=GPUS).uop.multi(0), device=GPUS)
     else:
       y = Tensor.empty((batch, seq, self.weight.shape[0]), dtype=dtypes.float)
-    y = Tensor.custom_kernel(y, x_fp8, w_fp8, fxn=custom_matmul, grad_fxn=custom_matmul_backward)[0]
+    def backward(grad: UOp, kernel: UOp) -> tuple[UOp, UOp]:
+      return custom_matmul_backward(grad, kernel, hybrid=self.hybrid)
+    y = Tensor.custom_kernel(y, x_fp8, w_fp8, fxn=custom_matmul, grad_fxn=backward)[0]
     y = y * w_scale * x_scale
     if self.bias is not None: y = y + self.bias
     if original_ndim == 2: y = y.reshape(batch, self.weight.shape[0])
     return y.cast(x.dtype)
 
-def _replace_linear(layer: nn.Linear):
-  fp8_linear = FP8Linear(layer.weight.shape[1], layer.weight.shape[0], layer.bias is not None)
+def _replace_linear(layer: nn.Linear, hybrid:bool=False):
+  fp8_linear = FP8Linear(layer.weight.shape[1], layer.weight.shape[0], layer.bias is not None, hybrid=hybrid)
   fp8_linear.weight = layer.weight
   if layer.bias is not None: fp8_linear.bias = layer.bias
   return fp8_linear
 
 def _swap_linear_with_fp8(model, module_filter_fn:Callable[[Any, str],bool]|None=None, fqn:str="", parent:Any|None=None,
-                          attr_name:str="", visited:set|None=None):
+                          attr_name:str="", visited:set|None=None, hybrid:bool=False):
   if visited is None: visited = set()
   if id(model) in visited: return
   visited.add(id(model))
   if isinstance(model, (str, int, float, bool, type(None), Tensor, UOp)): return
   elif isinstance(model, nn.Linear):
     if module_filter_fn is not None and not module_filter_fn(model, fqn): return
-    fp8_linear = _replace_linear(model)
+    fp8_linear = _replace_linear(model, hybrid)
     if parent is not None and attr_name:
       setattr(parent, attr_name, fp8_linear)
   elif isinstance(model, list):
     for i, item in enumerate(model):
       child_fqn = f"{fqn}.{i}" if fqn else str(i)
-      if isinstance(item, nn.Linear) and (module_filter_fn is None or module_filter_fn(item, child_fqn)): model[i] = _replace_linear(item)
-      else: _swap_linear_with_fp8(item, module_filter_fn, child_fqn, None, "", visited)
+      if isinstance(item, nn.Linear) and (module_filter_fn is None or module_filter_fn(item, child_fqn)): model[i] = _replace_linear(item, hybrid)
+      else: _swap_linear_with_fp8(item, module_filter_fn, child_fqn, None, "", visited, hybrid)
   elif isinstance(model, dict):
     for key, item in list(model.items()):
       child_fqn = f"{fqn}.{key}" if fqn else str(key)
-      if isinstance(item, nn.Linear) and (module_filter_fn is None or module_filter_fn(item, child_fqn)): model[key] = _replace_linear(item)
-      else: _swap_linear_with_fp8(item, module_filter_fn, child_fqn, None, "", visited)
+      if isinstance(item, nn.Linear) and (module_filter_fn is None or module_filter_fn(item, child_fqn)): model[key] = _replace_linear(item, hybrid)
+      else: _swap_linear_with_fp8(item, module_filter_fn, child_fqn, None, "", visited, hybrid)
   elif hasattr(model, "__dict__"):
     for attr_key in list(vars(model).keys()):
       try: attr = getattr(model, attr_key)
       except Exception: continue
       child_fqn = f"{fqn}.{attr_key}" if fqn else attr_key
-      _swap_linear_with_fp8(attr, module_filter_fn, child_fqn, model, attr_key, visited)
+      _swap_linear_with_fp8(attr, module_filter_fn, child_fqn, model, attr_key, visited, hybrid)
 
-def convert_to_float8_training(model, module_filter_fn:Callable[[Any,str],bool]|None=None):
-  _swap_linear_with_fp8(model, module_filter_fn, "", None, "")
+def convert_to_float8_training(model, module_filter_fn:Callable[[Any,str],bool]|None=None, hybrid:bool=False):
+  _swap_linear_with_fp8(model, module_filter_fn, "", None, "", hybrid=hybrid)
   return model
