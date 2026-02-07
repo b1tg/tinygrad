@@ -69,7 +69,7 @@ def mem_type(x:UOp) -> str:
 
 def render_wmma(ctx: "PTXRenderer", wmma: UOp):
   assert ctx.wmma_r, "registry values for wmma must be populated"
-  (N, M, K), dtype_in, dtype_out = wmma.arg[1], wmma.arg[2], wmma.arg[3]
+  (N, M, K), (dtype_a, dtype_b), dtype_out = wmma.arg[1], wmma.arg[2], wmma.arg[3]
 
   for src, regs in zip(wmma.src, ctx.wmma_r):
     for i, reg in enumerate(regs): # pack input and acc registers
@@ -77,8 +77,7 @@ def render_wmma(ctx: "PTXRenderer", wmma: UOp):
       else: yield f"mov.b32 {reg}, {{{', '.join(ctx.r[src][i * elems_per_reg : (i+1) * elems_per_reg])}}};"
 
   dt_map_in, dt_map_out = {dtypes.float: "tf32", dtypes.half: "f16"}, {dtypes.float: "f32", dtypes.half: "f16"}
-  yield f'mma.sync.aligned.m{M}n{N}k{K}.row.col.{dt_map_out[dtype_out]}.{dt_map_in[dtype_in[0]]}.{dt_map_in[dtype_in[1]]}' + \
-        f'.{dt_map_out[dtype_out]}{" "*12}'+\
+  yield f'mma.sync.aligned.m{M}n{N}k{K}.row.col.{dt_map_out[dtype_out]}.{dt_map_in[dtype_a]}.{dt_map_in[dtype_b]}.{dt_map_out[dtype_out]}{" "*12}'+\
         f'{{{", ".join(ctx.wmma_r[2])}}}, {{{", ".join(ctx.wmma_r[0])}}}, {{{", ".join(ctx.wmma_r[1])}}}, {{{", ".join(ctx.wmma_r[2])}}};'
 
   for i, reg in enumerate(ctx.wmma_r[2]): # unpack acc registers

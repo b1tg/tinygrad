@@ -13,16 +13,17 @@ if getenv("UINT"): dtype_in, acc_dtype = dtypes.uint8, dtypes.int32
 
 dtype_in_a = dtype_in
 dtype_in_b = dtype_in
+fp8_hybrid = getenv("FP8_HYBRID", 0)
 
 N = getenv("N", 4096)
 M = getenv("M", N)
 K = getenv("K", N)
 CNT = getenv("CNT", 10)
 
-atol, rtol = {dtypes.half:{1e-3, 1e-2}, dtypes.bfloat16:(1e-3, 1e-2), dtypes.fp8e4m3:(1e-1, 1e-1), dtypes.fp8e5m2:(1.0, 5e-1)}.get(dtypes.fp8e5m2 if getenv("FP8_HYBRID") else dtype_in, (1e-4, 3e-2))
-
-if getenv("FP8_HYBRID") == 1: dtype_in_a, dtype_in_b = dtypes.fp8e4m3, dtypes.fp8e5m2
-elif getenv("FP8_HYBRID") == 2: dtype_in_a, dtype_in_b = dtypes.fp8e5m2, dtypes.fp8e4m3
+atol, rtol = {dtypes.half:{1e-3, 1e-2}, dtypes.bfloat16:(1e-3, 1e-2), dtypes.fp8e4m3:(1e-1, 1e-1),
+              dtypes.fp8e5m2:(1.0, 5e-1)}.get(dtypes.fp8e5m2 if fp8_hybrid else dtype_in, (1e-4, 3e-2))
+if fp8_hybrid == 1: dtype_in_a, dtype_in_b = dtypes.fp8e4m3, dtypes.fp8e5m2
+elif fp8_hybrid == 2: dtype_in_a, dtype_in_b = dtypes.fp8e5m2, dtypes.fp8e4m3
 
 ATOL, RTOL = getenv("ATOL", atol), getenv("RTOL", rtol)
 
@@ -45,8 +46,6 @@ if __name__ == "__main__":
       a, b = init_matrix(M, K, dtype_in_a), init_matrix(K, N, dtype_in_b)
     c = a.matmul(b, dtype=acc_dtype).realize()
 
-  print(f"{a.dtype=}, {b.dtype=}, {c.dtype=}, {acc_dtype=}")
-
   if getenv("SHOULD_USE_TC"):
     sched = a.matmul(b, dtype=acc_dtype).schedule()
     ei = get_single_element(sched)
@@ -55,8 +54,6 @@ if __name__ == "__main__":
 
   ref = a.numpy().astype(np.float32) @ b.numpy().astype(np.float32)
   res = c.numpy()
-  print("ref: ", ref)
-  print("res: ", res)
   try:
     np.testing.assert_allclose(res, ref, rtol=RTOL, atol=ATOL)
   except AssertionError as e:

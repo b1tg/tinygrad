@@ -287,7 +287,6 @@ class Scheduler:
             tne = [x.replace(tag=1) for x in ne]
             ret = reduceop.substitute(dict(zip(ne, tne)))
             srcs = list((ret.src[0] if ret.src[0].op is not Ops.CAST else ret.src[0].src[0]).src)
-            # for FP8, strip CAST and use original FP8 sources
             srcs = [s.src[0] if s.op is Ops.CAST and s.src and s.src[0].dtype.scalar() in dtypes.fp8s else s for s in srcs]
             srcs = [x.substitute(dict(zip(tne, [ne[i] for i in argsort(p)]))) for x,p in zip(srcs, tc.permutes_for_shape_str(tc.base_shape_str()))]
 

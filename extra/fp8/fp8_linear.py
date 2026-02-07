@@ -68,7 +68,7 @@ class FP8Linear:
     if original_ndim == 2: y = y.reshape(batch, self.weight.shape[0])
     return y.cast(x.dtype)
 
-def _replace_linear(layer: nn.Linear, hybrid:bool=False):
+def _replace_linear(layer: nn.Linear, hybrid: bool=False):
   fp8_linear = FP8Linear(layer.weight.shape[1], layer.weight.shape[0], layer.bias is not None, hybrid=hybrid)
   fp8_linear.weight = layer.weight
   if layer.bias is not None: fp8_linear.bias = layer.bias
