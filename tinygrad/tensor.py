@@ -3379,8 +3379,8 @@ class Tensor(OpMixin):
     """
     if isinstance(x, Tensor): x, y = x._broadcasted(y)
     elif isinstance(y, Tensor): y, x = y._broadcasted(x)
-    cond, x = self._broadcasted(x, match_dtype=False)
-    cond, y = cond._broadcasted(y, match_dtype=False)
+    cond, x = self._broadcasted(x, match_dtype=False, backward_cast=False)
+    cond, y = cond._broadcasted(y, match_dtype=False, backward_cast=False)
     return cond.cast(dtypes.bool)._apply_uop(UOp.where, *x._broadcasted(y))
 
   def copysign(self, other) -> Tensor:
