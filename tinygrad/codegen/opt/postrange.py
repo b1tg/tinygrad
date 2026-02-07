@@ -229,12 +229,10 @@ class Scheduler:
         tensor_cores = self.ren.tensor_cores if tc_select == -1 else [self.ren.tensor_cores[tc_select]]
       except IndexError:
         raise KernelOptError(f"invalid tensor core choice {tc_select}")
-      # look through one layer of CAST to get original dtype (for FP8 only)
-      in0_dtype = in0.src[0].dtype.scalar() if in0.op is Ops.CAST and in0.src and in0.src[0].dtype.scalar() in dtypes.fp8s else in0.dtype.scalar()
-      in1_dtype = in1.src[0].dtype.scalar() if in1.op is Ops.CAST and in1.src and in1.src[0].dtype.scalar() in dtypes.fp8s else in1.dtype.scalar()
+      in0_dtype = in0.src[0].dtype.scalar() if in0.op is Ops.CAST else in0.dtype.scalar()
+      in1_dtype = in1.src[0].dtype.scalar() if in1.op is Ops.CAST else in1.dtype.scalar()
       for tc in tensor_cores:
         if self.ren.device in ("CUDA", "NV") and tc.dtype_in[0] == dtypes.float and not ALLOW_TF32: continue
-        # Match tensor core with input dtypes (supports both homogeneous and mixed-precision)
         if tc.dtype_in == (in0_dtype, in1_dtype) and tc.dtype_out == reduceop.dtype.scalar():
           # tensor cores have three ranges. X, Y, and REDUCE
           in0_ranges = sorted([u for u in in0.ranges if u not in in1.ranges], key=lambda x: x.arg[0], reverse=True)
@@ -287,7 +285,7 @@ class Scheduler:
             tne = [x.replace(tag=1) for x in ne]
             ret = reduceop.substitute(dict(zip(ne, tne)))
             srcs = list((ret.src[0] if ret.src[0].op is not Ops.CAST else ret.src[0].src[0]).src)
-            srcs = [s.src[0] if s.op is Ops.CAST and s.src and s.src[0].dtype.scalar() in dtypes.fp8s else s for s in srcs]
+            srcs = [s.src[0] if s.op is Ops.CAST and s.src[0].dtype.scalar() == dt else s for s, dt in zip(srcs, tc.dtype_in)]
             srcs = [x.substitute(dict(zip(tne, [ne[i] for i in argsort(p)]))) for x,p in zip(srcs, tc.permutes_for_shape_str(tc.base_shape_str()))]
 
             # get reduce/upcast axes for the tensor cores
