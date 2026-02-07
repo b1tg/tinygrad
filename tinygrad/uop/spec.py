@@ -139,6 +139,9 @@ _tensor_spec = PatternMatcher([
   # allow CALL/PARAM
   (UPat(Ops.CALL, src=(UPat(name="f"),), name="c", allow_any_len=True), lambda c,f: c.dtype == f.dtype),
   (UPat(Ops.PARAM), lambda: True),
+
+  # allow MUL with mixed fp8 types for mixed-precision tensor cores
+  (UPat(Ops.MUL, name="x"), lambda x: True if all(dtypes.is_float(y.dtype) and y.dtype.scalar().itemsize == 1 for y in x.src) else None),
 ])+movement_ops+shared_spec
 
 tensor_spec = PatternMatcher([
@@ -202,6 +205,9 @@ kernel_spec = PatternMatcher([
 
   # reduce must be on ranges
   (UPat(Ops.REDUCE, src=(UPat(),), allow_any_len=True, name="x"), lambda x: all(y.dtype in (dtypes.index, dtypes.int) for y in x.src[1:])),
+
+  # allow MUL with mixed fp8 types for mixed-precision tensor cores
+  (UPat(Ops.MUL, name="x"), lambda x: True if all(dtypes.is_float(y.dtype) and y.dtype.scalar().itemsize == 1 for y in x.src) else None),
 ])+movement_ops+shared_codegen_spec+shared_spec
 
 # ***** UOp spec in linearized programs *****

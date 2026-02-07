@@ -14,8 +14,8 @@ class TestFP8Linear(unittest.TestCase):
   def setUp(self):
     Tensor.manual_seed(42)
 
-  def _test_forward(self, shape, in_features, out_features):
-    fp8_layer = FP8Linear(in_features, out_features)
+  def _test_forward(self, shape, in_features, out_features, hybrid=False):
+    fp8_layer = FP8Linear(in_features, out_features, hybrid=hybrid)
     normal_layer = Linear(in_features, out_features)
     weight = Tensor.randn(out_features, in_features, dtype=dtypes.float32)  * 0.2
     bias = Tensor.randn(out_features, dtype=dtypes.float32)  * 0.2
@@ -27,8 +27,8 @@ class TestFP8Linear(unittest.TestCase):
     y_fp8, y_normal = fp8_layer(x), normal_layer(x)
     np.testing.assert_allclose(y_fp8.numpy(), y_normal.numpy(), rtol=0.1, atol=0.1)
 
-  def _test_backward(self, shape, in_features, out_features):
-    fp8_layer = FP8Linear(in_features, out_features)
+  def _test_backward(self, shape, in_features, out_features, hybrid=False):
+    fp8_layer = FP8Linear(in_features, out_features, hybrid=hybrid)
     normal_layer = Linear(in_features, out_features)
     weight = Tensor.randn(out_features, in_features, dtype=dtypes.float32) * 0.2
     bias = Tensor.randn(out_features, dtype=dtypes.float32) * 0.2
@@ -47,6 +47,12 @@ class TestFP8Linear(unittest.TestCase):
 
   def test_backward_2d(self): self._test_backward((BS, in_dim), in_dim, out_dim)
   def test_backward_3d(self): self._test_backward((BS, T, in_dim), in_dim, out_dim)
+
+  def test_hybrid_forward_2d(self): self._test_forward((BS, in_dim), in_dim, out_dim, hybrid=True)
+  def test_hybrid_forward_3d(self): self._test_forward((BS, T, in_dim), in_dim, out_dim, hybrid=True)
+
+  def test_hybrid_backward_2d(self): self._test_backward((BS, in_dim), in_dim, out_dim, hybrid=True)
+  def test_hybrid_backward_3d(self): self._test_backward((BS, T, in_dim), in_dim, out_dim, hybrid=True)
 
   def test_filter(self):
     class Model:

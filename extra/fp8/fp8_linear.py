@@ -14,7 +14,7 @@ def quantize_to_fp8(x: Tensor, dtype=dtypes.fp8e4m3):
   res = x_clamped_ste.cast(dtype)
   return res, scale.float().reciprocal()
 
-def custom_matmul(output: UOp, inp: UOp, weight: UOp) -> UOp:
+def _scaled_mm_kernel(output: UOp, inp: UOp, weight: UOp) -> UOp:
   SEQ = inp.shape[1]
   OUT = weight.shape[0]
   IN = weight.shape[-1]
@@ -25,25 +25,63 @@ def custom_matmul(output: UOp, inp: UOp, weight: UOp) -> UOp:
   product = (inp.index((seq_idx*IN+reduce_idx+batch_idx*IN*SEQ)) * weight.index((out_idx*IN+reduce_idx))).cast(dtypes.float)
   reduced = product.reduce(reduce_idx, arg=Ops.ADD)
   store_op = output.index((seq_idx*OUT+out_idx+batch_idx*OUT*SEQ), ptr=True).store(reduced).end(batch_idx, seq_idx, out_idx)
-  return store_op.sink(arg=KernelInfo(name=f"fp8_matmul_{inp.shape}x{weight.shape}"))
+  return store_op.sink(arg=KernelInfo(name=f"scaled_mm_{inp.shape}x{weight.shape}"))
 
-def custom_matmul_backward(gradient: UOp, kernel: UOp, hybrid:bool=False) -> tuple[UOp, UOp]:
+def _scaled_mm_backward(gradient: UOp, kernel: UOp, grad_dtype) -> tuple:
   _, input_uop, weight_uop = kernel.src
   input_tensor = Tensor(input_uop, device=input_uop.device)
   grad_tensor = Tensor(gradient, device=gradient.device)
   weight_tensor = Tensor(weight_uop, device=weight_uop.device)
-  if hybrid:
-    grad_quantized, scale = quantize_to_fp8(grad_tensor, dtype=dtypes.fp8e5m2)
-  else:
-    grad_quantized, scale = quantize_to_fp8(grad_tensor)
-  scale_scalar = scale.reshape(())
-  with Tensor.no_dtype_promote():
-    grad_weight = Tensor.einsum("bso,bsi->oi", grad_quantized, input_tensor, dtype=dtypes.float)
-  grad_weight = grad_weight * scale_scalar
-  grad_2d = grad_quantized.reshape(grad_tensor.shape[0] * grad_tensor.shape[1], grad_tensor.shape[-1])
-  with Tensor.no_dtype_promote():
-    grad_input = (grad_2d.dot(weight_tensor, dtype=dtypes.float)).contiguous().reshape(input_tensor.shape) * scale
+  grad_fp8, grad_scale = quantize_to_fp8(grad_tensor, dtype=grad_dtype)
+  grad_scale_scalar = grad_scale.reshape(())
+  bs = grad_tensor.shape[0] * grad_tensor.shape[1]
+  grad_2d = grad_fp8.reshape(bs, grad_tensor.shape[-1])
+  input_2d = input_tensor.reshape(bs, input_tensor.shape[-1])
+  # grad_weight: (O, B*S) @ (B*S, I) = (O, I)
+  grad_weight = _scaled_mm(grad_2d.T, input_2d.T, grad_scale_scalar)
+  # grad_input: (B*S, O) @ (O, I) = (B*S, I)
+  grad_input = _scaled_mm(grad_2d, weight_tensor.T, grad_scale_scalar).contiguous().reshape(input_tensor.shape)
   return (None, grad_input.uop, grad_weight.uop)
+
+def _scaled_mm(a: Tensor, b: Tensor, scale_a: Tensor|float=1.0, scale_b: Tensor|float=1.0,
+               out_dtype=dtypes.float, grad_dtype=None) -> Tensor:
+  """Scaled FP8 matrix multiply: (a @ b^T) * scale_a * scale_b with accumulation in out_dtype.
+
+  Args:
+    a: FP8 tensor of shape (*, K)
+    b: FP8 tensor of shape (N, K) — weight in standard (out_features, in_features) layout
+    scale_a, scale_b: scale factors for a and b
+    out_dtype: accumulation/output dtype (default: float32)
+    grad_dtype: if set, quantize gradients to this FP8 dtype in backward for tensor core usage
+  """
+  if grad_dtype is None:
+    # replicate dot() reshape logic for a @ b^T
+    x, w = a, b.T
+    dx, dw = x.ndim, w.ndim
+    if x.shape[-1] != w.shape[axis_w:=-min(w.ndim, 2)]: raise RuntimeError(f"cannot dot {x.shape} and {w.shape}")
+    x = x.reshape(*x.shape[0:-1], *[1]*min(dx-1, dw-1, 1), x.shape[-1])
+    w = w.reshape(*w.shape[0:-2], *[1]*min(dx-1, dw-1, 1), *w.shape[axis_w:]).transpose(-1, axis_w)
+    # multiply without dtype promotion (critical for FP8 tensor cores)
+    lhs, rhs = x._broadcasted(w, match_dtype=False, backward_cast=False)
+    result = lhs._apply_uop(lambda a, b: a.alu(Ops.MUL, b), rhs)
+    return result.sum(-1, dtype=out_dtype).cast(out_dtype) * scale_a * scale_b
+  # custom backward path: ensure 3D for UOp kernel
+  original_shape = a.shape
+  original_ndim = len(a.shape)
+  if original_ndim == 2: a = a.reshape(a.shape[0], 1, a.shape[1])
+  batch, seq, in_feat = a.shape
+  out_feat = b.shape[0]
+  GPUS = b.device
+  if isinstance(GPUS, tuple) and len(GPUS) > 1:
+    y = Tensor(Tensor.empty((batch//len(GPUS), seq, out_feat), dtype=out_dtype, device=GPUS).uop.multi(0), device=GPUS)
+  else:
+    y = Tensor.empty((batch, seq, out_feat), dtype=out_dtype)
+  def backward(gradient: UOp, kernel: UOp) -> tuple:
+    return _scaled_mm_backward(gradient, kernel, grad_dtype)
+  y = Tensor.custom_kernel(y, a, b, fxn=_scaled_mm_kernel, grad_fxn=backward)[0]
+  y = y * scale_a * scale_b
+  if original_ndim == 2: y = y.reshape(original_shape[0], out_feat)
+  return y
 
 class FP8Linear:
   def __init__(self, in_features:int, out_features:int, bias:bool=True, hybrid:bool=False):
@@ -52,22 +90,11 @@ class FP8Linear:
     self.hybrid = hybrid
 
   def __call__(self, x: Tensor) -> Tensor:
-    original_ndim = len(x.shape)
-    if original_ndim == 2: x = x.reshape(x.shape[0], 1, x.shape[1])
-    batch, seq, _ = x.shape
     w_fp8, w_scale = quantize_to_fp8(self.weight)
     x_fp8, x_scale = quantize_to_fp8(x)
-    GPUS = self.weight.device
-    if isinstance(GPUS, tuple) and len(GPUS) > 1:
-      y = Tensor(Tensor.empty((batch//len(GPUS), seq, self.weight.shape[0]), dtype=dtypes.float, device=GPUS).uop.multi(0), device=GPUS)
-    else:
-      y = Tensor.empty((batch, seq, self.weight.shape[0]), dtype=dtypes.float)
-    def backward(grad: UOp, kernel: UOp) -> tuple[UOp, UOp]:
-      return custom_matmul_backward(grad, kernel, hybrid=self.hybrid)
-    y = Tensor.custom_kernel(y, x_fp8, w_fp8, fxn=custom_matmul, grad_fxn=backward)[0]
-    y = y * w_scale * x_scale
+    grad_dtype = dtypes.fp8e5m2 if self.hybrid else dtypes.fp8e4m3
+    y = _scaled_mm(x_fp8, w_fp8, x_scale, w_scale, grad_dtype=grad_dtype)
     if self.bias is not None: y = y + self.bias
-    if original_ndim == 2: y = y.reshape(batch, self.weight.shape[0])
     return y.cast(x.dtype)
 
 def _replace_linear(layer: nn.Linear, hybrid: bool=False):
