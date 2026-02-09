@@ -27,6 +27,14 @@ def _scaled_mm_kernel(output: UOp, inp: UOp, weight: UOp) -> UOp:
   store_op = output.index((seq_idx*OUT+out_idx+batch_idx*OUT*SEQ), ptr=True).store(reduced).end(batch_idx, seq_idx, out_idx)
   return store_op.sink(arg=KernelInfo(name=f"scaled_mm_{inp.shape}x{weight.shape}"))
 
+def _fp8_matmul(x: Tensor, w: Tensor, dtype=dtypes.float) -> Tensor:
+  """x @ w without fp8 type promotion, accumulating in dtype. Preserves mixed fp8 types for TC."""
+  dx, dw = x.ndim, w.ndim
+  x = x.reshape(*x.shape[0:-1], *[1]*min(dx-1, dw-1, 1), x.shape[-1])
+  w = w.reshape(*w.shape[0:-2], *[1]*min(dx-1, dw-1, 1), *w.shape[-min(w.ndim, 2):]).transpose(-1, -min(w.ndim, 2))
+  lhs, rhs = x._broadcasted(w, match_dtype=False, backward_cast=False)
+  return lhs._apply_uop(lambda a, b: a.alu(Ops.MUL, b), rhs).sum(-1, dtype=dtype).cast(dtype)
+
 def _scaled_mm_backward(gradient: UOp, kernel: UOp, grad_dtype) -> tuple:
   _, input_uop, weight_uop = kernel.src
   input_tensor = Tensor(input_uop, device=input_uop.device)
@@ -37,10 +45,8 @@ def _scaled_mm_backward(gradient: UOp, kernel: UOp, grad_dtype) -> tuple:
   bs = grad_tensor.shape[0] * grad_tensor.shape[1]
   grad_2d = grad_fp8.reshape(bs, grad_tensor.shape[-1])
   input_2d = input_tensor.reshape(bs, input_tensor.shape[-1])
-  # grad_weight: (O, B*S) @ (B*S, I) = (O, I)
-  grad_weight = _scaled_mm(grad_2d.T, input_2d.T, grad_scale_scalar)
-  # grad_input: (B*S, O) @ (O, I) = (B*S, I)
-  grad_input = _scaled_mm(grad_2d, weight_tensor.T, grad_scale_scalar).contiguous().reshape(input_tensor.shape)
+  grad_input = _fp8_matmul(grad_2d.contiguous(), weight_tensor).contiguous().reshape(input_tensor.shape) * grad_scale
+  grad_weight = _fp8_matmul(grad_2d.contiguous().T, input_2d.contiguous()) * grad_scale_scalar
   return (None, grad_input.uop, grad_weight.uop)
 
 def _scaled_mm(a: Tensor, b: Tensor, scale_a: Tensor|float=1.0, scale_b: Tensor|float=1.0,
