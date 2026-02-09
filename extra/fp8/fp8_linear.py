@@ -36,7 +36,7 @@ def _fp8_matmul(x: Tensor, w: Tensor, dtype=dtypes.float) -> Tensor:
   return lhs._apply_uop(lambda a, b: a.alu(Ops.MUL, b), rhs).sum(-1, dtype=dtype).cast(dtype)
 
 def _scaled_mm_backward(gradient: UOp, kernel: UOp, grad_dtype) -> tuple:
-  _, input_uop, weight_uop = kernel.src
+  _, input_uop, weight_uop = kernel.src[1:]
   input_tensor = Tensor(input_uop, device=input_uop.device)
   grad_tensor = Tensor(gradient, device=gradient.device)
   weight_tensor = Tensor(weight_uop, device=weight_uop.device)
