@@ -213,6 +213,26 @@ class dtypes:
 
   fp8s = (fp8e4m3, fp8e5m2, fp8e4m3fnuz, fp8e5m2fnuz)
   floats = fp8s + (float16, bfloat16, float32, float64)
+
+  @staticmethod
+  def fp8e4m3_hw() -> DType:
+    from tinygrad import Device
+    if Device.DEFAULT == "AMD":
+      target = getattr(Device["AMD"], "target", None)
+      if target == (9, 4, 2): return dtypes.fp8e4m3fnuz
+      if target == (9, 5, 0): return dtypes.fp8e4m3
+    if Device.DEFAULT in ("CUDA", "NV"): return dtypes.fp8e4m3
+    return dtypes.fp8e4m3fnuz
+
+  @staticmethod
+  def fp8e5m2_hw() -> DType:
+    from tinygrad import Device
+    if Device.DEFAULT == "AMD":
+      target = getattr(Device["AMD"], "target", None)
+      if target == (9, 4, 2): return dtypes.fp8e5m2fnuz
+      if target == (9, 5, 0): return dtypes.fp8e5m2
+    if Device.DEFAULT in ("CUDA", "NV"): return dtypes.fp8e5m2
+    return dtypes.fp8e5m2fnuz
   int8s = (uint8, int8)
   int16s = (uint16, int16)
   int32s = (uint32, int32)

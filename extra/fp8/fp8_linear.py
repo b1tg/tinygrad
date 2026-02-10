@@ -2,14 +2,14 @@ from typing import Callable, Any
 from tinygrad import Tensor, dtypes, nn, UOp
 from tinygrad.uop.ops import KernelInfo, AxisType, Ops
 
-def quantize_to_fp8(x: Tensor, dtype=dtypes.fp8e4m3):
-  fp8_min = -448.0 if dtype == dtypes.fp8e4m3 else -57344.0
-  fp8_max = 448.0 if dtype == dtypes.fp8e4m3 else 57344.0
+def quantize_to_fp8(x: Tensor, dtype=None):
+  if dtype is None: dtype = dtypes.fp8e4m3_hw()
+  fp8_max = {dtypes.fp8e4m3: 448.0, dtypes.fp8e4m3fnuz: 240.0, dtypes.fp8e5m2: 57344.0, dtypes.fp8e5m2fnuz: 57344.0}[dtype]
   x_abs_max = x.abs().max().detach()
   scale = fp8_max / (x_abs_max + 1e-8)
   x_scaled = x * scale
   x_det = x_scaled.detach()
-  x_clamped = x_det.clamp(fp8_min, fp8_max)
+  x_clamped = x_det.clamp(-fp8_max, fp8_max)
   x_clamped_ste = x_scaled + (x_clamped - x_det)
   res = x_clamped_ste.cast(dtype)
   return res, scale.float().reciprocal()
