@@ -302,7 +302,7 @@ def float_to_fp8(x: float, dtype: DType) -> int:
   hulp, sign, exp, mant, absx = 1<<(52-sb), ((xb>>63)&1)<<7, ((xb>>52)&0x7FF)-1023+bias, (xb>>(53-sb))&mm, xb&0x7FFFFFFFFFFFFFFF
   if absx <= md: res = 0
   elif absx > 0x7FF0000000000000: res = 0x7F if dtype == dtypes.fp8e4m3 else 0x7E | mant
-  elif absx > ovf: res = mx
+  elif absx > ovf: res = 0x80 if dtype == dtypes.fp8e4m3fnuz else mx
   elif absx >= mn:
     res, rb = (exp<<(sb-1))|mant, xb&((hulp<<1)-1)
     if rb > hulp or (rb == hulp and mant & 1): res += 1

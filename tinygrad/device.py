@@ -352,10 +352,12 @@ def is_dtype_supported(dtype:DType, device:str|None=None) -> bool:
     if device in {"CPU"}: return not CI and platform.machine() in {"arm", "arm64", "aarch64", "x86_64", "amd64"} and not CPU_LVP
     return device in {"AMD", "CL", "PYTHON", "NULL"}
   if dtype in dtypes.fp8s:
-    if dtype in (dtypes.fp8e4m3fnuz, dtypes.fp8e5m2fnuz): return device in {"PYTHON", "NULL"}
     if device == "CUDA": return not CI and not CUDA_PTX
     if device == "NV": return not CI and not NV_PTX and not NV_NAK
-    if device == "AMD": return not CI and getattr(Device["AMD"], "target") in {(9,4,2), (9,5,0)}
+    if device == "AMD":
+      return not CI and dtype in {(9,4,2): (dtypes.fp8e4m3fnuz, dtypes.fp8e5m2fnuz),
+        (9,5,0): (dtypes.fp8e4m3, dtypes.fp8e5m2)}.get(getattr(Device["AMD"], "target"), tuple())
+    if dtype in (dtypes.fp8e4m3fnuz, dtypes.fp8e5m2fnuz): return device in {"PYTHON", "NULL"}
     return device in {"PYTHON", "NULL"}
   if device == "WEBGPU": return dtype in [dtypes.bool, dtypes.char, dtypes.uchar, dtypes.short,
                                           dtypes.ushort, dtypes.float, dtypes.int32, dtypes.uint32, dtypes.half]
