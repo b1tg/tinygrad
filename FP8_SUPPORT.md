@@ -69,6 +69,39 @@ supported_dtypes = {
 
 ### Supported Types by Backend
 
+#### NVIDIA RTX 4090 (sm_89, CUDA=1)
+
+Tested on: 5x NVIDIA GeForce RTX 4090, CUDA Driver 12.8, NVRTC 12.8
+
+Only supports standard variants via `cuda_fp8.h` (`__nv_fp8_e4m3`, `__nv_fp8_e5m2`):
+- ✅ fp8e4m3
+- ✅ fp8e5m2
+- ❌ fp8e4m3fnuz (NVRTC CompileError: `float8_e4m3fnuz` undefined)
+- ❌ fp8e5m2fnuz (NVRTC CompileError: `float8_e5m2fnuz` undefined)
+
+| Feature | fp8e4m3 | fp8e5m2 | fp8e4m3fnuz | fp8e5m2fnuz |
+|---------|---------|---------|-------------|-------------|
+| Cast float32 -> fp8 | ✅ | ✅ | ❌ | ❌ |
+| Cast fp8 -> float32 | ✅ | ✅ | ❌ | ❌ |
+| Cast fp8 -> float16 | ✅ | ✅ | ❌ | ❌ |
+| Cast fp8 -> bfloat16 | ✅ | ✅ | ❌ | ❌ |
+| Element-wise ops (+, *) | ✅ | ✅ | ❌ | ❌ |
+| Matmul (fp8 @ fp8) | ✅ | ✅ | ❌ | ❌ |
+| Tensor Core (WMMA) | ✅ (m16n8k32) | ✅ | ❌ | ❌ |
+| FP8 Linear (extra/) | ✅ (6/6 pass) | ✅ | ❌ | ❌ |
+
+**Tensor Core Details**: FP8 matmul uses WMMA instructions on sm_89 (Ada Lovelace):
+- Instruction: `mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32`
+- TC config: `cuda_81632_f8` (8x16x32 tile, FP8 inputs, FP32 accumulator)
+- Automatically selected for matrices >= 64x64
+
+**Matmul Accuracy** (32x32, inputs scaled by 0.1):
+
+| Type | Max Abs Error | Mean Abs Error | Mean Rel Error |
+|------|---------------|----------------|----------------|
+| fp8e4m3 | 0.019 | 0.002 | 0.35 |
+| fp8e5m2 | 0.021 | 0.004 | 0.48 |
+
 #### AMD gfx942 (MI300)
 Only supports FNUZ variants:
 - ✅ fp8e4m3fnuz
@@ -94,80 +127,80 @@ Software emulation using `float_to_fp8()` and `fp8_to_float()` functions in `tin
 
 ## Boundary Value Behavior
 
-### FP8E4M3 (Standard) - NOT on gfx942
+### FP8E4M3 (Standard)
 
-| Value | PyTorch | TinyGrad PYTHON=1 | AMD gfx942 |
-|-------|---------|-------------------|------------|
-| 0.0 | 0.0 (0x00) | 0.0 (0x00) | N/A |
-| 1.0 | 1.0 (0x38) | 1.0 (0x38) | N/A |
-| 448.0 (max) | 448.0 (0x7e) | 448.0 (0x7e) | N/A |
-| 449.0 (overflow) | 448.0 (0x7e) | 448.0 (0x7e) | N/A |
-| 464.0 (threshold) | 448.0 (0x7e) | 448.0 (0x7e) | N/A |
-| > 464.0 (large overflow) | **NaN** (0x7f) | 448.0 (0x7e) | N/A |
-| inf | NaN (0x7f) | NaN (0x7f) | N/A |
-| nan | NaN (0x7f) | NaN (0x7f) | N/A |
+| Value | PyTorch | TinyGrad PYTHON=1 | CUDA (RTX 4090) | AMD gfx942 |
+|-------|---------|-------------------|-----------------|------------|
+| 0.0 | 0.0 (0x00) | 0.0 (0x00) | 0.0 (0x00) | N/A |
+| 1.0 | 1.0 (0x38) | 1.0 (0x38) | 1.0 (0x38) | N/A |
+| 448.0 (max) | 448.0 (0x7e) | 448.0 (0x7e) | 448.0 (0x7e) | N/A |
+| 449.0 (overflow) | 448.0 (0x7e) | 448.0 (0x7e) | 448.0 (0x7e) | N/A |
+| 464.0 (threshold) | 448.0 (0x7e) | 448.0 (0x7e) | 448.0 (0x7e) | N/A |
+| 500.0 (large overflow) | **NaN** (0x7f) | 448.0 (0x7e) | **448.0** (0x7e) | N/A |
+| inf | NaN (0x7f) | NaN (0x7f) | **448.0** (0x7e) | N/A |
+| nan | NaN (0x7f) | NaN (0x7f) | NaN (0x7f) | N/A |
 
-**Overflow Threshold**: 464.0 (3.6% above max)
+**Key difference**: CUDA saturates `inf` to max (448.0, 0x7e), while PYTHON=1 encodes it as NaN (0x7f). PyTorch also encodes it as NaN (0x7f).
 
-### FP8E5M2 (Standard) - NOT on gfx942
+### FP8E5M2 (Standard)
 
-| Value | PyTorch | TinyGrad PYTHON=1 | AMD gfx942 |
-|-------|---------|-------------------|------------|
-| 0.0 | 0.0 (0x00) | 0.0 (0x00) | N/A |
-| 1.0 | 1.0 (0x3c) | 1.0 (0x3c) | N/A |
-| 57344.0 (max) | 57344.0 (0x7b) | 57344.0 (0x7b) | N/A |
-| 60000.0 (overflow) | 57344.0 (0x7b) | 57344.0 (0x7b) | N/A |
-| 61440.0 (threshold) | 57344.0 (0x7b) | 57344.0 (0x7b) | N/A |
-| > 61440.0 (large overflow) | **Inf** (0x7c) | 57344.0 (0x7b) | N/A |
-| inf | Inf (0x7c) | Inf (0x7c) | N/A |
-| nan | NaN (0x7f) | NaN (0x7e) | N/A |
+| Value | PyTorch | TinyGrad PYTHON=1 | CUDA (RTX 4090) | AMD gfx942 |
+|-------|---------|-------------------|-----------------|------------|
+| 0.0 | 0.0 (0x00) | 0.0 (0x00) | 0.0 (0x00) | N/A |
+| 1.0 | 1.0 (0x3c) | 1.0 (0x3c) | 1.0 (0x3c) | N/A |
+| 57344.0 (max) | 57344.0 (0x7b) | 57344.0 (0x7b) | 57344.0 (0x7b) | N/A |
+| 60000.0 (overflow) | 57344.0 (0x7b) | 57344.0 (0x7b) | 57344.0 (0x7b) | N/A |
+| 61440.0 (threshold) | 57344.0 (0x7b) | 57344.0 (0x7b) | 57344.0 (0x7b) | N/A |
+| 65536.0 (large overflow) | **Inf** (0x7c) | 57344.0 (0x7b) | **57344.0** (0x7b) | N/A |
+| inf | Inf (0x7c) | Inf (0x7c) | **57344.0** (0x7b) | N/A |
+| nan | NaN (0x7f) | NaN (0x7e) | NaN (0x7f) | N/A |
 
-**Overflow Threshold**: 61440.0 (7.1% above max)
+**Key differences**:
+- CUDA saturates `inf` to max (57344.0, 0x7b), while PYTHON=1 preserves Inf (0x7c) and PyTorch preserves Inf
+- NaN encoding: CUDA 0x7f, PYTHON 0x7e, PyTorch 0x7f (all decode to NaN)
 
-### FP8E4M3FNUZ ✅ SUPPORTED on gfx942
+### FP8E4M3FNUZ
 
-| Value | PyTorch | TinyGrad PYTHON=1 | AMD gfx942 |
-|-------|---------|-------------------|------------|
-| 0.0 | 0.0 (0x00) | 0.0 (0x00) | 0.0 (0x00) |
-| 1.0 | 1.0 (0x40) | 1.0 (0x40) | 1.0 (0x40) |
-| 240.0 (max) | 240.0 (0x7f) | 240.0 (0x7f) | 240.0 (0x7f) |
-| 241.0 (overflow) | 240.0 (0x7f) | 240.0 (0x7f) | 240.0 (0x7f) |
-| 280.0 (large overflow) | **NaN** (0x80) | **NaN** (0x80) | **NaN** (0x80) |
-| inf | **NaN** (0x80) | **NaN** (0x80) | **NaN** (0x80) |
-| nan | **NaN** (0x80) | **NaN** (0x80) | **NaN** (0x80) |
+| Value | PyTorch | TinyGrad PYTHON=1 | CUDA (RTX 4090) | AMD gfx942 |
+|-------|---------|-------------------|-----------------|------------|
+| 0.0 | 0.0 (0x00) | 0.0 (0x00) | N/A | 0.0 (0x00) |
+| 1.0 | 1.0 (0x40) | 1.0 (0x40) | N/A | 1.0 (0x40) |
+| 240.0 (max) | 240.0 (0x7f) | 240.0 (0x7f) | N/A | 240.0 (0x7f) |
+| 241.0 (overflow) | 240.0 (0x7f) | 240.0 (0x7f) | N/A | 240.0 (0x7f) |
+| 280.0 (large overflow) | **NaN** (0x80) | **NaN** (0x80) | N/A | **NaN** (0x80) |
+| inf | **NaN** (0x80) | **NaN** (0x80) | N/A | **NaN** (0x80) |
+| nan | **NaN** (0x80) | **NaN** (0x80) | N/A | **NaN** (0x80) |
 
-**Note**: ✅ All three backends match perfectly for FNUZ types
+**Note**: ✅ PyTorch, PYTHON=1 and gfx942 all match perfectly. CUDA does not support FNUZ.
 
-### FP8E5M2FNUZ ✅ SUPPORTED on gfx942
+### FP8E5M2FNUZ
 
-| Value | PyTorch | TinyGrad PYTHON=1 | AMD gfx942 |
-|-------|---------|-------------------|------------|
-| 0.0 | 0.0 (0x00) | 0.0 (0x00) | 0.0 (0x00) |
-| 1.0 | 1.0 (0x40) | 1.0 (0x40) | 1.0 (0x40) |
-| 57344.0 (max) | 57344.0 (0x7f) | 57344.0 (0x7f) | 57344.0 (0x7f) |
-| 60000.0 (overflow) | 57344.0 (0x7f) | 57344.0 (0x7f) | 57344.0 (0x7f) |
-| inf | **NaN** (0x80) | **NaN** (0x80) | **NaN** (0x80) |
-| nan | **NaN** (0x80) | **NaN** (0x80) | **NaN** (0x80) |
+| Value | PyTorch | TinyGrad PYTHON=1 | CUDA (RTX 4090) | AMD gfx942 |
+|-------|---------|-------------------|-----------------|------------|
+| 0.0 | 0.0 (0x00) | 0.0 (0x00) | N/A | 0.0 (0x00) |
+| 1.0 | 1.0 (0x40) | 1.0 (0x40) | N/A | 1.0 (0x40) |
+| 57344.0 (max) | 57344.0 (0x7f) | 57344.0 (0x7f) | N/A | 57344.0 (0x7f) |
+| 60000.0 (overflow) | 57344.0 (0x7f) | 57344.0 (0x7f) | N/A | 57344.0 (0x7f) |
+| inf | **NaN** (0x80) | **NaN** (0x80) | N/A | **NaN** (0x80) |
+| nan | **NaN** (0x80) | **NaN** (0x80) | N/A | **NaN** (0x80) |
 
-**Note**: ✅ All three backends match perfectly for FNUZ types
+**Note**: ✅ PyTorch, PYTHON=1 and gfx942 all match perfectly. CUDA does not support FNUZ.
 
-## Known Differences Between PyTorch and TinyGrad
+## Known Differences
 
-### 1. FP8E4M3 Large Overflow
-- **PyTorch**: Values > 464.0 → NaN
-- **TinyGrad**: All overflow → Clamp to 448.0
+### 1. CUDA vs PYTHON=1: inf Handling
+- **CUDA**: `inf` → Saturates to max value (fp8e4m3: 448.0, fp8e5m2: 57344.0)
+- **PYTHON=1**: `inf` → NaN for fp8e4m3 (0x7f), Inf for fp8e5m2 (0x7c)
+- **Impact**: Only affects edge cases with inf inputs
+
+### 2. CUDA vs PyTorch: Large Overflow
+- **PyTorch**: Values > 464.0 → NaN (fp8e4m3), Values > 61440.0 → Inf (fp8e5m2)
+- **CUDA (tinygrad)**: All overflow → Clamp to max
 - **Impact**: Minimal (rare in practice)
 
-### 2. FP8E5M2 Large Overflow
-- **PyTorch**: Values > 61440.0 → Inf
-- **TinyGrad**: All overflow → Clamp to 57344.0
-- **Impact**: Minimal (rare in practice)
-
-### 3. NaN Representation
-- **FP8E5M2 NaN**:
-  - PyTorch: 0x7f
-  - TinyGrad: 0x7e
-- **Impact**: Cosmetic (both decode to NaN)
+### 3. NaN Encoding
+- **FP8E5M2**: CUDA 0x7f, PYTHON 0x7e, PyTorch 0x7f
+- **Impact**: Cosmetic (all decode to NaN)
 
 ## Implementation Details
 
@@ -204,13 +237,20 @@ static inline __attribute__((device)) unsigned char f32_to_fp8(float v, int is_b
 
 ## Test Status
 
-All FP8 tests pass:
 ```bash
+# CUDA=1 (RTX 4090, after is_dtype_supported fix)
+CUDA=1 python -m pytest test/test_dtype.py -k "fp8 or Fp8"
+# 56 passed, 4 skipped
+
+CUDA=1 python -m pytest test/testextra/test_fp8_linear.py
+# 6 passed (forward_2d, forward_3d, backward_2d, backward_3d, filter, multi_gpu)
+
+# PYTHON=1 / AMD gfx942
 python -m pytest test/test_dtype.py test/test_dtype_alu.py -q
 # 288 passed, 55 skipped, 1 xfailed
 ```
 
-Skipped tests are for unsupported dtypes on specific hardware (e.g., non-FNUZ on gfx942).
+Skipped tests are for unsupported dtypes on specific hardware (e.g., FNUZ on CUDA, non-FNUZ on gfx942).
 
 ## Recommendations
 
