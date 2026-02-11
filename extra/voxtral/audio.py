@@ -185,3 +185,83 @@ def compute_mel_spectrogram(audio: Tensor, mel_filters_list: list[list[float]]) 
   log_spec = log_spec.maximum(Tensor.full(log_spec.shape, GLOBAL_LOG_MEL_MAX - 8.0))
   log_spec = (log_spec + 4.0) / 4.0
   return log_spec
+
+# ============================================================================
+# Incremental mel spectrogram (matching C vox_mel_ctx_t)
+# ============================================================================
+
+class IncrementalMel:
+  """Compute mel frames incrementally as audio samples arrive.
+
+  Each frame t needs samples[t*HOP_LENGTH : t*HOP_LENGTH + WINDOW_SIZE].
+  Frames are computed in pure Python (per-frame DFT on 400 samples is cheap).
+  """
+  def __init__(self, left_pad_samples: int = 0):
+    self.mel_filters = compute_mel_filters()  # [n_freq, n_mel]
+    self._dft_cos, self._dft_sin, self._n_freq = _build_dft_matrix(WINDOW_SIZE)
+    self._window = _hann_window(WINDOW_SIZE)
+    # Sample buffer: center-pad (200) + left_pad zeros
+    self.left_pad = WINDOW_SIZE // 2 + left_pad_samples
+    self.samples: list[float] = [0.0] * self.left_pad
+    self.mel_frames: list[list[float]] = []
+
+  def feed(self, new_samples: list[float]) -> int:
+    """Append samples, compute available mel frames. Returns new frame count."""
+    self.samples.extend(new_samples)
+    return self._compute_available()
+
+  def finish(self, right_pad_samples: int = 0) -> int:
+    """Finalize: add right + reflect padding, compute remaining, drop last frame."""
+    # Right padding zeros
+    self.samples.extend([0.0] * right_pad_samples)
+    # Reflect padding (200 samples from end of real content)
+    real_end = len(self.samples) - right_pad_samples
+    pad_len = WINDOW_SIZE // 2
+    for i in range(pad_len):
+      src = real_end - 2 - i
+      self.samples.append(self.samples[src] if src >= 0 else 0.0)
+    self._compute_available()
+    # Drop last frame (vLLM convention: stft[..., :-1])
+    if self.mel_frames:
+      self.mel_frames.pop()
+    return len(self.mel_frames)
+
+  @property
+  def n_frames(self) -> int:
+    return len(self.mel_frames)
+
+  def get_mel_tensor(self, start: int = 0, count: int | None = None) -> Tensor:
+    """Return mel frames as Tensor [NUM_MEL_BINS, count]."""
+    end = start + count if count is not None else len(self.mel_frames)
+    data = self.mel_frames[start:end]
+    return Tensor(data).T  # [n_mel, n_frames]
+
+  def _compute_available(self) -> int:
+    """Compute all mel frames whose window fits in current samples."""
+    n_fft = WINDOW_SIZE
+    n_freq = self._n_freq
+    new_count = 0
+    while True:
+      t = len(self.mel_frames)
+      start = t * HOP_LENGTH
+      if start + n_fft > len(self.samples):
+        break
+      # Windowed frame
+      windowed = [self.samples[start + i] * self._window[i] for i in range(n_fft)]
+      # DFT -> power spectrum
+      power = []
+      for k in range(n_freq):
+        off = k * n_fft
+        re = sum(windowed[n] * self._dft_cos[off + n] for n in range(n_fft))
+        im = sum(windowed[n] * self._dft_sin[off + n] for n in range(n_fft))
+        power.append(re * re + im * im)
+      # Mel filterbank + log scale
+      mel_row = []
+      for m in range(NUM_MEL_BINS):
+        s = sum(self.mel_filters[f][m] * power[f] for f in range(n_freq))
+        val = math.log10(max(s, 1e-10))
+        val = max(val, GLOBAL_LOG_MEL_MAX - 8.0)
+        mel_row.append((val + 4.0) / 4.0)
+      self.mel_frames.append(mel_row)
+      new_count += 1
+    return new_count

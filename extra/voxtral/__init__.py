@@ -182,6 +182,206 @@ class Adapter:
     return out
 
 # ============================================================================
+# Streaming Encoder (incremental conv stem + KV cache)
+# ============================================================================
+
+class StreamingConvStem:
+  """Incremental conv stem with boundary-correct tail buffers.
+
+  Conv0: kernel=3, stride=1, causal -> needs 2-frame mel tail between chunks
+  Conv1: kernel=3, stride=2 -> needs even input (residual tracking) + 2-frame conv0 tail
+  """
+  def __init__(self, encoder: Encoder):
+    self.encoder = encoder
+    self.initialized = False
+    self.mel_tail: Tensor | None = None       # [128, 2]
+    self.conv0_tail: Tensor | None = None     # [1280, 2]
+    self.conv0_residual: Tensor | None = None # [1280, 1]
+    self.conv0_residual_count = 0
+    self._conv1_initialized = False
+
+  def process(self, mel_new: Tensor) -> Tensor | None:
+    """Process new mel frames [128, n_new] -> [new_seq, 1280] or None."""
+    n_new = mel_new.shape[1]
+    if n_new <= 0: return None
+
+    # Phase 1: Conv0
+    if not self.initialized:
+      mel_3d = mel_new.unsqueeze(0)
+      conv0_out = causal_conv1d(mel_3d, self.encoder.conv_layers_0_conv.weight, self.encoder.conv_layers_0_conv.bias, stride=1).gelu()
+      conv0_new = conv0_out.squeeze(0)  # [1280, conv0_len]
+      self.mel_tail = mel_new[:, -2:].contiguous().realize() if n_new >= 2 else mel_new.pad((None, (2 - n_new, 0))).contiguous().realize()
+      self.initialized = True
+    else:
+      padded = self.mel_tail.cat(mel_new, dim=1)
+      padded_3d = padded.unsqueeze(0)
+      conv0_full = causal_conv1d(padded_3d, self.encoder.conv_layers_0_conv.weight, self.encoder.conv_layers_0_conv.bias, stride=1).gelu()
+      conv0_new = conv0_full.squeeze(0)[:, 2:]  # discard overlap
+      self.mel_tail = mel_new[:, -2:].contiguous().realize() if n_new >= 2 else self.mel_tail
+
+    # Phase 2: Stride alignment (even count for conv1 stride=2)
+    conv0_new_len = conv0_new.shape[1]
+    total_avail = self.conv0_residual_count + conv0_new_len
+    new_res = total_avail & 1
+    feed_from_new = conv0_new_len - (new_res if self.conv0_residual_count == 0 else (total_avail - self.conv0_residual_count) - (total_avail - new_res - self.conv0_residual_count))
+
+    # Simpler: figure out how many total to feed (even number), then how many from new
+    feed_total = total_avail - new_res
+    if feed_total <= 0:
+      if new_res and conv0_new_len > 0:
+        self.conv0_residual = conv0_new[:, -1:].contiguous().realize()
+      self.conv0_residual_count = new_res
+      return None
+
+    # Build feed buffer
+    parts = []
+    if self.conv0_residual_count == 1 and self.conv0_residual is not None:
+      parts.append(self.conv0_residual)
+      from_new = feed_total - 1
+    else:
+      from_new = feed_total
+    parts.append(conv0_new[:, :from_new])
+    feed = parts[0].cat(*parts[1:], dim=1) if len(parts) > 1 else parts[0]
+
+    # Save new residual
+    if new_res and conv0_new_len > from_new:
+      self.conv0_residual = conv0_new[:, -1:].contiguous().realize()
+    else:
+      self.conv0_residual = None
+    self.conv0_residual_count = new_res
+
+    # Phase 3: Conv1
+    if not self._conv1_initialized:
+      conv1_in = feed.unsqueeze(0)
+      conv1_discard = 0
+      self._conv1_initialized = True
+      self.conv0_tail = feed[:, -2:].contiguous().realize() if feed.shape[1] >= 2 else feed.pad((None, (2 - feed.shape[1], 0))).contiguous().realize()
+    else:
+      conv1_in = self.conv0_tail.cat(feed, dim=1).unsqueeze(0)
+      conv1_discard = 1
+      self.conv0_tail = feed[:, -2:].contiguous().realize() if feed.shape[1] >= 2 else self.conv0_tail
+
+    conv1_out = causal_conv1d(conv1_in, self.encoder.conv_layers_1_conv.weight, self.encoder.conv_layers_1_conv.bias, stride=2).gelu()
+    conv1_out = conv1_out.squeeze(0)
+
+    if conv1_discard > 0 and conv1_out.shape[1] > conv1_discard:
+      conv1_out = conv1_out[:, conv1_discard:]
+    elif conv1_discard > 0:
+      return None
+
+    if conv1_out.shape[1] <= 0: return None
+    return conv1_out.permute(1, 0)  # [seq, 1280]
+
+
+class StreamingEncoder:
+  """Incremental encoder with per-layer KV cache, matching C vox_encoder_forward_incremental."""
+  def __init__(self, encoder: Encoder):
+    self.encoder = encoder
+    self.conv_stem = StreamingConvStem(encoder)
+    self.cache_k: list[Tensor | None] = [None] * ENC_LAYERS
+    self.cache_v: list[Tensor | None] = [None] * ENC_LAYERS
+    self.cache_len = 0
+    self.pos_offset = 0
+    self.enc_residual: Tensor | None = None
+    self.enc_residual_count = 0
+
+  def reset(self):
+    self.conv_stem = StreamingConvStem(self.encoder)
+    self.cache_k = [None] * ENC_LAYERS
+    self.cache_v = [None] * ENC_LAYERS
+    self.cache_len = 0
+    self.pos_offset = 0
+    self.enc_residual = None
+    self.enc_residual_count = 0
+
+  def _compact_cache(self):
+    if self.cache_len <= ENC_WINDOW: return
+    discard = self.cache_len - ENC_WINDOW
+    for i in range(ENC_LAYERS):
+      if self.cache_k[i] is not None:
+        self.cache_k[i] = self.cache_k[i][:, :, discard:, :].contiguous().realize()
+        self.cache_v[i] = self.cache_v[i][:, :, discard:, :].contiguous().realize()
+    self.pos_offset += discard
+    self.cache_len = ENC_WINDOW
+
+  def _encoder_forward_incremental(self, x: Tensor) -> Tensor:
+    """Process [new_len, 1280] through transformer layers with KV cache. Returns [new_len, 1280]."""
+    new_len = x.shape[0]
+    if self.cache_len + new_len > ENC_WINDOW:
+      self._compact_cache()
+    cache_len = self.cache_len
+    logical_start = self.pos_offset + cache_len
+
+    # RoPE for new positions
+    rope_cos, rope_sin = precompute_rope_interleaved(ENC_HEAD_DIM, logical_start + new_len, ENC_ROPE_THETA)
+    rope_cos_new = rope_cos[logical_start:logical_start + new_len]
+    rope_sin_new = rope_sin[logical_start:logical_start + new_len]
+
+    h = x
+    for i, layer in enumerate(self.encoder.transformer_layers):
+      x_norm = layer.attention_norm(h)
+      q = layer.attention_wq(x_norm).unsqueeze(0)
+      k = layer.attention_wk(x_norm).unsqueeze(0)
+      v = layer.attention_wv(x_norm).unsqueeze(0)
+
+      q = apply_rope_interleaved(q, rope_cos_new, rope_sin_new, ENC_HEADS, ENC_HEAD_DIM)
+      k = apply_rope_interleaved(k, rope_cos_new, rope_sin_new, ENC_KV_HEADS, ENC_HEAD_DIM)
+
+      q = q.squeeze(0).reshape(new_len, ENC_HEADS, ENC_HEAD_DIM).permute(1, 0, 2).unsqueeze(0)
+      k_new = k.squeeze(0).reshape(new_len, ENC_KV_HEADS, ENC_HEAD_DIM).permute(1, 0, 2).unsqueeze(0)
+      v_new = v.squeeze(0).reshape(new_len, ENC_KV_HEADS, ENC_HEAD_DIM).permute(1, 0, 2).unsqueeze(0)
+
+      if self.cache_k[i] is not None:
+        full_k = self.cache_k[i].cat(k_new, dim=2)
+        full_v = self.cache_v[i].cat(v_new, dim=2)
+      else:
+        full_k, full_v = k_new, v_new
+
+      self.cache_k[i] = full_k.contiguous().realize()
+      self.cache_v[i] = full_v.contiguous().realize()
+
+      total_kv = cache_len + new_len
+      mask = Tensor.full((1, 1, new_len, total_kv), float("-inf")).triu(cache_len + 1)
+      attn_out = q.float().scaled_dot_product_attention(full_k.float(), full_v.float(), attn_mask=mask)
+      attn_out = attn_out.squeeze(0).permute(1, 0, 2).reshape(new_len, ENC_HEADS * ENC_HEAD_DIM)
+      h = h + layer.attention_wo(attn_out)
+
+      x_norm = layer.ffn_norm(h)
+      gate = layer.feed_forward_w1(x_norm).silu()
+      up = layer.feed_forward_w3(x_norm)
+      h = h + layer.feed_forward_w2(gate * up)
+
+    h = self.encoder.transformer_norm(h)
+    self.cache_len = cache_len + new_len
+    return h
+
+  def process_mel(self, mel_new: Tensor) -> Tensor | None:
+    """Process new mel [128, n_frames] -> [aligned_seq, 1280] or None."""
+    conv_out = self.conv_stem.process(mel_new)
+    if conv_out is None: return None
+
+    enc_out = self._encoder_forward_incremental(conv_out)
+    enc_out_len = enc_out.shape[0]
+
+    # Combine with residual, align to DOWNSAMPLE_FACTOR
+    if self.enc_residual is not None and self.enc_residual_count > 0:
+      combined = self.enc_residual.cat(enc_out, dim=0)
+    else:
+      combined = enc_out
+    total = combined.shape[0]
+    usable = (total // DOWNSAMPLE_FACTOR) * DOWNSAMPLE_FACTOR
+    leftover = total - usable
+
+    if leftover > 0:
+      self.enc_residual = combined[usable:].contiguous().realize()
+    else:
+      self.enc_residual = None
+    self.enc_residual_count = leftover
+
+    if usable <= 0: return None
+    return combined[:usable]
+
+# ============================================================================
 # Decoder (with pre-allocated KV cache + JIT)
 # ============================================================================
 

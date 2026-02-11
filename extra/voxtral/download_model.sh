@@ -7,7 +7,7 @@
 set -e
 
 MODEL_ID="mistralai/Voxtral-Mini-4B-Realtime-2602"
-MODEL_DIR="voxtral-model"
+MODEL_DIR="extra/voxtral-model"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
