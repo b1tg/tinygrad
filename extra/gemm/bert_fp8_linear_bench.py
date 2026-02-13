@@ -6,7 +6,7 @@ Usage:
   BEAM=3 python extra/gemm/bert_fp8_linear_bench.py --backward
 """
 import argparse, time
-from tinygrad import Tensor, dtypes, nn, Device
+from tinygrad import Tensor, dtypes, nn, Device, TinyJit
 from tinygrad.helpers import getenv
 from extra.fp8.fp8_linear import FP8Linear
 
@@ -22,38 +22,41 @@ SHAPES = [
 ]
 
 def bench_forward(layer, x, cnt, warmup):
+  @TinyJit
+  def step():
+    return layer(x).realize()
   for _ in range(warmup):
-    layer(x).realize()
+    step()
   times = []
   for _ in range(cnt):
     Device[Device.DEFAULT].synchronize()
     st = time.perf_counter()
-    layer(x).realize()
+    step()
     Device[Device.DEFAULT].synchronize()
     times.append(time.perf_counter() - st)
   return sorted(times)[len(times) // 2]
 
 def bench_forward_backward(layer, x, cnt, warmup):
-  for _ in range(warmup):
+  layer.weight.requires_grad_(True)
+  @TinyJit
+  def step():
     y = layer(x)
     y.sum().backward()
-    Tensor.realize(y, x.grad)
-    x.grad = None
+    Tensor.realize(y, x.grad, layer.weight.grad)
+  for _ in range(warmup):
+    step()
   times = []
   for _ in range(cnt):
     Device[Device.DEFAULT].synchronize()
     st = time.perf_counter()
-    y = layer(x)
-    y.sum().backward()
-    Tensor.realize(y, x.grad)
+    step()
     Device[Device.DEFAULT].synchronize()
     times.append(time.perf_counter() - st)
-    x.grad = None
   return sorted(times)[len(times) // 2]
 
 if __name__ == "__main__":
   parser = argparse.ArgumentParser()
-  parser.add_argument("--bs", type=int, default=8)
+  parser.add_argument("--bs", type=int, default=12)
   parser.add_argument("--seq", type=int, default=SEQ)
   parser.add_argument("--cnt", type=int, default=getenv("CNT", 10))
   parser.add_argument("--warmup", type=int, default=3)
