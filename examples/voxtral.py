@@ -1,0 +1,287 @@
+#!/usr/bin/env python3
+# Voxtral Realtime 4B speech-to-text — mistralai/Voxtral-Mini-4B-Realtime-2602
+import sys, os, math, struct, wave, json, base64, functools, time, argparse
+from tinygrad import Tensor, nn, dtypes, UOp, TinyJit
+
+SAMPLE_RATE, HOP_LENGTH, WINDOW_SIZE, NUM_MEL_BINS = 16000, 160, 400, 128
+DOWNSAMPLE_FACTOR, VOCAB_SIZE, ADA_NORM_DIM = 4, 131072, 32
+ENC_DIM, ENC_LAYERS, ENC_HEADS, ENC_HEAD_DIM, ENC_HIDDEN, ENC_KV_HEADS = 1280, 32, 32, 64, 5120, 32
+DEC_DIM, DEC_LAYERS, DEC_HEADS, DEC_HEAD_DIM, DEC_HIDDEN, DEC_KV_HEADS = 3072, 26, 32, 128, 9216, 8
+NORM_EPS, ROPE_THETA, MAX_CONTEXT = 1e-5, 1_000_000.0, 512
+TOKEN_BOS, TOKEN_EOS, TOKEN_PAD = 1, 2, 32
+N_LEFT_PAD, N_DELAY, N_RIGHT_PAD, RAW_TOK_LEN = 32, 6, 17, 1280
+
+@functools.cache
+def precompute_rope(head_dim: int, max_len: int, theta: float = ROPE_THETA):
+  freqs = 1.0 / (theta ** (Tensor.arange(0, head_dim, 2).float() / head_dim))
+  angles = Tensor.arange(max_len).float().unsqueeze(-1) * freqs.unsqueeze(0)
+  return angles.cos().contiguous(), angles.sin().contiguous()
+
+def apply_rope(x: Tensor, cos_f: Tensor, sin_f: Tensor, n_heads: int, head_dim: int):
+  B, T, _ = x.shape
+  x = x.reshape(B, T, n_heads, head_dim)
+  cos_f, sin_f = cos_f.reshape(1, T, 1, head_dim // 2), sin_f.reshape(1, T, 1, head_dim // 2)
+  x1, x2 = x[..., ::2], x[..., 1::2]
+  return Tensor.stack(x1 * cos_f - x2 * sin_f, x2 * cos_f + x1 * sin_f, dim=-1).flatten(-2).reshape(B, T, n_heads * head_dim)
+
+def causal_conv1d(x: Tensor, weight: Tensor, bias: Tensor, stride: int):
+  K, pad = weight.shape[-1], weight.shape[-1] - stride
+  target = (math.ceil((x.shape[-1] - K + pad) / stride + 1) - 1) * stride + K - pad
+  return x.pad((None, None, (pad, int(target - x.shape[-1])))).conv2d(weight, bias, stride=stride)
+
+def compute_time_embedding(t_value: float, dim: int = DEC_DIM):
+  inv_freq = (-math.log(10000.0) * Tensor.arange(dim // 2).float() / (dim // 2)).exp()
+  emb = t_value * inv_freq
+  return emb.cos().cat(emb.sin())
+
+class EncoderLayer:
+  def __init__(self):
+    self.attention_wq = nn.Linear(ENC_DIM, ENC_HEADS * ENC_HEAD_DIM, bias=True)
+    self.attention_wk = nn.Linear(ENC_DIM, ENC_KV_HEADS * ENC_HEAD_DIM, bias=False)
+    self.attention_wv = nn.Linear(ENC_DIM, ENC_KV_HEADS * ENC_HEAD_DIM, bias=True)
+    self.attention_wo = nn.Linear(ENC_HEADS * ENC_HEAD_DIM, ENC_DIM, bias=True)
+    self.attention_norm = nn.RMSNorm(ENC_DIM, NORM_EPS)
+    self.feed_forward_w1, self.feed_forward_w3 = nn.Linear(ENC_DIM, ENC_HIDDEN, bias=False), nn.Linear(ENC_DIM, ENC_HIDDEN, bias=False)
+    self.feed_forward_w2 = nn.Linear(ENC_HIDDEN, ENC_DIM, bias=True)
+    self.ffn_norm = nn.RMSNorm(ENC_DIM, NORM_EPS)
+
+  def __call__(self, h: Tensor, rope_cos: Tensor, rope_sin: Tensor, mask: Tensor):
+    x = self.attention_norm(h)
+    q = apply_rope(self.attention_wq(x).unsqueeze(0), rope_cos, rope_sin, ENC_HEADS, ENC_HEAD_DIM).squeeze(0)
+    k = apply_rope(self.attention_wk(x).unsqueeze(0), rope_cos, rope_sin, ENC_KV_HEADS, ENC_HEAD_DIM).squeeze(0)
+    v = self.attention_wv(x)
+    S = q.shape[0]
+    q = q.reshape(S, ENC_HEADS, ENC_HEAD_DIM).permute(1, 0, 2).unsqueeze(0)
+    k = k.reshape(S, ENC_KV_HEADS, ENC_HEAD_DIM).permute(1, 0, 2).unsqueeze(0)
+    v = v.reshape(S, ENC_KV_HEADS, ENC_HEAD_DIM).permute(1, 0, 2).unsqueeze(0)
+    attn = q.scaled_dot_product_attention(k, v, attn_mask=mask)
+    h = h + self.attention_wo(attn.squeeze(0).permute(1, 0, 2).reshape(S, -1))
+    x = self.ffn_norm(h)
+    return (h + self.feed_forward_w2(self.feed_forward_w1(x).silu() * self.feed_forward_w3(x))).realize()
+
+class Encoder:
+  def __init__(self):
+    self.conv_layers_0_conv = nn.Conv1d(NUM_MEL_BINS, ENC_DIM, 3, stride=1, bias=True)
+    self.conv_layers_1_conv = nn.Conv1d(ENC_DIM, ENC_DIM, 3, stride=2, bias=True)
+    self.transformer_layers = [EncoderLayer() for _ in range(ENC_LAYERS)]
+    self.transformer_norm = nn.RMSNorm(ENC_DIM, NORM_EPS)
+
+  def __call__(self, mel: Tensor):
+    h = causal_conv1d(mel.unsqueeze(0), self.conv_layers_0_conv.weight, self.conv_layers_0_conv.bias, stride=1).gelu()
+    h = causal_conv1d(h, self.conv_layers_1_conv.weight, self.conv_layers_1_conv.bias, stride=2).gelu()
+    h = h.squeeze(0).permute(1, 0)
+    trunc = h.shape[0] % DOWNSAMPLE_FACTOR
+    if trunc > 0: h = h[trunc:]
+    S = h.shape[0]
+    rope_cos, rope_sin = precompute_rope(ENC_HEAD_DIM, S)
+    mask = Tensor.full((1, 1, S, S), float("-inf")).triu(1).realize()
+    for layer in self.transformer_layers: h = layer(h, rope_cos, rope_sin, mask)
+    return self.transformer_norm(h)
+
+class Adapter:
+  def __init__(self):
+    self.audio_language_projection_0 = nn.Linear(ENC_DIM * DOWNSAMPLE_FACTOR, DEC_DIM, bias=False)
+    self.audio_language_projection_2 = nn.Linear(DEC_DIM, DEC_DIM, bias=False)
+  def __call__(self, enc_out: Tensor):
+    return self.audio_language_projection_2(self.audio_language_projection_0(
+      enc_out.reshape(enc_out.shape[0] // DOWNSAMPLE_FACTOR, ENC_DIM * DOWNSAMPLE_FACTOR)).gelu())
+
+class DecoderLayer:
+  def __init__(self, max_context: int):
+    self.attention_wq = nn.Linear(DEC_DIM, DEC_HEADS * DEC_HEAD_DIM, bias=False)
+    self.attention_wk = nn.Linear(DEC_DIM, DEC_KV_HEADS * DEC_HEAD_DIM, bias=False)
+    self.attention_wv = nn.Linear(DEC_DIM, DEC_KV_HEADS * DEC_HEAD_DIM, bias=False)
+    self.attention_wo = nn.Linear(DEC_HEADS * DEC_HEAD_DIM, DEC_DIM, bias=False)
+    self.attention_norm = nn.RMSNorm(DEC_DIM, NORM_EPS)
+    self.feed_forward_w1, self.feed_forward_w3 = nn.Linear(DEC_DIM, DEC_HIDDEN, bias=False), nn.Linear(DEC_DIM, DEC_HIDDEN, bias=False)
+    self.feed_forward_w2 = nn.Linear(DEC_HIDDEN, DEC_DIM, bias=False)
+    self.ffn_norm = nn.RMSNorm(DEC_DIM, NORM_EPS)
+    self.ada_rms_norm_t_cond_0 = nn.Linear(DEC_DIM, ADA_NORM_DIM, bias=False)
+    self.ada_rms_norm_t_cond_2 = nn.Linear(ADA_NORM_DIM, DEC_DIM, bias=False)
+    self.max_context = max_context
+
+  def __call__(self, x: Tensor, start_pos, t_cond: Tensor):
+    B, T, _ = x.shape
+    x_norm = self.attention_norm(x)
+    q, k, v = self.attention_wq(x_norm), self.attention_wk(x_norm), self.attention_wv(x_norm)
+    rope_cos, rope_sin = precompute_rope(DEC_HEAD_DIM, self.max_context)
+    q = apply_rope(q, rope_cos[start_pos:start_pos+T], rope_sin[start_pos:start_pos+T], DEC_HEADS, DEC_HEAD_DIM)
+    k = apply_rope(k, rope_cos[start_pos:start_pos+T], rope_sin[start_pos:start_pos+T], DEC_KV_HEADS, DEC_HEAD_DIM)
+    q = q.reshape(B, T, DEC_HEADS, DEC_HEAD_DIM).transpose(1, 2)
+    k = k.reshape(B, T, DEC_KV_HEADS, DEC_HEAD_DIM).transpose(1, 2)
+    v = v.reshape(B, T, DEC_KV_HEADS, DEC_HEAD_DIM).transpose(1, 2)
+    if not hasattr(self, "cache_kv"):
+      self.cache_kv = Tensor.zeros(2, B, DEC_KV_HEADS, self.max_context, DEC_HEAD_DIM, dtype=k.dtype).contiguous().realize()
+    self.cache_kv[:, :, :, start_pos:start_pos+T, :].assign(Tensor.stack(k, v)).realize()
+    keys, vals = self.cache_kv[0, :, :, :start_pos+T, :], self.cache_kv[1, :, :, :start_pos+T, :]
+    mask = Tensor.full((1, 1, T, start_pos+T), float("-inf"), dtype=x.dtype).triu(int(start_pos)+1) if T > 1 else None
+    attn = q.scaled_dot_product_attention(keys, vals, attn_mask=mask, enable_gqa=True).transpose(1, 2).reshape(B, T, -1)
+    h = x + self.attention_wo(attn)
+    h_norm = self.ffn_norm(h) * (1 + self.ada_rms_norm_t_cond_2(self.ada_rms_norm_t_cond_0(t_cond).gelu()).reshape(1, 1, DEC_DIM))
+    return (h + self.feed_forward_w2(self.feed_forward_w1(h_norm).silu().contiguous() * self.feed_forward_w3(h_norm))).contiguous()
+
+class Decoder:
+  def __init__(self, max_context: int = MAX_CONTEXT):
+    self.tok_embeddings = nn.Embedding(VOCAB_SIZE, DEC_DIM)
+    self.layers = [DecoderLayer(max_context) for _ in range(DEC_LAYERS)]
+    self.norm = nn.RMSNorm(DEC_DIM, NORM_EPS)
+    self.max_context, self.forward_jit = max_context, TinyJit(self._forward_one)
+
+  def _forward_one(self, embed: Tensor, start_pos, t_cond: Tensor) -> Tensor:
+    h = embed
+    for layer in self.layers: h = layer(h, start_pos, t_cond)
+    return (self.norm(h)[:, -1, :] @ self.tok_embeddings.weight.T).argmax(-1, keepdim=True)
+
+  def prefill(self, input_embeds: Tensor, t_cond: Tensor):
+    h = input_embeds.unsqueeze(0)
+    for layer in self.layers:
+      h = layer(h, 0, t_cond)
+      h = h.realize()
+    return h
+
+  def decode_token(self, embed: Tensor, pos: int, t_cond: Tensor, use_jit: bool = True) -> int:
+    h = embed.reshape(1, 1, DEC_DIM)
+    v = UOp.variable("start_pos", 1, self.max_context - 1)
+    tok = self.forward_jit(h, v.bind(pos), t_cond) if use_jit else self._forward_one(h, pos, t_cond)
+    return int(tok.item())
+
+# mel spectrogram (Slaney-style, matching mistral_common)
+def _h2m(f): return 3*f/200 if f < 1000 else 15 + 27/math.log(6.4) * math.log(f/1000)
+def _m2h(m): return 200*m/3 if m < 15 else 1000 * math.exp(math.log(6.4)/27 * (m-15))
+
+def compute_mel_filters():
+  n_freq = 1 + WINDOW_SIZE // 2
+  fft_f = [i * (SAMPLE_RATE // 2) / (n_freq - 1) for i in range(n_freq)]
+  mel_min, mel_max = _h2m(0), _h2m(8000)
+  ff = [_m2h(mel_min + i * (mel_max - mel_min) / (NUM_MEL_BINS + 1)) for i in range(NUM_MEL_BINS + 2)]
+  fd = [ff[i+1] - ff[i] for i in range(len(ff)-1)]
+  return [[max(0, min((fft_f[f] - ff[m]) / fd[m], (ff[m+2] - fft_f[f]) / fd[m+1])) * 2 / (ff[m+2] - ff[m])
+           for m in range(NUM_MEL_BINS)] for f in range(n_freq)]
+
+@functools.cache
+def _mel_basis():
+  n_freq = 1 + WINDOW_SIZE // 2
+  mel_filters = compute_mel_filters()
+  window = 0.5 * (1.0 - (2 * math.pi / WINDOW_SIZE * Tensor.arange(WINDOW_SIZE).float()).cos())
+  angles = (2 * math.pi / WINDOW_SIZE) * Tensor.arange(n_freq).float().unsqueeze(1) * Tensor.arange(WINDOW_SIZE).float().unsqueeze(0)
+  return Tensor(mel_filters).contiguous(), window.contiguous(), angles.cos().contiguous(), angles.sin().contiguous()
+
+def compute_mel_spectrogram(audio: Tensor):
+  mel_filters, window, dft_cos, dft_sin = _mel_basis()
+  n_fft, hop, n_freq = WINDOW_SIZE, HOP_LENGTH, 1 + WINDOW_SIZE // 2
+  audio = audio.pad(((n_fft // 2, n_fft // 2),))
+  n_frames = 1 + (audio.shape[0] - n_fft) // hop
+  frames = audio[(Tensor.arange(n_frames).unsqueeze(1) * hop + Tensor.arange(n_fft).unsqueeze(0)).flatten()].reshape(n_frames, n_fft) * window
+  real, imag = frames @ dft_cos.T, frames @ (-dft_sin).T
+  mel_spec = ((real.square() + imag.square())[:-1] @ mel_filters).T
+  log_spec = mel_spec.clamp(min_=1e-10).log2() * math.log10(2)
+  return (log_spec.maximum(Tensor.full(log_spec.shape, -6.5)) + 4.0) / 4.0
+
+def load_wav(path: str):
+  with wave.open(path, 'rb') as wf:
+    sr, nc, sw, nf = wf.getframerate(), wf.getnchannels(), wf.getsampwidth(), wf.getnframes()
+    raw = wf.readframes(nf)
+  if sw == 2: samples, scale = struct.unpack(f"<{nf*nc}h", raw), 1/32768
+  elif sw == 4: samples, scale = struct.unpack(f"<{nf*nc}i", raw), 1/2147483648
+  elif sw == 1: samples, scale = [b - 128 for b in raw], 1/128
+  else: raise ValueError(f"Unsupported sample width: {sw}")
+  floats = [s * scale for s in samples]
+  if nc > 1: floats = [sum(floats[i:i+nc]) / nc for i in range(0, len(floats), nc)]
+  return floats, sr
+
+def resample_linear(samples, src_sr, dst_sr):
+  if src_sr == dst_sr: return samples
+  ratio = src_sr / dst_sr
+  return [samples[int(i*ratio)] * (1 - (i*ratio - int(i*ratio))) + (samples[int(i*ratio)+1] if int(i*ratio)+1 < len(samples) else samples[-1]) * (i*ratio - int(i*ratio))
+          for i in range(int(len(samples) * dst_sr / src_sr))]
+
+def load_tokenizer(model_dir: str):
+  with open(os.path.join(model_dir, "tekken.json")) as f: data = json.load(f)
+  vocab, n_special = data["vocab"], int(data.get("config", {}).get("default_num_special_tokens", 1000))
+  special_ids = {int(st["rank"]) for st in data.get("special_tokens", []) if "rank" in st}
+  cache: dict[int, bytes] = {}
+  def decode(tids):
+    out = bytearray()
+    for t in tids:
+      if t < n_special or t in special_ids: continue
+      if t not in cache: cache[t] = base64.b64decode(vocab[t - n_special]["token_bytes"]) if 0 <= t - n_special < len(vocab) else b""
+      out += cache[t]
+    return out.decode("utf-8", errors="replace")
+  return decode
+
+def load_voxtral(model_dir: str, max_context: int = MAX_CONTEXT):
+  state_dict = nn.state.safe_load(os.path.join(model_dir, "consolidated.safetensors"))
+  encoder, adapter, decoder = Encoder(), Adapter(), Decoder(max_context)
+  ENC_PFX = "mm_streams_embeddings.embedding_module.whisper_encoder."
+  ADA_PFX = "mm_streams_embeddings.embedding_module."
+  SUBS = [("attention.wq", "attention_wq"), ("attention.wk", "attention_wk"), ("attention.wv", "attention_wv"), ("attention.wo", "attention_wo"),
+          ("feed_forward.w1", "feed_forward_w1"), ("feed_forward.w2", "feed_forward_w2"), ("feed_forward.w3", "feed_forward_w3")]
+  def remap(k):
+    for old, new in SUBS: k = k.replace(old, new)
+    return k
+  # encoder
+  enc_state = {}
+  for k, v in state_dict.items():
+    if not k.startswith(ENC_PFX): continue
+    nk = k[len(ENC_PFX):].replace("transformer.layers.", "transformer_layers.").replace("transformer.norm.", "transformer_norm.")
+    nk = nk.replace("conv_layers.0.conv.", "conv_layers_0_conv.").replace("conv_layers.1.conv.", "conv_layers_1_conv.")
+    enc_state[remap(nk)] = v
+  nn.state.load_state_dict(encoder, enc_state, strict=True, verbose=False)
+  # adapter
+  nn.state.load_state_dict(adapter, {
+    "audio_language_projection_0.weight": state_dict[f"{ADA_PFX}audio_language_projection.0.weight"],
+    "audio_language_projection_2.weight": state_dict[f"{ADA_PFX}audio_language_projection.2.weight"],
+  }, strict=True, verbose=False)
+  # decoder
+  dec_state = {}
+  for k, v in state_dict.items():
+    if k.startswith("layers.") or k == "norm.weight":
+      dec_state[remap(k).replace("ada_rms_norm_t_cond.0", "ada_rms_norm_t_cond_0").replace("ada_rms_norm_t_cond.2", "ada_rms_norm_t_cond_2")] = v
+    elif k == f"{ADA_PFX}tok_embeddings.weight": dec_state["tok_embeddings.weight"] = v
+  nn.state.load_state_dict(decoder, dec_state, strict=True, verbose=False)
+  for model in [encoder, adapter, decoder]:
+    for s in nn.state.get_parameters(model): s.replace(s.contiguous())
+  return encoder, adapter, decoder
+
+if __name__ == "__main__":
+  parser = argparse.ArgumentParser(description="Voxtral Realtime 4B transcription")
+  parser.add_argument("model_dir", help="Model directory with consolidated.safetensors and tekken.json")
+  parser.add_argument("wav_path", help="WAV audio file to transcribe")
+  args = parser.parse_args()
+
+  audio, sr = load_wav(args.wav_path)
+  if sr != SAMPLE_RATE: audio = resample_linear(audio, sr, SAMPLE_RATE)
+  print(f"Audio: {len(audio)} samples ({len(audio)/SAMPLE_RATE:.1f}s)", file=sys.stderr)
+
+  prompt_ids = [TOKEN_BOS] + [TOKEN_PAD] * (N_LEFT_PAD + N_DELAY)
+  n = len(audio)
+  padded = [0.0] * (N_LEFT_PAD * RAW_TOK_LEN) + audio + [0.0] * ((RAW_TOK_LEN - n % RAW_TOK_LEN) % RAW_TOK_LEN + N_RIGHT_PAD * RAW_TOK_LEN)
+
+  mel = compute_mel_spectrogram(Tensor(padded))
+  if mel.shape[1] % 2 != 0: mel = mel[:, 1:]
+  print(f"Mel: {mel.shape[1]} frames", file=sys.stderr)
+
+  encoder, adapter, decoder = load_voxtral(args.model_dir, max_context=max(mel.shape[1] // 8 + 64, 256))
+  Tensor.no_grad = True
+  mel = mel.realize()
+
+  t0 = time.time()
+  ada_out = adapter(encoder(mel)).realize()
+  n_audio, L = ada_out.shape[0], len(prompt_ids)
+  t_cond = compute_time_embedding(float(N_DELAY)).realize()
+  prefix_embeds = ada_out[:L] + decoder.tok_embeddings(Tensor(prompt_ids, dtype=dtypes.int))
+
+  if L > 1: decoder.prefill(prefix_embeds[:-1], t_cond)
+  token = decoder.decode_token(prefix_embeds[-1], pos=L - 1, t_cond=t_cond, use_jit=False)
+  generated = [token]
+
+  for pos in range(L, n_audio):
+    if token == TOKEN_EOS: break
+    embed = ada_out[pos] + decoder.tok_embeddings.weight[token]
+    token = decoder.decode_token(embed, pos=pos, t_cond=t_cond, use_jit=True)
+    generated.append(token)
+
+  t1 = time.time()
+  if generated and generated[-1] == TOKEN_EOS: generated = generated[:-1]
+  print(load_tokenizer(args.model_dir)(generated).strip())
+  print(f"{len(generated)} tokens in {t1-t0:.1f}s ({len(generated)/(t1-t0):.1f} tok/s)", file=sys.stderr)
