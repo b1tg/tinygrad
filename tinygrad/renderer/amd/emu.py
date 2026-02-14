@@ -65,7 +65,7 @@ from tinygrad.runtime.autogen.amd.cdna.str_pcode import PCODE as PCODE_CDNA
 from tinygrad.runtime.autogen.amd.rdna3 import ins as ir3
 from tinygrad.runtime.autogen.amd.rdna4 import ins as ir4
 from tinygrad.runtime.autogen.amd.cdna import ins as irc
-from tinygrad.renderer.amd.dsl import VCC_LO, EXEC_LO, SCC, ttmp
+from tinygrad.renderer.amd.dsl import VCC_LO, VCC_HI, EXEC_LO, EXEC_HI, SCC, ttmp
 from tinygrad.runtime.autogen.amd.common import Fmt, OpType
 from tinygrad.renderer.amd.pcode import parse_block, _FUNCS
 
@@ -138,11 +138,11 @@ def _cond_hi16(cond, val: UOp) -> UOp: return _cond(cond, _hi16(val), val)
 def _apply_opsel(val: UOp, sel_bit: int, opsel: int) -> UOp: return _hi16(val) if opsel & (1 << sel_bit) else val
 
 def _set_lane_bit(old: UOp, lane: UOp, val: UOp, exec_mask: UOp) -> UOp:
-  """Set/clear a single bit in a 32-bit mask based on lane index, respecting exec mask."""
-  mask = _c(1) << lane.cast(dtypes.uint32)
-  new_bit = _to_u32(val) << lane.cast(dtypes.uint32)
-  cleared = old & (mask ^ _c(MASK32))
-  return _lane_active(exec_mask, lane).where(cleared | new_bit, old)
+  """Set/clear a single bit in a 64-bit mask based on lane index, respecting exec mask."""
+  mask = _c(1, dtypes.uint64) << lane.cast(dtypes.uint64)
+  new_bit = val.cast(dtypes.uint64) << lane.cast(dtypes.uint64)
+  cleared = old.cast(dtypes.uint64) & (mask ^ _c(0xFFFFFFFFFFFFFFFF, dtypes.uint64))
+  return _lane_active(exec_mask, lane).where(cleared | new_bit, old.cast(dtypes.uint64))
 
 def _val_to_u32(val: UOp) -> UOp:
   """Convert any value to uint32 for storage (bitcast floats, cast ints)."""
@@ -162,6 +162,8 @@ _pcode_fixes = {
   'V_DIV_FIXUP_F64': ('D0.f64 = sign_out ? -abs(S0.f64) : abs(S0.f64)',
     'D0.f64 = isNAN(S0.f64) ? (sign_out ? -INF : +INF) : (sign_out ? -abs(S0.f64) : abs(S0.f64))'),
   'V_TRIG_PREOP_F64': ("result = 64'F((1201'B(2.0 / PI)[1200 : 0] << shift.u32) & 1201'0x1fffffffffffff)", "result = trig_preop_result(shift)"),
+  'V_BITOP3_B32': ("TTBL = { INST.OMOD[1 : 0], INST.ABS[2 : 0], INST.NEG[2 : 0] }", ""),  # TTBL pre-computed from instruction fields
+  'V_BITOP3_B16': ("TTBL = { INST.OMOD[1 : 0], INST.ABS[2 : 0], INST.NEG[2 : 0] }", ""),
 }
 
 def _get_pcode_dict(op) -> dict:
@@ -362,10 +364,30 @@ class _Ctx:
 
   def rexec(self) -> UOp:
     """Read EXEC register as 64-bit value (EXEC_LO + EXEC_HI)."""
-    from tinygrad.renderer.amd.dsl import EXEC_HI
-    exec_lo = self.rsgpr_dyn(_c(EXEC_LO.offset))
-    exec_hi = self.rsgpr_dyn(_c(EXEC_HI.offset))
-    return _u64(exec_lo, exec_hi)
+    return _u64(self.rsgpr_dyn(_c(EXEC_LO.offset)), self.rsgpr_dyn(_c(EXEC_HI.offset)))
+
+  def wexec(self, val: UOp) -> list[UOp]:
+    """Write EXEC register as 64-bit value, splitting into EXEC_LO and EXEC_HI."""
+    lo, hi = _split64(val)
+    return [self.wsgpr_dyn(_c(EXEC_LO.offset), lo), self.wsgpr_dyn(_c(EXEC_HI.offset), hi)]
+
+  def rvcc(self) -> UOp:
+    """Read VCC register as 64-bit value (VCC_LO + VCC_HI)."""
+    return _u64(self.rsgpr_dyn(_c(VCC_LO.offset)), self.rsgpr_dyn(_c(VCC_HI.offset)))
+
+  def wvcc(self, val: UOp) -> list[UOp]:
+    """Write VCC register as 64-bit value, splitting into VCC_LO and VCC_HI."""
+    lo, hi = _split64(val)
+    return [self.wsgpr_dyn(_c(VCC_LO.offset), lo), self.wsgpr_dyn(_c(VCC_HI.offset), hi)]
+
+  def wsgpr_pair(self, reg: UOp, val: UOp) -> list[UOp]:
+    """Write a 64-bit value to an SGPR pair (reg, reg+1)."""
+    lo, hi = _split64(val)
+    return [self.wsgpr_dyn(reg, lo), self.wsgpr_dyn(reg + _c(1), hi)]
+
+  def rsgpr_pair(self, reg: UOp) -> UOp:
+    """Read an SGPR pair (reg, reg+1) as a 64-bit value."""
+    return _u64(self.rsgpr_dyn(reg), self.rsgpr_dyn(reg + _c(1)))
 
   def wsgpr_dyn(self, reg: UOp, val: UOp) -> UOp:
     """Write SGPR with dynamic register index. Writes to NULL (124) are discarded."""
@@ -504,7 +526,7 @@ class _Ctx:
     vcc_val, exec_val = None, None
     for dest, val in assigns:
       if 'D0' in dest and '[laneId]' in dest:
-        raw_stores.append(('vcc', self.wsgpr_dyn(_c(VCC_LO.offset), _set_lane_bit(self.rsgpr_dyn(_c(VCC_LO.offset)), lane, val, exec_mask))))
+        raw_stores.append(('vcc', _set_lane_bit(self.rvcc(), lane, val, exec_mask)))
       elif dest.startswith('D0'):
         if (slice_match := re.match(r'D0\[(\d+)\s*:\s*(\d+)\]', dest)):
           hi_bit, lo_bit = int(slice_match.group(1)), int(slice_match.group(2))
@@ -535,6 +557,7 @@ class _Ctx:
       elif dest.startswith('SCC'): raw_stores.append(('scc', self.wsgpr_dyn(_c(SCC.offset), _to_u32(val))))
 
     stores, lane_stores, scalar_stores = [], [s for t, s in raw_stores if t == 'vgpr'], [s for t, s in raw_stores if t == 'scc']
+    vcc_lane_stores = [s for t, s in raw_stores if t == 'vcc']
     slice_stores = [s for t, s in raw_stores if t == 'vgpr_slice']
     if slice_stores:
       result = self.rvgpr_dyn(vdst_reg, lane)
@@ -543,10 +566,12 @@ class _Ctx:
         result = (result & (mask ^ UOp.const(dtypes.uint32, 0xFFFFFFFF))) | (val_bits << UOp.const(dtypes.uint32, lo_bit))
       lane_stores.append(self.wvgpr_dyn(vdst_reg, lane, result, exec_mask))
     if lane_stores: stores.append(UOp.sink(*lane_stores).end(lane))
+    # Write VCC/EXEC masks as 64-bit pairs (needed for CDNA 64-lane waves)
+    if vcc_lane_stores: stores.extend(self.wsgpr_pair(_c(vcc_reg), vcc_lane_stores[-1]))
     for mask_val, reg in [(vcc_val, vcc_reg), (exec_val, EXEC_LO.offset)]:
       if mask_val is None: continue
       def get_bit(l, v=mask_val): return (_to_u32(v.substitute({lane: l})) & _c(1)).cast(dtypes.uint32)
-      stores.append(self.wsgpr_dyn(_c(reg), self.unroll_lanes(get_bit, exec_mask, apply_exec=False)))
+      stores.extend(self.wsgpr_pair(_c(reg), self.unroll_lanes(get_bit, exec_mask, apply_exec=False)))
     stores.extend(scalar_stores)
     return UOp.sink(*stores, *self.inc_pc())
 
@@ -723,10 +748,10 @@ def _compile_vopc(inst: ir3.VOPC|ir3.VOP3|ir4.VOPC|ir4.VOP3|irc.VOPC|irc.VOP3, c
 
   # CMPX e32: writes EXEC only; CMPX e64: writes both EXEC and SDST; non-CMPX: writes dst only
   if is_cmpx:
-    stores = [ctx.wsgpr_dyn(_c(EXEC_LO.offset), new_result)]
-    if not is_vopc: stores.append(ctx.wsgpr_dyn(dst_off, new_result))
+    stores = ctx.wexec(new_result)
+    if not is_vopc: stores.extend(ctx.wsgpr_pair(dst_off, new_result))
   else:
-    stores = [ctx.wsgpr_dyn(dst_off, new_result)] if not is_vopc else [ctx.wsgpr_dyn(_c(VCC_LO.offset), new_result)]
+    stores = ctx.wsgpr_pair(dst_off, new_result) if not is_vopc else ctx.wvcc(new_result)
   return UOp.sink(*stores, *ctx.inc_pc())
 
 def _compile_vop3(inst: ir3.VOP3 | ir4.VOP3 | irc.VOP3, ctx: _Ctx) -> UOp:
@@ -747,6 +772,7 @@ def _compile_vop3(inst: ir3.VOP3 | ir4.VOP3 | irc.VOP3, ctx: _Ctx) -> UOp:
     return _compile_vopc(inst, ctx, opsel=opsel, abs_bits=getattr(inst, 'abs', 0) or 0, neg_bits=getattr(inst, 'neg', 0) or 0)
 
   # Regular VOP3 - read operands dynamically
+  is_bitop3 = 'BITOP3' in op_name
   lane = ctx.range()
   vdst_reg = ctx.inst_field(type(inst).vdst)
   literal = ctx.inst_field(type(inst).literal) if hasattr(type(inst), 'literal') else None  # type: ignore[union-attr]
@@ -759,11 +785,19 @@ def _compile_vop3(inst: ir3.VOP3 | ir4.VOP3 | irc.VOP3, ctx: _Ctx) -> UOp:
     src1 = _apply_opsel(src1, 1, opsel)
     src2 = _apply_opsel(src2, 2, opsel)
   abs_bits, neg_bits = getattr(inst, 'abs', 0) or 0, getattr(inst, 'neg', 0) or 0
-  src0 = _apply_src_mods(src0, 0, abs_bits, neg_bits, bits['s0'])
-  src1 = _apply_src_mods(src1, 1, abs_bits, neg_bits, bits['s1'])
-  src2 = _apply_src_mods(src2, 2, abs_bits, neg_bits, bits['s2'])
+  if not is_bitop3:  # BITOP3 repurposes abs/neg/omod as truth table bits
+    src0 = _apply_src_mods(src0, 0, abs_bits, neg_bits, bits['s0'])
+    src1 = _apply_src_mods(src1, 1, abs_bits, neg_bits, bits['s1'])
+    src2 = _apply_src_mods(src2, 2, abs_bits, neg_bits, bits['s2'])
   srcs = {'S0': src0, 'S1': src1, 'S2': src2}
-  if inst.op in (ir3.VOP3Op.V_CNDMASK_B32_E64, ir3.VOP3Op.V_CNDMASK_B16, irc.VOP3Op.V_CNDMASK_B32_E64) and src2 is not None: srcs['VCC'] = src2
+  # BITOP3: compute truth table from instruction fields (TTBL = {omod[1:0], abs[2:0], neg[2:0]})
+  if is_bitop3:
+    omod_val = ctx.inst_field(type(inst).omod)
+    abs_val = ctx.inst_field(type(inst).abs)
+    neg_val = ctx.inst_field(type(inst).neg)
+    srcs['TTBL'] = (omod_val << _c(6)) | (abs_val << _c(3)) | neg_val
+  if inst.op in (ir3.VOP3Op.V_CNDMASK_B32_E64, ir3.VOP3Op.V_CNDMASK_B16, irc.VOP3Op.V_CNDMASK_B32_E64) and src2 is not None:
+    srcs['VCC'] = ctx.rsgpr_pair(ctx.inst_field(type(inst).src2))
   # FMAC instructions need D0 (accumulator) from destination register
   if 'FMAC' in op_name: srcs['D0'] = ctx.rvgpr_dyn(vdst_reg, lane)
   opsel_dst_hi = bool(opsel & 0b1000) and bits['d'] == 16
@@ -963,9 +997,9 @@ def _compile_vopd(inst: ir3.VOPD | ir4.VOPD, ctx: _Ctx) -> UOp:
     if op in (ir3.VOPDOp.V_DUAL_FMAAK_F32, ir3.VOPDOp.V_DUAL_FMAMK_F32, ir4.VOPDOp.V_DUAL_FMAAK_F32, ir4.VOPDOp.V_DUAL_FMAMK_F32):
       assert literal is not None
       srcs['SIMM32'] = literal
-    if op in (ir3.VOPDOp.V_DUAL_CNDMASK_B32, ir4.VOPDOp.V_DUAL_CNDMASK_B32): srcs['VCC'] = ctx.rsgpr_dyn(_c(VCC_LO.offset))
+    if op in (ir3.VOPDOp.V_DUAL_CNDMASK_B32, ir4.VOPDOp.V_DUAL_CNDMASK_B32): srcs['VCC'] = ctx.rvcc()
     pcode = get_pcode(vop)
-    srcs.update({'VCC': ctx.rsgpr_dyn(_c(VCC_LO.offset)), 'EXEC': exec_mask, 'SCC': ctx.rsgpr_dyn(_c(SCC.offset)), 'laneId': lane})
+    srcs.update({'VCC': ctx.rvcc(), 'EXEC': exec_mask, 'SCC': ctx.rsgpr_dyn(_c(SCC.offset)), 'laneId': lane})
     for dest, val in parse_pcode(pcode, srcs)[1]:
       if dest.startswith('D0'): all_stores.append(ctx.wvgpr_dyn(vdst_reg, lane, _val_to_u32(val), exec_mask, after=srcy1))
   return UOp.sink(UOp.group(*all_stores).end(lane), *ctx.inc_pc())
