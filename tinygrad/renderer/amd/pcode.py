@@ -221,6 +221,22 @@ def _sad_u8(a: UOp, b: UOp, acc: UOp, masked: bool = False) -> UOp:
     result = result + (a_byte.ne(_u32(0)).where(diff, _u32(0)) if masked else diff)
   return result
 
+def _fp8_to_f32(a: UOp, exp_bits: int, man_bits: int, bias: int) -> UOp:
+  """Convert FP8/BF8 (8-bit float) to float32 by constructing the IEEE754 bit pattern."""
+  v = a.cast(dtypes.uint32) & _u32(0xFF)
+  sign = (v >> _u32(7)) << _u32(31)
+  exp = (v >> _u32(man_bits)) & _u32((1 << exp_bits) - 1)
+  man = v & _u32((1 << man_bits) - 1)
+  # Normal: f32_bits = sign | ((exp + 127 - bias) << 23) | (man << (23 - man_bits))
+  f32_normal = sign | ((exp + _u32(127 - bias)) << _u32(23)) | (man << _u32(23 - man_bits))
+  # Subnormal (exp==0): value = sign * 2^(1-bias) * (man / 2^man_bits), construct via float math
+  sub_man_f = man.cast(dtypes.float32) * _const(dtypes.float32, 2.0 ** (1 - bias - man_bits))
+  sub_bits = (sub_man_f.bitcast(dtypes.uint32) & _u32(0x7FFFFFFF)) | sign
+  # Zero when exp==0 and man==0
+  is_zero = exp.eq(_u32(0)) & man.eq(_u32(0))
+  is_subnorm = exp.eq(_u32(0)) & man.ne(_u32(0))
+  return is_zero.where(_u32(0) | sign, is_subnorm.where(sub_bits, f32_normal)).bitcast(dtypes.float32)
+
 _FUNCS: dict[str, Callable[..., UOp]] = {
   'sqrt': lambda a: UOp(Ops.SQRT, a.dtype, (a,)), 'trunc': lambda a: UOp(Ops.TRUNC, a.dtype, (a,)),
   'log2': lambda a: UOp(Ops.LOG2, a.dtype, (a,)), 'sin': lambda a: _trig_reduce(a),
@@ -282,6 +298,9 @@ _FUNCS: dict[str, Callable[..., UOp]] = {
   # SAD (Sum of Absolute Differences) - sum |a_i - b_i| for 4 bytes + accumulator
   'v_sad_u8': lambda a, b, c: _sad_u8(a, b, c),
   'v_msad_u8': lambda a, b, c: _sad_u8(a, b, c, masked=True),
+  # FP8 E4M3 (sign=1, exp=4, mantissa=3, bias=7) and BF8 E5M2 (sign=1, exp=5, mantissa=2, bias=15) to float32
+  'fp8_to_f32': lambda a: _fp8_to_f32(a, 4, 3, 7),
+  'bf8_to_f32': lambda a: _fp8_to_f32(a, 5, 2, 15),
   # System NOPs - these are scheduling hints, no effect on emulation
   'MIN': lambda a, b: (a < b).where(a, b),
   's_nop': lambda a: _u32(0),
@@ -664,9 +683,11 @@ class Parser:
       self.eat('LPAREN')
       inner = self.parse()
       self.eat('RPAREN')
-      dt = {('U',32): dtypes.uint32, ('U',64): dtypes.uint64, ('I',32): dtypes.int, ('I',64): dtypes.int64,
+      dt = {('U',8): dtypes.uint8, ('U',16): dtypes.uint16, ('U',32): dtypes.uint32, ('U',64): dtypes.uint64,
+            ('I',8): dtypes.int8, ('I',16): dtypes.int16, ('I',32): dtypes.int, ('I',64): dtypes.int64,
             ('F',16): dtypes.half, ('F',32): dtypes.float32, ('F',64): dtypes.float64,
-            ('B',32): dtypes.uint32, ('B',64): dtypes.uint64}.get((type_char, bits), dtypes.uint64 if bits > 32 else dtypes.uint32)
+            ('B',8): dtypes.uint8, ('B',16): dtypes.uint16, ('B',32): dtypes.uint32, ('B',64): dtypes.uint64,
+            }.get((type_char, bits), dtypes.uint64 if bits > 32 else dtypes.uint32)
       if type_char == 'F' and inner.dtype in (dtypes.uint32, dtypes.uint64, dtypes.ulong, dtypes.int, dtypes.int64):
         if inner.dtype.itemsize != dt.itemsize: inner = inner.cast(dtypes.uint32 if dt.itemsize == 4 else dtypes.uint64)
         return inner.bitcast(dt)
