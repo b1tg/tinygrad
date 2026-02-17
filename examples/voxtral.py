@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Voxtral Realtime 4B speech-to-text — mistralai/Voxtral-Mini-4B-Realtime-2602
-import sys, os, math, struct, wave, json, base64, functools, time, argparse, subprocess
+import sys, os, math, struct, json, base64, functools, time, argparse, subprocess
 from tinygrad import Tensor, nn, dtypes, UOp, TinyJit
 
 SAMPLE_RATE, HOP_LENGTH, WINDOW_SIZE, NUM_MEL_BINS = 16000, 160, 400, 128
@@ -28,11 +28,6 @@ def causal_conv1d(x: Tensor, weight: Tensor, bias: Tensor, stride: int):
   K, pad = weight.shape[-1], weight.shape[-1] - stride
   target = (math.ceil((x.shape[-1] - K + pad) / stride + 1) - 1) * stride + K - pad
   return x.pad((None, None, (pad, int(target - x.shape[-1])))).conv2d(weight, bias, stride=stride)
-
-def compute_time_embedding(t_value: float, dim: int = DEC_DIM):
-  inv_freq = (-math.log(10000.0) * Tensor.arange(dim // 2).float() / (dim // 2)).exp()
-  emb = t_value * inv_freq
-  return emb.cos().cat(emb.sin())
 
 class EncoderLayer:
   def __init__(self):
@@ -136,7 +131,7 @@ class DecoderLayer:
     self.ada_rms_norm_t_cond_2 = nn.Linear(ADA_NORM_DIM, DEC_DIM, bias=False)
     self.max_context = max_context
 
-  def __call__(self, x: Tensor, start_pos, t_cond: Tensor):
+  def __call__(self, x: Tensor, start_pos):
     B, T, _ = x.shape
     x_norm = self.attention_norm(x)
     q, k, v = self.attention_wq(x_norm), self.attention_wk(x_norm), self.attention_wv(x_norm)
@@ -153,7 +148,7 @@ class DecoderLayer:
     mask = Tensor.full((1, 1, T, start_pos+T), float("-inf"), dtype=x.dtype).triu(int(start_pos)+1) if T > 1 else None
     attn = q.scaled_dot_product_attention(keys, vals, attn_mask=mask, enable_gqa=True).transpose(1, 2).reshape(B, T, -1)
     h = x + self.attention_wo(attn)
-    h_norm = self.ffn_norm(h) * (1 + self.ada_rms_norm_t_cond_2(self.ada_rms_norm_t_cond_0(t_cond).gelu()).reshape(1, 1, DEC_DIM))
+    h_norm = self.ffn_norm(h) * self.ada_scale
     return (h + self.feed_forward_w2(self.feed_forward_w1(h_norm).silu().contiguous() * self.feed_forward_w3(h_norm))).contiguous()
 
 class Decoder:
@@ -163,22 +158,29 @@ class Decoder:
     self.norm = nn.RMSNorm(DEC_DIM, NORM_EPS)
     self.max_context, self.forward_jit = max_context, TinyJit(self._forward_one)
 
-  def _forward_one(self, embed: Tensor, start_pos, t_cond: Tensor) -> Tensor:
+  def precompute_ada(self, t_value: float):
+    inv_freq = (-math.log(10000.0) * Tensor.arange(DEC_DIM // 2).float() / (DEC_DIM // 2)).exp()
+    emb = t_value * inv_freq
+    t_cond = emb.cos().cat(emb.sin())
+    for layer in self.layers:
+      layer.ada_scale = (1 + layer.ada_rms_norm_t_cond_2(layer.ada_rms_norm_t_cond_0(t_cond).gelu()).reshape(1, 1, DEC_DIM)).realize()
+
+  def _forward_one(self, embed: Tensor, start_pos) -> Tensor:
     h = embed
-    for layer in self.layers: h = layer(h, start_pos, t_cond)
+    for layer in self.layers: h = layer(h, start_pos)
     return (self.norm(h)[:, -1, :] @ self.tok_embeddings.weight.T).argmax(-1, keepdim=True)
 
-  def prefill(self, input_embeds: Tensor, t_cond: Tensor):
+  def prefill(self, input_embeds: Tensor):
     h = input_embeds.unsqueeze(0)
     for layer in self.layers:
-      h = layer(h, 0, t_cond)
+      h = layer(h, 0)
       h = h.realize()
     return h
 
-  def decode_token(self, embed: Tensor, pos: int, t_cond: Tensor, use_jit: bool = True) -> int:
+  def decode_token(self, embed: Tensor, pos: int, use_jit: bool = True) -> int:
     h = embed.reshape(1, 1, DEC_DIM)
     v = UOp.variable("start_pos", 1, self.max_context - 1)
-    tok = self.forward_jit(h, v.bind(pos), t_cond) if use_jit else self._forward_one(h, pos, t_cond)
+    tok = self.forward_jit(h, v.bind(pos)) if use_jit else self._forward_one(h, pos)
     return int(tok.item())
 
 # mel spectrogram (Slaney-style, matching mistral_common)
@@ -213,35 +215,10 @@ def compute_mel_spectrogram(audio: Tensor):
   log_spec = mel_spec.clamp(min_=1e-10).log2() * math.log10(2)
   return (log_spec.maximum(Tensor.full(log_spec.shape, -6.5)) + 4.0) / 4.0
 
-def load_wav(path: str):
-  with wave.open(path, 'rb') as wf:
-    sr, nc, sw, nf = wf.getframerate(), wf.getnchannels(), wf.getsampwidth(), wf.getnframes()
-    raw = wf.readframes(nf)
-  if sw == 2: samples, scale = struct.unpack(f"<{nf*nc}h", raw), 1/32768
-  elif sw == 4: samples, scale = struct.unpack(f"<{nf*nc}i", raw), 1/2147483648
-  elif sw == 1: samples, scale = [b - 128 for b in raw], 1/128
-  else: raise ValueError(f"Unsupported sample width: {sw}")
-  floats = [s * scale for s in samples]
-  if nc > 1: floats = [sum(floats[i:i+nc]) / nc for i in range(0, len(floats), nc)]
-  return floats, sr
-
-def load_audio_ffmpeg(path: str):
-  """Decode any audio format to mono f32le PCM via ffmpeg."""
-  cmd = ["ffmpeg", "-i", path, "-f", "f32le", "-acodec", "pcm_f32le", "-ac", "1", "-ar", str(SAMPLE_RATE), "-v", "quiet", "-"]
-  result = subprocess.run(cmd, capture_output=True)
-  if result.returncode != 0: raise RuntimeError(f"ffmpeg failed: {result.stderr.decode()}")
-  floats = list(struct.unpack(f"<{len(result.stdout)//4}f", result.stdout))
-  return floats, SAMPLE_RATE
-
 def load_audio(path: str):
-  if path.endswith(".wav"): return load_wav(path)
-  return load_audio_ffmpeg(path)
-
-def resample_linear(samples, src_sr, dst_sr):
-  if src_sr == dst_sr: return samples
-  ratio = src_sr / dst_sr
-  return [samples[int(i*ratio)] * (1 - (i*ratio - int(i*ratio))) + (samples[int(i*ratio)+1] if int(i*ratio)+1 < len(samples) else samples[-1]) * (i*ratio - int(i*ratio))
-          for i in range(int(len(samples) * dst_sr / src_sr))]
+  result = subprocess.run(["ffmpeg", "-i", path, "-f", "f32le", "-acodec", "pcm_f32le", "-ac", "1", "-ar", str(SAMPLE_RATE), "-v", "quiet", "-"], capture_output=True)
+  if result.returncode != 0: raise RuntimeError(f"ffmpeg failed: {result.stderr.decode()}")
+  return list(struct.unpack(f"<{len(result.stdout)//4}f", result.stdout))
 
 def load_tokenizer(model_dir: str):
   with open(os.path.join(model_dir, "tekken.json")) as f: data = json.load(f)
@@ -262,18 +239,14 @@ def load_voxtral(model_dir: str, max_context: int = MAX_CONTEXT):
   encoder, adapter, decoder = Encoder(), Adapter(), Decoder(max_context)
   ENC_PFX = "mm_streams_embeddings.embedding_module.whisper_encoder."
   ADA_PFX = "mm_streams_embeddings.embedding_module."
-  SUBS = [("attention.wq", "attention_wq"), ("attention.wk", "attention_wk"), ("attention.wv", "attention_wv"), ("attention.wo", "attention_wo"),
-          ("feed_forward.w1", "feed_forward_w1"), ("feed_forward.w2", "feed_forward_w2"), ("feed_forward.w3", "feed_forward_w3")]
-  def remap(k):
-    for old, new in SUBS: k = k.replace(old, new)
-    return k
   # encoder
   enc_state = {}
   for k, v in state_dict.items():
     if not k.startswith(ENC_PFX): continue
-    nk = k[len(ENC_PFX):].replace("transformer.layers.", "transformer_layers.").replace("transformer.norm.", "transformer_norm.")
-    nk = nk.replace("conv_layers.0.conv.", "conv_layers_0_conv.").replace("conv_layers.1.conv.", "conv_layers_1_conv.")
-    enc_state[remap(nk)] = v
+    nk = k[len(ENC_PFX):].replace("transformer.layers.", "transformer_layers.").replace("transformer.norm.", "transformer_norm.") \
+         .replace("conv_layers.0.conv.", "conv_layers_0_conv.").replace("conv_layers.1.conv.", "conv_layers_1_conv.") \
+         .replace("attention.", "attention_").replace("feed_forward.", "feed_forward_")
+    enc_state[nk] = v
   nn.state.load_state_dict(encoder, enc_state, strict=True, verbose=False)
   # adapter
   nn.state.load_state_dict(adapter, {
@@ -284,7 +257,7 @@ def load_voxtral(model_dir: str, max_context: int = MAX_CONTEXT):
   dec_state = {}
   for k, v in state_dict.items():
     if k.startswith("layers.") or k == "norm.weight":
-      dec_state[remap(k).replace("ada_rms_norm_t_cond.0", "ada_rms_norm_t_cond_0").replace("ada_rms_norm_t_cond.2", "ada_rms_norm_t_cond_2")] = v
+      dec_state[k.replace("attention.", "attention_").replace("feed_forward.", "feed_forward_").replace("t_cond.", "t_cond_")] = v
     elif k == f"{ADA_PFX}tok_embeddings.weight": dec_state["tok_embeddings.weight"] = v
   nn.state.load_state_dict(decoder, dec_state, strict=True, verbose=False)
   for model in [encoder, adapter, decoder]:
@@ -297,8 +270,7 @@ if __name__ == "__main__":
   parser.add_argument("audio_path", help="Audio file to transcribe (WAV, OGG, MP3, etc.)")
   args = parser.parse_args()
 
-  audio, sr = load_audio(args.audio_path)
-  if sr != SAMPLE_RATE: audio = resample_linear(audio, sr, SAMPLE_RATE)
+  audio = load_audio(args.audio_path)
   print(f"Audio: {len(audio)} samples ({len(audio)/SAMPLE_RATE:.1f}s)", file=sys.stderr)
 
   prompt_ids = [TOKEN_BOS] + [TOKEN_PAD] * (N_LEFT_PAD + N_DELAY)
@@ -318,11 +290,11 @@ if __name__ == "__main__":
   t_enc = time.time()
   print(f"Encoder+Adapter: {t_enc-t0:.1f}s", file=sys.stderr)
   n_audio, L = ada_out.shape[0], len(prompt_ids)
-  t_cond = compute_time_embedding(float(N_DELAY)).realize()
+  decoder.precompute_ada(float(N_DELAY))
   prefix_embeds = ada_out[:L] + decoder.tok_embeddings(Tensor(prompt_ids, dtype=dtypes.int))
 
-  if L > 1: decoder.prefill(prefix_embeds[:-1], t_cond)
-  token = decoder.decode_token(prefix_embeds[-1], pos=L - 1, t_cond=t_cond, use_jit=False)
+  if L > 1: decoder.prefill(prefix_embeds[:-1])
+  token = decoder.decode_token(prefix_embeds[-1], pos=L - 1, use_jit=False)
   generated = [token]
   t_prefill = time.time()
   print(f"Prefill: {t_prefill-t_enc:.1f}s", file=sys.stderr)
@@ -330,7 +302,7 @@ if __name__ == "__main__":
   for pos in range(L, n_audio):
     if token == TOKEN_EOS: break
     embed = ada_out[pos] + decoder.tok_embeddings.weight[token]
-    token = decoder.decode_token(embed, pos=pos, t_cond=t_cond, use_jit=True)
+    token = decoder.decode_token(embed, pos=pos, use_jit=True)
     generated.append(token)
 
   t1 = time.time()
