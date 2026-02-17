@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # Voxtral Realtime 4B speech-to-text — mistralai/Voxtral-Mini-4B-Realtime-2602
-import sys, os, math, struct, wave, json, base64, functools, time, argparse
+import sys, os, math, struct, wave, json, base64, functools, time, argparse, subprocess
 from tinygrad import Tensor, nn, dtypes, UOp, TinyJit
 
 SAMPLE_RATE, HOP_LENGTH, WINDOW_SIZE, NUM_MEL_BINS = 16000, 160, 400, 128
 DOWNSAMPLE_FACTOR, VOCAB_SIZE, ADA_NORM_DIM = 4, 131072, 32
-ENC_DIM, ENC_LAYERS, ENC_HEADS, ENC_HEAD_DIM, ENC_HIDDEN, ENC_KV_HEADS = 1280, 32, 32, 64, 5120, 32
+ENC_DIM, ENC_LAYERS, ENC_HEADS, ENC_HEAD_DIM, ENC_HIDDEN, ENC_KV_HEADS, ENC_WINDOW = 1280, 32, 32, 64, 5120, 32, 750
 DEC_DIM, DEC_LAYERS, DEC_HEADS, DEC_HEAD_DIM, DEC_HIDDEN, DEC_KV_HEADS = 3072, 26, 32, 128, 9216, 8
 NORM_EPS, ROPE_THETA, MAX_CONTEXT = 1e-5, 1_000_000.0, 512
 TOKEN_BOS, TOKEN_EOS, TOKEN_PAD = 1, 2, 32
@@ -59,6 +59,33 @@ class EncoderLayer:
     x = self.ffn_norm(h)
     return (h + self.feed_forward_w2(self.feed_forward_w1(x).silu() * self.feed_forward_w3(x))).realize()
 
+  def forward_chunk(self, h: Tensor, rope_cos: Tensor, rope_sin: Tensor, k_cache: Tensor | None, v_cache: Tensor | None):
+    x = self.attention_norm(h)
+    q = apply_rope(self.attention_wq(x).unsqueeze(0), rope_cos, rope_sin, ENC_HEADS, ENC_HEAD_DIM).squeeze(0)
+    k = apply_rope(self.attention_wk(x).unsqueeze(0), rope_cos, rope_sin, ENC_KV_HEADS, ENC_HEAD_DIM).squeeze(0)
+    v = self.attention_wv(x)
+    C = q.shape[0]
+    q = q.reshape(C, ENC_HEADS, ENC_HEAD_DIM).permute(1, 0, 2).unsqueeze(0)
+    k_new = k.reshape(C, ENC_KV_HEADS, ENC_HEAD_DIM).permute(1, 0, 2).unsqueeze(0)
+    v_new = v.reshape(C, ENC_KV_HEADS, ENC_HEAD_DIM).permute(1, 0, 2).unsqueeze(0)
+    if k_cache is not None:
+      k_all, v_all = k_cache.cat(k_new, dim=2), v_cache.cat(v_new, dim=2)
+    else:
+      k_all, v_all = k_new, v_new
+    cache_len = k_all.shape[2] - C
+    mask = Tensor.full((1, 1, C, k_all.shape[2]), float("-inf")).triu(cache_len + 1)
+    attn = q.scaled_dot_product_attention(k_all, v_all, attn_mask=mask)
+    h = h + self.attention_wo(attn.squeeze(0).permute(1, 0, 2).reshape(C, -1))
+    x = self.ffn_norm(h)
+    h = (h + self.feed_forward_w2(self.feed_forward_w1(x).silu() * self.feed_forward_w3(x))).realize()
+    # trim KV cache to sliding window
+    if k_all.shape[2] > ENC_WINDOW:
+      d = k_all.shape[2] - ENC_WINDOW
+      k_all, v_all = k_all[:, :, d:, :], v_all[:, :, d:, :]
+    return h, k_all.contiguous().realize(), v_all.contiguous().realize()
+
+ENC_CHUNK = 256
+
 class Encoder:
   def __init__(self):
     self.conv_layers_0_conv = nn.Conv1d(NUM_MEL_BINS, ENC_DIM, 3, stride=1, bias=True)
@@ -74,8 +101,17 @@ class Encoder:
     if trunc > 0: h = h[trunc:]
     S = h.shape[0]
     rope_cos, rope_sin = precompute_rope(ENC_HEAD_DIM, S)
-    mask = Tensor.full((1, 1, S, S), float("-inf")).triu(1).realize()
-    for layer in self.transformer_layers: h = layer(h, rope_cos, rope_sin, mask)
+    if S <= ENC_WINDOW:
+      mask = Tensor.full((1, 1, S, S), float("-inf")).triu(1).realize()
+      for layer in self.transformer_layers: h = layer(h, rope_cos, rope_sin, mask)
+    else:
+      for layer in self.transformer_layers:
+        chunks, k_cache, v_cache = [], None, None
+        for start in range(0, S, ENC_CHUNK):
+          end = min(start + ENC_CHUNK, S)
+          h_chunk, k_cache, v_cache = layer.forward_chunk(h[start:end], rope_cos[start:end], rope_sin[start:end], k_cache, v_cache)
+          chunks.append(h_chunk)
+        h = Tensor.cat(*chunks)
     return self.transformer_norm(h)
 
 class Adapter:
@@ -189,6 +225,18 @@ def load_wav(path: str):
   if nc > 1: floats = [sum(floats[i:i+nc]) / nc for i in range(0, len(floats), nc)]
   return floats, sr
 
+def load_audio_ffmpeg(path: str):
+  """Decode any audio format to mono f32le PCM via ffmpeg."""
+  cmd = ["ffmpeg", "-i", path, "-f", "f32le", "-acodec", "pcm_f32le", "-ac", "1", "-ar", str(SAMPLE_RATE), "-v", "quiet", "-"]
+  result = subprocess.run(cmd, capture_output=True)
+  if result.returncode != 0: raise RuntimeError(f"ffmpeg failed: {result.stderr.decode()}")
+  floats = list(struct.unpack(f"<{len(result.stdout)//4}f", result.stdout))
+  return floats, SAMPLE_RATE
+
+def load_audio(path: str):
+  if path.endswith(".wav"): return load_wav(path)
+  return load_audio_ffmpeg(path)
+
 def resample_linear(samples, src_sr, dst_sr):
   if src_sr == dst_sr: return samples
   ratio = src_sr / dst_sr
@@ -246,10 +294,10 @@ def load_voxtral(model_dir: str, max_context: int = MAX_CONTEXT):
 if __name__ == "__main__":
   parser = argparse.ArgumentParser(description="Voxtral Realtime 4B transcription")
   parser.add_argument("model_dir", help="Model directory with consolidated.safetensors and tekken.json")
-  parser.add_argument("wav_path", help="WAV audio file to transcribe")
+  parser.add_argument("audio_path", help="Audio file to transcribe (WAV, OGG, MP3, etc.)")
   args = parser.parse_args()
 
-  audio, sr = load_wav(args.wav_path)
+  audio, sr = load_audio(args.audio_path)
   if sr != SAMPLE_RATE: audio = resample_linear(audio, sr, SAMPLE_RATE)
   print(f"Audio: {len(audio)} samples ({len(audio)/SAMPLE_RATE:.1f}s)", file=sys.stderr)
 
@@ -267,6 +315,8 @@ if __name__ == "__main__":
 
   t0 = time.time()
   ada_out = adapter(encoder(mel)).realize()
+  t_enc = time.time()
+  print(f"Encoder+Adapter: {t_enc-t0:.1f}s", file=sys.stderr)
   n_audio, L = ada_out.shape[0], len(prompt_ids)
   t_cond = compute_time_embedding(float(N_DELAY)).realize()
   prefix_embeds = ada_out[:L] + decoder.tok_embeddings(Tensor(prompt_ids, dtype=dtypes.int))
@@ -274,6 +324,8 @@ if __name__ == "__main__":
   if L > 1: decoder.prefill(prefix_embeds[:-1], t_cond)
   token = decoder.decode_token(prefix_embeds[-1], pos=L - 1, t_cond=t_cond, use_jit=False)
   generated = [token]
+  t_prefill = time.time()
+  print(f"Prefill: {t_prefill-t_enc:.1f}s", file=sys.stderr)
 
   for pos in range(L, n_audio):
     if token == TOKEN_EOS: break
@@ -284,4 +336,4 @@ if __name__ == "__main__":
   t1 = time.time()
   if generated and generated[-1] == TOKEN_EOS: generated = generated[:-1]
   print(load_tokenizer(args.model_dir)(generated).strip())
-  print(f"{len(generated)} tokens in {t1-t0:.1f}s ({len(generated)/(t1-t0):.1f} tok/s)", file=sys.stderr)
+  print(f"{len(generated)} tokens in {t1-t0:.1f}s ({len(generated)/(t1-t0):.1f} tok/s), decode: {t1-t_prefill:.1f}s ({len(generated)/(t1-t_prefill):.1f} tok/s)", file=sys.stderr)
