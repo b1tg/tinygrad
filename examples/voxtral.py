@@ -149,14 +149,14 @@ class DecoderLayer:
     attn = q.scaled_dot_product_attention(keys, vals, attn_mask=mask, enable_gqa=True).transpose(1, 2).reshape(B, T, -1)
     h = x + self.attention_wo(attn)
     h_norm = self.ffn_norm(h) * self.ada_scale
-    return (h + self.feed_forward_w2(self.feed_forward_w1(h_norm).silu().contiguous() * self.feed_forward_w3(h_norm))).contiguous()
+    return (h + self.feed_forward_w2(self.feed_forward_w1(h_norm).silu() * self.feed_forward_w3(h_norm))).contiguous()
 
 class Decoder:
   def __init__(self, max_context: int = MAX_CONTEXT):
     self.tok_embeddings = nn.Embedding(VOCAB_SIZE, DEC_DIM)
     self.layers = [DecoderLayer(max_context) for _ in range(DEC_LAYERS)]
     self.norm = nn.RMSNorm(DEC_DIM, NORM_EPS)
-    self.max_context, self.forward_jit = max_context, TinyJit(self._forward_one)
+    self.max_context, self.forward_jit = max_context, TinyJit(self._decode_step)
 
   def precompute_ada(self, t_value: float):
     inv_freq = (-math.log(10000.0) * Tensor.arange(DEC_DIM // 2).float() / (DEC_DIM // 2)).exp()
@@ -165,10 +165,13 @@ class Decoder:
     for layer in self.layers:
       layer.ada_scale = (1 + layer.ada_rms_norm_t_cond_2(layer.ada_rms_norm_t_cond_0(t_cond).gelu()).reshape(1, 1, DEC_DIM)).realize()
 
-  def _forward_one(self, embed: Tensor, start_pos) -> Tensor:
-    h = embed
+  def _run_layers(self, h: Tensor, start_pos) -> Tensor:
     for layer in self.layers: h = layer(h, start_pos)
     return (self.norm(h)[:, -1, :] @ self.tok_embeddings.weight.T).argmax(-1, keepdim=True)
+
+  def _decode_step(self, ada_out: Tensor, token_id: Tensor, start_pos) -> Tensor:
+    h = (ada_out[start_pos:start_pos+1] + self.tok_embeddings(token_id)).reshape(1, 1, DEC_DIM)
+    return self._run_layers(h, start_pos)
 
   def prefill(self, input_embeds: Tensor):
     h = input_embeds.unsqueeze(0)
@@ -177,11 +180,8 @@ class Decoder:
       h = h.realize()
     return h
 
-  def decode_token(self, embed: Tensor, pos: int, use_jit: bool = True) -> int:
-    h = embed.reshape(1, 1, DEC_DIM)
-    v = UOp.variable("start_pos", 1, self.max_context - 1)
-    tok = self.forward_jit(h, v.bind(pos)) if use_jit else self._forward_one(h, pos)
-    return int(tok.item())
+  def decode_first(self, embed: Tensor, pos: int) -> int:
+    return int(self._run_layers(embed.reshape(1, 1, DEC_DIM), pos).item())
 
 # mel spectrogram (Slaney-style, matching mistral_common)
 def _h2m(f): return 3*f/200 if f < 1000 else 15 + 27/math.log(6.4) * math.log(f/1000)
@@ -235,33 +235,19 @@ def load_tokenizer(model_dir: str):
   return decode
 
 def load_voxtral(model_dir: str, max_context: int = MAX_CONTEXT):
-  state_dict = nn.state.safe_load(os.path.join(model_dir, "consolidated.safetensors"))
+  sd = nn.state.safe_load(os.path.join(model_dir, "consolidated.safetensors"))
   encoder, adapter, decoder = Encoder(), Adapter(), Decoder(max_context)
-  ENC_PFX = "mm_streams_embeddings.embedding_module.whisper_encoder."
-  ADA_PFX = "mm_streams_embeddings.embedding_module."
-  # encoder
-  enc_state = {}
-  for k, v in state_dict.items():
-    if not k.startswith(ENC_PFX): continue
-    nk = k[len(ENC_PFX):].replace("transformer.layers.", "transformer_layers.").replace("transformer.norm.", "transformer_norm.") \
-         .replace("conv_layers.0.conv.", "conv_layers_0_conv.").replace("conv_layers.1.conv.", "conv_layers_1_conv.") \
-         .replace("attention.", "attention_").replace("feed_forward.", "feed_forward_")
-    enc_state[nk] = v
-  nn.state.load_state_dict(encoder, enc_state, strict=True, verbose=False)
-  # adapter
-  nn.state.load_state_dict(adapter, {
-    "audio_language_projection_0.weight": state_dict[f"{ADA_PFX}audio_language_projection.0.weight"],
-    "audio_language_projection_2.weight": state_dict[f"{ADA_PFX}audio_language_projection.2.weight"],
-  }, strict=True, verbose=False)
-  # decoder
-  dec_state = {}
-  for k, v in state_dict.items():
-    if k.startswith("layers.") or k == "norm.weight":
-      dec_state[k.replace("attention.", "attention_").replace("feed_forward.", "feed_forward_").replace("t_cond.", "t_cond_")] = v
-    elif k == f"{ADA_PFX}tok_embeddings.weight": dec_state["tok_embeddings.weight"] = v
-  nn.state.load_state_dict(decoder, dec_state, strict=True, verbose=False)
-  for model in [encoder, adapter, decoder]:
-    for s in nn.state.get_parameters(model): s.replace(s.contiguous())
+  EP, AP = "mm_streams_embeddings.embedding_module.whisper_encoder.", "mm_streams_embeddings.embedding_module."
+  def r(k): return k.replace("transformer.layers.", "transformer_layers.").replace("transformer.norm.", "transformer_norm.") \
+    .replace("conv_layers.0.conv.", "conv_layers_0_conv.").replace("conv_layers.1.conv.", "conv_layers_1_conv.") \
+    .replace("attention.", "attention_").replace("feed_forward.", "feed_forward_").replace("t_cond.", "t_cond_").replace("projection.", "projection_")
+  nn.state.load_state_dict(encoder, {r(k[len(EP):]): v for k, v in sd.items() if k.startswith(EP)}, strict=True, verbose=False)
+  nn.state.load_state_dict(adapter, {r(k[len(AP):]): v for k, v in sd.items() if k.startswith(AP+"audio")}, strict=True, verbose=False)
+  dec = {r(k): v for k, v in sd.items() if k.startswith("layers.") or k == "norm.weight"}
+  dec["tok_embeddings.weight"] = sd[AP+"tok_embeddings.weight"]
+  nn.state.load_state_dict(decoder, dec, strict=True, verbose=False)
+  for m in [encoder, adapter, decoder]:
+    for s in nn.state.get_parameters(m): s.replace(s.contiguous())
   return encoder, adapter, decoder
 
 if __name__ == "__main__":
@@ -294,15 +280,16 @@ if __name__ == "__main__":
   prefix_embeds = ada_out[:L] + decoder.tok_embeddings(Tensor(prompt_ids, dtype=dtypes.int))
 
   if L > 1: decoder.prefill(prefix_embeds[:-1])
-  token = decoder.decode_token(prefix_embeds[-1], pos=L - 1, use_jit=False)
+  token = decoder.decode_first(prefix_embeds[-1], pos=L - 1)
   generated = [token]
   t_prefill = time.time()
   print(f"Prefill: {t_prefill-t_enc:.1f}s", file=sys.stderr)
 
+  v = UOp.variable("start_pos", 1, decoder.max_context - 1)
   for pos in range(L, n_audio):
     if token == TOKEN_EOS: break
-    embed = ada_out[pos] + decoder.tok_embeddings.weight[token]
-    token = decoder.decode_token(embed, pos=pos, use_jit=True)
+    token_id = decoder.forward_jit(ada_out, Tensor([token], dtype=dtypes.int), v.bind(pos))
+    token = int(token_id.item())
     generated.append(token)
 
   t1 = time.time()
