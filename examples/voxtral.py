@@ -40,29 +40,15 @@ class EncoderLayer:
     self.feed_forward_w2 = nn.Linear(ENC_HIDDEN, ENC_DIM, bias=True)
     self.ffn_norm = nn.RMSNorm(ENC_DIM, NORM_EPS)
 
-  def __call__(self, h: Tensor, rope_cos: Tensor, rope_sin: Tensor, mask: Tensor):
+  def __call__(self, h: Tensor, rope_cos: Tensor, rope_sin: Tensor, k_cache: Tensor | None, v_cache: Tensor | None):
     x = self.attention_norm(h)
-    q = apply_rope(self.attention_wq(x).unsqueeze(0), rope_cos, rope_sin, ENC_HEADS, ENC_HEAD_DIM).squeeze(0)
-    k = apply_rope(self.attention_wk(x).unsqueeze(0), rope_cos, rope_sin, ENC_KV_HEADS, ENC_HEAD_DIM).squeeze(0)
+    q = apply_rope(self.attention_wq(x), rope_cos, rope_sin, ENC_HEADS, ENC_HEAD_DIM)
+    k = apply_rope(self.attention_wk(x), rope_cos, rope_sin, ENC_KV_HEADS, ENC_HEAD_DIM)
     v = self.attention_wv(x)
-    S = q.shape[0]
-    q = q.reshape(S, ENC_HEADS, ENC_HEAD_DIM).permute(1, 0, 2).unsqueeze(0)
-    k = k.reshape(S, ENC_KV_HEADS, ENC_HEAD_DIM).permute(1, 0, 2).unsqueeze(0)
-    v = v.reshape(S, ENC_KV_HEADS, ENC_HEAD_DIM).permute(1, 0, 2).unsqueeze(0)
-    attn = q.scaled_dot_product_attention(k, v, attn_mask=mask)
-    h = h + self.attention_wo(attn.squeeze(0).permute(1, 0, 2).reshape(S, -1))
-    x = self.ffn_norm(h)
-    return (h + self.feed_forward_w2(self.feed_forward_w1(x).silu() * self.feed_forward_w3(x))).realize()
-
-  def forward_chunk(self, h: Tensor, rope_cos: Tensor, rope_sin: Tensor, k_cache: Tensor | None, v_cache: Tensor | None):
-    x = self.attention_norm(h)
-    q = apply_rope(self.attention_wq(x).unsqueeze(0), rope_cos, rope_sin, ENC_HEADS, ENC_HEAD_DIM).squeeze(0)
-    k = apply_rope(self.attention_wk(x).unsqueeze(0), rope_cos, rope_sin, ENC_KV_HEADS, ENC_HEAD_DIM).squeeze(0)
-    v = self.attention_wv(x)
-    C = q.shape[0]
-    q = q.reshape(C, ENC_HEADS, ENC_HEAD_DIM).permute(1, 0, 2).unsqueeze(0)
-    k_new = k.reshape(C, ENC_KV_HEADS, ENC_HEAD_DIM).permute(1, 0, 2).unsqueeze(0)
-    v_new = v.reshape(C, ENC_KV_HEADS, ENC_HEAD_DIM).permute(1, 0, 2).unsqueeze(0)
+    C = q.shape[1]
+    q = q.reshape(1, C, ENC_HEADS, ENC_HEAD_DIM).transpose(1, 2)
+    k_new = k.reshape(1, C, ENC_KV_HEADS, ENC_HEAD_DIM).transpose(1, 2)
+    v_new = v.reshape(1, C, ENC_KV_HEADS, ENC_HEAD_DIM).transpose(1, 2)
     if k_cache is not None:
       k_all, v_all = k_cache.cat(k_new, dim=2), v_cache.cat(v_new, dim=2)
     else:
@@ -70,15 +56,13 @@ class EncoderLayer:
     cache_len = k_all.shape[2] - C
     mask = Tensor.full((1, 1, C, k_all.shape[2]), float("-inf")).triu(cache_len + 1)
     attn = q.scaled_dot_product_attention(k_all, v_all, attn_mask=mask)
-    h = h + self.attention_wo(attn.squeeze(0).permute(1, 0, 2).reshape(C, -1))
+    h = h + self.attention_wo(attn.transpose(1, 2).reshape(1, C, -1))
     x = self.ffn_norm(h)
     h = (h + self.feed_forward_w2(self.feed_forward_w1(x).silu() * self.feed_forward_w3(x))).realize()
     if k_all.shape[2] > ENC_WINDOW:
       d = k_all.shape[2] - ENC_WINDOW
       k_all, v_all = k_all[:, :, d:, :], v_all[:, :, d:, :]
     return h, k_all.contiguous().realize(), v_all.contiguous().realize()
-
-ENC_CHUNK = 750
 
 class Encoder:
   def __init__(self):
@@ -90,23 +74,19 @@ class Encoder:
   def __call__(self, mel: Tensor):
     h = causal_conv1d(mel.unsqueeze(0), self.conv_layers_0_conv.weight, self.conv_layers_0_conv.bias, stride=1).gelu()
     h = causal_conv1d(h, self.conv_layers_1_conv.weight, self.conv_layers_1_conv.bias, stride=2).gelu()
-    h = h.squeeze(0).permute(1, 0)
-    trunc = h.shape[0] % DOWNSAMPLE_FACTOR
-    if trunc > 0: h = h[trunc:]
-    S = h.shape[0]
+    h = h.permute(0, 2, 1)
+    trunc = h.shape[1] % DOWNSAMPLE_FACTOR
+    if trunc > 0: h = h[:, trunc:]
+    S = h.shape[1]
     rope_cos, rope_sin = precompute_rope(ENC_HEAD_DIM, S)
-    if S <= ENC_WINDOW:
-      mask = Tensor.full((1, 1, S, S), float("-inf")).triu(1).realize()
-      for layer in self.transformer_layers: h = layer(h, rope_cos, rope_sin, mask)
-    else:
-      for layer in self.transformer_layers:
-        chunks, k_cache, v_cache = [], None, None
-        for start in range(0, S, ENC_CHUNK):
-          end = min(start + ENC_CHUNK, S)
-          h_chunk, k_cache, v_cache = layer.forward_chunk(h[start:end], rope_cos[start:end], rope_sin[start:end], k_cache, v_cache)
-          chunks.append(h_chunk)
-        h = Tensor.cat(*chunks)
-    return self.transformer_norm(h)
+    for layer in self.transformer_layers:
+      chunks, k_cache, v_cache = [], None, None
+      for start in range(0, S, ENC_WINDOW):
+        end = min(start + ENC_WINDOW, S)
+        h_chunk, k_cache, v_cache = layer(h[:, start:end], rope_cos[start:end], rope_sin[start:end], k_cache, v_cache)
+        chunks.append(h_chunk)
+      h = Tensor.cat(*chunks, dim=1)
+    return self.transformer_norm(h.squeeze(0))
 
 class Adapter:
   def __init__(self):
@@ -237,9 +217,10 @@ def load_voxtral(model_dir: str, max_context: int = MAX_CONTEXT):
   sd = nn.state.safe_load(os.path.join(model_dir, "consolidated.safetensors"))
   encoder, adapter, decoder = Encoder(), Adapter(), Decoder(max_context)
   EP, AP = "mm_streams_embeddings.embedding_module.whisper_encoder.", "mm_streams_embeddings.embedding_module."
-  def r(k): return k.replace("transformer.layers.", "transformer_layers.").replace("transformer.norm.", "transformer_norm.") \
-    .replace("conv_layers.0.conv.", "conv_layers_0_conv.").replace("conv_layers.1.conv.", "conv_layers_1_conv.") \
-    .replace("attention.", "attention_").replace("feed_forward.", "feed_forward_").replace("t_cond.", "t_cond_").replace("projection.", "projection_")
+  def r(k):
+    for p in ["transformer.layers", "transformer.norm", "conv_layers.0.conv", "conv_layers.1.conv"]: k = k.replace(p, p.replace(".", "_"))
+    for p in ["attention", "feed_forward", "t_cond", "projection"]: k = k.replace(p + ".", p + "_")
+    return k
   nn.state.load_state_dict(encoder, {r(k[len(EP):]): v for k, v in sd.items() if k.startswith(EP)}, strict=True, verbose=False)
   nn.state.load_state_dict(adapter, {r(k[len(AP):]): v for k, v in sd.items() if k.startswith(AP+"audio")}, strict=True, verbose=False)
   dec = {r(k): v for k, v in sd.items() if k.startswith("layers.") or k == "norm.weight"}
