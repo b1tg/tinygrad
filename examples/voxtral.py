@@ -73,13 +73,12 @@ class EncoderLayer:
     h = h + self.attention_wo(attn.squeeze(0).permute(1, 0, 2).reshape(C, -1))
     x = self.ffn_norm(h)
     h = (h + self.feed_forward_w2(self.feed_forward_w1(x).silu() * self.feed_forward_w3(x))).realize()
-    # trim KV cache to sliding window
     if k_all.shape[2] > ENC_WINDOW:
       d = k_all.shape[2] - ENC_WINDOW
       k_all, v_all = k_all[:, :, d:, :], v_all[:, :, d:, :]
     return h, k_all.contiguous().realize(), v_all.contiguous().realize()
 
-ENC_CHUNK = 256
+ENC_CHUNK = 750
 
 class Encoder:
   def __init__(self):
@@ -171,7 +170,7 @@ class Decoder:
 
   def _decode_step(self, ada_out: Tensor, token_id: Tensor, start_pos) -> Tensor:
     h = (ada_out[start_pos:start_pos+1] + self.tok_embeddings(token_id)).reshape(1, 1, DEC_DIM)
-    return self._run_layers(h, start_pos)
+    return self._run_layers(h, start_pos).realize()
 
   def prefill(self, input_embeds: Tensor):
     h = input_embeds.unsqueeze(0)
@@ -267,7 +266,9 @@ if __name__ == "__main__":
   if mel.shape[1] % 2 != 0: mel = mel[:, 1:]
   print(f"Mel: {mel.shape[1]} frames", file=sys.stderr)
 
+  t_load = time.time()
   encoder, adapter, decoder = load_voxtral(args.model_dir, max_context=max(mel.shape[1] // 8 + 64, 256))
+  print(f"Model load: {time.time()-t_load:.1f}s", file=sys.stderr)
   Tensor.no_grad = True
   mel = mel.realize()
 
@@ -286,13 +287,16 @@ if __name__ == "__main__":
   print(f"Prefill: {t_prefill-t_enc:.1f}s", file=sys.stderr)
 
   v = UOp.variable("start_pos", 1, decoder.max_context - 1)
+  tokenize = load_tokenizer(args.model_dir)
+  sys.stdout.write(tokenize([token])); sys.stdout.flush()
   for pos in range(L, n_audio):
     if token == TOKEN_EOS: break
     token_id = decoder.forward_jit(ada_out, Tensor([token], dtype=dtypes.int), v.bind(pos))
     token = int(token_id.item())
     generated.append(token)
+    sys.stdout.write(tokenize([token])); sys.stdout.flush()
+  print()
 
   t1 = time.time()
   if generated and generated[-1] == TOKEN_EOS: generated = generated[:-1]
-  print(load_tokenizer(args.model_dir)(generated).strip())
   print(f"{len(generated)} tokens in {t1-t0:.1f}s ({len(generated)/(t1-t0):.1f} tok/s), decode: {t1-t_prefill:.1f}s ({len(generated)/(t1-t_prefill):.1f} tok/s)", file=sys.stderr)
