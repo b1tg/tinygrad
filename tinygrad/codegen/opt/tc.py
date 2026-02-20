@@ -128,9 +128,9 @@ amd_cdna_1616128 = [TensorCore(dims=(16,16,128), threads=64, elements_per_thread
            (('l0', 'l1', 'l2', 'l3', 'r5', 'r6'), ('r0', 'r1'), ('l4', 'l5', 'u0', 'u1', 'r2', 'r3', 'r4'))))
   for di,do in [(dtypes.fp8e5m2,dtypes.float),(dtypes.fp8e4m3,dtypes.float)]]
 
-amd_cdna3 = amd_cdna_161632[2:4] + amd_cdna_161616
+amd_cdna3 = [tc for tc in amd_cdna_161632 if tc.dtype_in not in (dtypes.fp8e4m3, dtypes.fp8e5m2)] + amd_cdna_161616
 
-amd_cdna4 = amd_cdna_1616128 + amd_cdna_161632[:2] + amd_cdna_161632[4:] + amd_cdna_161616
+amd_cdna4 = amd_cdna_1616128 + [tc for tc in amd_cdna_161632 if tc.dtype_in not in (dtypes.fp8e4m3fnuz, dtypes.fp8e5m2fnuz)] + amd_cdna_161616
 
 # ***** Apple Metal *****
 

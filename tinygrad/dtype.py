@@ -215,24 +215,18 @@ class dtypes:
   floats = fp8s + (float16, bfloat16, float32, float64)
 
   @staticmethod
-  def fp8e4m3_hw() -> DType:
+  def _fp8_hw(standard: DType, fnuz: DType) -> DType:
     from tinygrad import Device
     if Device.DEFAULT == "AMD":
       target = getattr(Device["AMD"], "target", None)
-      if target == (9, 4, 2): return dtypes.fp8e4m3fnuz
-      if target == (9, 5, 0): return dtypes.fp8e4m3
-    if Device.DEFAULT in ("CUDA", "NV"): return dtypes.fp8e4m3
-    return dtypes.fp8e4m3
+      if target == (9, 4, 2): return fnuz
+      if target == (9, 5, 0): return standard
+    return standard
 
   @staticmethod
-  def fp8e5m2_hw() -> DType:
-    from tinygrad import Device
-    if Device.DEFAULT == "AMD":
-      target = getattr(Device["AMD"], "target", None)
-      if target == (9, 4, 2): return dtypes.fp8e5m2fnuz
-      if target == (9, 5, 0): return dtypes.fp8e5m2
-    if Device.DEFAULT in ("CUDA", "NV"): return dtypes.fp8e5m2
-    return dtypes.fp8e5m2
+  def fp8e4m3_hw() -> DType: return dtypes._fp8_hw(dtypes.fp8e4m3, dtypes.fp8e4m3fnuz)
+  @staticmethod
+  def fp8e5m2_hw() -> DType: return dtypes._fp8_hw(dtypes.fp8e5m2, dtypes.fp8e5m2fnuz)
 
   int8s = (uint8, int8)
   int16s = (uint16, int16)
@@ -306,7 +300,8 @@ def float_to_bf16(x):
   u = (u + 0x7FFF + ((u >> 16) & 1)) & 0xFFFF0000
   return struct.unpack('f', struct.pack('I', u))[0]
 
-# fp8-float conversions: (bias, sig_bits, mant_mask, min_denorm_half, ovf_threshold, max_norm, min_norm) as double bits
+# fp8-float conversions: (bias, sig_bits, mant_mask, min_denorm_half, ovf_threshold, max_norm, min_norm)
+# min_denorm_half, ovf_threshold, min_norm are raw double (IEEE 754) bit patterns
 _fp8_cfg = {
   dtypes.fp8e4m3: (7, 4, 0x7, 0x3F50000000000000, 0x407D000000000000, 0x7E, 0x3F90000000000000),
   dtypes.fp8e5m2: (15, 3, 0x3, 0x3EE0000000000000, 0x40EE000000000000-1, 0x7B, 0x3F10000000000000),
