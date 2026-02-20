@@ -175,9 +175,11 @@ def compute_mel_filters():
   return [[max(0, min((fft_f[f] - ff[m]) / fd[m], (ff[m+2] - fft_f[f]) / fd[m+1])) * 2 / (ff[m+2] - ff[m])
            for m in range(NUM_MEL_BINS)] for f in range(n_freq)]
 
+@functools.cache
+def _mel_basis(): return Tensor(compute_mel_filters()).contiguous(), Tensor.hann_window(WINDOW_SIZE).contiguous()
+
 def compute_mel_spectrogram(audio: Tensor):
-  mel_filters = Tensor(compute_mel_filters())
-  window = Tensor.hann_window(WINDOW_SIZE)
+  mel_filters, window = _mel_basis()
   stft = audio.stft(WINDOW_SIZE, HOP_LENGTH, window=window, pad_mode="constant", return_complex=True)
   magnitudes = stft[..., :-1, :].square().sum(-1)
   mel_spec = mel_filters.T @ magnitudes
