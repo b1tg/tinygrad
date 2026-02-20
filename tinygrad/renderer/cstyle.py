@@ -461,11 +461,8 @@ class CUDARenderer(CStyleLanguage):
     return super().render_kernel(function_name, kernel, bufs, uops, prefix=prefix)
 
 def fp8_index(dtype: DType):
-  """Returns 0-3: 0=e4m3, 1=e5m2, 2=e4m3fnuz, 3=e5m2fnuz"""
+  """Returns 0-3: 0=e4m3, 1=e5m2, 2=e4m3fnuz, 3=e5m2fnuz. &1 gives 0=fp8(e4m3), 1=bf8(e5m2)."""
   return (dtypes.fp8e4m3, dtypes.fp8e5m2, dtypes.fp8e4m3fnuz, dtypes.fp8e5m2fnuz).index(dtype.scalar())
-def fp8_wmma_index(dtype: DType):
-  """Returns 0 for e4m3 variants, 1 for e5m2 variants (for WMMA intrinsics)"""
-  return 0 if dtype.scalar() in (dtypes.fp8e4m3, dtypes.fp8e4m3fnuz) else 1
 def _ocml(op): return lambda x,dtype: f"__ocml_{op}_f{ {dtypes.half:16, dtypes.double:64}.get(dtype, 32)}({x})"
 
 class AMDHIPRenderer(CStyleLanguage):
@@ -489,12 +486,12 @@ class AMDHIPRenderer(CStyleLanguage):
     if self.is_cdna(self.arch):
       self.string_rewrite = PatternMatcher([
         (UPat(Ops.WMMA, name="x"), lambda ctx,x: f"__{x.arg[0]}({ctx[x.src[0]]}, {ctx[x.src[1]]}, {ctx[x.src[2]]},"
-          f" {fp8_wmma_index(x.src[0].dtype)}, {fp8_wmma_index(x.src[0].dtype)}, 0, 0, 0, 0)" if x.arg[1][2] == 128 else None),
+          f" {fp8_index(x.src[0].dtype)&1}, {fp8_index(x.src[0].dtype)&1}, 0, 0, 0, 0)" if x.arg[1][2] == 128 else None),
         (UPat(Ops.WMMA, name="x"), lambda ctx,x: f"__{x.arg[0]}({ctx[x.src[0]]}, {ctx[x.src[1]]}, {ctx[x.src[2]]}, 0, 0, 0)"),
         (UPat(Ops.CAST, dtypes.fp8s, (UPat.var("y", dtypes.float),), name="x",),
           lambda ctx,x,y: f"f32_to_fp8({ctx[x.src[0]]}, {fp8_index(x.dtype)})"),
         (UPat(Ops.CAST, dtypes.float, (UPat.var("y", dtypes.fp8s),), name="x",),
-          lambda ctx,x,y: f"__builtin_amdgcn_cvt_f32_{('fp8', 'bf8')[fp8_wmma_index(y.dtype)]}((unsigned int){ctx[x.src[0]]}, 0)"),
+          lambda ctx,x,y: f"__builtin_amdgcn_cvt_f32_{('fp8', 'bf8')[fp8_index(y.dtype)&1]}((unsigned int){ctx[x.src[0]]}, 0)"),
       ]) + base_rewrite
   def __reduce__(self): return self.__class__, (self.arch,)
 
