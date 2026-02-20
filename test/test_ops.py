@@ -246,6 +246,22 @@ class TestOps(unittest.TestCase):
     self.helper_test_exception([(8,)], lambda x: x.unfold(0, 9, 3), expected=RuntimeError)
     self.helper_test_exception([(8,)], lambda x: x.unfold(0, 1, -1), expected=RuntimeError)
 
+  def test_hann_window(self):
+    for n in [1, 5, 10, 400]:
+      helper_test_op([], lambda n=n: torch.hann_window(n, periodic=True), lambda n=n: Tensor.hann_window(n, periodic=True), forward_only=True)
+      helper_test_op([], lambda n=n: torch.hann_window(n, periodic=False), lambda n=n: Tensor.hann_window(n, periodic=False), forward_only=True)
+
+  def test_stft(self):
+    def torch_stft(x, **kw): return torch.view_as_real(x.stft(**kw))
+    def tiny_stft(x, **kw): return x.stft(**kw)
+    kw = dict(n_fft=16, hop_length=4, return_complex=True, center=True)
+    helper_test_op([(64,)], lambda x: torch_stft(x, **kw), lambda x: tiny_stft(x, **kw), forward_only=True, atol=2e-5, rtol=1e-3)
+    kw2 = dict(n_fft=16, hop_length=8, return_complex=True, center=False)
+    helper_test_op([(64,)], lambda x: torch_stft(x, **kw2), lambda x: tiny_stft(x, **kw2), forward_only=True, atol=2e-5, rtol=1e-3)
+    kw3 = dict(n_fft=16, hop_length=4, window=torch.hann_window(16), return_complex=True)
+    kw3t = dict(n_fft=16, hop_length=4, window=Tensor.hann_window(16), return_complex=True)
+    helper_test_op([(64,)], lambda x: torch_stft(x, **kw3), lambda x: tiny_stft(x, **kw3t), forward_only=True, atol=2e-5, rtol=1e-3)
+
   def test_meshgrid(self):
     x, xt = torch.tensor([0.,1.,2.], requires_grad=True), Tensor([0.,1.,2.], requires_grad=True)
     y, yt = torch.tensor([3.,4.,5.,6.], requires_grad=True), Tensor([3.,4.,5.,6.], requires_grad=True)

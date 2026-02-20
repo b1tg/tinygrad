@@ -751,6 +751,13 @@ class Tensor(OpMixin):
     t = (Tensor.arange(n, device=device).unsqueeze(-1) == Tensor.arange(m, device=device))
     return t.cast(dtype or dtypes.default_float).requires_grad_(requires_grad)
 
+  @staticmethod
+  def hann_window(window_length:int, periodic:bool=True, **kwargs) -> Tensor:
+    """Creates a Hann window of size `window_length`. Matches `torch.hann_window`."""
+    if window_length <= 1: return Tensor.ones(window_length, **kwargs)
+    N = window_length if periodic else window_length - 1  # periodic: symmetric window of N+1 with last point dropped
+    return 0.5 * (1 - (Tensor.arange(window_length, **kwargs).float() * (2 * math.pi / N)).cos())
+
   def _multi_like(self, fxn, *args, **kwargs) -> Tensor:
     dtype = kwargs.pop("dtype", self.dtype)
     if kwargs.get("device") is not None: raise RuntimeError("cannot specify `device` on `*_like` of a multi device tensor")
@@ -1426,6 +1433,25 @@ class Tensor(OpMixin):
     dim = self._resolve_dim(dim)
     perm_to_last = tuple(i for i in range(self.ndim) if i != dim) + (dim,)
     return self.permute(perm_to_last)._pool((size,), step).permute(argsort(perm_to_last) + (self.ndim,))
+
+  def stft(self, n_fft:int, hop_length:int|None=None, win_length:int|None=None, window:Tensor|None=None,
+           center:bool=True, pad_mode:str="reflect", normalized:bool=False, onesided:bool|None=None,
+           return_complex:bool|None=None) -> Tensor:
+    """Short-time Fourier transform. Returns `(..., n_freq, n_frames, 2)` where last dim is [real, imag] (no complex dtype)."""
+    assert return_complex, "return_complex=True required"
+    if hop_length is None: hop_length = n_fft // 4
+    if win_length is None: win_length = n_fft
+    if onesided is None: onesided = True
+    x = self.pad((n_fft // 2, n_fft // 2), mode=pad_mode) if center else self
+    frames = x.unfold(-1, n_fft, hop_length)  # (..., n_frames, n_fft)
+    if window is not None:
+      if win_length < n_fft: window = window.pad(((n_fft - win_length) // 2, (n_fft - win_length + 1) // 2))
+      frames = frames * window
+    n_freq = n_fft // 2 + 1 if onesided else n_fft
+    k, n = Tensor.arange(n_freq).float().unsqueeze(1), Tensor.arange(n_fft).float().unsqueeze(0)
+    angles = 2 * math.pi * k * n / n_fft  # DFT basis matrix
+    real, imag = frames @ angles.cos().T, frames @ (-angles.sin()).T
+    return Tensor.stack(real, imag, dim=-1).permute(*range(self.ndim - 1), -2, -3, -1)  # (..., n_freq, n_frames, 2)
 
   def meshgrid(self:Tensor, *args:Tensor, indexing:str="ij") -> tuple[Tensor, ...]:
     """

@@ -175,22 +175,12 @@ def compute_mel_filters():
   return [[max(0, min((fft_f[f] - ff[m]) / fd[m], (ff[m+2] - fft_f[f]) / fd[m+1])) * 2 / (ff[m+2] - ff[m])
            for m in range(NUM_MEL_BINS)] for f in range(n_freq)]
 
-@functools.cache
-def _mel_basis():
-  n_freq = 1 + WINDOW_SIZE // 2
-  mel_filters = compute_mel_filters()
-  window = 0.5 * (1.0 - (2 * math.pi / WINDOW_SIZE * Tensor.arange(WINDOW_SIZE).float()).cos())
-  angles = (2 * math.pi / WINDOW_SIZE) * Tensor.arange(n_freq).float().unsqueeze(1) * Tensor.arange(WINDOW_SIZE).float().unsqueeze(0)
-  return Tensor(mel_filters).contiguous(), window.contiguous(), angles.cos().contiguous(), angles.sin().contiguous()
-
 def compute_mel_spectrogram(audio: Tensor):
-  mel_filters, window, dft_cos, dft_sin = _mel_basis()
-  n_fft, hop, n_freq = WINDOW_SIZE, HOP_LENGTH, 1 + WINDOW_SIZE // 2
-  audio = audio.pad(((n_fft // 2, n_fft // 2),))
-  n_frames = 1 + (audio.shape[0] - n_fft) // hop
-  frames = audio[(Tensor.arange(n_frames).unsqueeze(1) * hop + Tensor.arange(n_fft).unsqueeze(0)).flatten()].reshape(n_frames, n_fft) * window
-  real, imag = frames @ dft_cos.T, frames @ (-dft_sin).T
-  mel_spec = ((real.square() + imag.square())[:-1] @ mel_filters).T
+  mel_filters = Tensor(compute_mel_filters())
+  window = Tensor.hann_window(WINDOW_SIZE)
+  stft = audio.stft(WINDOW_SIZE, HOP_LENGTH, window=window, pad_mode="constant", return_complex=True)
+  magnitudes = stft[..., :-1, :].square().sum(-1)
+  mel_spec = mel_filters.T @ magnitudes
   log_spec = mel_spec.clamp(min_=1e-10).log2() * math.log10(2)
   return (log_spec.maximum(Tensor.full(log_spec.shape, -6.5)) + 4.0) / 4.0
 
@@ -250,7 +240,6 @@ if __name__ == "__main__":
   t_load = time.time()
   encoder, adapter, decoder = load_voxtral(args.model_dir, max_context=max(mel.shape[1] // 8 + 64, 256))
   print(f"Model load: {time.time()-t_load:.1f}s", file=sys.stderr)
-  Tensor.no_grad = True
   mel = mel.realize()
 
   t0 = time.time()
