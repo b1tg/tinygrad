@@ -2,7 +2,7 @@ from typing import cast
 import math, struct, sys
 from tinygrad.codegen.opt import tc
 from tinygrad.renderer import Renderer
-from tinygrad.renderer.cstyle import AMDHIPRenderer, create_non_native_float_pats, pm_manual_bf16_cast
+from tinygrad.renderer.cstyle import AMDHIPRenderer, create_non_native_float_pats, fp8_index, pm_manual_bf16_cast
 from tinygrad.uop.decompositions import xexp2, xlog2
 from tinygrad.uop.ops import UOp, PatternMatcher, UPat, Ops, GroupOp, range_str
 from tinygrad.dtype import dtypes, float_to_fp8, DType, PtrDType, truncate
@@ -12,7 +12,8 @@ def ldt(dt:DType):
   if dt.vcount > 1: return f"<{dt.vcount} x {ldt(dt.scalar())}>"
   if isinstance(dt, PtrDType): return ldt(dt.base) + "*"
   return {dtypes.void: "void", dtypes.bool: "i1", dtypes.int8: "i8", dtypes.int16: "i16", dtypes.int32: "i32", dtypes.int64: "i64",
-          dtypes.uint8: "i8", dtypes.uint16: "i16", dtypes.uint32: "i32", dtypes.uint64: "i64", dtypes.fp8e4m3: "i8", dtypes.fp8e5m2: "i8",
+          dtypes.uint8: "i8", dtypes.uint16: "i16", dtypes.uint32: "i32", dtypes.uint64: "i64",
+          dtypes.fp8e4m3: "i8", dtypes.fp8e5m2: "i8", dtypes.fp8e4m3fnuz: "i8", dtypes.fp8e5m2fnuz: "i8",
           dtypes.float16: "half", dtypes.bfloat16: "bfloat", dtypes.float32: "float", dtypes.float64: "double"}[dt]
 
 def lconst(x, dtype:DType):
@@ -49,7 +50,7 @@ def render_wmma_amx(ctx, wmma: UOp) -> str:
 
 def render_wmma_amd(ctx, wmma: UOp, cdna=False) -> str:
   dt_map = {dtypes.half: "f16", dtypes.float: "f32", dtypes.ushort: "bf16.1k" if cdna else "bf16", dtypes.bfloat16: "bf16.1k" if cdna else "bf16",
-            dtypes.fp8e4m3: ".fp8.fp8", dtypes.fp8e5m2: ".bf8.bf8"}
+            dtypes.fp8e4m3: ".fp8.fp8", dtypes.fp8e5m2: ".bf8.bf8", dtypes.fp8e4m3fnuz: ".fp8.fp8", dtypes.fp8e5m2fnuz: ".bf8.bf8"}
   # https://github.com/llvm/llvm-project/blob/main/clang/test/CodeGenOpenCL/builtins-amdgcn-mfma.cl
   N,M,K = wmma.arg[1]
   if cdna:
@@ -227,10 +228,10 @@ class AMDLLVMRenderer(LLVMRenderer):
     lambda ctx, x: f"  {ctx[x]} = call {ldt(x.dtype)} @llvm.{llvm_intrinsics[x.op]}.{ldt(x.dtype.scalar())}({ldt(x.src[0].dtype)} {ctx[x.src[0]]})"),
     (UPat(Ops.BARRIER), lambda ctx: barrier),
     (UPat(Ops.CAST, dtypes.fp8s, (UPat.var("y", dtypes.float),), name="x",), lambda ctx,x,y:
-      f"  {ctx[x]} = call i8 @f32_to_fp8({ldt(x.src[0].dtype)}  {ctx[x.src[0]]}, i1 {'1' if x.dtype == dtypes.fp8e5m2 else '0'})"),
+      f"  {ctx[x]} = call i8 @f32_to_fp8({ldt(x.src[0].dtype)}  {ctx[x.src[0]]}, i32 {fp8_index(x.dtype)})"),
     (UPat(Ops.CAST, dtypes.float, (UPat.var("y", dtypes.fp8s),), name="x",), lambda ctx,x,y:
       f"  {ctx[x.src[0]]}_i32 = zext i8 {ctx[x.src[0]]} to i32\n"
-      f"  {ctx[x]} = call float @llvm.amdgcn.cvt.f32.{'bf8' if y.dtype == dtypes.fp8e5m2 else 'fp8'}(i32 {ctx[x.src[0]]}_i32, i32 0)"),
+      f"  {ctx[x]} = call float @llvm.amdgcn.cvt.f32.{'bf8' if fp8_index(y.dtype) & 1 else 'fp8'}(i32 {ctx[x.src[0]]}_i32, i32 0)"),
   ]) + base_rewrite
   extra_matcher = LLVMRenderer.extra_matcher + create_non_native_float_pats(dtypes.fp8s) + PatternMatcher([
     (UPat(Ops.CAST, name="x", dtype=dtypes.half.vec(16), src=UPat.var("y", dtypes.half.vec(8))),
@@ -242,13 +243,19 @@ class AMDLLVMRenderer(LLVMRenderer):
     (UPat(Ops.EXP2, dtype=dtypes.double, src=(UPat.var("d"),)), xexp2),
   ])
   def render(self, uops: list[UOp]) -> str:
-    prefix = ["""define i8 @f32_to_fp8(float %val, i1 %is_bf8) {
+    prefix = ["""define i8 @f32_to_fp8(float %val, i32 %fp8_type) {
 entry: %ival = bitcast float %val to i32\n  %exp = and i32 %ival, 2139095040\n  %is_special = icmp eq i32 %exp, 2139095040
+%is_fp8 = icmp eq i32 %fp8_type, 0\n  %is_bf8 = icmp eq i32 %fp8_type, 1\n  %is_fp8_fnuz = icmp eq i32 %fp8_type, 2
 br i1 %is_special, label %select_clip, label %clip
-clip: br i1 %is_bf8, label %bf8_clip, label %fp8_clip
+clip: br i1 %is_fp8, label %fp8_clip, label %clip2\nclip2: br i1 %is_bf8, label %bf8_clip, label %clip3
+clip3: br i1 %is_fp8_fnuz, label %fp8_fnuz_clip, label %bf8_fnuz_clip
+bf8_fnuz_clip: %clamped_bf8_fnuz = call float @llvm.amdgcn.fmed3.f32(float %val, float 57344.0, float -57344.0)\n  br label %select_clip
+fp8_fnuz_clip: %clamped_fp8_fnuz = call float @llvm.amdgcn.fmed3.f32(float %val, float 240.0, float -240.0)\n  br label %select_clip
 bf8_clip: %clamped_bf8 = call float @llvm.amdgcn.fmed3.f32(float %val, float 57344.0, float -57344.0)\n  br label %select_clip
 fp8_clip: %clamped_fp8 = call float @llvm.amdgcn.fmed3.f32(float %val, float 448.0, float -448.0)    \n  br label %select_clip
-select_clip: %phi_val = phi float [%val, %entry], [%clamped_bf8, %bf8_clip], [%clamped_fp8, %fp8_clip]\n  br i1 %is_bf8, label %do_bf8, label %do_fp8
+select_clip: %phi_val = phi float [%val, %entry], [%clamped_bf8_fnuz, %bf8_fnuz_clip], \
+[%clamped_fp8_fnuz, %fp8_fnuz_clip], [%clamped_bf8, %bf8_clip], [%clamped_fp8, %fp8_clip]
+%is_bf8_out = and i32 %fp8_type, 1\n  %is_bf8b_out = icmp ne i32 %is_bf8_out, 0\n  br i1 %is_bf8b_out, label %do_bf8, label %do_fp8
 do_bf8: %packed_bf8 = call i32 @llvm.amdgcn.cvt.pk.bf8.f32(float %phi_val, float %phi_val, i32 0, i1 false)\n  br label %exit
 do_fp8: %packed_fp8 = call i32 @llvm.amdgcn.cvt.pk.fp8.f32(float %phi_val, float %phi_val, i32 0, i1 false)\n  br label %exit
 exit: %packed = phi i32 [%packed_bf8, %do_bf8], [%packed_fp8, %do_fp8]\n  %trunc = trunc i32 %packed to i8\n  ret i8 %trunc
@@ -274,7 +281,7 @@ exit: %packed = phi i32 [%packed_bf8, %do_bf8], [%packed_fp8, %do_fp8]\n  %trunc
             x.src[2]), (*x.arg,)) if x.src[0].dtype == dtypes.bfloat16.vec(4) else None),
         (UPat(Ops.WMMA, name="x", dtype=dtypes.float.vec(4)),
           lambda x: UOp(Ops.WMMA, dtypes.float.vec(4), (x.src[0].bitcast(dtypes.uint64), x.src[1].bitcast(dtypes.uint64),
-            x.src[2]), (*x.arg,)) if x.src[0].dtype in (dtypes.fp8e4m3.vec(8), dtypes.fp8e5m2.vec(8)) else None),
+            x.src[2]), (*x.arg,)) if x.src[0].dtype.scalar() in dtypes.fp8s and x.src[0].dtype.count == 8 else None),
       ])
     if self.arch.split(":")[0] in {"gfx1100", "gfx1151"}:
       self.extra_matcher += PatternMatcher([
