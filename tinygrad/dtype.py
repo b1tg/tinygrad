@@ -222,7 +222,7 @@ class dtypes:
       if target == (9, 4, 2): return dtypes.fp8e4m3fnuz
       if target == (9, 5, 0): return dtypes.fp8e4m3
     if Device.DEFAULT in ("CUDA", "NV"): return dtypes.fp8e4m3
-    return dtypes.fp8e4m3fnuz
+    return dtypes.fp8e4m3
 
   @staticmethod
   def fp8e5m2_hw() -> DType:
@@ -232,7 +232,8 @@ class dtypes:
       if target == (9, 4, 2): return dtypes.fp8e5m2fnuz
       if target == (9, 5, 0): return dtypes.fp8e5m2
     if Device.DEFAULT in ("CUDA", "NV"): return dtypes.fp8e5m2
-    return dtypes.fp8e5m2fnuz
+    return dtypes.fp8e5m2
+
   int8s = (uint8, int8)
   int16s = (uint16, int16)
   int32s = (uint32, int32)
@@ -305,7 +306,7 @@ def float_to_bf16(x):
   u = (u + 0x7FFF + ((u >> 16) & 1)) & 0xFFFF0000
   return struct.unpack('f', struct.pack('I', u))[0]
 
-# fp8-float conversions: (bias, significand_bits, mantissa_mask, min_denorm/2, overflow_threshold, max_norm, min_norm) as double bits
+# fp8-float conversions: (bias, sig_bits, mant_mask, min_denorm_half, ovf_threshold, max_norm, min_norm) as double bits
 _fp8_cfg = {
   dtypes.fp8e4m3: (7, 4, 0x7, 0x3F50000000000000, 0x407D000000000000, 0x7E, 0x3F90000000000000),
   dtypes.fp8e5m2: (15, 3, 0x3, 0x3EE0000000000000, 0x40EE000000000000-1, 0x7B, 0x3F10000000000000),
@@ -317,30 +318,35 @@ def float_to_fp8(x: float, dtype: DType) -> int:
   if fnuz and (not math.isfinite(x) or x == 0.0): return 0x80 if not math.isfinite(x) else 0x00
   if dtype == dtypes.fp8e4m3 and not math.isfinite(x): return 0x7f if math.copysign(1, x) > 0 else 0xff
   if dtype == dtypes.fp8e5m2 and math.isinf(x): return 0x7c if math.copysign(1, x) > 0 else 0xfc
-  bias, sb, mm, md, ovf, mx, mn = _fp8_cfg[dtype]
-  xb, = struct.unpack('Q', struct.pack('d', x))
-  hulp, sign, exp, mant, absx = 1<<(52-sb), ((xb>>63)&1)<<7, ((xb>>52)&0x7FF)-1023+bias, (xb>>(53-sb))&mm, xb&0x7FFFFFFFFFFFFFFF
-  if absx <= md: res = 0
-  elif absx > 0x7FF0000000000000: res = 0x7F if dtype == dtypes.fp8e4m3 else 0x7E | mant
-  elif absx > ovf: res = 0x80 if dtype == dtypes.fp8e4m3fnuz else mx
-  elif absx >= mn:
-    res, rb = (exp<<(sb-1))|mant, xb&((hulp<<1)-1)
-    if rb > hulp or (rb == hulp and mant & 1): res += 1
+  bias, sig_bits, mant_mask, min_denorm_half, ovf_threshold, max_norm, min_norm = _fp8_cfg[dtype]
+  xbits, = struct.unpack('Q', struct.pack('d', x))
+  half_ulp = 1 << (52 - sig_bits)
+  sign, exp, mantissa, absx = ((xbits>>63)&1)<<7, ((xbits>>52)&0x7FF)-1023+bias, (xbits>>(53-sig_bits))&mant_mask, xbits&0x7FFFFFFFFFFFFFFF
+  if absx <= min_denorm_half: res = 0
+  elif absx > 0x7FF0000000000000: res = 0x7F if dtype == dtypes.fp8e4m3 else 0x7E | mantissa
+  elif absx > ovf_threshold: res = 0x80 if dtype == dtypes.fp8e4m3fnuz else max_norm
+  elif absx >= min_norm:
+    res = (exp << (sig_bits - 1)) | mantissa
+    round_bits = xbits & ((half_ulp << 1) - 1)
+    if round_bits > half_ulp or (round_bits == half_ulp and mantissa & 1): res += 1
   else:
-    sh, mant = 1-exp, mant|(1<<(sb-1))
-    res, rb = mant>>sh, (xb|(1<<52))&((hulp<<(sh+1))-1)
-    if rb > (hulp<<sh) or (rb == (hulp<<sh) and res & 1): res += 1
+    shift = 1 - exp
+    mantissa |= 1 << (sig_bits - 1)
+    res = mantissa >> shift
+    round_bits = (xbits | (1 << 52)) & ((half_ulp << (shift + 1)) - 1)
+    if round_bits > (half_ulp << shift) or (round_bits == (half_ulp << shift) and res & 1): res += 1
   return int(res | sign if (res or not fnuz) else 0)
 
 def fp8_to_float(x: int, dtype: DType) -> float:
   if dtype in (dtypes.fp8e4m3fnuz, dtypes.fp8e5m2fnuz) and x == 0x80: return float('nan')
   if (x & 0x7F) == 0: return -0.0 if x & 0x80 else 0.0
-  bias, sb = _fp8_cfg[dtype][:2]
-  mb, eb, sign, exp, mant = sb-1, 8-sb, (x>>7)&1, (x>>(sb-1))&((1<<(8-sb))-1), x&((1<<(sb-1))-1)
-  if dtype not in (dtypes.fp8e4m3fnuz, dtypes.fp8e5m2fnuz) and exp == (1<<eb)-1:
-    if dtype == dtypes.fp8e5m2: return float('nan') if mant else (-float('inf') if sign else float('inf'))
-    if mant == (1<<mb)-1: return float('nan')
-  val = (mant/(1<<mb)) * 2**(1-bias) if exp == 0 else (1+mant/(1<<mb)) * 2**(exp-bias)
+  bias, sig_bits = _fp8_cfg[dtype][:2]
+  mant_bits, exp_bits = sig_bits - 1, 8 - sig_bits
+  sign, exp, mantissa = (x >> 7) & 1, (x >> mant_bits) & ((1 << exp_bits) - 1), x & ((1 << mant_bits) - 1)
+  if dtype not in (dtypes.fp8e4m3fnuz, dtypes.fp8e5m2fnuz) and exp == (1 << exp_bits) - 1:
+    if dtype == dtypes.fp8e5m2: return float('nan') if mantissa else (-float('inf') if sign else float('inf'))
+    if mantissa == (1 << mant_bits) - 1: return float('nan')
+  val = (mantissa / (1 << mant_bits)) * 2 ** (1 - bias) if exp == 0 else (1 + mantissa / (1 << mant_bits)) * 2 ** (exp - bias)
   return -val if sign else val
 
 def storage_fmt_for_dtype(dtype:DType): return 'H' if dtype == dtypes.bfloat16 else 'B' if dtype in dtypes.fp8s else dtype.fmt
