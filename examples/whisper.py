@@ -1,6 +1,6 @@
 # thanks to https://github.com/openai/whisper for a good chunk of MIT licensed code
 
-import sys, base64, multiprocessing, itertools, collections
+import sys, base64, multiprocessing, itertools, collections, functools
 from typing import Optional, Union, Literal, List
 
 from tinygrad import Tensor, TinyJit, Variable, nn, dtypes
@@ -133,6 +133,9 @@ HOP_LENGTH = 160
 N_MELS = 80
 FRAMES_PER_SEGMENT = SAMPLES_PER_SEGMENT // HOP_LENGTH # 3000
 
+@functools.cache
+def _mel_basis(): return mel(sr=RATE, n_fft=N_FFT, n_mels=N_MELS), Tensor.hann_window(N_FFT)
+
 def prep_audio(waveforms: List[np.ndarray], batch_size: int, truncate=False) -> np.ndarray:
   """
   :param waveforms: A list of possibly variable length 16000Hz audio samples
@@ -158,15 +161,17 @@ def prep_audio(waveforms: List[np.ndarray], batch_size: int, truncate=False) -> 
     # we could have a symbolic batch_size dim instead of manually padding here if conv/layernorm supported symbolic shapes
     waveforms = np.pad(waveforms, pad_width=((0, batch_size - waveforms.shape[0]), (0, 0)))
 
-  stft = librosa.stft(waveforms, n_fft=N_FFT, hop_length=HOP_LENGTH, window='hann', dtype=np.csingle)
-  magnitudes = np.absolute(stft[..., :-1]) ** 2
-  mel_spec = mel(sr=RATE, n_fft=N_FFT, n_mels=N_MELS).numpy() @ magnitudes
+  audio = Tensor(waveforms)
+  mel_f, window = _mel_basis()
+  stft = audio.stft(N_FFT, HOP_LENGTH, window=window, pad_mode="constant", return_complex=True)
+  magnitudes = stft[..., :-1, :].square().sum(-1)
+  mel_spec = mel_f @ magnitudes
 
-  log_spec = np.log10(np.clip(mel_spec, 1e-10, None))
-  log_spec = np.maximum(log_spec, log_spec.max((1,2), keepdims=True) - 8.0)
+  log_spec = mel_spec.clamp(min_=1e-10).log10()
+  log_spec = log_spec.maximum(log_spec.max(axis=(1,2), keepdim=True) - 8.0)
   log_spec = (log_spec + 4.0) / 4.0
 
-  return log_spec
+  return log_spec.numpy()
 
 LANGUAGES = {
   "en": "english", "zh": "chinese", "de": "german", "es": "spanish", "ru": "russian", "ko": "korean", "fr": "french", "ja": "japanese", "pt": "portuguese", "tr": "turkish",
