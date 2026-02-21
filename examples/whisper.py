@@ -1,6 +1,6 @@
 # thanks to https://github.com/openai/whisper for a good chunk of MIT licensed code
 
-import sys, base64, multiprocessing, itertools, collections, functools
+import sys, base64, multiprocessing, itertools, collections, functools, struct, subprocess
 from typing import Optional, Union, Literal, List
 
 from tinygrad import Tensor, TinyJit, Variable, nn, dtypes
@@ -9,7 +9,6 @@ from tinygrad.helpers import getenv, fetch
 
 from examples.audio_helpers import mel
 import numpy as np
-import librosa
 
 class MultiHeadAttention:
   def __init__(self, n_state, n_head, kv_caching: Literal['cross', 'self']=None, max_self_attn_cache_len=None):
@@ -236,8 +235,9 @@ def init_whisper(model_name="tiny.en", batch_size=1):
   return model, enc
 
 def load_file_waveform(filename):
-  waveform, _ = librosa.load(filename, sr=RATE)
-  return waveform
+  result = subprocess.run(["ffmpeg", "-i", filename, "-f", "f32le", "-acodec", "pcm_f32le", "-ac", "1", "-ar", str(RATE), "-v", "quiet", "-"], capture_output=True)
+  if result.returncode != 0: raise RuntimeError(f"ffmpeg failed: {result.stderr.decode()}")
+  return np.array(struct.unpack(f"<{len(result.stdout)//4}f", result.stdout), dtype=np.float32)
 
 def transcribe_file(model, enc, filename):
   return transcribe_waveform(model, enc, [load_file_waveform(filename)])
