@@ -5,9 +5,9 @@ Usage:
   python extra/nemotron-asr/transcribe.py model.gguf test.wav
   python extra/nemotron-asr/transcribe.py model.nemo test.wav
 """
-import sys, math, struct, tarfile, tempfile, os
-from tinygrad import Tensor, nn, dtypes
-from tinygrad.nn.state import torch_load, load_state_dict
+import sys, math, struct, tarfile, tempfile, os, pathlib
+from tinygrad import Tensor, nn, dtypes, TinyJit
+from tinygrad.nn.state import torch_load, load_state_dict, gguf_load
 
 # ============================================================================
 # Constants
@@ -289,61 +289,55 @@ class NemotronASR:
     self.preprocessor = PreprocessorWeights()
 
 # ============================================================================
-# Greedy RNN-T decoding (numpy - sequential per-step, too slow for tinygrad graph overhead)
+# Greedy RNN-T decoding (TinyJit-cached LSTM step)
 # ============================================================================
-def _sigmoid(x):
-  import numpy as np
-  return 1.0 / (1.0 + np.exp(-np.clip(x, -88, 88)))
-
 def _lstm_cell(x, h, c, w_ih, w_hh, b_ih, b_hh):
-  import numpy as np
   gates = x @ w_ih.T + b_ih + h @ w_hh.T + b_hh
   hs = h.shape[-1]
-  i = _sigmoid(gates[..., :hs])
-  f = _sigmoid(gates[..., hs:2*hs])
-  g = np.tanh(gates[..., 2*hs:3*hs])
-  o = _sigmoid(gates[..., 3*hs:])
+  i, f, g, o = gates[..., :hs].sigmoid(), gates[..., hs:2*hs].sigmoid(), gates[..., 2*hs:3*hs].tanh(), gates[..., 3*hs:].sigmoid()
   c_new = f * c + i * g
-  h_new = o * np.tanh(c_new)
-  return h_new, c_new
+  return o * c_new.tanh(), c_new
+
+def _make_decoder_step(model):
+  lstm = model.decoder.prediction.dec_rnn.lstm
+  wl = [(lstm.weight_ih_l0, lstm.weight_hh_l0, lstm.bias_ih_l0, lstm.bias_hh_l0),
+        (lstm.weight_ih_l1, lstm.weight_hh_l1, lstm.bias_ih_l1, lstm.bias_hh_l1)]
+  dec_w, dec_b = model.joint.pred.weight, model.joint.pred.bias
+  out_w, out_b = model.joint.joint_net[2].weight, model.joint.joint_net[2].bias
+  @TinyJit
+  def step(emb, h0, c0, h1, c1, enc_proj):
+    h0n, c0n = _lstm_cell(emb, h0, c0, *wl[0])
+    h1n, c1n = _lstm_cell(h0n, h1, c1, *wl[1])
+    logits = (enc_proj + h1n @ dec_w.T + dec_b).relu() @ out_w.T + out_b
+    best = logits.argmax(-1, keepdim=True)
+    return best.realize(), h0n.realize(), c0n.realize(), h1n.realize(), c1n.realize()
+  return step
 
 def greedy_decode(encoder_out, model, vocab):
-  import numpy as np
-  encoder_out_np = encoder_out.numpy()
-  embed_w = model.decoder.prediction.embed.weight.numpy()
-  lstm = model.decoder.prediction.dec_rnn.lstm
-  w_ih = [lstm.weight_ih_l0.numpy(), lstm.weight_ih_l1.numpy()]
-  w_hh = [lstm.weight_hh_l0.numpy(), lstm.weight_hh_l1.numpy()]
-  b_ih = [lstm.bias_ih_l0.numpy(), lstm.bias_ih_l1.numpy()]
-  b_hh = [lstm.bias_hh_l0.numpy(), lstm.bias_hh_l1.numpy()]
-  enc_w = model.joint.enc.weight.numpy()
-  enc_b = model.joint.enc.bias.numpy()
-  dec_w = model.joint.pred.weight.numpy()
-  dec_b = model.joint.pred.bias.numpy()
-  out_w = model.joint.joint_net[2].weight.numpy()
-  out_b = model.joint.joint_net[2].bias.numpy()
+  step_fn = _make_decoder_step(model)
+  embed_w = model.decoder.prediction.embed.weight
+  # precompute all encoder projections at once
+  enc_proj_all = (encoder_out[0] @ model.joint.enc.weight.T + model.joint.enc.bias).realize()
 
-  time_steps = encoder_out_np.shape[1]
-  h = [np.zeros(DECODER_DIM, dtype=np.float32), np.zeros(DECODER_DIM, dtype=np.float32)]
-  c = [np.zeros(DECODER_DIM, dtype=np.float32), np.zeros(DECODER_DIM, dtype=np.float32)]
-  prev_token = BLANK_TOKEN
-  tokens = []
+  time_steps = encoder_out.shape[1]
+  # persistent LSTM state buffers — use .assign() to update in-place (JIT output buffers get reused, .contiguous() doesn't create independent copies)
+  h0, c0 = Tensor.zeros(DECODER_DIM).contiguous().realize(), Tensor.zeros(DECODER_DIM).contiguous().realize()
+  h1, c1 = Tensor.zeros(DECODER_DIM).contiguous().realize(), Tensor.zeros(DECODER_DIM).contiguous().realize()
+  enc_proj = Tensor.zeros(JOINT_DIM).contiguous().realize()
+  emb = Tensor.zeros(DECODER_DIM).contiguous().realize()
+  prev_token, tokens = BLANK_TOKEN, []
 
   for t in range(time_steps):
-    enc_frame = encoder_out_np[0, t]
-    enc_proj = enc_frame @ enc_w.T + enc_b
-    for _sym in range(10):
-      emb = embed_w[prev_token]
-      h0, c0 = _lstm_cell(emb, h[0], c[0], w_ih[0], w_hh[0], b_ih[0], b_hh[0])
-      h1, c1 = _lstm_cell(h0, h[1], c[1], w_ih[1], w_hh[1], b_ih[1], b_hh[1])
-      dec_proj = h1 @ dec_w.T + dec_b
-      logits = np.maximum(enc_proj + dec_proj, 0) @ out_w.T + out_b
-      best = int(logits.argmax())
-      if best == BLANK_TOKEN:
-        break
+    enc_proj.assign(enc_proj_all[t:t+1].reshape(JOINT_DIM)).realize()
+    for _ in range(10):
+      emb.assign(embed_w[prev_token:prev_token+1].reshape(DECODER_DIM)).realize()
+      best_t, h0n, c0n, h1n, c1n = step_fn(emb, h0, c0, h1, c1, enc_proj)
+      best = best_t.item()
+      if best == BLANK_TOKEN: break
       tokens.append(best)
       prev_token = best
-      h[0], c[0], h[1], c[1] = h0, c0, h1, c1
+      h0.assign(h0n).realize(); c0.assign(c0n).realize()
+      h1.assign(h1n).realize(); c1.assign(c1n).realize()
 
   return tokens_to_text(tokens, vocab)
 
@@ -375,109 +369,24 @@ def load_nemo(path):
     os.unlink(tmp_path)
   return weights, vocab
 
-def load_gguf(path):
-  """Load weights and vocab from GGUF format."""
-  import numpy as np
-  with open(path, 'rb') as f:
-    magic = f.read(4)
-    assert magic == b'GGUF', f"not a GGUF file: {magic}"
-    version, = struct.unpack('<I', f.read(4))
-    n_tensors, = struct.unpack('<q', f.read(8))
-    n_kv, = struct.unpack('<q', f.read(8))
+def load_gguf_weights(path):
+  """Load weights and vocab from GGUF using tinygrad's built-in loader."""
+  from tinygrad import Device
+  kv_data, state_dict = gguf_load(Tensor(pathlib.Path(path)).to(Device.DEFAULT))
 
-    def read_string():
-      length, = struct.unpack('<Q', f.read(8))
-      return f.read(length)
+  # extract vocab from metadata (stored as one big string, 8 raw bytes per token — must re-encode because gguf_load decodes UTF-8)
+  vocab_bytes = kv_data.get('tokenizer.vocab', '').encode('utf-8')
+  vocab_size = kv_data.get('nemo.vocab_size', VOCAB_SIZE)
+  vocab = [vocab_bytes[i*8:(i+1)*8].split(b'\x00')[0].decode('utf-8') for i in range(vocab_size)]
 
-    # read KV pairs
-    metadata = {}
-    for _ in range(n_kv):
-      key = read_string().decode('utf-8')
-      vtype, = struct.unpack('<i', f.read(4))
-      if vtype == 4: val, = struct.unpack('<I', f.read(4))  # uint32
-      elif vtype == 5: val, = struct.unpack('<i', f.read(4))  # int32
-      elif vtype == 6: val, = struct.unpack('<f', f.read(4))  # float32
-      elif vtype == 8: val = read_string()  # string (bytes)
-      else: raise ValueError(f"unknown GGUF kv type {vtype} for key {key}")
-      metadata[key] = val
-
-    # extract vocab from metadata
-    vocab_data = metadata.get('tokenizer.vocab', b'')
-    vocab_size = metadata.get('nemo.vocab_size', VOCAB_SIZE)
-    vocab = []
-    for i in range(vocab_size):
-      entry = vocab_data[i*8:(i+1)*8]
-      s = entry.split(b'\x00')[0].decode('utf-8', errors='replace')
-      vocab.append(s)
-
-    # read tensor infos
-    GGML_TYPE_F32 = 0
-    GGML_TYPE_F16 = 1
-    GGML_TYPE_Q8_0 = 8
-    GGML_TYPE_Q4_0 = 2
-    tensor_infos = []
-    for _ in range(n_tensors):
-      name = read_string().decode('utf-8')
-      n_dims, = struct.unpack('<I', f.read(4))
-      dims = [struct.unpack('<q', f.read(8))[0] for _ in range(n_dims)]
-      ttype, = struct.unpack('<i', f.read(4))
-      offset, = struct.unpack('<Q', f.read(8))
-      tensor_infos.append((name, dims, ttype, offset))
-
-    # align to 32 bytes for data section
-    pos = f.tell()
-    aligned = (pos + 31) // 32 * 32
-    f.seek(aligned)
-    data_start = f.tell()
-
-    # load tensors
-    weights = {}
-    for name, dims, ttype, offset in tensor_infos:
-      # dims are in GGUF order (reversed from numpy)
-      shape = list(reversed(dims))
-      n_elements = 1
-      for d in shape: n_elements *= d
-      f.seek(data_start + offset)
-
-      if ttype == GGML_TYPE_F32:
-        data = np.frombuffer(f.read(n_elements * 4), dtype=np.float32).reshape(shape)
-      elif ttype == GGML_TYPE_F16:
-        data = np.frombuffer(f.read(n_elements * 2), dtype=np.float16).reshape(shape).astype(np.float32)
-      elif ttype == GGML_TYPE_Q8_0:
-        n_blocks = (n_elements + 31) // 32
-        raw = f.read(n_blocks * 34)
-        block_dt = np.dtype([('scale', np.float16), ('quants', np.int8, 32)])
-        blocks = np.frombuffer(raw, dtype=block_dt)
-        scales = blocks['scale'].astype(np.float32)
-        quants = blocks['quants'].astype(np.float32)
-        data = (quants * scales[:, None]).reshape(-1)[:n_elements].reshape(shape)
-      elif ttype == GGML_TYPE_Q4_0:
-        n_blocks = (n_elements + 31) // 32
-        raw = f.read(n_blocks * 18)
-        block_dt = np.dtype([('scale', np.float16), ('quants', np.uint8, 16)])
-        blocks = np.frombuffer(raw, dtype=block_dt)
-        scales = blocks['scale'].astype(np.float32)
-        packed = blocks['quants']
-        low = (packed & 0x0F).astype(np.int8) - 8
-        high = ((packed >> 4) & 0x0F).astype(np.int8) - 8
-        quants = np.concatenate([low, high], axis=1).astype(np.float32)
-        data = (quants * scales[:, None]).reshape(-1)[:n_elements].reshape(shape)
-      else:
-        print(f"warning: skipping tensor {name} with unsupported type {ttype}")
-        continue
-
-      # handle conv weights stored as 2D in GGUF (need to restore 3D for our model)
-      if 'pointwise_conv1.weight' in name and len(shape) == 2:
-        data = data[:, :, np.newaxis]  # [out, in] -> [out, in, 1]
-      elif 'pointwise_conv2.weight' in name and len(shape) == 2:
-        data = data[:, :, np.newaxis]
-      elif 'depthwise_conv.weight' in name and len(shape) == 2:
-        # GGUF stores as [kernel, d_model] (transposed), restore to [d_model, 1, kernel]
-        data = data.T[:, np.newaxis, :]
-      elif name == 'preprocessor.featurizer.fb' and len(shape) == 3:
-        data = data.squeeze(0)  # [1, n_mels, n_bins] -> [n_mels, n_bins]
-
-      weights[name] = Tensor(data)
+  # reshape conv weights from GGUF 2D format to our model's 3D format
+  weights = {}
+  for name, t in state_dict.items():
+    if 'pointwise_conv1.weight' in name and t.ndim == 2: t = t.unsqueeze(-1)
+    elif 'pointwise_conv2.weight' in name and t.ndim == 2: t = t.unsqueeze(-1)
+    elif 'depthwise_conv.weight' in name and t.ndim == 2: t = t.T.unsqueeze(1)
+    elif name == 'preprocessor.featurizer.fb' and t.ndim == 3: t = t[0]
+    weights[name] = t
 
   return weights, vocab
 
@@ -492,26 +401,23 @@ def build_model(weights, vocab):
 def load_wav(path):
   """Load WAV file as Tensor at 16kHz."""
   import wave
-  import numpy as np
   with wave.open(path, 'rb') as wf:
-    sr = wf.getframerate()
-    nch = wf.getnchannels()
-    sw = wf.getsampwidth()
-    data = wf.readframes(wf.getnframes())
-  if sw == 2:
-    audio = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
-  elif sw == 4:
-    audio = np.frombuffer(data, dtype=np.int32).astype(np.float32) / 2147483648.0
-  else:
-    raise ValueError(f"unsupported sample width {sw}")
-  if nch > 1:
-    audio = audio.reshape(-1, nch)[:, 0]
+    sr, nch, sw = wf.getframerate(), wf.getnchannels(), wf.getsampwidth()
+    raw = wf.readframes(wf.getnframes())
+  n = len(raw) // sw // nch
+  fmt = {2: f'<{n*nch}h', 4: f'<{n*nch}i'}[sw]
+  scale = {2: 32768.0, 4: 2147483648.0}[sw]
+  audio = Tensor(list(struct.unpack(fmt, raw)), dtype=dtypes.float32) / scale
+  if nch > 1: audio = audio.reshape(-1, nch)[:, 0]
   if sr != SAMPLE_RATE:
     ratio = SAMPLE_RATE / sr
-    new_len = int(len(audio) * ratio)
-    indices = np.arange(new_len) / ratio
-    audio = np.interp(indices, np.arange(len(audio)), audio).astype(np.float32)
-  return Tensor(audio)
+    new_len = int(audio.shape[0] * ratio)
+    idx = Tensor.arange(new_len, dtype=dtypes.float32) / ratio
+    idx_f = idx.cast(dtypes.int32)
+    idx_c = (idx_f + 1).minimum(audio.shape[0] - 1)
+    frac = idx - idx_f.cast(dtypes.float32)
+    audio = audio[idx_f] * (1 - frac) + audio[idx_c] * frac
+  return audio
 
 def transcribe(model, vocab, audio_path):
   audio = load_wav(audio_path)
@@ -538,7 +444,7 @@ if __name__ == "__main__":
   audio_path = sys.argv[2]
 
   if model_path.endswith('.gguf'):
-    weights, vocab = load_gguf(model_path)
+    weights, vocab = load_gguf_weights(model_path)
   else:
     weights, vocab = load_nemo(model_path)
 
