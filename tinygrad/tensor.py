@@ -1511,7 +1511,7 @@ class Tensor(OpMixin):
     if normalized:
       scale = 1 / math.sqrt(n_fft)
       real, imag = real * scale, imag * scale
-    return Tensor.stack(real, imag, dim=-1).permute(*range(self.ndim - 1), -2, -3, -1)
+    return Tensor.stack(real, imag, dim=-1).permute(*range(self.ndim - 1), -2, -3, -1).contiguous()
 
   def meshgrid(self:Tensor, *args:Tensor, indexing:str="ij") -> tuple[Tensor, ...]:
     """
