@@ -181,11 +181,11 @@ class Encoder:
 class NemotronASR:
   def __init__(self):
     self.encoder = Encoder()
+    cell0, cell1 = nn.LSTMCell(DECODER_DIM, DECODER_DIM), nn.LSTMCell(DECODER_DIM, DECODER_DIM)
     lstm = NS(
-      weight_ih_l0=Tensor.zeros(4*DECODER_DIM, DECODER_DIM), weight_hh_l0=Tensor.zeros(4*DECODER_DIM, DECODER_DIM),
-      bias_ih_l0=Tensor.zeros(4*DECODER_DIM), bias_hh_l0=Tensor.zeros(4*DECODER_DIM),
-      weight_ih_l1=Tensor.zeros(4*DECODER_DIM, DECODER_DIM), weight_hh_l1=Tensor.zeros(4*DECODER_DIM, DECODER_DIM),
-      bias_ih_l1=Tensor.zeros(4*DECODER_DIM), bias_hh_l1=Tensor.zeros(4*DECODER_DIM),
+      step0=lambda x, hc: cell0(x, hc), step1=lambda x, hc: cell1(x, hc),
+      weight_ih_l0=cell0.weight_ih, weight_hh_l0=cell0.weight_hh, bias_ih_l0=cell0.bias_ih, bias_hh_l0=cell0.bias_hh,
+      weight_ih_l1=cell1.weight_ih, weight_hh_l1=cell1.weight_hh, bias_ih_l1=cell1.bias_ih, bias_hh_l1=cell1.bias_hh,
     )
     self.decoder = NS(prediction=NS(embed=nn.Embedding(VOCAB_SIZE, DECODER_DIM), dec_rnn=NS(lstm=lstm)))
     self.joint = NS(
@@ -196,23 +196,14 @@ class NemotronASR:
     self.preprocessor = NS(featurizer=NS(fb=Tensor.zeros(N_MELS, N_FFT // 2 + 1), window=Tensor.zeros(N_WINDOW)))
 
 
-def _lstm_cell(x, h, c, w_ih, w_hh, b_ih, b_hh):
-  gates = x @ w_ih.T + b_ih + h @ w_hh.T + b_hh
-  hs = h.shape[-1]
-  i, f, g, o = gates[..., :hs].sigmoid(), gates[..., hs:2*hs].sigmoid(), gates[..., 2*hs:3*hs].tanh(), gates[..., 3*hs:].sigmoid()
-  c_new = f * c + i * g
-  return o * c_new.tanh(), c_new
-
 def _make_decoder_step(model):
   lstm = model.decoder.prediction.dec_rnn.lstm
-  wl = [(lstm.weight_ih_l0, lstm.weight_hh_l0, lstm.bias_ih_l0, lstm.bias_hh_l0),
-        (lstm.weight_ih_l1, lstm.weight_hh_l1, lstm.bias_ih_l1, lstm.bias_hh_l1)]
   dec_w, dec_b = model.joint.pred.weight, model.joint.pred.bias
   out_w, out_b = model.joint.joint_net[2].weight, model.joint.joint_net[2].bias
   @TinyJit
   def step(emb, h0, c0, h1, c1, enc_proj):
-    h0n, c0n = _lstm_cell(emb, h0, c0, *wl[0])
-    h1n, c1n = _lstm_cell(h0n, h1, c1, *wl[1])
+    h0n, c0n = lstm.step0(emb, (h0, c0))
+    h1n, c1n = lstm.step1(h0n, (h1, c1))
     logits = (enc_proj + h1n @ dec_w.T + dec_b).relu() @ out_w.T + out_b
     best = logits.argmax(-1, keepdim=True)
     return best.realize(), h0n.realize(), c0n.realize(), h1n.realize(), c1n.realize()
@@ -224,16 +215,16 @@ def greedy_decode(encoder_out, model, vocab):
   enc_proj_all = (encoder_out[0] @ model.joint.enc.weight.T + model.joint.enc.bias).realize()
 
   time_steps = encoder_out.shape[1]
-  h0, c0 = Tensor.zeros(DECODER_DIM).contiguous().realize(), Tensor.zeros(DECODER_DIM).contiguous().realize()
-  h1, c1 = Tensor.zeros(DECODER_DIM).contiguous().realize(), Tensor.zeros(DECODER_DIM).contiguous().realize()
-  enc_proj = Tensor.zeros(JOINT_DIM).contiguous().realize()
-  emb = Tensor.zeros(DECODER_DIM).contiguous().realize()
+  h0, c0 = Tensor.zeros(1, DECODER_DIM).contiguous().realize(), Tensor.zeros(1, DECODER_DIM).contiguous().realize()
+  h1, c1 = Tensor.zeros(1, DECODER_DIM).contiguous().realize(), Tensor.zeros(1, DECODER_DIM).contiguous().realize()
+  enc_proj = Tensor.zeros(1, JOINT_DIM).contiguous().realize()
+  emb = Tensor.zeros(1, DECODER_DIM).contiguous().realize()
   prev_token, tokens = BLANK_TOKEN, []
 
   for t in range(time_steps):
-    enc_proj.assign(enc_proj_all[t:t+1].reshape(JOINT_DIM)).realize()
+    enc_proj.assign(enc_proj_all[t:t+1]).realize()
     for _ in range(10):
-      emb.assign(embed_w[prev_token:prev_token+1].reshape(DECODER_DIM)).realize()
+      emb.assign(embed_w[prev_token:prev_token+1]).realize()
       best_t, h0n, c0n, h1n, c1n = step_fn(emb, h0, c0, h1, c1, enc_proj)
       best = best_t.item()
       if best == BLANK_TOKEN: break
