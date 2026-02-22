@@ -14,7 +14,9 @@ def _lazy_map_numbers(x:UOp, inf:UOp, _inf:UOp, nan:UOp, ratio:UOp):
 
 # *** helper functions for bit manipulation ***
 def mantissa_bits(d:DType) -> int: return dtypes.finfo(d.scalar())[1]
-def exponent_bias(d:DType) -> int: return (1 << (dtypes.finfo(d.scalar())[0] - 1)) - 1
+def exponent_bias(d:DType) -> int:
+  fe = dtypes.finfo(d.scalar())[0]
+  return (1 << (fe - 1)) - (0 if d.scalar() in dtypes.fp8_fnuz else 1)
 def exponent_mask(d:DType) -> int: return (1 << dtypes.finfo(d.scalar())[0]) - 1
 
 # **** utils ****
@@ -389,27 +391,41 @@ def f2f(v, fr:DType, to:DType):
     sign, nosign = shl((v & shl(1, fs-1)).cast(f2f_dt[to]), ts - fs), (v & (shl(1, fs-1) - 1)).cast(f2f_dt[to])
     exp, norm = shr(nosign, fm), shl(nosign, tm - fm) + shl(tb - fb, tm)
     nan = shl(nosign, tm - fm) | shl((shl(1, te) - 1), tm)
-    # fp8e4m3 has only one nan
+    if fr in dtypes.fp8_fnuz:
+      fnuz_nan = sign.ne(0) & nosign.eq(0)
+      qnan = shl(shl(1, te) - 1, tm) | shl(1, tm - 1)
+      return fnuz_nan.where(qnan, sign | exp.eq(0).where(0, norm)).bitcast(to)
     is_nan = (nosign.eq(shl(1, fm + fe) - 1) if fr == dtypes.fp8e4m3 else exp.eq(shl(1, fe) - 1))
     return (sign | exp.eq(0).where(0, is_nan.where(nan, norm))).bitcast(to)
   elif fe >= te and fm > tm:
+    src_exp = shr(v, fm) & (shl(1, fe) - 1)
+    nan_src = src_exp.eq(shl(1, fe) - 1) & (v & (shl(1, fm) - 1)).ne(0)
     v = f2f_clamp(v.bitcast(fr), to).bitcast(f2f_dt[fr])
     sign, nosign = shr(v, fs - ts) & shl(1, ts - 1), v & (shl(1, fs - 1) - 1)
     norm = (rne(nosign, fm - tm) - shl(fb - tb, tm)).cast(f2f_dt[to])
     underflow = (shr(v, fm) & (shl(1, fe) - 1)) < (1 + fb - tb)
     nan_mantissa = (shl(1, tm) - 1) if to == dtypes.fp8e4m3 else (shr(nosign, fm - tm) & (shl(1, tm) - 1))
     nan = (sign | nan_mantissa | shl(shl(1, te) - 1, tm)).cast(f2f_dt[to])
-    is_nan = (shr(v, fm) & (shl(1, fe) - 1)).eq(shl(1, fe) - 1)
+    is_nan = nan_src | (shr(v, fm) & (shl(1, fe) - 1)).eq(shl(1, fe) - 1)
+    if to in dtypes.fp8_fnuz:
+      return is_nan.where(shl(1, ts - 1), underflow.where(0, sign.cast(f2f_dt[to]) | norm))
     return is_nan.where(nan, sign.cast(f2f_dt[to]) | underflow.where(0, norm))
   else: raise NotImplementedError(f"unsupported decomp {fr} -> {to}")
 
 def f2f_clamp(val:UOp, dt:DType) -> UOp:
   e, m = dtypes.finfo(dt)
-  max_exp, max_man = ((1 << e) - 1, (1 << m) - 2) if dt == dtypes.fp8e4m3 else ((1 << e) - 2, (1 << m) - 1)
-  mx = val.const_like(2.0**(max_exp - exponent_bias(dt)) * (1.0 + max_man / (1 << m)))
-  sat = mx if dt in dtypes.fp8s else val.const_like(float('inf'))
+  se, sm = dtypes.finfo(val.dtype)
+  bits = val.bitcast(f2f_dt[val.dtype])
+  isnan = ((shr(bits, sm) & (shl(1, se) - 1)).eq(shl(1, se) - 1) & (bits & (shl(1, sm) - 1)).ne(0))
+  if dt in dtypes.fp8_fnuz:
+    max_exp, max_man = (1 << e) - 1, (1 << m) - 1
+    mx = sat = val.const_like(2.0**(max_exp - exponent_bias(dt)) * (1.0 + max_man / (1 << m)))
+  else:
+    max_exp, max_man = ((1 << e) - 1, (1 << m) - 2) if dt == dtypes.fp8e4m3 else ((1 << e) - 2, (1 << m) - 1)
+    mx = val.const_like(2.0**(max_exp - exponent_bias(dt)) * (1.0 + max_man / (1 << m)))
+    sat = mx if dt in dtypes.fp8s else val.const_like(float('inf'))
   # FIXME: CMPLT of nan is undefined
-  return val.ne(val).where(val, (val < -mx).where(-sat, (mx < val).where(sat, val)))
+  return isnan.where(val, (val < -mx).where(-sat, (mx < val).where(sat, val)))
 
 def f2f_load(x: UOp, fr:DType, to:DType) -> UOp:
   if (n:=x.dtype.count) == 1: return f2f(x.replace(dtype=f2f_dt[fr]), fr, to)

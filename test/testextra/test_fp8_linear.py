@@ -9,7 +9,7 @@ from test.helpers import not_support_multi_device, needs_second_gpu
 
 BS, T, in_dim, out_dim = 16, 4, 128, 128
 
-@unittest.skipUnless(is_dtype_supported(dtypes.fp8e4m3), f"no fp8e4m3 on {Device.DEFAULT}")
+@unittest.skipUnless(is_dtype_supported(dtypes.fp8e4m3_hw()), f"no {dtypes.fp8e4m3_hw()} on {Device.DEFAULT}")
 class TestFP8Linear(unittest.TestCase):
   def setUp(self):
     Tensor.manual_seed(42)
