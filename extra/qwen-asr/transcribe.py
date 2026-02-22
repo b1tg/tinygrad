@@ -164,6 +164,10 @@ def rope(pos: Tensor, hd: int, theta: float) -> tuple[Tensor, Tensor]:
 def precompute_rope(max_ctx: int, hd: int, theta: float) -> tuple[Tensor, Tensor]:
   return rope(Tensor.arange(max_ctx, dtype=dtypes.int32), hd, theta)
 
+def round_bucket(need: int, max_ctx: int, step: int = 256) -> int:
+  if need <= 0: return min(step, max_ctx)
+  return min(max_ctx, ((need + step - 1) // step) * step)
+
 
 def apply_rope(x: Tensor, c: Tensor, s: Tensor, hd: int) -> Tensor:
   h = hd // 2
@@ -278,11 +282,12 @@ class Decoder:
       if verbose and (i + 1) % 8 == 0: print(f"  Decoder layer {i + 1}/{self.l} loaded", file=os.sys.stderr)
     self.kv_k = [Tensor.zeros(self.max_ctx, self.kdim, dtype=dtypes.float32).contiguous().realize() for _ in range(self.l)]
     self.kv_v = [Tensor.zeros(self.max_ctx, self.kdim, dtype=dtypes.float32).contiguous().realize() for _ in range(self.l)]
-    self.step_jit = TinyJit(self._step_core) if self.use_jit else None
+    self.jit_bucket_step = max(32, min(self.max_ctx, int(os.getenv("JIT_BUCKET_STEP", "256"))))
+    self.step_jits: dict[int, TinyJit] = {}
 
   def tok(self, ids: Tensor | int) -> Tensor: return self.emb[ids]
 
-  def layer(self, h: Tensor, i: int, pos: int | Variable, full_ctx=False) -> Tensor:
+  def layer(self, h: Tensor, i: int, pos: int | Variable, kv_len: int | None = None) -> Tensor:
     l, s = self.layers[i], h.shape[0]
     if isinstance(pos, int) and pos + s > self.max_ctx:
       raise RuntimeError(f"decoder context overflow: {pos+s} > {self.max_ctx}")
@@ -297,8 +302,8 @@ class Decoder:
 
     self.kv_k[i][pos:pos+s].assign(k).realize()
     self.kv_v[i][pos:pos+s].assign(v).realize()
-    if full_ctx:
-      a = causal_attn(q, self.kv_k[i], self.kv_v[i], self.h, self.kh, self.hd, pos, 0)
+    if kv_len is not None:
+      a = causal_attn(q, self.kv_k[i][:kv_len], self.kv_v[i][:kv_len], self.h, self.kh, self.hd, pos, 0)
     else:
       end = pos + s
       a = causal_attn(q, self.kv_k[i][:end], self.kv_v[i][:end], self.h, self.kh, self.hd, pos, 0)
@@ -309,9 +314,9 @@ class Decoder:
     h = (h + lin(gu[:, :l["ff"]].silu() * gu[:, l["ff"]:], l["d"])).realize()
     return h
 
-  def _step_core(self, emb: Tensor, pos: int | Variable) -> Tensor:
+  def _step_core(self, emb: Tensor, pos: int | Variable, kv_len: int | None = None) -> Tensor:
     h = emb.unsqueeze(0) if emb.ndim == 1 else emb
-    for i in range(self.l): h = self.layer(h, i, pos, full_ctx=self.use_jit)
+    for i in range(self.l): h = self.layer(h, i, pos, kv_len=kv_len)
     return lin(rms(h, self.norm, self.eps).float().squeeze(0), self.lm)
 
   def prefill(self, x: Tensor, verbose=True) -> Tensor:
@@ -323,8 +328,11 @@ class Decoder:
   def step(self, emb: Tensor, pos: int, use_jit: bool | None = None) -> Tensor:
     j = self.use_jit if use_jit is None else use_jit
     if j:
-      vp = Variable("pos", 0, self.max_ctx - 1).bind(pos)
-      return self.step_jit(emb.contiguous().realize(), vp)
+      b = round_bucket(pos + 1, self.max_ctx, self.jit_bucket_step)
+      if b not in self.step_jits:
+        self.step_jits[b] = TinyJit(lambda e, p, bl=b: self._step_core(e, p, kv_len=bl))
+      vp = Variable(f"pos_{b}", 0, b - 1).bind(pos)
+      return self.step_jits[b](emb.contiguous().realize(), vp)
     return self._step_core(emb, pos)
 
 

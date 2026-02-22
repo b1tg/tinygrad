@@ -57,5 +57,11 @@ class TestQwenAsrHelpers(unittest.TestCase):
     self.assertEqual(self.m.cast_weight(t, use_bf16_weights=False).dtype, dtypes.float)
     self.assertEqual(self.m.cast_weight(t, use_bf16_weights=True).dtype, dtypes.bfloat16)
 
+  def test_round_bucket(self):
+    self.assertEqual(self.m.round_bucket(1, 1024, 256), 256)
+    self.assertEqual(self.m.round_bucket(256, 1024, 256), 256)
+    self.assertEqual(self.m.round_bucket(257, 1024, 256), 512)
+    self.assertEqual(self.m.round_bucket(1100, 1024, 256), 1024)
+
 if __name__ == "__main__":
   unittest.main()
