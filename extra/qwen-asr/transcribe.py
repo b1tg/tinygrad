@@ -169,9 +169,7 @@ def apply_rope(x: Tensor, c: Tensor, s: Tensor, hd: int) -> Tensor:
 def full_attn(q: Tensor, k: Tensor, v: Tensor, h: int, kh: int, hd: int, cs: list[int] | None = None) -> Tensor:
   if cs is not None and len(cs) > 2:
     outs = [full_attn(q[cs[i]:cs[i+1]], k[cs[i]:cs[i+1]], v[cs[i]:cs[i+1]], h, kh, hd) for i in range(len(cs)-1)]
-    o = outs[0]
-    for z in outs[1:]: o = o.cat(z, dim=0)
-    return o
+    return outs[0].cat(*outs[1:], dim=0) if len(outs) > 1 else outs[0]
   sq = q.shape[0]
   qq = q.reshape(sq, h, hd).transpose(0, 1).unsqueeze(0)
   kk = k.reshape(sq, kh, hd).transpose(0, 1).unsqueeze(0)
@@ -208,8 +206,7 @@ def encode(mel: Tensor, w: Weights, c: dict, use_jit=False, verbose=True) -> Ten
     for cw, cb in conv: x = x.conv2d(cw, cb, stride=2, padding=1).gelu()
     b, ch, f, t = x.shape
     chunks.append(x.permute(0, 3, 1, 2).reshape(b, t, ch * f).squeeze(0).realize())
-  x = chunks[0]
-  for z in chunks[1:]: x = x.cat(z, dim=0)
+  x = chunks[0].cat(*chunks[1:], dim=0) if len(chunks) > 1 else chunks[0]
   if verbose: print(f"  Conv output: {mel.shape[1]} frames -> {x.shape[0]} tokens", file=os.sys.stderr)
 
   x = lin(x, outp).realize()
@@ -219,8 +216,7 @@ def encode(mel: Tensor, w: Weights, c: dict, use_jit=False, verbose=True) -> Ten
   for z in chunks:
     ys.append(x[off:off + z.shape[0]] + pe[:z.shape[0]])
     off += z.shape[0]
-  x = ys[0]
-  for z in ys[1:]: x = x.cat(z, dim=0)
+  x = ys[0].cat(*ys[1:], dim=0) if len(ys) > 1 else ys[0]
 
   win = tpc * (c["enwi"] // chunk)
   cs, pos = [0], 0
@@ -251,6 +247,7 @@ class Decoder:
   def __init__(self, w: Weights, c: dict, use_jit=False, verbose=True, max_ctx=32768):
     self.w, self.c, self.use_jit = w, c, use_jit
     self.h, self.kh, self.hd, self.l, self.eps, self.theta = c["dah"], c["dkvh"], c["dhd"], c["dl"], c["deps"], c["theta"]
+    self.qdim, self.kdim = self.h * self.hd, self.kh * self.hd
     self.max_ctx = max_ctx
     self.emb = w["thinker.model.embed_tokens.weight"].contiguous().realize()
     self.lm = w["thinker.lm_head.weight"].contiguous().realize()
@@ -261,15 +258,21 @@ class Decoder:
       p = f"thinker.model.layers.{i}"
       layer = {
         "in": w[f"{p}.input_layernorm.weight"], "post": w[f"{p}.post_attention_layernorm.weight"],
-        "q": w[f"{p}.self_attn.q_proj.weight"], "k": w[f"{p}.self_attn.k_proj.weight"], "v": w[f"{p}.self_attn.v_proj.weight"],
         "o": w[f"{p}.self_attn.o_proj.weight"], "qn": w[f"{p}.self_attn.q_norm.weight"], "kn": w[f"{p}.self_attn.k_norm.weight"],
-        "g": w[f"{p}.mlp.gate_proj.weight"], "u": w[f"{p}.mlp.up_proj.weight"], "d": w[f"{p}.mlp.down_proj.weight"],
+        "d": w[f"{p}.mlp.down_proj.weight"],
       }
-      self.layers.append({k: v.contiguous().realize() for k, v in layer.items()})
+      q = w[f"{p}.self_attn.q_proj.weight"]
+      k = w[f"{p}.self_attn.k_proj.weight"]
+      v = w[f"{p}.self_attn.v_proj.weight"]
+      g = w[f"{p}.mlp.gate_proj.weight"]
+      u = w[f"{p}.mlp.up_proj.weight"]
+      layer["qkv"] = q.cat(k, v, dim=0)
+      layer["gu"] = g.cat(u, dim=0)
+      layer["ff"] = g.shape[0]
+      self.layers.append({k: (v.contiguous().realize() if isinstance(v, Tensor) else v) for k, v in layer.items()})
       if verbose and (i + 1) % 8 == 0: print(f"  Decoder layer {i + 1}/{self.l} loaded", file=os.sys.stderr)
-    kvd = self.kh * self.hd
-    self.kv_k = [Tensor.zeros(self.max_ctx, kvd, dtype=dtypes.float32).contiguous().realize() for _ in range(self.l)]
-    self.kv_v = [Tensor.zeros(self.max_ctx, kvd, dtype=dtypes.float32).contiguous().realize() for _ in range(self.l)]
+    self.kv_k = [Tensor.zeros(self.max_ctx, self.kdim, dtype=dtypes.float32).contiguous().realize() for _ in range(self.l)]
+    self.kv_v = [Tensor.zeros(self.max_ctx, self.kdim, dtype=dtypes.float32).contiguous().realize() for _ in range(self.l)]
     self.step_jit = TinyJit(self._step_core) if self.use_jit else None
 
   def tok(self, ids: Tensor | int) -> Tensor: return self.emb[ids]
@@ -279,12 +282,13 @@ class Decoder:
     if isinstance(pos, int) and pos + s > self.max_ctx:
       raise RuntimeError(f"decoder context overflow: {pos+s} > {self.max_ctx}")
     xn = rms(h, l["in"], self.eps)
-    q, k, v = lin(xn, l["q"]), lin(xn, l["k"]), lin(xn, l["v"])
+    qkv = lin(xn, l["qkv"])
+    q, k, v = qkv[:, :self.qdim], qkv[:, self.qdim:self.qdim+self.kdim], qkv[:, self.qdim+self.kdim:]
     q, k = q.reshape(s, self.h, self.hd), k.reshape(s, self.kh, self.hd)
     q, k = rms(q, l["qn"], self.eps), rms(k, l["kn"], self.eps)
     c, s0 = self.rc[pos:pos+s], self.rs[pos:pos+s]
     q, k = apply_rope(q, c, s0, self.hd), apply_rope(k, c, s0, self.hd)
-    q, k, v = q.reshape(s, self.h * self.hd), k.reshape(s, self.kh * self.hd), v.reshape(s, self.kh * self.hd)
+    q, k, v = q.reshape(s, self.qdim), k.reshape(s, self.kdim), v.reshape(s, self.kdim)
 
     self.kv_k[i][pos:pos+s].assign(k).realize()
     self.kv_v[i][pos:pos+s].assign(v).realize()
@@ -296,7 +300,8 @@ class Decoder:
 
     h = (h + lin(a, l["o"])).realize()
     xn = rms(h, l["post"], self.eps)
-    h = (h + lin(lin(xn, l["g"]).silu() * lin(xn, l["u"]), l["d"])).realize()
+    gu = lin(xn, l["gu"])
+    h = (h + lin(gu[:, :l["ff"]].silu() * gu[:, l["ff"]:], l["d"])).realize()
     return h
 
   def _step_core(self, emb: Tensor, pos: int | Variable) -> Tensor:
