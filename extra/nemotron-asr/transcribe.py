@@ -4,10 +4,16 @@
 Usage:
   python extra/nemotron-asr/transcribe.py model.gguf test.wav
   python extra/nemotron-asr/transcribe.py model.nemo test.wav
+  python extra/nemotron-asr/transcribe.py model.gguf --live
 """
-import sys, math, struct, tarfile, tempfile, os, pathlib
+import sys, math, struct, tarfile, tempfile, os, pathlib, argparse
 from tinygrad import Tensor, nn, dtypes, TinyJit
 from tinygrad.nn.state import torch_load, load_state_dict, gguf_load
+try:
+  from live import transcribe_live_segmented, add_live_args, validate_live_args
+except ModuleNotFoundError:
+  sys.path.append(str(pathlib.Path(__file__).resolve().parent))
+  from live import transcribe_live_segmented, add_live_args, validate_live_args
 
 # ============================================================================
 # Constants
@@ -419,35 +425,57 @@ def load_wav(path):
     audio = audio[idx_f] * (1 - frac) + audio[idx_c] * frac
   return audio
 
-def transcribe(model, vocab, audio_path):
-  audio = load_wav(audio_path)
-  print(f"audio: {audio.shape[0]} samples, {audio.shape[0]/SAMPLE_RATE:.2f}s")
+def transcribe_audio(model, vocab, audio, show_details=True):
+  if show_details:
+    print(f"audio: {audio.shape[0]} samples, {audio.shape[0]/SAMPLE_RATE:.2f}s")
 
   filterbank = model.preprocessor.featurizer.fb
   window = model.preprocessor.featurizer.window
   mel = preprocess(audio, filterbank, window)
-  print(f"mel: {mel.shape}")
+  if show_details: print(f"mel: {mel.shape}")
 
   mel_t = mel.reshape(1, mel.shape[0], mel.shape[1])  # [1, T, 128]
   encoder_out = model.encoder(mel_t)
-  print(f"encoder: {encoder_out.shape}")
+  if show_details: print(f"encoder: {encoder_out.shape}")
 
   text = greedy_decode(encoder_out, model, vocab)
   return text
 
+def transcribe(model, vocab, audio_path):
+  return transcribe_audio(model, vocab, load_wav(audio_path), show_details=True)
+
+def load_model(model_path):
+  if model_path.endswith(".gguf"): weights, vocab = load_gguf_weights(model_path)
+  else: weights, vocab = load_nemo(model_path)
+  return build_model(weights, vocab), vocab
+
+def parse_args(argv):
+  parser = argparse.ArgumentParser(description="Nemotron ASR tinygrad transcription")
+  parser.add_argument("model_path", help="path to model.nemo or model.gguf")
+  parser.add_argument("audio_path", nargs="?", help="path to input wav (omit when using --live)")
+  parser.add_argument("--live", action="store_true", help="capture microphone input and transcribe continuously")
+  add_live_args(parser)
+  args = parser.parse_args(argv)
+  if args.live and args.audio_path is not None: parser.error("audio_path cannot be used with --live")
+  if not args.live and args.audio_path is None: parser.error("audio_path is required unless --live is set")
+  validate_live_args(parser, args)
+  return args
+
 if __name__ == "__main__":
-  if len(sys.argv) < 3:
-    print("usage: python extra/nemotron-asr/transcribe.py <model.nemo|model.gguf> <audio.wav>")
-    sys.exit(1)
-
-  model_path = sys.argv[1]
-  audio_path = sys.argv[2]
-
-  if model_path.endswith('.gguf'):
-    weights, vocab = load_gguf_weights(model_path)
+  args = parse_args(sys.argv[1:])
+  model, vocab = load_model(args.model_path)
+  if args.live:
+    try:
+      decode = lambda audio: transcribe_audio(model, vocab, audio, show_details=False)
+      transcribe_live_segmented(decode, SAMPLE_RATE, args.chunk_seconds, args.max_chunks, args.mic_gain,
+                                args.vad_threshold, args.vad_end_seconds, args.segment_max_seconds,
+                                args.segment_overlap_seconds, args.vad_ratio, args.vad_preroll_seconds,
+                                live_queue_chunks=args.live_queue_chunks, live_debug_level=args.live_debug_level)
+    except KeyboardInterrupt:
+      if args.live_debug_level >= 1:
+        print("\nlive input stopped")
+    except RuntimeError as e:
+      print(f"error: {e}")
+      sys.exit(1)
   else:
-    weights, vocab = load_nemo(model_path)
-
-  model = build_model(weights, vocab)
-  text = transcribe(model, vocab, audio_path)
-  print(text)
+    print(transcribe(model, vocab, args.audio_path))
