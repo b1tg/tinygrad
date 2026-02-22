@@ -47,6 +47,15 @@ python extra/qwen-asr/transcribe.py \
   --silent --timings-json
 ```
 
+Enable JIT attention path:
+
+```bash
+python extra/qwen-asr/transcribe.py \
+  extra/antirez-qwen-asr/qwen3-asr-0.6b \
+  extra/antirez-qwen-asr/samples/test_speech.wav \
+  --silent --timings-json --jit
+```
+
 ## 3. Benchmark Tinygrad vs C
 
 ### Fair Comparison (CPU vs CPU)
@@ -68,6 +77,16 @@ antirez  mean=0.881s  p50=0.830s  min=0.773s  max=1.040s
 speedup antirez/tinygrad (mean wall): 31.78x
 ```
 
+CPU with JIT enabled for tinygrad:
+
+```bash
+CPU=1 python extra/qwen-asr/benchmark.py \
+  --model-dir extra/antirez-qwen-asr/qwen3-asr-0.6b \
+  --audio extra/antirez-qwen-asr/samples/test_speech.wav \
+  --tinygrad-args "--jit" \
+  --warmup 1 --runs 3
+```
+
 ### Tinygrad Best Speed (METAL=1)
 
 Use this when you want fastest tinygrad on Apple hardware:
@@ -76,6 +95,7 @@ Use this when you want fastest tinygrad on Apple hardware:
 METAL=1 python extra/qwen-asr/benchmark.py \
   --model-dir extra/antirez-qwen-asr/qwen3-asr-0.6b \
   --audio extra/antirez-qwen-asr/samples/test_speech.wav \
+  --tinygrad-args "--jit" \
   --warmup 1 --runs 3
 ```
 
@@ -85,6 +105,13 @@ METAL result (`samples/test_speech.wav`, 3 runs):
 tinygrad mean=20.391s p50=20.278s min=19.762s max=21.133s
 antirez  mean=1.358s  p50=1.421s  min=1.209s  max=1.446s
 speedup antirez/tinygrad (mean wall): 15.01x
+```
+
+Single-run METAL timings seen locally:
+
+```text
+without --jit: wall_seconds ~22.31s
+with --jit:    wall_seconds ~20.06s
 ```
 
 ### Output Format

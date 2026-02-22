@@ -56,6 +56,7 @@ def main() -> None:
   parser.add_argument("--warmup", type=int, default=1)
   parser.add_argument("--python", default=sys.executable)
   parser.add_argument("--tinygrad-script", default="extra/qwen-asr/transcribe.py")
+  parser.add_argument("--tinygrad-args", default="")
   parser.add_argument("--antirez-bin", default="extra/antirez-qwen-asr/qwen_asr")
   parser.add_argument("--antirez-args", default="--silent")
   args = parser.parse_args()
@@ -69,7 +70,7 @@ def main() -> None:
   if not antirez_bin.exists():
     raise FileNotFoundError(f"missing antirez binary: {antirez_bin}")
 
-  tiny_cmd = [args.python, str(tiny_script), args.model_dir, args.audio, "--silent", "--timings-json"]
+  tiny_cmd = [args.python, str(tiny_script), args.model_dir, args.audio, "--silent", "--timings-json"] + args.tinygrad_args.split()
   antirez_cmd = [str(antirez_bin), "-d", args.model_dir, "-i", args.audio] + args.antirez_args.split()
 
   print("Commands:")

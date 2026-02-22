@@ -11,7 +11,7 @@ import argparse, json, math, os, sys, time, wave
 from typing import Callable
 
 import numpy as np
-from tinygrad import Device, Tensor, dtypes
+from tinygrad import Device, Tensor, TinyJit, Variable, dtypes
 from tinygrad.nn.state import safe_load
 
 # ============================================================================
@@ -343,7 +343,7 @@ def causal_attention(q: Tensor, k: Tensor, v: Tensor, n_heads: int, n_kv_heads: 
 # Encoder
 # ============================================================================
 
-def encoder_forward(mel: Tensor, sf: MultiSafetensors, cfg: dict, verbose: bool = True) -> Tensor:
+def encoder_forward(mel: Tensor, sf: MultiSafetensors, cfg: dict, verbose: bool = True, use_jit: bool = False) -> Tensor:
   prefix = "thinker.audio_tower"
   d_model = cfg["enc_d_model"]
   n_layers = cfg["enc_layers"]
@@ -409,6 +409,8 @@ def encoder_forward(mel: Tensor, sf: MultiSafetensors, cfg: dict, verbose: bool 
   if verbose:
     print(f"  Attention windows (cu_seqlens): {cu_seqlens}", file=sys.stderr)
 
+  attn_jit = TinyJit(lambda qq, kk, vv: full_attention(qq, kk, vv, n_heads, n_heads, head_dim, cu_seqlens=cu_seqlens)) if use_jit else None
+
   for layer in range(n_layers):
     lp = f"{prefix}.layers.{layer}"
 
@@ -425,7 +427,7 @@ def encoder_forward(mel: Tensor, sf: MultiSafetensors, cfg: dict, verbose: bool 
     k = linear(x_norm, wk, wk_b)
     v = linear(x_norm, wv, wv_b)
 
-    attn_out = full_attention(q, k, v, n_heads, n_heads, head_dim, cu_seqlens=cu_seqlens)
+    attn_out = attn_jit(q, k, v) if attn_jit is not None else full_attention(q, k, v, n_heads, n_heads, head_dim, cu_seqlens=cu_seqlens)
     x = (x + linear(attn_out, wo, wo_b)).realize()
 
     ffn_ln_w = get_weight(sf, f"{lp}.final_layer_norm.weight")
@@ -460,7 +462,7 @@ def encoder_forward(mel: Tensor, sf: MultiSafetensors, cfg: dict, verbose: bool 
 # ============================================================================
 
 class Decoder:
-  def __init__(self, sf: MultiSafetensors, cfg: dict, verbose: bool = True):
+  def __init__(self, sf: MultiSafetensors, cfg: dict, verbose: bool = True, use_jit: bool = False):
     self.sf = sf
     self.cfg = cfg
     self.hidden_size = cfg["dec_hidden_size"]
@@ -470,6 +472,7 @@ class Decoder:
     self.head_dim = cfg["dec_head_dim"]
     self.eps = cfg["dec_rms_norm_eps"]
     self.rope_theta = cfg["dec_rope_theta"]
+    self.use_jit = use_jit
 
     self.tok_embeddings = get_weight(sf, "thinker.model.embed_tokens.weight")
     self.lm_head = get_weight(sf, "thinker.lm_head.weight")
@@ -482,6 +485,7 @@ class Decoder:
         print(f"  Decoder layer {i + 1}/{self.n_layers} loaded", file=sys.stderr)
 
     self.kv_cache: dict[int, tuple[Tensor, Tensor]] = {}
+    self.causal_jits: dict[tuple[int, int], TinyJit] = {}
 
   def _load_layer(self, i: int) -> dict[str, Tensor]:
     lp = f"thinker.model.layers.{i}"
@@ -498,6 +502,18 @@ class Decoder:
       "up_proj": get_weight(self.sf, f"{lp}.mlp.up_proj.weight"),
       "down_proj": get_weight(self.sf, f"{lp}.mlp.down_proj.weight"),
     }
+
+  def _causal_attention_forward(self, q: Tensor, k: Tensor, v: Tensor, q_start_pos: Variable | int, kv_start_pos: Variable | int) -> Tensor:
+    return causal_attention(
+      q,
+      k,
+      v,
+      self.n_heads,
+      self.n_kv_heads,
+      self.head_dim,
+      q_start_pos=q_start_pos,
+      kv_start_pos=kv_start_pos,
+    )
 
   def embed_token(self, token_id: int) -> Tensor:
     return self.tok_embeddings[token_id]
@@ -538,16 +554,24 @@ class Decoder:
     self.kv_cache[layer_idx] = (k_cache.realize(), v_cache.realize())
 
     kv_start_pos = (pos + seq_len - 1) - (k_cache.shape[0] - 1)
-    attn_out = causal_attention(
-      q,
-      k_cache,
-      v_cache,
-      self.n_heads,
-      self.n_kv_heads,
-      self.head_dim,
-      q_start_pos=pos,
-      kv_start_pos=kv_start_pos,
-    )
+    attn_key = (q.shape[0], k_cache.shape[0])
+    if self.use_jit:
+      if attn_key not in self.causal_jits:
+        self.causal_jits[attn_key] = TinyJit(self._causal_attention_forward)
+      q_start = Variable("q_start_pos", 0, 32768).bind(pos)
+      kv_start = Variable("kv_start_pos", 0, 32768).bind(kv_start_pos)
+      attn_out = self.causal_jits[attn_key](q, k_cache, v_cache, q_start, kv_start)
+    else:
+      attn_out = causal_attention(
+        q,
+        k_cache,
+        v_cache,
+        self.n_heads,
+        self.n_kv_heads,
+        self.head_dim,
+        q_start_pos=pos,
+        kv_start_pos=kv_start_pos,
+      )
 
     h = (h + linear(attn_out, l["o_proj"])).realize()
 
@@ -637,7 +661,7 @@ def parse_asr_text(text: str) -> str:
 # Pipeline
 # ============================================================================
 
-def transcribe(model_dir: str, wav_path: str, max_new_tokens: int = 1024, verbose: bool = True) -> dict:
+def transcribe(model_dir: str, wav_path: str, max_new_tokens: int = 1024, verbose: bool = True, use_jit: bool = False) -> dict:
   t0 = time.perf_counter()
 
   audio_array, sr = load_audio(wav_path)
@@ -672,7 +696,7 @@ def transcribe(model_dir: str, wav_path: str, max_new_tokens: int = 1024, verbos
   if verbose:
     print("Running encoder...", file=sys.stderr)
   t_enc0 = time.perf_counter()
-  audio_embeds = encoder_forward(mel, sf_file, cfg, verbose=verbose).realize()
+  audio_embeds = encoder_forward(mel, sf_file, cfg, verbose=verbose, use_jit=use_jit).realize()
   enc_s = time.perf_counter() - t_enc0
 
   n_audio = audio_embeds.shape[0]
@@ -685,7 +709,7 @@ def transcribe(model_dir: str, wav_path: str, max_new_tokens: int = 1024, verbos
 
   if verbose:
     print("Loading decoder...", file=sys.stderr)
-  decoder = Decoder(sf_file, cfg, verbose=verbose)
+  decoder = Decoder(sf_file, cfg, verbose=verbose, use_jit=use_jit)
 
   prefix_ids = Tensor(np.array(PROMPT_PREFIX, dtype=np.int32), dtype=dtypes.int32)
   suffix_ids = Tensor(np.array(PROMPT_SUFFIX, dtype=np.int32), dtype=dtypes.int32)
@@ -745,9 +769,10 @@ def main() -> None:
   parser.add_argument("--max-new-tokens", type=int, default=1024)
   parser.add_argument("--silent", action="store_true", help="only print transcript")
   parser.add_argument("--timings-json", action="store_true", help="print timing JSON to stderr")
+  parser.add_argument("--jit", action="store_true", help="enable TinyJit attention path")
   args = parser.parse_args()
 
-  out = transcribe(args.model_dir, args.audio, max_new_tokens=args.max_new_tokens, verbose=not args.silent)
+  out = transcribe(args.model_dir, args.audio, max_new_tokens=args.max_new_tokens, verbose=not args.silent, use_jit=args.jit)
   print(out["text"])
 
   if args.timings_json:

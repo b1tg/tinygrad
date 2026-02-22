@@ -43,6 +43,5 @@ class TestQwenAsrHelpers(unittest.TestCase):
     self.assertGreater(mel.shape[1], 0)
     self.assertTrue(np.isfinite(mel).all())
 
-
 if __name__ == "__main__":
   unittest.main()
