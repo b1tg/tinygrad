@@ -137,7 +137,7 @@ def custom_gemm(C:UOp, A:UOp, B:UOp) -> UOp:
     acc_load = acc_after[N_inner_loop, M_inner_loop]
 
     # do WMMA
-    wmma_arg = ('WMMA_16_16_32_half_float', (16, 16, 32), dtypes.half, dtypes.float, 'AMD', 64, ((), (), ((3, 2), (2, 2))), ())
+    wmma_arg = ('WMMA_16_16_32_half_float', (16, 16, 32), (dtypes.half, dtypes.half), dtypes.float, 'AMD', 64, ((), (), ((3, 2), (2, 2))), ())
     out = UOp(Ops.WMMA, dtypes.float.vec(4), (Ar[M_inner_loop], Br[N_inner_loop], acc_load), arg=wmma_arg)
 
     # store back the acc
@@ -193,7 +193,7 @@ acc = acc[init_l:=UOp.range(4, 1)].set(0.0, end=init_l)
 
 # do the wmma
 acc_load = UOp.vectorize(*[acc.after(K_loop)[i] for i in range(4)])
-wmma_arg = ('WMMA_16_16_32_half_float', (16, 16, 32), dtypes.half, dtypes.float, 'AMD', 64, ((), (), ((3, 2), (2, 2))), ())
+wmma_arg = ('WMMA_16_16_32_half_float', (16, 16, 32), (dtypes.half, dtypes.half), dtypes.float, 'AMD', 64, ((), (), ((3, 2), (2, 2))), ())
 out = UOp(Ops.WMMA, dtypes.float.vec(4), (A_in, B_in, acc_load), arg=wmma_arg)
 
 # store back the acc
