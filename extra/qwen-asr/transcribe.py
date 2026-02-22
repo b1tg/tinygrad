@@ -156,6 +156,9 @@ def rope(pos: Tensor, hd: int, theta: float) -> tuple[Tensor, Tensor]:
   e = a.cat(a, dim=-1)
   return e.cos(), e.sin()
 
+def precompute_rope(max_ctx: int, hd: int, theta: float) -> tuple[Tensor, Tensor]:
+  return rope(Tensor.arange(max_ctx, dtype=dtypes.int32), hd, theta)
+
 
 def apply_rope(x: Tensor, c: Tensor, s: Tensor, hd: int) -> Tensor:
   h = hd // 2
@@ -245,68 +248,74 @@ def encode(mel: Tensor, w: Weights, c: dict, use_jit=False, verbose=True) -> Ten
 
 
 class Decoder:
-  def __init__(self, w: Weights, c: dict, use_jit=False, verbose=True):
+  def __init__(self, w: Weights, c: dict, use_jit=False, verbose=True, max_ctx=32768):
     self.w, self.c, self.use_jit = w, c, use_jit
     self.h, self.kh, self.hd, self.l, self.eps, self.theta = c["dah"], c["dkvh"], c["dhd"], c["dl"], c["deps"], c["theta"]
-    self.emb, self.lm, self.norm = w["thinker.model.embed_tokens.weight"], w["thinker.lm_head.weight"], w["thinker.model.norm.weight"]
+    self.max_ctx = max_ctx
+    self.emb = w["thinker.model.embed_tokens.weight"].contiguous().realize()
+    self.lm = w["thinker.lm_head.weight"].contiguous().realize()
+    self.norm = w["thinker.model.norm.weight"].contiguous().realize()
+    self.rc, self.rs = precompute_rope(self.max_ctx, self.hd, self.theta)
     self.layers = []
     for i in range(self.l):
       p = f"thinker.model.layers.{i}"
-      self.layers.append({
+      layer = {
         "in": w[f"{p}.input_layernorm.weight"], "post": w[f"{p}.post_attention_layernorm.weight"],
         "q": w[f"{p}.self_attn.q_proj.weight"], "k": w[f"{p}.self_attn.k_proj.weight"], "v": w[f"{p}.self_attn.v_proj.weight"],
         "o": w[f"{p}.self_attn.o_proj.weight"], "qn": w[f"{p}.self_attn.q_norm.weight"], "kn": w[f"{p}.self_attn.k_norm.weight"],
         "g": w[f"{p}.mlp.gate_proj.weight"], "u": w[f"{p}.mlp.up_proj.weight"], "d": w[f"{p}.mlp.down_proj.weight"],
-      })
+      }
+      self.layers.append({k: v.contiguous().realize() for k, v in layer.items()})
       if verbose and (i + 1) % 8 == 0: print(f"  Decoder layer {i + 1}/{self.l} loaded", file=os.sys.stderr)
-    self.kv, self.jits = {}, {}
+    kvd = self.kh * self.hd
+    self.kv_k = [Tensor.zeros(self.max_ctx, kvd, dtype=dtypes.float32).contiguous().realize() for _ in range(self.l)]
+    self.kv_v = [Tensor.zeros(self.max_ctx, kvd, dtype=dtypes.float32).contiguous().realize() for _ in range(self.l)]
+    self.step_jit = TinyJit(self._step_core) if self.use_jit else None
 
   def tok(self, ids: Tensor | int) -> Tensor: return self.emb[ids]
 
-  def _ca_jit(self, q: Tensor, k: Tensor, v: Tensor, qp: Variable | int, kp: Variable | int) -> Tensor:
-    return causal_attn(q, k, v, self.h, self.kh, self.hd, qp, kp)
-
-  def layer(self, h: Tensor, i: int, pos: int) -> Tensor:
+  def layer(self, h: Tensor, i: int, pos: int | Variable, full_ctx=False) -> Tensor:
     l, s = self.layers[i], h.shape[0]
+    if isinstance(pos, int) and pos + s > self.max_ctx:
+      raise RuntimeError(f"decoder context overflow: {pos+s} > {self.max_ctx}")
     xn = rms(h, l["in"], self.eps)
     q, k, v = lin(xn, l["q"]), lin(xn, l["k"]), lin(xn, l["v"])
     q, k = q.reshape(s, self.h, self.hd), k.reshape(s, self.kh, self.hd)
     q, k = rms(q, l["qn"], self.eps), rms(k, l["kn"], self.eps)
-    c, s0 = rope(Tensor.arange(pos, pos + s, dtype=dtypes.int32), self.hd, self.theta)
+    c, s0 = self.rc[pos:pos+s], self.rs[pos:pos+s]
     q, k = apply_rope(q, c, s0, self.hd), apply_rope(k, c, s0, self.hd)
     q, k, v = q.reshape(s, self.h * self.hd), k.reshape(s, self.kh * self.hd), v.reshape(s, self.kh * self.hd)
 
-    if i not in self.kv: kc, vc = k, v
+    self.kv_k[i][pos:pos+s].assign(k).realize()
+    self.kv_v[i][pos:pos+s].assign(v).realize()
+    if full_ctx:
+      a = causal_attn(q, self.kv_k[i], self.kv_v[i], self.h, self.kh, self.hd, pos, 0)
     else:
-      ok, ov = self.kv[i]
-      kc, vc = ok.cat(k, dim=0), ov.cat(v, dim=0)
-    self.kv[i] = (kc.realize(), vc.realize())
-    kp = (pos + s - 1) - (kc.shape[0] - 1)
-
-    if self.use_jit:
-      key = (q.shape[0], kc.shape[0])
-      if key not in self.jits: self.jits[key] = TinyJit(self._ca_jit)
-      qs, ks = Variable("qpos", 0, 32768).bind(pos), Variable("kpos", 0, 32768).bind(kp)
-      a = self.jits[key](q, kc, vc, qs, ks)
-    else:
-      a = causal_attn(q, kc, vc, self.h, self.kh, self.hd, pos, kp)
+      end = pos + s
+      a = causal_attn(q, self.kv_k[i][:end], self.kv_v[i][:end], self.h, self.kh, self.hd, pos, 0)
 
     h = (h + lin(a, l["o"])).realize()
     xn = rms(h, l["post"], self.eps)
     h = (h + lin(lin(xn, l["g"]).silu() * lin(xn, l["u"]), l["d"])).realize()
     return h
 
+  def _step_core(self, emb: Tensor, pos: int | Variable) -> Tensor:
+    h = emb.unsqueeze(0) if emb.ndim == 1 else emb
+    for i in range(self.l): h = self.layer(h, i, pos, full_ctx=self.use_jit)
+    return lin(rms(h, self.norm, self.eps).float().squeeze(0), self.lm)
+
   def prefill(self, x: Tensor, verbose=True) -> Tensor:
-    self.kv = {}
     for i in range(self.l):
       x = self.layer(x, i, 0)
       if verbose and (i < 2 or (i + 1) % 8 == 0): print(f"  Decoder prefill layer {i+1}/{self.l}", file=os.sys.stderr)
     return x
 
-  def step(self, emb: Tensor, pos: int) -> Tensor:
-    h = emb.unsqueeze(0) if emb.ndim == 1 else emb
-    for i in range(self.l): h = self.layer(h, i, pos)
-    return lin(rms(h, self.norm, self.eps).float().squeeze(0), self.lm)
+  def step(self, emb: Tensor, pos: int, use_jit: bool | None = None) -> Tensor:
+    j = self.use_jit if use_jit is None else use_jit
+    if j:
+      vp = Variable("pos", 0, self.max_ctx - 1).bind(pos)
+      return self.step_jit(emb.contiguous().realize(), vp)
+    return self._step_core(emb, pos)
 
 
 # tinygrad/apps/llm.py-compatible byte mapping
@@ -359,14 +368,14 @@ def transcribe(model_dir: str, wav: str, max_new_tokens=1024, verbose=True, use_
   enc_s = time.perf_counter() - te
 
   ids = PROMPT_PREFIX + [TOK_AUDIO_PAD] * ae.shape[0] + PROMPT_SUFFIX
-  dec = Decoder(w, c, use_jit=use_jit, verbose=verbose)
+  dec = Decoder(w, c, use_jit=use_jit, verbose=verbose, max_ctx=len(ids) + max_new_tokens + 8)
   pre = dec.tok(Tensor(PROMPT_PREFIX, dtype=dtypes.int32))
   suf = dec.tok(Tensor(PROMPT_SUFFIX, dtype=dtypes.int32))
   emb = pre.cat(ae, dim=0).cat(suf, dim=0)
 
   td = time.perf_counter()
   if len(ids) > 1: dec.prefill(emb[:-1], verbose=verbose)
-  t = int(dec.step(emb[-1], len(ids) - 1).realize().argmax().item())
+  t = int(dec.step(emb[-1], len(ids) - 1, use_jit=False).realize().argmax().item())
   out = [t]
   for i in range(max_new_tokens - 1):
     if t in EOS: break

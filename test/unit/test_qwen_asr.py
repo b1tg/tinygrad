@@ -44,5 +44,13 @@ class TestQwenAsrHelpers(unittest.TestCase):
     self.assertFalse(math.isnan(float(mel.min().item())))
     self.assertFalse(math.isnan(float(mel.max().item())))
 
+  def test_precompute_rope_matches_rope(self):
+    c0, s0 = self.m.rope(Tensor.arange(7, dtype=dtypes.int32), 8, 10000.0)
+    c1, s1 = self.m.precompute_rope(7, 8, 10000.0)
+    self.assertEqual(c1.shape, (7, 8))
+    self.assertEqual(s1.shape, (7, 8))
+    self.assertLess(float((c0 - c1).square().max().item()), 1e-7)
+    self.assertLess(float((s0 - s1).square().max().item()), 1e-7)
+
 if __name__ == "__main__":
   unittest.main()
