@@ -112,9 +112,14 @@ def compute_mel_spectrogram(audio: Tensor, mel_filters: Tensor) -> Tensor:
   return (x.maximum(x.max() - 8.0) + 4.0).div(4.0).T
 
 
+def cast_weight(t: Tensor, use_bf16_weights: bool) -> Tensor:
+  return t if (use_bf16_weights or t.dtype != dtypes.bfloat16) else t.float()
+
+
 class Weights:
-  def __init__(self, model_dir: str):
+  def __init__(self, model_dir: str, use_bf16_weights=False):
     self.model_dir, self.cache = model_dir, {}
+    self.use_bf16_weights = use_bf16_weights
     idx = os.path.join(model_dir, "model.safetensors.index.json")
     s = os.path.join(model_dir, "model.safetensors")
     self.wmap = json.load(open(idx, encoding="utf-8"))["weight_map"] if os.path.exists(idx) else None
@@ -129,7 +134,7 @@ class Weights:
         self.cache[shard] = safe_load(os.path.join(self.model_dir, shard))
       t = self.cache[shard][k]
     if isinstance(t.device, str) and t.device.startswith("DISK:"): t = t.to(Device.DEFAULT)
-    return t.float() if t.dtype == dtypes.bfloat16 else t
+    return cast_weight(t, self.use_bf16_weights)
 
 
 def lin(x: Tensor, w: Tensor, b: Tensor | None = None) -> Tensor:
@@ -353,7 +358,7 @@ def parse_asr_text(s: str) -> str:
   return s.split(maxsplit=2)[2] if s.lower().startswith("language ") and len(s.split(maxsplit=2)) >= 3 else s
 
 
-def transcribe(model_dir: str, wav: str, max_new_tokens=1024, verbose=True, use_jit=False) -> dict:
+def transcribe(model_dir: str, wav: str, max_new_tokens=1024, verbose=True, use_jit=False, use_bf16_weights=False) -> dict:
   t0 = time.perf_counter()
   a, sr = load_audio(wav)
   if sr != SR:
@@ -362,7 +367,7 @@ def transcribe(model_dir: str, wav: str, max_new_tokens=1024, verbose=True, use_
   if verbose: print(f"Audio: {len(a)} samples ({len(a)/SR:.1f}s)", file=os.sys.stderr)
 
   c = cfg(model_dir)
-  w = Weights(model_dir)
+  w = Weights(model_dir, use_bf16_weights=use_bf16_weights)
   mfb = compute_mel_filters()
   tm = time.perf_counter()
   m = compute_mel_spectrogram(Tensor(a, dtype=dtypes.float32), mfb).realize()
@@ -410,9 +415,10 @@ def main() -> None:
   p.add_argument("--silent", action="store_true")
   p.add_argument("--timings-json", action="store_true")
   p.add_argument("--jit", action="store_true", help="enable TinyJit attention path")
+  p.add_argument("--bf16-weights", action="store_true", help="keep bfloat16 weights instead of casting to float32")
   a = p.parse_args()
 
-  o = transcribe(a.model_dir, a.audio, max_new_tokens=a.max_new_tokens, verbose=not a.silent, use_jit=a.jit)
+  o = transcribe(a.model_dir, a.audio, max_new_tokens=a.max_new_tokens, verbose=not a.silent, use_jit=a.jit, use_bf16_weights=a.bf16_weights)
   print(o["text"])
   if a.timings_json: print(json.dumps({k: v for k, v in o.items() if k != "text"}, sort_keys=True), file=os.sys.stderr)
 

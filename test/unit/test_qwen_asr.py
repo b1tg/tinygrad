@@ -52,5 +52,10 @@ class TestQwenAsrHelpers(unittest.TestCase):
     self.assertLess(float((c0 - c1).square().max().item()), 1e-7)
     self.assertLess(float((s0 - s1).square().max().item()), 1e-7)
 
+  def test_cast_weight_bfloat16_control(self):
+    t = Tensor([1.0, 2.0], dtype=dtypes.bfloat16)
+    self.assertEqual(self.m.cast_weight(t, use_bf16_weights=False).dtype, dtypes.float)
+    self.assertEqual(self.m.cast_weight(t, use_bf16_weights=True).dtype, dtypes.bfloat16)
+
 if __name__ == "__main__":
   unittest.main()

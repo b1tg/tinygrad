@@ -56,6 +56,15 @@ python extra/qwen-asr/transcribe.py \
   --silent --timings-json --jit
 ```
 
+Optional: keep model weights in bfloat16 (can reduce memory bandwidth on some GPUs):
+
+```bash
+python extra/qwen-asr/transcribe.py \
+  extra/antirez-qwen-asr/qwen3-asr-0.6b \
+  extra/antirez-qwen-asr/samples/test_speech.wav \
+  --silent --timings-json --jit --bf16-weights
+```
+
 ## 3. Benchmark Tinygrad vs C
 
 ### Fair Comparison (CPU vs CPU)
