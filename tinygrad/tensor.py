@@ -778,6 +778,13 @@ class Tensor(OpMixin):
     t = (Tensor.arange(n, device=device).unsqueeze(-1) == Tensor.arange(m_, device=device))
     return t.cast(dtype or dtypes.default_float).requires_grad_(requires_grad)
 
+  @staticmethod
+  def hann_window(window_length:int, periodic:bool=True, **kwargs) -> Tensor:
+    """Creates a Hann window of size `window_length`. Matches `torch.hann_window`."""
+    if window_length <= 1: return Tensor.ones(window_length, **kwargs)
+    N = window_length if periodic else window_length - 1
+    return 0.5 * (1 - (Tensor.arange(window_length, **kwargs).float() * (2 * math.pi / N)).cos())
+
   def _multi_like(self, fxn, *args, **kwargs) -> Tensor:
     dtype = kwargs.pop("dtype", self.dtype)
     if kwargs.get("device") is not None: raise RuntimeError("cannot specify `device` on `*_like` of a multi device tensor")
@@ -1458,6 +1465,53 @@ class Tensor(OpMixin):
     assert isinstance(dim_sz, int), f"does not support symbolic shape in split dimension {dim}: {self.shape}"
     assert chunks > 0, f"expect chunks to be greater than 0, got: {chunks}"
     return list(self.split(ceildiv(dim_sz, chunks) if dim_sz else [0]*chunks, dim=dim))
+
+  def unfold(self, dim:int, size:sint, step:int) -> Tensor:
+    """
+    Unfolds the tensor along dimension `dim` into overlapping windows.
+
+    Each window has length `size` and begins every `step` elements of `self`.
+    Returns the input tensor with dimension `dim` replaced by dims `(n_windows, size)`
+    where `n_windows = (self.shape[dim] - size) // step + 1`.
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    unfolded = Tensor.arange(8).unfold(0,2,2)
+    print("\\n".join([repr(x.numpy()) for x in unfolded]))
+    ```
+    ```python exec="true" source="above" session="tensor" result="python"
+    unfolded = Tensor.arange(27).reshape(3,3,3).unfold(-1,2,3)
+    print("\\n".join([repr(x.numpy()) for x in unfolded]))
+    ```
+    """
+    dim = self._resolve_dim(dim)
+    if size < 0: raise RuntimeError(f'size must be >= 0 but got {size=}')
+    if step <= 0: raise RuntimeError(f'step must be > 0 but got {step=}')
+    if isinstance(dim_sz := self.shape[dim], int) and size > dim_sz:
+      raise RuntimeError(f'maximum size for tensor at dimension {dim} is {dim_sz} but size is {size}')
+    perm_to_last = tuple(i for i in range(self.ndim) if i != dim) + (dim,)
+    return self.permute(perm_to_last)._pool((size,), step).permute(argsort(perm_to_last) + (self.ndim,))
+
+  def stft(self, n_fft:int, hop_length:int|None=None, win_length:int|None=None, window:Tensor|None=None, center:bool=True,
+           pad_mode:str="reflect", normalized:bool=False, onesided:bool|None=None, return_complex:bool|None=None) -> Tensor:
+    """Short-time Fourier transform. Returns `(..., n_freq, n_frames, 2)` where last dim is [real, imag]."""
+    assert return_complex, "return_complex=True required"
+    if hop_length is None: hop_length = n_fft // 4
+    if win_length is None: win_length = n_fft
+    if onesided is None: onesided = True
+    x = self.pad((n_fft // 2, n_fft // 2), mode=pad_mode) if center else self
+    frames = x.unfold(-1, n_fft, hop_length)
+    if window is not None:
+      if win_length < n_fft: window = window.pad(((n_fft - win_length) // 2, (n_fft - win_length + 1) // 2))
+      frames = frames * window
+    n_freq = n_fft // 2 + 1 if onesided else n_fft
+    k = Tensor.arange(n_freq).float().unsqueeze(1)
+    n = Tensor.arange(n_fft).float().unsqueeze(0)
+    angles = 2 * math.pi * (k @ n) / n_fft
+    real, imag = frames @ angles.cos().T, frames @ (-angles.sin()).T
+    if normalized:
+      scale = 1 / math.sqrt(n_fft)
+      real, imag = real * scale, imag * scale
+    return Tensor.stack(real, imag, dim=-1).permute(*range(self.ndim - 1), -2, -3, -1)
 
   def meshgrid(self:Tensor, *args:Tensor, indexing:str="ij") -> tuple[Tensor, ...]:
     """

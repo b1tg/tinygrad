@@ -1,6 +1,6 @@
 import importlib.util, pathlib, unittest
-import numpy as np
-from tinygrad import Tensor
+import math, random
+from tinygrad import Tensor, dtypes
 
 
 def load_qwen_module():
@@ -31,17 +31,18 @@ class TestQwenAsrHelpers(unittest.TestCase):
   def test_mel_filters_shape(self):
     fb = self.m.compute_mel_filters()
     self.assertEqual(fb.shape, (201, 128))
-    self.assertTrue(np.isfinite(fb).all())
-    self.assertGreater(float(fb.sum()), 0.0)
+    self.assertGreater(float(fb.sum().item()), 0.0)
+    self.assertFalse(math.isnan(float(fb.min().item())))
+    self.assertFalse(math.isnan(float(fb.max().item())))
 
   def test_mel_spectrogram_shape(self):
-    np.random.seed(0)
-    audio = Tensor(np.random.randn(16000).astype(np.float32))
-    fb = Tensor(self.m.compute_mel_filters().astype(np.float32))
-    mel = self.m.compute_mel_spectrogram(audio, fb).numpy()
+    random.seed(0)
+    audio = Tensor([random.uniform(-1.0, 1.0) for _ in range(16000)], dtype=dtypes.float32)
+    mel = self.m.compute_mel_spectrogram(audio, self.m.compute_mel_filters())
     self.assertEqual(mel.shape[0], 128)
     self.assertGreater(mel.shape[1], 0)
-    self.assertTrue(np.isfinite(mel).all())
+    self.assertFalse(math.isnan(float(mel.min().item())))
+    self.assertFalse(math.isnan(float(mel.max().item())))
 
 if __name__ == "__main__":
   unittest.main()

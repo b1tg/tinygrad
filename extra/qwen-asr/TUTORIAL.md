@@ -83,7 +83,7 @@ CPU with JIT enabled for tinygrad:
 CPU=1 python extra/qwen-asr/benchmark.py \
   --model-dir extra/antirez-qwen-asr/qwen3-asr-0.6b \
   --audio extra/antirez-qwen-asr/samples/test_speech.wav \
-  --tinygrad-args "--jit" \
+  --tinygrad-jit \
   --warmup 1 --runs 3
 ```
 
@@ -95,7 +95,7 @@ Use this when you want fastest tinygrad on Apple hardware:
 METAL=1 python extra/qwen-asr/benchmark.py \
   --model-dir extra/antirez-qwen-asr/qwen3-asr-0.6b \
   --audio extra/antirez-qwen-asr/samples/test_speech.wav \
-  --tinygrad-args "--jit" \
+  --tinygrad-jit \
   --warmup 1 --runs 3
 ```
 
@@ -146,4 +146,4 @@ If C benchmark binary is missing:
 make -C extra/antirez-qwen-asr blas
 ```
 
-If `soundfile` is unavailable, the tinygrad script falls back to stdlib `wave` input for WAV files.
+The tinygrad script uses stdlib `wave` input, so provide PCM WAV files.
