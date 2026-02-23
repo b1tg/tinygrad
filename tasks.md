@@ -13,6 +13,9 @@ Make `MOCKGPU_ARCH=cdna4` emulator behavior match rdna3/rdna4 baseline (real emu
 - Full CI bundle in provided workflow: `NOT DONE YET`
 - Latest full cdna4 run (`-n=2`, `backend=amd`): `27 failed, 842 passed, 139 skipped, 5 xfailed, 29 errors` (27m28s)
 - Current primary blocker: emu compile failure on `v_exp_f16_e32(...)` causing `test_hcq` errors and many `test_cfg_viz` failures
+- Module status since that full run:
+  - `test/backend/test_dtype.py`: `PASS` (`236 passed, 48 skipped`)
+  - `test/backend/test_dtype_alu.py`: `PASS` (`38 passed, 9 skipped, 1 xfailed`)
 
 ## Completed
 
@@ -25,6 +28,11 @@ Make `MOCKGPU_ARCH=cdna4` emulator behavior match rdna3/rdna4 baseline (real emu
   - [x] `test_conv2d`
   - [x] `test_grouped_conv2d`
 - [x] Verify `test/backend/test_ops.py` passes on cdna4 (`350 passed`).
+- [x] Fix fp64 pcode destination typing in emu branch-merging paths (`test_dtype` regression fix, commit `7532c9927`).
+- [x] Fix dtype_alu transcendental/fp8 paths in cdna4 emu:
+  - [x] VOP3P `V_FMA_MIX*` source-width handling
+  - [x] pcode if/else merge type inference for branch-local variables
+  - [x] Verify `test/backend/test_dtype_alu.py` passes on cdna4 (`38 passed, 9 skipped, 1 xfailed`) (commit `e86be7d9f`)
 
 ## In Progress
 
@@ -37,11 +45,7 @@ Make `MOCKGPU_ARCH=cdna4` emulator behavior match rdna3/rdna4 baseline (real emu
 
 ### Failing Tests (latest full run, `backend=amd`, `-n=2`)
 
-- [ ] DType / fp paths:
-  - [ ] `test/backend/test_dtype_alu.py::TestDTypeALU::test_emulated_fp8e4m3_unary`
-  - [ ] `test/backend/test_dtype.py::TestDoubleDType::test_float64_increased_precision`
-  - [ ] `test/backend/test_dtype_alu.py::TestDTypeALU::test_emulated_fp8e5m2_unary`
-  - [ ] `test/backend/test_dtype_alu.py::TestDTypeALU::test_float16_unary`
+- [x] DType / fp paths (resolved after the last full run; see module status above).
 - [ ] Randomness:
   - [ ] `test/backend/test_randomness.py::TestRandomness::test_randn_finite`
   - [ ] `test/backend/test_randomness.py::TestRandomness::test_scaled_uniform`
@@ -74,7 +78,7 @@ Make `MOCKGPU_ARCH=cdna4` emulator behavior match rdna3/rdna4 baseline (real emu
 ### Workflow Coverage Tracking
 
 - [x] Run full workflow test bundle for cdna4 with `backend=amd` and parallel pytest (`-n=2`).
-- [ ] Re-run full workflow test bundle for cdna4 with `backend=amd` after fixes (target: zero failures/errors).
+- [ ] Re-run full workflow test bundle for cdna4 with `backend=amd` after dtype/dtype_alu fixes (target: updated failure list).
 - [ ] Run full workflow test bundle for cdna4 with `backend=amdllvm`.
 
 ## Verification Commands
