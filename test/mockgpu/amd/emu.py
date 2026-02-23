@@ -1857,13 +1857,17 @@ def _exec_cdna_scratch_load_store_python(st: WaveState, inst) -> bool:
         raw = raw_bytes[0]
         if '_D16' in opn:
           val16 = (ctypes.c_int8(raw).value & 0xFFFF) if signed else (raw & 0xFFFF)
-          _write_data(data_reg, lane, ((val16 << 16) if d16_hi else val16) & MASK32)
+          old = _read_data(data_reg, lane)
+          merged = ((old & 0x0000FFFF) | ((val16 & 0xFFFF) << 16)) if d16_hi else ((old & 0xFFFF0000) | (val16 & 0xFFFF))
+          _write_data(data_reg, lane, merged & MASK32)
         else:
           _write_data(data_reg, lane, (ctypes.c_int8(raw).value if signed else raw) & MASK32)
       elif nbytes == 2:
         raw = raw_bytes[0] | (raw_bytes[1] << 8)
         if '_D16' in opn:
-          _write_data(data_reg, lane, ((raw << 16) if d16_hi else raw) & MASK32)
+          old = _read_data(data_reg, lane)
+          merged = ((old & 0x0000FFFF) | ((raw & 0xFFFF) << 16)) if d16_hi else ((old & 0xFFFF0000) | (raw & 0xFFFF))
+          _write_data(data_reg, lane, merged & MASK32)
         else:
           _write_data(data_reg, lane, (ctypes.c_int16(raw).value if signed else raw) & MASK32)
       else:
@@ -1988,7 +1992,9 @@ def _exec_cdna_global_load_python(st: WaveState, inst) -> bool:
       raw = ctypes.c_uint8.from_address(addr).value
       if is_d16:
         val16 = (ctypes.c_int8(raw).value & 0xFFFF) if signed else (raw & 0xFFFF)
-        _write_dst(vdst_reg, lane, ((val16 << 16) if load_hi else val16) & MASK32)
+        old = _read_dst(vdst_reg, lane)
+        merged = ((old & 0x0000FFFF) | ((val16 & 0xFFFF) << 16)) if load_hi else ((old & 0xFFFF0000) | (val16 & 0xFFFF))
+        _write_dst(vdst_reg, lane, merged & MASK32)
       else:
         val = ctypes.c_int8(raw).value if signed else raw
         _write_dst(vdst_reg, lane, val & MASK32)
@@ -1998,7 +2004,9 @@ def _exec_cdna_global_load_python(st: WaveState, inst) -> bool:
       raw = ctypes.c_uint16.from_address(addr).value
       if is_d16:
         val16 = raw & 0xFFFF
-        _write_dst(vdst_reg, lane, ((val16 << 16) if load_hi else val16) & MASK32)
+        old = _read_dst(vdst_reg, lane)
+        merged = ((old & 0x0000FFFF) | ((val16 & 0xFFFF) << 16)) if load_hi else ((old & 0xFFFF0000) | (val16 & 0xFFFF))
+        _write_dst(vdst_reg, lane, merged & MASK32)
       else:
         val = ctypes.c_int16(raw).value if signed else raw
         _write_dst(vdst_reg, lane, val & MASK32)
@@ -2158,14 +2166,18 @@ def _exec_cdna_flat_load_python(st: WaveState, inst) -> bool:
       raw = ctypes.c_uint8.from_address(addr).value
       if is_d16:
         val16 = (ctypes.c_int8(raw).value & 0xFFFF) if signed else (raw & 0xFFFF)
-        _write_dst(vdst_reg, lane, ((val16 << 16) if load_hi else val16) & MASK32)
+        old = _read_dst(vdst_reg, lane)
+        merged = ((old & 0x0000FFFF) | ((val16 & 0xFFFF) << 16)) if load_hi else ((old & 0xFFFF0000) | (val16 & 0xFFFF))
+        _write_dst(vdst_reg, lane, merged & MASK32)
       else:
         _write_dst(vdst_reg, lane, (ctypes.c_int8(raw).value if signed else raw) & MASK32)
     elif load_nbytes == 2:
       raw = ctypes.c_uint16.from_address(addr).value
       if is_d16:
         val16 = raw & 0xFFFF
-        _write_dst(vdst_reg, lane, ((val16 << 16) if load_hi else val16) & MASK32)
+        old = _read_dst(vdst_reg, lane)
+        merged = ((old & 0x0000FFFF) | ((val16 & 0xFFFF) << 16)) if load_hi else ((old & 0xFFFF0000) | (val16 & 0xFFFF))
+        _write_dst(vdst_reg, lane, merged & MASK32)
       else:
         _write_dst(vdst_reg, lane, (ctypes.c_int16(raw).value if signed else raw) & MASK32)
     else:

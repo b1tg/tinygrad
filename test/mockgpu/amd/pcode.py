@@ -1245,10 +1245,11 @@ def parse_block(lines: list[str], start: int, env: dict[str, VarVal], funcs: dic
           if base is None:
             # If this variable is introduced inside branches (common for declared arrays),
             # infer type from branch values instead of defaulting to u32.
+            # NOTE: base must stay a neutral default for the "condition is false" path.
             inferred: Any = else_assigns.get(var)
             if inferred is None:
               inferred = next((ba[var] for _, ba in conditions if isinstance(ba, dict) and var in ba), None)
-            base = inferred if inferred is not None else _u32(0)
+            base = _cast_to(_u32(0), inferred.dtype) if isinstance(inferred, UOp) else _u32(0)
           res: Any = else_assigns.get(var, base)
           for cond, ba in reversed(conditions):  # type: ignore[assignment]
             if isinstance(ba, dict) and var in ba:
