@@ -231,7 +231,8 @@ VOPD_TO_VOP2 = {
   ir4.VOPDOp.V_DUAL_MOV_B32: ir3.VOP1Op.V_MOV_B32_E32, ir4.VOPDOp.V_DUAL_CNDMASK_B32: ir3.VOP2Op.V_CNDMASK_B32_E32,
   ir4.VOPDOp.V_DUAL_FMAAK_F32: ir3.VOP2Op.V_FMAAK_F32_E32, ir4.VOPDOp.V_DUAL_FMAMK_F32: ir3.VOP2Op.V_FMAMK_F32_E32,
 }
-WAVE_SIZE = int(getenv("MOCKGPU_WAVE_SIZE", 64 if getenv("MOCKGPU_ARCH", "") == "cdna4" else 32))
+emu_arch = str(getenv("MOCKGPU_EMU_ARCH", getenv("MOCKGPU_ARCH", "")))
+WAVE_SIZE = int(getenv("MOCKGPU_WAVE_SIZE", 64 if emu_arch == "cdna" else 32))
 ENFORCE_MEM_RANGES = bool(getenv("MOCKGPU_ENFORCE_MEM_RANGES", 0))
 # Special registers stored after inline constants (256-260)
 PC_LO_IDX, PC_HI_IDX, SCRATCH_STRIDE_IDX, SCRATCH_BASE_IDX = 256, 257, 259, 260
@@ -1703,6 +1704,16 @@ def _addr_in_valid_ranges(addr: int, nbytes: int) -> bool:
     if st_addr <= addr and addr + nbytes <= st_addr + sz: return True
   return not _VALID_MEM_RANGES
 
+def _resolve_addr_in_valid_ranges(addr: int, nbytes: int) -> int | None:
+  if _addr_in_valid_ranges(addr, nbytes): return addr
+  if not _VALID_MEM_RANGES: return None
+  lo = addr & MASK32
+  for st_addr, sz in _VALID_MEM_RANGES:
+    hi = st_addr & ~MASK32
+    cand = hi | lo
+    if st_addr <= cand and cand + nbytes <= st_addr + sz: return cand
+  return None
+
 def _exec_cdna_scratch_load_store_python(st: WaveState, inst) -> bool:
   if not isinstance(inst, irc.SCRATCH): return False
   if not hasattr(inst, 'op'): return False
@@ -1836,32 +1847,73 @@ def _exec_cdna_scratch_load_store_python(st: WaveState, inst) -> bool:
   st.pc = st.pc + inst.size()
   return True
 
+_MEM_LOAD_SPECS: dict[str, tuple[int, int, bool, bool, bool]] = {
+  # legacy cdna naming
+  'UBYTE': (1, 1, False, False, False), 'SBYTE': (1, 1, True, False, False),
+  'USHORT': (2, 1, False, False, False), 'SSHORT': (2, 1, True, False, False),
+  'DWORD': (4, 1, False, False, False), 'DWORDX2': (8, 2, False, False, False),
+  'DWORDX3': (12, 3, False, False, False), 'DWORDX4': (16, 4, False, False, False),
+  'UBYTE_D16': (1, 1, False, True, False), 'UBYTE_D16_HI': (1, 1, False, True, True),
+  'SBYTE_D16': (1, 1, True, True, False), 'SBYTE_D16_HI': (1, 1, True, True, True),
+  'SHORT_D16': (2, 1, False, True, False), 'SHORT_D16_HI': (2, 1, False, True, True),
+  # rdna4 naming used by MOCKGPU_ARCH=cdna4 path (EMU_ARCH=rdna4)
+  'U8': (1, 1, False, False, False), 'I8': (1, 1, True, False, False),
+  'U16': (2, 1, False, False, False), 'I16': (2, 1, True, False, False),
+  'B32': (4, 1, False, False, False), 'B64': (8, 2, False, False, False),
+  'B96': (12, 3, False, False, False), 'B128': (16, 4, False, False, False),
+  'D16_U8': (1, 1, False, True, False), 'D16_I8': (1, 1, True, True, False),
+  'D16_B16': (2, 1, False, True, False), 'D16_HI_U8': (1, 1, False, True, True),
+  'D16_HI_I8': (1, 1, True, True, True), 'D16_HI_B16': (2, 1, False, True, True),
+}
+_MEM_STORE_SPECS: dict[str, tuple[int, int, bool]] = {
+  # legacy cdna naming
+  'BYTE': (1, 1, False), 'BYTE_D16_HI': (1, 1, True),
+  'SHORT': (2, 1, False), 'SHORT_D16_HI': (2, 1, True),
+  'DWORD': (4, 1, False), 'DWORDX2': (8, 2, False), 'DWORDX3': (12, 3, False), 'DWORDX4': (16, 4, False),
+  # rdna4 naming used by MOCKGPU_ARCH=cdna4 path (EMU_ARCH=rdna4)
+  'B8': (1, 1, False), 'B16': (2, 1, False), 'B32': (4, 1, False), 'B64': (8, 2, False), 'B96': (12, 3, False), 'B128': (16, 4, False),
+  'D16_HI_B8': (1, 1, True), 'D16_HI_B16': (2, 1, True),
+}
+
+def _decode_mem_load_spec(opn: str, prefix: str) -> tuple[int, int, bool, bool, bool] | None:
+  if not opn.startswith(prefix): return None
+  return _MEM_LOAD_SPECS.get(opn[len(prefix):])
+
+def _decode_mem_store_spec(opn: str, prefix: str) -> tuple[int, int, bool] | None:
+  if not opn.startswith(prefix): return None
+  return _MEM_STORE_SPECS.get(opn[len(prefix):])
+
+def _op_offset(inst, *names: str) -> int | None:
+  for name in names:
+    field = getattr(inst, name, None)
+    if hasattr(field, 'offset'): return field.offset
+  return None
+
+def _decode_signed_inst_offset(inst) -> int | None:
+  for name in ('offset', 'ioffset'):
+    if not hasattr(type(inst), name) or not hasattr(inst, name): continue
+    off_field = getattr(type(inst), name)
+    off_bits = off_field.hi - off_field.lo + 1
+    off_mask = (1 << off_bits) - 1
+    off_sign = 1 << (off_bits - 1)
+    off_raw = int(getattr(inst, name)) & off_mask
+    return off_raw - (1 << off_bits) if (off_raw & off_sign) else off_raw
+  return None
+
 def _exec_cdna_global_load_python(st: WaveState, inst) -> bool:
-  if not isinstance(inst, irc.GLOBAL): return False
+  if not isinstance(inst, (irc.GLOBAL, ir4.VGLOBAL)): return False
   if not hasattr(inst, 'op') or not inst.op.name.startswith('GLOBAL_LOAD_'): return False
   opn = inst.op.name
   if opn.startswith('GLOBAL_LOAD_LDS_'): return False
-  if any(not hasattr(getattr(inst, x), 'offset') for x in ('addr', 'vdst', 'saddr')): return False
+  addr_off = _op_offset(inst, 'addr', 'vaddr')
+  vdst_off = _op_offset(inst, 'vdst')
+  saddr_off = _op_offset(inst, 'saddr')
+  if addr_off is None or vdst_off is None or saddr_off is None: return False
 
-  # Decode width/sign from opcode.
-  load_nbytes, load_words, signed = 0, 1, False
-  if opn in ('GLOBAL_LOAD_UBYTE', 'GLOBAL_LOAD_SBYTE', 'GLOBAL_LOAD_UBYTE_D16', 'GLOBAL_LOAD_UBYTE_D16_HI',
-             'GLOBAL_LOAD_SBYTE_D16', 'GLOBAL_LOAD_SBYTE_D16_HI'):
-    load_nbytes, signed = 1, opn.startswith('GLOBAL_LOAD_SBYTE')
-  elif opn in ('GLOBAL_LOAD_USHORT', 'GLOBAL_LOAD_SSHORT', 'GLOBAL_LOAD_SHORT_D16', 'GLOBAL_LOAD_SHORT_D16_HI'):
-    load_nbytes, signed = 2, opn in ('GLOBAL_LOAD_SSHORT',)
-  elif opn == 'GLOBAL_LOAD_DWORD':
-    load_nbytes = 4
-  elif opn == 'GLOBAL_LOAD_DWORDX2':
-    load_nbytes, load_words = 8, 2
-  elif opn == 'GLOBAL_LOAD_DWORDX3':
-    load_nbytes, load_words = 12, 3
-  elif opn == 'GLOBAL_LOAD_DWORDX4':
-    load_nbytes, load_words = 16, 4
-  else:
-    return False
+  spec = _decode_mem_load_spec(opn, 'GLOBAL_LOAD_')
+  if spec is None: return False
+  load_nbytes, load_words, signed, is_d16, load_hi = spec
 
-  addr_off, vdst_off, saddr_off = inst.addr.offset, inst.vdst.offset, inst.saddr.offset
   if min(addr_off, vdst_off) < 256: return False
   addr_reg, vdst_reg = addr_off - 256, vdst_off - 256
   acc_mode = int(getattr(inst, 'acc', 0) or 0)
@@ -1875,14 +1927,9 @@ def _exec_cdna_global_load_python(st: WaveState, inst) -> bool:
   use_saddr = saddr_off < 124
   saddr_base = (st._read_sgpr(saddr_off) | (st._read_sgpr(saddr_off + 1) << 32)) if use_saddr else 0
 
-  off_field = type(inst).offset
-  off_bits = off_field.hi - off_field.lo + 1
-  off_sign = 1 << (off_bits - 1)
-  off_mask = (1 << off_bits) - 1
-  off_raw = int(inst.offset) & off_mask
-  ioff = off_raw - (1 << off_bits) if (off_raw & off_sign) else off_raw
+  ioff = _decode_signed_inst_offset(inst)
+  if ioff is None: return False
 
-  is_d16, load_hi = ('_D16' in opn), opn.endswith('_D16_HI')
   exec_mask = st._read_sgpr(EXEC_LO.offset) | (st._read_sgpr(EXEC_LO.offset + 1) << 32)
   trace = bool(getenv("MOCKGPU_TRACE_LOAD", 0))
   loads, invalids = 0, 0
@@ -1897,10 +1944,12 @@ def _exec_cdna_global_load_python(st: WaveState, inst) -> bool:
       vaddr = st._read_vgpr(addr_reg, lane) | (st._read_vgpr(addr_reg + 1, lane) << 32)
       addr = (vaddr + ioff) & 0xFFFFFFFFFFFFFFFF
 
-    if not _addr_in_valid_ranges(addr, load_nbytes):
+    resolved_addr = _resolve_addr_in_valid_ranges(addr, load_nbytes)
+    if resolved_addr is None:
       invalids += 1
       for wi in range(load_words): _write_dst(vdst_reg + wi, lane, 0)
       continue
+    addr = resolved_addr
 
     if load_words > 1:
       for wi in range(load_words):
@@ -1935,29 +1984,26 @@ def _exec_cdna_global_load_python(st: WaveState, inst) -> bool:
       loads += 1
 
   if trace:
-    print(f"[emu-gload] {opn} loads={loads} invalid={invalids} saddr={saddr_off} addr={addr_off} vdst={vdst_off} acc={acc_mode} off={inst.offset}", flush=True)
+    print(f"[emu-gload] {opn} loads={loads} invalid={invalids} saddr={saddr_off} addr={addr_off} vdst={vdst_off} acc={acc_mode} "
+          f"off={getattr(inst, 'offset', getattr(inst, 'ioffset', 0))}", flush=True)
     if first is not None: print(f"[emu-gload] first lane={first[0]} addr=0x{first[1]:x} val=0x{int(first[2]):x}", flush=True)
 
   st.pc = st.pc + inst.size()
   return True
 
 def _exec_cdna_global_store_python(st: WaveState, inst) -> bool:
-  if not isinstance(inst, irc.GLOBAL): return False
+  if not isinstance(inst, (irc.GLOBAL, ir4.VGLOBAL)): return False
   if not hasattr(inst, 'op') or not inst.op.name.startswith('GLOBAL_STORE_'): return False
-  if any(not hasattr(getattr(inst, x), 'offset') for x in ('addr', 'data', 'saddr')): return False
+  addr_off = _op_offset(inst, 'addr', 'vaddr')
+  data_off = _op_offset(inst, 'data', 'vsrc')
+  saddr_off = _op_offset(inst, 'saddr')
+  if addr_off is None or data_off is None or saddr_off is None: return False
 
   opn = inst.op.name
-  store_nbytes = 0
-  store_words = 1
-  if opn in ('GLOBAL_STORE_BYTE', 'GLOBAL_STORE_BYTE_D16_HI'): store_nbytes = 1
-  elif opn in ('GLOBAL_STORE_SHORT', 'GLOBAL_STORE_SHORT_D16_HI'): store_nbytes = 2
-  elif opn == 'GLOBAL_STORE_DWORD': store_nbytes = 4
-  elif opn == 'GLOBAL_STORE_DWORDX2': store_nbytes, store_words = 8, 2
-  elif opn == 'GLOBAL_STORE_DWORDX3': store_nbytes, store_words = 12, 3
-  elif opn == 'GLOBAL_STORE_DWORDX4': store_nbytes, store_words = 16, 4
-  else: return False
+  spec = _decode_mem_store_spec(opn, 'GLOBAL_STORE_')
+  if spec is None: return False
+  store_nbytes, store_words, store_hi = spec
 
-  addr_off, data_off, saddr_off = inst.addr.offset, inst.data.offset, inst.saddr.offset
   if min(addr_off, data_off) < 256: return False
   addr_reg, data_reg = addr_off - 256, data_off - 256
   acc_mode = int(getattr(inst, 'acc', 0) or 0)
@@ -1969,13 +2015,8 @@ def _exec_cdna_global_store_python(st: WaveState, inst) -> bool:
   use_saddr = saddr_off < 124
   saddr_base = (st._read_sgpr(saddr_off) | (st._read_sgpr(saddr_off + 1) << 32)) if use_saddr else 0
   # Sign-extend ioffset using the instruction field width.
-  off_field = type(inst).offset
-  off_bits = off_field.hi - off_field.lo + 1
-  off_sign = 1 << (off_bits - 1)
-  off_mask = (1 << off_bits) - 1
-  off_raw = int(inst.offset) & off_mask
-  ioff = off_raw - (1 << off_bits) if (off_raw & off_sign) else off_raw
-  store_hi = opn.endswith('D16_HI')
+  ioff = _decode_signed_inst_offset(inst)
+  if ioff is None: return False
   exec_mask = st._read_sgpr(EXEC_LO.offset) | (st._read_sgpr(EXEC_LO.offset + 1) << 32)
   trace = bool(getenv("MOCKGPU_TRACE_STORE", 0))
 
@@ -1989,7 +2030,9 @@ def _exec_cdna_global_store_python(st: WaveState, inst) -> bool:
     else:
       vaddr = st._read_vgpr(addr_reg, lane) | (st._read_vgpr(addr_reg + 1, lane) << 32)
       addr = (vaddr + ioff) & 0xFFFFFFFFFFFFFFFF
-    if not _addr_in_valid_ranges(addr, store_nbytes): continue
+    resolved_addr = _resolve_addr_in_valid_ranges(addr, store_nbytes)
+    if resolved_addr is None: continue
+    addr = resolved_addr
 
     if store_nbytes == 1:
       data = _read_data(data_reg, lane)
@@ -2010,9 +2053,9 @@ def _exec_cdna_global_store_python(st: WaveState, inst) -> bool:
   if trace:
     vdst_dbg = getattr(getattr(inst, 'vdst', None), 'offset', None)
     print(f"[emu-gstore] pc=0x{st.pc:x} off=0x{(st.pc - _CUR_LIB_BASE):x} {opn} writes={writes} exec=0x{exec_mask:x} saddr={saddr_off} addr={addr_off} data={data_off} acc={acc_mode} "
-          f"vdst={vdst_dbg} off={inst.offset} inst={inst!r}", flush=True)
+          f"vdst={vdst_dbg} off={getattr(inst, 'offset', getattr(inst, 'ioffset', 0))} inst={inst!r}", flush=True)
     if first is not None: print(f"[emu-gstore] first lane={first[0]} addr=0x{first[1]:x} val=0x{int(first[2]):x}", flush=True)
-    elif writes == 0 and use_saddr:
+    elif writes == 0:
       raw0 = st._read_vgpr(addr_reg, 0)
       raw1 = st._read_vgpr(addr_reg + 1, 0)
       raw_vdst = st._read_vgpr(vdst_dbg - 256, 0) if (vdst_dbg is not None and vdst_dbg >= 256) else None
@@ -2032,34 +2075,27 @@ def _exec_cdna_global_store_python(st: WaveState, inst) -> bool:
         rv = st._read_vgpr(vdst_dbg - 256, li) if (vdst_dbg is not None and vdst_dbg >= 256) else 0
         lane_dump.append((li, r, rv))
       print(f"[emu-gstore] lanes addr_reg/vdst={[(li, hex(r), hex(rv)) for li, r, rv in lane_dump]}", flush=True)
+      s_lo = max(0, saddr_off - 2)
+      s_hi = min(127, saddr_off + 3)
+      s_dump = [(si, hex(st._read_sgpr(si))) for si in range(s_lo, s_hi + 1)]
+      print(f"[emu-gstore] sgpr[{s_lo}:{s_hi}]={s_dump}", flush=True)
 
   st.pc = st.pc + inst.size()
   return True
 
 def _exec_cdna_flat_load_python(st: WaveState, inst) -> bool:
-  if not isinstance(inst, irc.FLAT): return False
+  if not isinstance(inst, (irc.FLAT, ir4.VFLAT)): return False
   if not hasattr(inst, 'op') or not inst.op.name.startswith('FLAT_LOAD_'): return False
   opn = inst.op.name
-  if any(not hasattr(getattr(inst, x), 'offset') for x in ('addr', 'vdst', 'saddr')): return False
+  addr_off = _op_offset(inst, 'addr', 'vaddr')
+  vdst_off = _op_offset(inst, 'vdst')
+  saddr_off = _op_offset(inst, 'saddr')
+  if addr_off is None or vdst_off is None or saddr_off is None: return False
 
-  load_nbytes, load_words, signed = 0, 1, False
-  if opn in ('FLAT_LOAD_UBYTE', 'FLAT_LOAD_SBYTE', 'FLAT_LOAD_UBYTE_D16', 'FLAT_LOAD_UBYTE_D16_HI',
-             'FLAT_LOAD_SBYTE_D16', 'FLAT_LOAD_SBYTE_D16_HI'):
-    load_nbytes, signed = 1, opn.startswith('FLAT_LOAD_SBYTE')
-  elif opn in ('FLAT_LOAD_USHORT', 'FLAT_LOAD_SSHORT', 'FLAT_LOAD_SHORT_D16', 'FLAT_LOAD_SHORT_D16_HI'):
-    load_nbytes, signed = 2, opn in ('FLAT_LOAD_SSHORT',)
-  elif opn == 'FLAT_LOAD_DWORD':
-    load_nbytes = 4
-  elif opn == 'FLAT_LOAD_DWORDX2':
-    load_nbytes, load_words = 8, 2
-  elif opn == 'FLAT_LOAD_DWORDX3':
-    load_nbytes, load_words = 12, 3
-  elif opn == 'FLAT_LOAD_DWORDX4':
-    load_nbytes, load_words = 16, 4
-  else:
-    return False
+  spec = _decode_mem_load_spec(opn, 'FLAT_LOAD_')
+  if spec is None: return False
+  load_nbytes, load_words, signed, is_d16, load_hi = spec
 
-  addr_off, vdst_off, saddr_off = inst.addr.offset, inst.vdst.offset, inst.saddr.offset
   if min(addr_off, vdst_off) < 256: return False
   addr_reg, vdst_reg = addr_off - 256, vdst_off - 256
   acc_mode = int(getattr(inst, 'acc', 0) or 0)
@@ -2069,13 +2105,8 @@ def _exec_cdna_flat_load_python(st: WaveState, inst) -> bool:
     else: st._write_vgpr(reg, lane_id, val)
   use_saddr = saddr_off < 124
   saddr_base = (st._read_sgpr(saddr_off) | (st._read_sgpr(saddr_off + 1) << 32)) if use_saddr else 0
-  off_field = type(inst).offset
-  off_bits = off_field.hi - off_field.lo + 1
-  off_sign = 1 << (off_bits - 1)
-  off_mask = (1 << off_bits) - 1
-  off_raw = int(inst.offset) & off_mask
-  ioff = off_raw - (1 << off_bits) if (off_raw & off_sign) else off_raw
-  is_d16, load_hi = ('_D16' in opn), opn.endswith('_D16_HI')
+  ioff = _decode_signed_inst_offset(inst)
+  if ioff is None: return False
   exec_mask = st._read_sgpr(EXEC_LO.offset) | (st._read_sgpr(EXEC_LO.offset + 1) << 32)
 
   for lane in range(WAVE_SIZE):
@@ -2087,9 +2118,11 @@ def _exec_cdna_flat_load_python(st: WaveState, inst) -> bool:
       vaddr = st._read_vgpr(addr_reg, lane) | (st._read_vgpr(addr_reg + 1, lane) << 32)
       addr = (vaddr + ioff) & 0xFFFFFFFFFFFFFFFF
 
-    if not _addr_in_valid_ranges(addr, load_nbytes):
+    resolved_addr = _resolve_addr_in_valid_ranges(addr, load_nbytes)
+    if resolved_addr is None:
       for wi in range(load_words): _write_dst(vdst_reg + wi, lane, 0)
       continue
+    addr = resolved_addr
 
     if load_words > 1:
       for wi in range(load_words): _write_dst(vdst_reg + wi, lane, ctypes.c_uint32.from_address(addr + wi * 4).value)
@@ -2116,20 +2149,17 @@ def _exec_cdna_flat_load_python(st: WaveState, inst) -> bool:
   return True
 
 def _exec_cdna_flat_store_python(st: WaveState, inst) -> bool:
-  if not isinstance(inst, irc.FLAT): return False
+  if not isinstance(inst, (irc.FLAT, ir4.VFLAT)): return False
   if not hasattr(inst, 'op') or not inst.op.name.startswith('FLAT_STORE_'): return False
-  if any(not hasattr(getattr(inst, x), 'offset') for x in ('addr', 'data', 'saddr')): return False
+  addr_off = _op_offset(inst, 'addr', 'vaddr')
+  data_off = _op_offset(inst, 'data', 'vsrc')
+  saddr_off = _op_offset(inst, 'saddr')
+  if addr_off is None or data_off is None or saddr_off is None: return False
   opn = inst.op.name
-  store_nbytes, store_words = 0, 1
-  if opn in ('FLAT_STORE_BYTE', 'FLAT_STORE_BYTE_D16_HI'): store_nbytes = 1
-  elif opn in ('FLAT_STORE_SHORT', 'FLAT_STORE_SHORT_D16_HI'): store_nbytes = 2
-  elif opn == 'FLAT_STORE_DWORD': store_nbytes = 4
-  elif opn == 'FLAT_STORE_DWORDX2': store_nbytes, store_words = 8, 2
-  elif opn == 'FLAT_STORE_DWORDX3': store_nbytes, store_words = 12, 3
-  elif opn == 'FLAT_STORE_DWORDX4': store_nbytes, store_words = 16, 4
-  else: return False
+  spec = _decode_mem_store_spec(opn, 'FLAT_STORE_')
+  if spec is None: return False
+  store_nbytes, store_words, store_hi = spec
 
-  addr_off, data_off, saddr_off = inst.addr.offset, inst.data.offset, inst.saddr.offset
   if min(addr_off, data_off) < 256: return False
   addr_reg, data_reg = addr_off - 256, data_off - 256
   acc_mode = int(getattr(inst, 'acc', 0) or 0)
@@ -2138,13 +2168,8 @@ def _exec_cdna_flat_store_python(st: WaveState, inst) -> bool:
     return st._read_accvgpr(reg, lane_id) if acc_mode else st._read_vgpr(reg, lane_id)
   use_saddr = saddr_off < 124
   saddr_base = (st._read_sgpr(saddr_off) | (st._read_sgpr(saddr_off + 1) << 32)) if use_saddr else 0
-  off_field = type(inst).offset
-  off_bits = off_field.hi - off_field.lo + 1
-  off_sign = 1 << (off_bits - 1)
-  off_mask = (1 << off_bits) - 1
-  off_raw = int(inst.offset) & off_mask
-  ioff = off_raw - (1 << off_bits) if (off_raw & off_sign) else off_raw
-  store_hi = opn.endswith('D16_HI')
+  ioff = _decode_signed_inst_offset(inst)
+  if ioff is None: return False
   exec_mask = st._read_sgpr(EXEC_LO.offset) | (st._read_sgpr(EXEC_LO.offset + 1) << 32)
 
   for lane in range(WAVE_SIZE):
@@ -2155,7 +2180,9 @@ def _exec_cdna_flat_store_python(st: WaveState, inst) -> bool:
     else:
       vaddr = st._read_vgpr(addr_reg, lane) | (st._read_vgpr(addr_reg + 1, lane) << 32)
       addr = (vaddr + ioff) & 0xFFFFFFFFFFFFFFFF
-    if not _addr_in_valid_ranges(addr, store_nbytes): continue
+    resolved_addr = _resolve_addr_in_valid_ranges(addr, store_nbytes)
+    if resolved_addr is None: continue
+    addr = resolved_addr
 
     if store_nbytes == 1:
       data = _read_data(data_reg, lane)

@@ -1,4 +1,4 @@
-import ctypes, time
+import ctypes, time, os
 from test.mockgpu.gpu import VirtGPU
 from test.mockgpu.helpers import _try_dlopen_remu
 from tinygrad.helpers import getbits, to_mv, getenv
@@ -7,6 +7,7 @@ from tinygrad.runtime.support import c
 MOCKGPU_ARCH = getenv("MOCKGPU_ARCH", "rdna3")
 # CDNA4 mock currently reuses the more complete RDNA4 emulation path for CI stability.
 EMU_ARCH = "rdna4" if MOCKGPU_ARCH == "cdna4" else MOCKGPU_ARCH
+os.environ["MOCKGPU_EMU_ARCH"] = EMU_ARCH
 GFX_TARGET_VERSION = {"rdna3": 110000, "rdna4": 120000}[EMU_ARCH]
 import tinygrad.runtime.autogen.amd_gpu as amd_gpu, tinygrad.runtime.autogen.am.pm4_nv as pm4
 
