@@ -647,11 +647,18 @@ class _Ctx:
 
   def compile_vop_pcode(self, op, srcs: dict[str, UOp], lane: UOp, vdst_reg: UOp, exec_mask: UOp,
                         opsel_dst_hi: bool | UOp = False, sdst_reg: int | None = None, clmp: int = 0,
-                        src0_off: UOp | None = None, sdwa_dst_sel: int | None = None, sdwa_dst_unused: int = 0) -> UOp:
+                        src0_off: UOp | None = None, sdwa_dst_sel: int | None = None, sdwa_dst_unused: int = 0,
+                        d_bits: int = 32, d_is_f64: bool = False) -> UOp:
     """Compile VOP instruction. Returns sink with stores and inc_pc."""
     pcode = get_pcode(op)
     vcc_reg = sdst_reg if sdst_reg is not None else VCC_LO.offset
     if 'VCC' not in srcs: srcs['VCC'] = self.rvcc(vcc_reg)
+    if 'D0' not in srcs:
+      if d_bits == 64:
+        d0_bits = _u64(self.rvgpr_dyn(vdst_reg, lane), self.rvgpr_dyn(vdst_reg + _c(1), lane))
+        srcs['D0'] = d0_bits.bitcast(dtypes.float64) if d_is_f64 else d0_bits
+      else:
+        srcs['D0'] = self.rvgpr_dyn(vdst_reg, lane)
     srcs.update({'EXEC': exec_mask, 'SCC': self.rsgpr_dyn(_c(SCC.offset)), 'laneId': lane, 'VDST': vdst_reg,
                  'ROUND_MODE': _c(0), 'ROUND_TOWARD_ZERO': _c(0), 'ROUND_NEAREST_EVEN': _c(0)})  # rounding mode constants
     _, assigns = parse_pcode(pcode, srcs)
@@ -863,6 +870,14 @@ def _compile_vop12(inst: ir3.VOP1 | ir3.VOP1_SDST | ir3.VOP2 | ir4.VOP1 | ir4.VO
   write_hi_half = bits['d'] == 16 and (vdst_reg >= _c(128))
   if isinstance(write_hi_half, UOp): vdst_reg = write_hi_half.where(vdst_reg - _c(128), vdst_reg)
   elif write_hi_half: vdst_reg -= 128
+
+  # D0 must match destination width so pcode branch-merging keeps the right type.
+  if bits['d'] == 64:
+    d0_bits = _u64(ctx.rvgpr_dyn(vdst_reg, lane), ctx.rvgpr_dyn(vdst_reg + _c(1), lane))
+    d0 = d0_bits.bitcast(dtypes.float64) if '_F64' in op_name else d0_bits
+  else:
+    d0 = _cond_hi16(write_hi_half, ctx.rvgpr_dyn(vdst_reg, lane))
+
   if isinstance(inst, (ir3.VOP1, ir4.VOP1, irc.VOP1)):
     # Handle VOP1 hi-half source operand (src0 >= v[128] for 16-bit ops)
     if is_sdwa:
@@ -877,7 +892,6 @@ def _compile_vop12(inst: ir3.VOP1 | ir3.VOP1_SDST | ir3.VOP2 | ir4.VOP1 | ir4.VO
         # Only compute hi-half when src0_off >= 384, use guarded index to prevent OOB access
         src0_reg = src0_hi.where(src0_off - _c(384), _c(0))
         s0 = src0_hi.where(_hi16(ctx.rvgpr_dyn(src0_reg, lane)), s0)
-    d0 = _cond_hi16(write_hi_half, ctx.rvgpr_dyn(vdst_reg, lane))
     srcs = {'S0': s0, 'D0': d0}
     src0_off = src0_off if not is_sdwa else _c(256) + ctx.inst_field(type(inst).vsrc0)  # type: ignore[union-attr]
   else:
@@ -887,7 +901,6 @@ def _compile_vop12(inst: ir3.VOP1 | ir3.VOP1_SDST | ir3.VOP2 | ir4.VOP1 | ir4.VO
     # 64 bit
     s1 = _u64(ctx.rvgpr_dyn(vsrc1_actual, lane), ctx.rvgpr_dyn(vsrc1_actual + _c(1), lane)) if bits.get('s1', 32) == 64 \
       else _cond_hi16(vsrc1_hi, ctx.rvgpr_dyn(vsrc1_actual, lane))
-    d0 = _cond_hi16(write_hi_half, ctx.rvgpr_dyn(vdst_reg, lane))  # FMAC/FMAMK hi-half dest needs hi-half accumulator
     if is_sdwa:
       vsrc0_reg = ctx.inst_field(type(inst).vsrc0)  # type: ignore[union-attr]
       s0 = _apply_sdwa_sel(ctx.rvgpr_dyn(vsrc0_reg, lane), inst.src0_sel)
@@ -911,7 +924,8 @@ def _compile_vop12(inst: ir3.VOP1 | ir3.VOP1_SDST | ir3.VOP2 | ir4.VOP1 | ir4.VO
       srcs['SIMM32'] = literal
   return ctx.compile_vop_pcode(inst.op, srcs, lane, vdst_reg, exec_mask, opsel_dst_hi=write_hi_half, src0_off=src0_off,
                                sdwa_dst_sel=getattr(inst, 'dst_sel', None) if has_sdwa_dst else None,
-                               sdwa_dst_unused=getattr(inst, 'dst_unused', 0) if has_sdwa_dst else 0)
+                               sdwa_dst_unused=getattr(inst, 'dst_unused', 0) if has_sdwa_dst else 0,
+                               d_bits=bits['d'], d_is_f64='_F64' in op_name)
 
 def _compile_vopc(inst: ir3.VOPC|ir3.VOP3|ir4.VOPC|ir4.VOP3|irc.VOPC|irc.VOP3, ctx: _Ctx,
                   opsel: int = 0, abs_bits: int = 0, neg_bits: int = 0) -> UOp:
@@ -1047,11 +1061,13 @@ def _compile_vop3(inst: ir3.VOP3 | ir4.VOP3 | irc.VOP3, ctx: _Ctx) -> UOp:
   # FMAC instructions need D0 (accumulator) from destination register
   if 'FMAC' in op_name: srcs['D0'] = ctx.rvgpr_dyn(vdst_reg, lane)
   opsel_dst_hi = bool(opsel & 0b1000) and bits['d'] == 16
-  return ctx.compile_vop_pcode(inst.op, srcs, lane, vdst_reg, exec_mask, opsel_dst_hi=opsel_dst_hi, clmp=getattr(inst, 'clmp', 0))
+  return ctx.compile_vop_pcode(inst.op, srcs, lane, vdst_reg, exec_mask, opsel_dst_hi=opsel_dst_hi, clmp=getattr(inst, 'clmp', 0),
+                               d_bits=bits['d'], d_is_f64='_F64' in op_name)
 
 def _compile_vop3sd(inst: ir3.VOP3SD | ir4.VOP3SD | irc.VOP3SD, ctx: _Ctx) -> UOp:
   exec_mask = ctx.rexec()
   bits, pcode, ops = inst.canonical_op_bits, get_pcode(inst.op), inst.canonical_operands
+  op_name = _op_name(inst)
 
   # Read operands dynamically from instruction encoding
   vdst_reg, sdst_off = ctx.inst_field(type(inst).vdst), ctx.inst_field(type(inst).sdst)
@@ -1062,7 +1078,12 @@ def _compile_vop3sd(inst: ir3.VOP3SD | ir4.VOP3SD | irc.VOP3SD, ctx: _Ctx) -> UO
   vcc_in_off = src2_off if has_carry_in else sdst_off
 
   def load_srcs(lane_uop):
-    ret = {'VCC': ctx.rmask_dyn(vcc_in_off), 'EXEC': exec_mask, 'SCC': ctx.rsgpr_dyn(_c(SCC.offset)), 'laneId': lane_uop}
+    if bits['d'] == 64:
+      d0_bits = _u64(ctx.rvgpr_dyn(vdst_reg, lane_uop), ctx.rvgpr_dyn(vdst_reg + _c(1), lane_uop))
+      d0 = d0_bits.bitcast(dtypes.float64) if '_F64' in op_name else d0_bits
+    else:
+      d0 = ctx.rvgpr_dyn(vdst_reg, lane_uop)
+    ret = {'VCC': ctx.rmask_dyn(vcc_in_off), 'EXEC': exec_mask, 'SCC': ctx.rsgpr_dyn(_c(SCC.offset)), 'laneId': lane_uop, 'D0': d0}
     ret['S0'] = ctx.rsrc_dyn(src0_off, lane_uop, bits['s0'], literal, ops['s0'][0] == Fmt.FMT_NUM_F64)
     ret['S1'] = ctx.rsrc_dyn(src1_off, lane_uop, bits['s1'], literal, ops['s1'][0] == Fmt.FMT_NUM_F64)
     if 's2' in ops: ret['S2'] = ctx.rsrc_dyn(src2_off, lane_uop, bits['s2'], literal, ops['s2'][0] == Fmt.FMT_NUM_F64)
@@ -1105,7 +1126,8 @@ def _compile_vop3sd(inst: ir3.VOP3SD | ir4.VOP3SD | irc.VOP3SD, ctx: _Ctx) -> UO
     # Write carry output (wsgpr_dyn handles NULL register 124)
     return UOp.sink(*ctx.wmask_dyn(sdst_off, final_vcc), UOp.group(*vgpr_stores).end(lane3), *ctx.inc_pc())
   else:
-    return ctx.compile_vop_pcode(inst.op, srcs, lane, vdst_reg, exec_mask, sdst_reg=inst.sdst.offset)
+    return ctx.compile_vop_pcode(inst.op, srcs, lane, vdst_reg, exec_mask, sdst_reg=inst.sdst.offset,
+                                 d_bits=bits['d'], d_is_f64='_F64' in _op_name(inst))
 
 def _compile_wmma(inst: ir3.VOP3P | ir4.VOP3P | irc.VOP3P, ctx: _Ctx) -> UOp:
   op_name = _op_name(inst)
