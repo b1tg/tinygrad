@@ -1,19 +1,49 @@
 # Tokenizer-based expression parser for AMD pcode
+import re
 from typing import Any, Callable
 from tinygrad.dtype import dtypes
 from tinygrad.uop.ops import Ops, UOp
+from tinygrad.helpers import getenv
 
 # Type alias for vars dict: stores UOps for variables and tuples for lambda definitions
 VarVal = UOp | tuple[str, list[str], str]
+DEFAULT_WAVE_SIZE = 64 if getenv("MOCKGPU_ARCH", "") == "cdna4" else 32
 
 def _const(dt, v): return UOp.const(dt, v)
 def _u32(v): return _const(dtypes.uint32, v)
 def _u64(v): return _const(dtypes.uint64, v)
 def _to_u32(v): return v if v.dtype == dtypes.uint32 else v.bitcast(dtypes.uint32) if v.dtype.itemsize == 4 else v.cast(dtypes.uint32)
 def _to_bool(v): return v if v.dtype == dtypes.bool else v.ne(_const(v.dtype, 0))
+_BITFIELD_DT = ((8, dtypes.uint8), (16, dtypes.uint16), (32, dtypes.uint32), (64, dtypes.uint64))
+
+def _mask_bits(v: UOp, bits: int, dt) -> UOp:
+  if bits >= dt.bitsize: return v.cast(dt) if v.dtype != dt else v
+  return (v.cast(dt) if v.dtype != dt else v) & _const(dt, (1 << bits) - 1)
+
+def _bitfield_cast(v: UOp, kind: str, bits: int) -> UOp:
+  if bits <= 0: return _u32(0)
+  if bits <= 32:
+    masked = _mask_bits(v, bits, dtypes.uint32)
+    if kind == 'i':
+      sign, ext = _u32(1 << (bits - 1)), _u32((~((1 << bits) - 1)) & 0xFFFFFFFF)
+      return ((masked & sign).ne(_u32(0)).where(masked | ext, masked)).bitcast(dtypes.int)
+    if kind == 'u':
+      for w, dt in _BITFIELD_DT:
+        if bits <= w: return masked.cast(dt)
+    return masked
+  if bits <= 64:
+    masked = _mask_bits(v, bits, dtypes.uint64)
+    if kind == 'i':
+      sign, ext = _u64(1 << (bits - 1)), _u64((~((1 << bits) - 1)) & 0xFFFFFFFFFFFFFFFF)
+      return ((masked & sign).ne(_u64(0)).where(masked | ext, masked)).bitcast(dtypes.int64)
+    return masked
+  # pcode may annotate huge packed bit-vectors (b128/b512/...). We keep host value width.
+  return v
+
 def _cast_to(v, dt):
   if v.dtype == dt: return v
   if dt == dtypes.half: return v.cast(dtypes.uint16).bitcast(dtypes.half)
+  if dt == dtypes.bfloat16: return v.cast(dtypes.uint16).bitcast(dtypes.bfloat16)
   return v.cast(dt) if dt.itemsize != v.dtype.itemsize else v.bitcast(dt)
 
 # Float bit extraction - returns (bits, exp_mask, mant_mask, quiet_bit, exp_shift) based on float type
@@ -51,6 +81,7 @@ def _set_bit(old, pos, val):
 
 def _val_to_bits(val):
   if val.dtype == dtypes.half: return val.bitcast(dtypes.uint16).cast(dtypes.uint32)
+  if val.dtype == dtypes.bfloat16: return val.bitcast(dtypes.uint16).cast(dtypes.uint32)
   if val.dtype == dtypes.float32: return val.bitcast(dtypes.uint32)
   if val.dtype == dtypes.float64: return val.bitcast(dtypes.uint64)
   return val if val.dtype == dtypes.uint32 else val.cast(dtypes.uint32)
@@ -248,6 +279,9 @@ _FUNCS: dict[str, Callable[..., UOp]] = {
   'i16_to_f16': lambda a: a.cast(dtypes.int16).cast(dtypes.half),
   'u16_to_f16': lambda a: a.cast(dtypes.uint16).cast(dtypes.half),
   'bf16_to_f32': lambda a: (((a.cast(dtypes.uint32) if a.dtype != dtypes.uint32 else a) & _u32(0xFFFF)) << _u32(16)).bitcast(dtypes.float32),
+  # Round-to-nearest-even f32->bf16 bit conversion. Return uint16 payload in low 16 bits.
+  'f32_to_bf16': lambda a: ((((a.bitcast(dtypes.float32).bitcast(dtypes.uint32) + _u32(0x7FFF)) +
+                              ((a.bitcast(dtypes.float32).bitcast(dtypes.uint32) >> _u32(16)) & _u32(1))) >> _u32(16)) & _u32(0xFFFF)),
   'isNAN': _isnan, 'isSignalNAN': lambda a: _check_nan(a, False),
   'isQuietNAN': lambda a: _check_nan(a, True), 'cvtToQuietNAN': _cvt_quiet,
   'isDENORM': _is_denorm, 'exponent': _exponent, 'divWouldBeDenorm': _div_would_be_denorm, 'sign': _sign,
@@ -312,7 +346,7 @@ for is_max, name in [(False, 'min'), (True, 'max')]:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 DTYPES = {'u32': dtypes.uint32, 'i32': dtypes.int, 'f32': dtypes.float32, 'b32': dtypes.uint32, 'u64': dtypes.uint64, 'i64': dtypes.int64,
-          'f64': dtypes.float64, 'b64': dtypes.uint64, 'u16': dtypes.uint16, 'i16': dtypes.short, 'f16': dtypes.half, 'b16': dtypes.uint16,
+          'f64': dtypes.float64, 'b64': dtypes.uint64, 'u16': dtypes.uint16, 'i16': dtypes.short, 'f16': dtypes.half, 'bf16': dtypes.bfloat16, 'b16': dtypes.uint16,
           'u8': dtypes.uint8, 'i8': dtypes.int8, 'b8': dtypes.uint8, 'u4': dtypes.uint8, 'i4': dtypes.int8, 'u1': dtypes.uint32}
 _BITS_DT = {8: dtypes.uint8, 16: dtypes.uint16, 32: dtypes.uint32, 64: dtypes.uint64}
 _NUM_SUFFIXES = ('ULL', 'LL', 'UL', 'U', 'L', 'F', 'f')
@@ -502,7 +536,8 @@ class Parser:
         self.eat('RBRACKET')
         vgpr = self.vars.get('_vgpr')
         if vgpr is None: return _u32(0)
-        return vgpr.index(_to_u32(reg) * _u32(32) + _to_u32(lane), ptr=True).load()
+        wave_size = _to_u32(self.vars.get('_wave_size', _u32(DEFAULT_WAVE_SIZE)))
+        return vgpr.index(_to_u32(reg) * wave_size + _to_u32(lane), ptr=True).load()
       if self.try_eat('LPAREN'):
         args = self._parse_args()
         self.eat('RPAREN')
@@ -514,8 +549,8 @@ class Parser:
       if name == 'OVERFLOW_F32': return _const(dtypes.uint32, 0x7F7FFFFF).bitcast(dtypes.float32)
       if name == 'UNDERFLOW_F64': return _const(dtypes.uint64, 1).bitcast(dtypes.float64)
       if name == 'OVERFLOW_F64': return _const(dtypes.uint64, 0x7FEFFFFFFFFFFFFF).bitcast(dtypes.float64)
-      if name == 'WAVE32': return _const(dtypes.bool, True)
-      if name == 'WAVE64': return _const(dtypes.bool, False)
+      if name == 'WAVE32': return _to_u32(self.vars.get('_wave_size', _u32(DEFAULT_WAVE_SIZE))).eq(_u32(32))
+      if name == 'WAVE64': return _to_u32(self.vars.get('_wave_size', _u32(DEFAULT_WAVE_SIZE))).eq(_u32(64))
       if name == 'WAVE_MODE' and self.try_eat('DOT') and self.try_eat_val('IEEE', 'IDENT'): return _u32(1)
       if self.try_eat('LBRACE'):
         idx = self.eat('NUM').val
@@ -527,7 +562,8 @@ class Parser:
           self.eat('RBRACKET')
           vgpr = self.vars.get('_vgpr')
           if vgpr is None: return _u32(0)
-          return vgpr.index(_to_u32(reg) * _u32(32) + _u32(int(idx)), ptr=True).load()
+          wave_size = _to_u32(self.vars.get('_wave_size', _u32(DEFAULT_WAVE_SIZE)))
+          return vgpr.index(_to_u32(reg) * wave_size + _u32(int(idx)), ptr=True).load()
         elem = self.vars.get(f'{name}@{idx}', self.vars.get(f'{name}{idx}'))
         if elem is None:
           # Extract bit idx from base variable (like var[idx])
@@ -566,7 +602,10 @@ class Parser:
         return result.cast(DTYPES.get(dt_name, dtypes.uint32))
       return result
     dt = DTYPES.get(field)
-    if dt is None: return base
+    if dt is None:
+      if (m := re.match(r'^([ubi])(\d+)$', field)) is not None:
+        return _bitfield_cast(base, m.group(1), int(m.group(2)))
+      return base
     if dt == base.dtype: return base
     if dt.itemsize == 2 and base.dtype.itemsize == 4:
       if dt == dtypes.uint16: return (base & _const(base.dtype, 0xFFFF)).cast(dtypes.uint16)
@@ -766,9 +805,18 @@ class Parser:
       if dt in (dtypes.uint64, dtypes.int64, dtypes.float64):
         idx2 = ((addr + _const(adt, 4)) >> _const(adt, 2)).cast(dtypes.int)
         val = val.cast(dtypes.uint64) | (mem.index(idx2, *gate).cast(dtypes.uint64) << _u64(32))
-      elif dt in (dtypes.uint8, dtypes.int8): val = (val >> ((addr & _const(adt, 3)).cast(dtypes.uint32) * _u32(8))) & _u32(0xFF)
+      elif dt in (dtypes.uint8, dtypes.int8):
+        byte = (val >> ((addr & _const(adt, 3)).cast(dtypes.uint32) * _u32(8))) & _u32(0xFF)
+        val = byte.cast(dtypes.int8).cast(dtypes.int32).bitcast(dtypes.uint32) if dt == dtypes.int8 else byte
       elif dt in (dtypes.uint16, dtypes.int16):
-        val = (val >> (((addr >> _const(adt, 1)) & _const(adt, 1)).cast(dtypes.uint32) * _u32(16))) & _u32(0xFFFF)
+        # 16-bit loads can be unaligned (addr&3 == 3), which straddles two dwords.
+        byte_off = (addr & _const(adt, 3)).cast(dtypes.uint32)
+        lo16 = (val >> (byte_off * _u32(8))) & _u32(0xFFFF)
+        idx2 = ((addr + _const(adt, 4)) >> _const(adt, 2)).cast(dtypes.int)
+        nxt = mem.index(idx2, *gate)
+        hi8 = (nxt & _u32(0xFF)) << _u32(8)
+        u16 = byte_off.eq(_u32(3)).where(((val >> _u32(24)) & _u32(0xFF)) | hi8, lo16)
+        val = u16.cast(dtypes.int16).cast(dtypes.int32).bitcast(dtypes.uint32) if dt == dtypes.int16 else u16
     return val
 
   def _coerce_cmp(self, l: UOp, r: UOp) -> tuple[UOp, UOp]:
@@ -812,7 +860,7 @@ def _subst_loop_var(line: str, loop_var: str, val: int) -> str:
 
 def _set_bits(old: UOp, val: UOp, width: int, offset: int) -> UOp:
   """Set bits [offset:offset+width) in old to val, masking and shifting appropriately."""
-  if old.dtype in (dtypes.half, dtypes.float32): old = _val_to_bits(old)
+  if old.dtype in (dtypes.half, dtypes.bfloat16, dtypes.float32): old = _val_to_bits(old)
   is64 = old.dtype in (dtypes.uint64, dtypes.int64) or offset + width > 32
   if is64:
     old = old.cast(dtypes.uint64) if old.dtype != dtypes.uint64 else old
@@ -990,7 +1038,8 @@ def parse_block(lines: list[str], start: int, env: dict[str, VarVal], funcs: dic
         ln = parse_tokens(lane_toks, env, funcs)
         rg, val = parse_tokens(reg_toks, env, funcs), parse_tokens(toks[j:], env, funcs)
         if assigns is not None:
-          assigns.append((f'VGPR[{_tok_str(lane_toks)}][{_tok_str(reg_toks)}]', (_to_u32(rg) * _u32(32) + _to_u32(ln), val)))
+          wave_size = _to_u32(env.get('_wave_size', _u32(DEFAULT_WAVE_SIZE)))
+          assigns.append((f'VGPR[{_tok_str(lane_toks)}][{_tok_str(reg_toks)}]', (_to_u32(rg) * wave_size + _to_u32(ln), val)))
         i += 1
         continue
 
@@ -1192,12 +1241,19 @@ def parse_block(lines: list[str], start: int, env: dict[str, VarVal], funcs: dic
         else_assigns = else_branch[1]
         all_vars = set().union(*[ba.keys() for _, ba in conditions if isinstance(ba, dict)], else_assigns.keys())
         for var in all_vars:
-          res: Any = else_assigns.get(var, block_assigns.get(var, env.get(var, _u32(0))))
+          base: Any = block_assigns.get(var, env.get(var, _u32(0)))
+          res: Any = else_assigns.get(var, base)
           for cond, ba in reversed(conditions):  # type: ignore[assignment]
             if isinstance(ba, dict) and var in ba:
               tv = ba[var]
               if isinstance(tv, UOp) and isinstance(res, UOp):
-                res = cond.where(tv, res.cast(tv.dtype) if tv.dtype != res.dtype and tv.dtype.itemsize == res.dtype.itemsize else res)
+                if isinstance(base, UOp):
+                  tv, res = _cast_to(tv, base.dtype), _cast_to(res, base.dtype)
+                elif tv.dtype != res.dtype and tv.dtype.itemsize == res.dtype.itemsize:
+                  res = res.cast(tv.dtype)
+                elif tv.dtype != res.dtype:
+                  res = _cast_to(res, tv.dtype)
+                res = cond.where(tv, res)
           block_assigns[var] = env[var] = res
       continue
 
@@ -1214,4 +1270,3 @@ def parse_block(lines: list[str], start: int, env: dict[str, VarVal], funcs: dic
 
 def parse_expr(expr: str, env: dict[str, VarVal], funcs: dict | None = None) -> UOp:
   return parse_tokens(tokenize(expr.strip().rstrip(';')), env, funcs)
-

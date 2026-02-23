@@ -6,7 +6,7 @@
 #   arg=3: lds - local data share
 #   arg=4: scratch - per-lane scratch memory
 from __future__ import annotations
-import ctypes, functools, re, platform, subprocess, tempfile
+import ctypes, functools, re, platform, subprocess, tempfile, struct
 from typing import Callable
 
 # Set/restore DAZ+FTZ (denormals-are-zero + flush-to-zero) to match RDNA3 default float mode
@@ -55,7 +55,7 @@ from tinygrad.uop.ops import UOp, Ops, KernelInfo, AxisType
 from tinygrad.dtype import dtypes
 from tinygrad.device import Buffer, BufferSpec
 from tinygrad.runtime.autogen import hsa
-from tinygrad.helpers import Context, DEBUG, PROFILE, colored
+from tinygrad.helpers import Context, DEBUG, PROFILE, colored, getenv
 from tinygrad.engine.realize import get_runner
 
 from tinygrad.renderer.amd import decode_inst
@@ -65,6 +65,7 @@ from tinygrad.runtime.autogen.amd.cdna.str_pcode import PCODE as PCODE_CDNA
 from tinygrad.runtime.autogen.amd.rdna3 import ins as ir3
 from tinygrad.runtime.autogen.amd.rdna4 import ins as ir4
 from tinygrad.runtime.autogen.amd.cdna import ins as irc
+from tinygrad.runtime.autogen.amd.cdna.operands import OPERANDS as CDNA_OPERANDS
 from tinygrad.renderer.amd.dsl import VCC_LO, EXEC_LO, SCC, ttmp
 from tinygrad.runtime.autogen.amd.common import Fmt, OpType
 from test.mockgpu.amd.pcode import parse_block, _FUNCS
@@ -230,11 +231,12 @@ VOPD_TO_VOP2 = {
   ir4.VOPDOp.V_DUAL_MOV_B32: ir3.VOP1Op.V_MOV_B32_E32, ir4.VOPDOp.V_DUAL_CNDMASK_B32: ir3.VOP2Op.V_CNDMASK_B32_E32,
   ir4.VOPDOp.V_DUAL_FMAAK_F32: ir3.VOP2Op.V_FMAAK_F32_E32, ir4.VOPDOp.V_DUAL_FMAMK_F32: ir3.VOP2Op.V_FMAMK_F32_E32,
 }
-WAVE_SIZE = 32
+WAVE_SIZE = int(getenv("MOCKGPU_WAVE_SIZE", 64 if getenv("MOCKGPU_ARCH", "") == "cdna4" else 32))
+ENFORCE_MEM_RANGES = bool(getenv("MOCKGPU_ENFORCE_MEM_RANGES", 0))
 # Special registers stored after inline constants (256-260)
 PC_LO_IDX, PC_HI_IDX, SCRATCH_STRIDE_IDX, SCRATCH_BASE_IDX = 256, 257, 259, 260
 # SGPR buffer: 0-127 = SGPRs, 128-255 = inline constants, 256-260 = special registers
-SGPR_COUNT, VGPR_SIZE = 261, 256 * 32
+SGPR_COUNT, VGPR_SIZE = 261, 256 * WAVE_SIZE
 # Sentinel PC value for s_endpgm
 ENDPGM_PC = 0xFFFFFFFFFFFFFFFF
 
@@ -246,7 +248,8 @@ def _to_u32(val: UOp) -> UOp:
   if val.dtype == dtypes.uint32: return val
   if val.dtype.itemsize == 4: return val.bitcast(dtypes.uint32)  # same size: bitcast (float32->uint32)
   return val.cast(dtypes.uint32)  # different size: cast (bool, int16, etc)
-def _lane_active(exec_mask: UOp, lane: UOp) -> UOp: return ((exec_mask >> lane.cast(dtypes.uint32)) & _c(1)).ne(_c(0))
+def _lane_active(exec_mask: UOp, lane: UOp) -> UOp:
+  return ((exec_mask.cast(dtypes.uint64) >> lane.cast(dtypes.uint64)) & _c(1, dtypes.uint64)).ne(_c(0, dtypes.uint64))
 def _hi16(v: UOp) -> UOp: return (v >> _c(16)) & _c(0xFFFF)
 def _cond(cond, if_true, if_false):
   """Select between values based on condition (works with UOp or bool)."""
@@ -288,11 +291,12 @@ def _apply_sdwa_dst(old: UOp, val: UOp, dst_sel: int, dst_unused: int) -> UOp:
   return base | write_bits
 
 def _set_lane_bit(old: UOp, lane: UOp, val: UOp, exec_mask: UOp) -> UOp:
-  """Set/clear a single bit in a 32-bit mask based on lane index, respecting exec mask."""
-  mask = _c(1) << lane.cast(dtypes.uint32)
-  new_bit = _to_u32(val) << lane.cast(dtypes.uint32)
-  cleared = old & (mask ^ _c(MASK32))
-  return _lane_active(exec_mask, lane).where(cleared | new_bit, old)
+  """Set/clear a single bit in a mask based on lane index, respecting exec mask."""
+  old_u64 = old.cast(dtypes.uint64)
+  mask = _c(1, dtypes.uint64) << lane.cast(dtypes.uint64)
+  new_bit = _to_u32(val).cast(dtypes.uint64) << lane.cast(dtypes.uint64)
+  cleared = old_u64 & (mask ^ _c((1 << WAVE_SIZE) - 1, dtypes.uint64))
+  return _lane_active(exec_mask, lane).where(cleared | new_bit, old_u64)
 
 def _val_to_u32(val: UOp) -> UOp:
   """Convert any value to uint32 for storage (bitcast floats, cast ints)."""
@@ -329,7 +333,8 @@ def get_pcode(op) -> str:
     alias_name = op_name[:-4] + '_E32'
     pcode = next((v for k, v in pcode_dict.items() if k.name == alias_name), None)
   if pcode is None: raise KeyError(op)
-  if op_name in _pcode_fixes: pcode = pcode.replace(*_pcode_fixes[op_name])
+  fix_name = op_name if op_name in _pcode_fixes else (op_name[:-4] if op_name.endswith('_E64') and op_name[:-4] in _pcode_fixes else None)
+  if fix_name is not None: pcode = pcode.replace(*_pcode_fixes[fix_name])
   if 'V_DIV_SCALE' in op_name:
     dt, exp_lim, ldexp_val = ('f32', '23', '64') if 'F32' in op_name else ('f64', '52', '128')
     for old, new in [(f'S2.{dt} / S1.{dt} == DENORM.{dt}', f'divWouldBeDenorm(S2.{dt}, S1.{dt})'), (f"1.0 / 64'F(S1.{dt}) == DENORM.f64", '0'),
@@ -360,6 +365,7 @@ def get_pcode(op) -> str:
 
 def parse_pcode(pcode: str, srcs: dict[str, UOp] | None = None) -> tuple[dict, list[tuple[str, UOp]]]:
   env: dict = srcs.copy() if srcs else {}
+  env.setdefault('_wave_size', _c(WAVE_SIZE))
   assigns: list[tuple[str, UOp]] = []
   raw_lines = [l.strip().rstrip(';') for l in pcode.split('\n') if l.strip() and not l.strip().startswith('//')]
   # TODO: pcode.py should tokenize full pcode string instead of line-by-line, then this hack can be removed
@@ -451,15 +457,15 @@ class _Ctx:
     self.inst_size, self._axis_id = inst_size, 0
     self.dyn_fields: list[tuple[int, int]] = []  # (lo, hi) of fields read dynamically
 
-  def range(self, n: int = 32) -> UOp:
+  def range(self, n: int = WAVE_SIZE) -> UOp:
     """Create a lane range UOp with unique axis ID."""
     self._axis_id += 1
     return UOp.range(n, self._axis_id, AxisType.LOOP, dtype=dtypes.int)
 
   def unroll_lanes(self, get_lane_bit, exec_mask: UOp, apply_exec: bool = True) -> UOp:
-    """Combine 32 lane bits into a 32-bit mask using RANGE+REDUCE."""
+    """Combine lane bits into a wave-sized mask using RANGE+REDUCE."""
     lane = self.range()
-    bit = get_lane_bit(lane).cast(dtypes.uint32) << lane.cast(dtypes.uint32)
+    bit = get_lane_bit(lane).cast(dtypes.uint64) << lane.cast(dtypes.uint64)
     result = bit.reduce(lane, arg=Ops.ADD)
     return result & exec_mask if apply_exec else result
 
@@ -520,15 +526,32 @@ class _Ctx:
     """Write SGPR with dynamic register index. Writes to NULL (124) are discarded."""
     return self.sgpr.index(reg.cast(dtypes.int), reg.ne(_c(124))).store(val.cast(dtypes.uint32))
 
+  def rmask_dyn(self, reg: UOp) -> UOp:
+    lo = self.rsgpr_dyn(reg).cast(dtypes.uint64)
+    if WAVE_SIZE == 64:
+      hi = self.rsgpr_dyn(reg + _c(1)).cast(dtypes.uint64)
+      return lo | (hi << _c(32, dtypes.uint64))
+    return lo
+
+  def wmask_dyn(self, reg: UOp, val: UOp) -> list[UOp]:
+    mask = val.cast(dtypes.uint64)
+    stores = [self.wsgpr_dyn(reg, mask.cast(dtypes.uint32))]
+    if WAVE_SIZE == 64:
+      stores.append(self.sgpr.index((reg + _c(1)).cast(dtypes.int), reg.ne(_c(124))).store((mask >> _c(32, dtypes.uint64)).cast(dtypes.uint32)))
+    return stores
+
+  def rexec(self) -> UOp: return self.rmask_dyn(_c(EXEC_LO.offset))
+  def rvcc(self, reg: int = VCC_LO.offset) -> UOp: return self.rmask_dyn(_c(reg))
+
   def rvgpr_dyn(self, reg: UOp, lane: UOp, valid: UOp | None = None) -> UOp:
     """Read VGPR with dynamic register index."""
-    idx = reg.cast(dtypes.int) * _c(32, dtypes.int) + lane.cast(dtypes.int)
+    idx = reg.cast(dtypes.int) * _c(WAVE_SIZE, dtypes.int) + lane.cast(dtypes.int)
     return self.vgpr.index(idx, valid, ptr=True).load() if valid is not None else self.vgpr.index(idx, ptr=True).load()
 
   def wvgpr_dyn(self, reg: UOp, lane: UOp, val: UOp, exec_mask: UOp, after: UOp | None = None) -> UOp:
     """Write VGPR with dynamic register index."""
     buf = self.vgpr.after(after) if after is not None else self.vgpr
-    offset = reg.cast(dtypes.int) * _c(32, dtypes.int) + lane.cast(dtypes.int)
+    offset = reg.cast(dtypes.int) * _c(WAVE_SIZE, dtypes.int) + lane.cast(dtypes.int)
     return buf.index(offset, _lane_active(exec_mask, lane)).store(val.cast(dtypes.uint32))
 
   def rsrc_dyn(self, off: UOp, lane: UOp | None, bits: int = 32, literal: UOp | None = None, is_f64: bool = False, do_cast: bool = True) -> UOp:
@@ -587,14 +610,14 @@ class _Ctx:
           stores.extend([self.wsgpr_dyn(sdst_reg, lo), self.wsgpr_dyn(sdst_reg + _c(1), hi)])
         else: stores.append(self.wsgpr_dyn(sdst_reg, _val_to_u32(val)))
       elif dest.startswith('SCC'): stores.append(self.wsgpr_dyn(_c(SCC.offset), _to_u32(val)))
-      elif dest.startswith('EXEC'): stores.append(self.wsgpr_dyn(_c(EXEC_LO.offset), _to_u32(val)))
-      elif dest.startswith('VCC'): stores.append(self.wsgpr_dyn(_c(VCC_LO.offset), _to_u32(val)))
+      elif dest.startswith('EXEC'): stores.extend(self.wmask_dyn(_c(EXEC_LO.offset), val.cast(dtypes.uint64)))
+      elif dest.startswith('VCC'): stores.extend(self.wmask_dyn(_c(VCC_LO.offset), val.cast(dtypes.uint64)))
     return stores
 
   def compile_sop_pcode(self, op, srcs: dict[str, UOp], sdst_reg: UOp, sdst_size: int) -> UOp:
     """Compile a scalar instruction with dynamic destination register."""
     pcode = get_pcode(op)
-    srcs.update({'VCC': self.rsgpr_dyn(_c(VCC_LO.offset)), 'EXEC': self.rsgpr_dyn(_c(EXEC_LO.offset)), 'SCC': self.rsgpr_dyn(_c(SCC.offset))})
+    srcs.update({'VCC': self.rvcc(), 'EXEC': self.rexec(), 'SCC': self.rsgpr_dyn(_c(SCC.offset))})
     if 'D0' not in srcs: srcs['D0'] = self.rsgpr_dyn(sdst_reg)  # D0 is current dest value for read-modify-write ops
     _, assigns = parse_pcode(pcode, srcs)
     return UOp.sink(*self.scalar_stores(assigns, sdst_reg, sdst_size), *self.inc_pc())
@@ -607,9 +630,9 @@ class _Ctx:
     src0_reg = (src0_off >= _c(256)).where(src0_off - _c(256), _c(0))  # VGPR index or 0
     src1_off = self.inst_field(type(inst).src1) if hasattr(type(inst), 'src1') else None
     src2_off = self.inst_field(type(inst).src2) if hasattr(type(inst), 'src2') else None
-    exec_lo = self.rsgpr_dyn(_c(EXEC_LO.offset))
+    exec_lo, exec_mask = self.rsgpr_dyn(_c(EXEC_LO.offset)), self.rexec()
     srcs = {
-      'SRC0': src0_reg, 'VDST': vdst_off, 'EXEC_LO': exec_lo, 'EXEC': exec_lo.cast(dtypes.uint64), '_vgpr': self.vgpr,
+      'SRC0': src0_reg, 'VDST': vdst_off, 'EXEC_LO': exec_lo, 'EXEC': exec_mask, '_vgpr': self.vgpr,
       'S0': self.rsrc_dyn(src0_off, _c(0, dtypes.int)) if 'WRITELANE' in op_name else src0_reg,
       'S1': self.rsrc_dyn(src1_off, _c(0, dtypes.int)) if src1_off is not None else _c(0),
       'S2': self.rsrc_dyn(src2_off, _c(0, dtypes.int)) if src2_off is not None else _c(0),
@@ -627,7 +650,7 @@ class _Ctx:
     """Compile VOP instruction. Returns sink with stores and inc_pc."""
     pcode = get_pcode(op)
     vcc_reg = sdst_reg if sdst_reg is not None else VCC_LO.offset
-    if 'VCC' not in srcs: srcs['VCC'] = self.rsgpr_dyn(_c(vcc_reg))
+    if 'VCC' not in srcs: srcs['VCC'] = self.rvcc(vcc_reg)
     srcs.update({'EXEC': exec_mask, 'SCC': self.rsgpr_dyn(_c(SCC.offset)), 'laneId': lane, 'VDST': vdst_reg,
                  'ROUND_MODE': _c(0), 'ROUND_TOWARD_ZERO': _c(0), 'ROUND_NEAREST_EVEN': _c(0)})  # rounding mode constants
     _, assigns = parse_pcode(pcode, srcs)
@@ -654,7 +677,7 @@ class _Ctx:
     vcc_val, exec_val = None, None
     for dest, val in assigns:
       if 'D0' in dest and '[laneId]' in dest:
-        raw_stores.append(('vcc', self.wsgpr_dyn(_c(VCC_LO.offset), _set_lane_bit(self.rsgpr_dyn(_c(VCC_LO.offset)), lane, val, exec_mask))))
+        vcc_val = val
       elif dest.startswith('D0'):
         if (slice_match := re.match(r'D0\[(\d+)\s*:\s*(\d+)\]', dest)):
           hi_bit, lo_bit = int(slice_match.group(1)), int(slice_match.group(2))
@@ -723,8 +746,8 @@ class _Ctx:
     if lane_stores: stores.append(UOp.sink(*lane_stores).end(lane))
     for mask_val, reg in [(vcc_val, vcc_reg), (exec_val, EXEC_LO.offset)]:
       if mask_val is None: continue
-      def get_bit(l, v=mask_val): return (_to_u32(v.substitute({lane: l})) & _c(1)).cast(dtypes.uint32)
-      stores.append(self.wsgpr_dyn(_c(reg), self.unroll_lanes(get_bit, exec_mask, apply_exec=False)))
+      def get_bit(l, v=mask_val): return (_to_u32(v.substitute({lane: l})) & _c(1)).cast(dtypes.uint64)
+      stores.extend(self.wmask_dyn(_c(reg), self.unroll_lanes(get_bit, exec_mask, apply_exec=False)))
     stores.extend(scalar_stores)
     return UOp.sink(*stores, *self.inc_pc())
 
@@ -747,9 +770,9 @@ def _compile_sopp(inst: ir3.SOPP | ir4.SOPP, ctx: _Ctx) -> UOp:
   if inst.op in _get_pcode_dict(inst.op):
     pcode = get_pcode(inst.op)
     pc_bytes = ctx.rpc()  # PC is already 64-bit byte address
-    vcc, exec_lo = ctx.rsgpr_dyn(_c(VCC_LO.offset)), ctx.rsgpr_dyn(_c(EXEC_LO.offset))
+    vcc, exec_mask = ctx.rvcc(), ctx.rexec()
     srcs = {'PC': pc_bytes.cast(dtypes.int64), 'SIMM16': simm16, 'SCC': ctx.rsgpr_dyn(_c(SCC.offset)), 'VCC': vcc,
-            'VCCZ': vcc.eq(UOp.const(dtypes.uint32, 0)).cast(dtypes.uint32), 'EXECZ': exec_lo.eq(UOp.const(dtypes.uint32, 0)).cast(dtypes.uint32)}
+            'VCCZ': vcc.eq(UOp.const(dtypes.uint64, 0)).cast(dtypes.uint32), 'EXECZ': exec_mask.eq(UOp.const(dtypes.uint64, 0)).cast(dtypes.uint32)}
     for dest, val in parse_pcode(pcode, srcs)[1]:
       if dest == 'PC' or dest.startswith('PC.'):
         lo, hi = _split64(val.cast(dtypes.uint64))
@@ -833,7 +856,7 @@ def _compile_vop12(inst: ir3.VOP1 | ir3.VOP1_SDST | ir3.VOP2 | ir4.VOP1 | ir4.VO
   if op_name in ('V_READFIRSTLANE_B32_E32', 'V_PERMLANE64_B32_E32'): return ctx.compile_lane_pcode(inst.op, inst)
   is_sdwa = isinstance(inst, (irc.VOP1_SDWA, irc.VOP2_SDWA, irc.VOP2_SDWA_SDST))
   has_sdwa_dst = isinstance(inst, (irc.VOP1_SDWA, irc.VOP2_SDWA))
-  lane, exec_mask, bits = ctx.range(), ctx.rsgpr_dyn(_c(EXEC_LO.offset)), inst.canonical_op_bits
+  lane, exec_mask, bits = ctx.range(), ctx.rexec(), inst.canonical_op_bits
   literal = ctx.inst_field(type(inst).literal) if hasattr(type(inst), 'literal') else None  # type: ignore[union-attr]
   vdst_reg = ctx.inst_field(type(inst).vdst)
   write_hi_half = bits['d'] == 16 and (vdst_reg >= _c(128))
@@ -891,7 +914,7 @@ def _compile_vop12(inst: ir3.VOP1 | ir3.VOP1_SDST | ir3.VOP2 | ir4.VOP1 | ir4.VO
 
 def _compile_vopc(inst: ir3.VOPC|ir3.VOP3|ir4.VOPC|ir4.VOP3|irc.VOPC|irc.VOP3, ctx: _Ctx,
                   opsel: int = 0, abs_bits: int = 0, neg_bits: int = 0) -> UOp:
-  exec_mask, op_name, bits = ctx.rsgpr_dyn(_c(EXEC_LO.offset)), _op_name(inst), inst.canonical_op_bits
+  exec_mask, op_name, bits = ctx.rexec(), _op_name(inst), inst.canonical_op_bits
   is_cmpx, is_vopc = 'CMPX' in op_name, hasattr(inst, 'vsrc1')  # is_vopc: e32 vs e64
   is_sdwa = isinstance(inst, irc.VOPC_SDWA_SDST)
   is_cdna = 'cdna' in type(inst).__module__
@@ -933,7 +956,7 @@ def _compile_vopc(inst: ir3.VOPC|ir3.VOP3|ir4.VOPC|ir4.VOP3|irc.VOPC|irc.VOP3, c
       s0 = _apply_src_mods(s0, 0, abs_bits, neg_bits, bits['s0'])
       s1 = _apply_src_mods(s1, 1, abs_bits, neg_bits, bits['s1'])
     for dest, val in parse_pcode(pcode, {'S0': s0, 'S1': s1, 'laneId': lc})[1]:
-      if '[laneId]' in dest and ('D0' in dest or 'EXEC' in dest): return val.cast(dtypes.uint32)
+      if '[laneId]' in dest and ('D0' in dest or 'EXEC' in dest): return val.cast(dtypes.uint64)
     return _c(0)
 
   new_bits = ctx.unroll_lanes(get_cmp_bit, exec_mask, apply_exec=False)
@@ -941,9 +964,7 @@ def _compile_vopc(inst: ir3.VOPC|ir3.VOP3|ir4.VOPC|ir4.VOP3|irc.VOPC|irc.VOP3, c
   new_result = new_bits & exec_mask
   cmp_mask_bits = 64 if is_cdna else 32
   def _mask_stores(base_reg: UOp, mask: UOp, width_bits: int) -> list[UOp]:
-    ret = [ctx.wsgpr_dyn(base_reg, mask)]
-    if width_bits == 64: ret.append(ctx.wsgpr_dyn(base_reg + _c(1), _c(0)))
-    return ret
+    return ctx.wmask_dyn(base_reg, mask.cast(dtypes.uint64)) if width_bits == 64 else [ctx.wsgpr_dyn(base_reg, _to_u32(mask))]
 
   # CMPX e32: writes EXEC only; CMPX e64: writes both EXEC and SDST; non-CMPX: writes dst only
   if is_cmpx:
@@ -956,7 +977,7 @@ def _compile_vopc(inst: ir3.VOPC|ir3.VOP3|ir4.VOPC|ir4.VOP3|irc.VOPC|irc.VOP3, c
   return UOp.sink(*stores, *ctx.inc_pc())
 
 def _compile_vop3(inst: ir3.VOP3 | ir4.VOP3 | irc.VOP3, ctx: _Ctx) -> UOp:
-  exec_mask = ctx.rsgpr_dyn(_c(EXEC_LO.offset))
+  exec_mask = ctx.rexec()
   bits = inst.canonical_op_bits
   opsel, op_name = getattr(inst, 'opsel', 0) or 0, _op_name(inst)
 
@@ -981,7 +1002,8 @@ def _compile_vop3(inst: ir3.VOP3 | ir4.VOP3 | irc.VOP3, ctx: _Ctx) -> UOp:
   if 'V_S_' in op_name:
     src0 = _apply_src_mods(ctx.rsrc_dyn(ctx.inst_field(type(inst).src0), _c(0, dtypes.int), bits['s0'], literal), 0, abs_bits, neg_bits, bits['s0'])
     srcs = {'S0': src0, 'EXEC': exec_mask, 'SCC': ctx.rsgpr_dyn(_c(SCC.offset)), 'laneId': _c(0, dtypes.int),
-            'ROUND_MODE': _c(0), 'ROUND_TOWARD_ZERO': _c(0)}
+            'ROUND_MODE': _c(0), 'ROUND_TOWARD_ZERO': _c(0), 'OPSEL': _c(opsel), 'NEG': _c(neg_bits), 'ABS': _c(abs_bits),
+            'OMOD': _c(getattr(inst, 'omod', 0) or 0)}
     _, assigns = parse_pcode(get_pcode(inst.op), srcs)
     stores = [ctx.wsgpr_dyn(vdst_reg, _val_to_u32(val)) for dest, val in assigns if dest.startswith('D0')]
     return UOp.sink(*stores, *ctx.inc_pc())
@@ -1017,7 +1039,8 @@ def _compile_vop3(inst: ir3.VOP3 | ir4.VOP3 | irc.VOP3, ctx: _Ctx) -> UOp:
   src0 = _apply_src_mods(src0, 0, abs_bits, neg_bits, bits['s0'])
   src1 = _apply_src_mods(src1, 1, abs_bits, neg_bits, bits['s1'])
   src2 = _apply_src_mods(src2, 2, abs_bits, neg_bits, bits['s2'])
-  srcs = {'S0': src0, 'S1': src1, 'S2': src2}
+  srcs = {'S0': src0, 'S1': src1, 'S2': src2, 'OPSEL': _c(opsel), 'NEG': _c(neg_bits), 'ABS': _c(abs_bits),
+          'OMOD': _c(getattr(inst, 'omod', 0) or 0)}
   #irx_CNDMASK series
   if 'CNDMASK' in op_name and src2 is not None: srcs['VCC'] = src2
   # FMAC instructions need D0 (accumulator) from destination register
@@ -1026,7 +1049,7 @@ def _compile_vop3(inst: ir3.VOP3 | ir4.VOP3 | irc.VOP3, ctx: _Ctx) -> UOp:
   return ctx.compile_vop_pcode(inst.op, srcs, lane, vdst_reg, exec_mask, opsel_dst_hi=opsel_dst_hi, clmp=getattr(inst, 'clmp', 0))
 
 def _compile_vop3sd(inst: ir3.VOP3SD | ir4.VOP3SD | irc.VOP3SD, ctx: _Ctx) -> UOp:
-  exec_mask = ctx.rsgpr_dyn(_c(EXEC_LO.offset))
+  exec_mask = ctx.rexec()
   bits, pcode, ops = inst.canonical_op_bits, get_pcode(inst.op), inst.canonical_operands
 
   # Read operands dynamically from instruction encoding
@@ -1038,7 +1061,7 @@ def _compile_vop3sd(inst: ir3.VOP3SD | ir4.VOP3SD | irc.VOP3SD, ctx: _Ctx) -> UO
   vcc_in_off = src2_off if has_carry_in else sdst_off
 
   def load_srcs(lane_uop):
-    ret = {'VCC': ctx.rsgpr_dyn(vcc_in_off), 'EXEC': exec_mask, 'SCC': ctx.rsgpr_dyn(_c(SCC.offset)), 'laneId': lane_uop}
+    ret = {'VCC': ctx.rmask_dyn(vcc_in_off), 'EXEC': exec_mask, 'SCC': ctx.rsgpr_dyn(_c(SCC.offset)), 'laneId': lane_uop}
     ret['S0'] = ctx.rsrc_dyn(src0_off, lane_uop, bits['s0'], literal, ops['s0'][0] == Fmt.FMT_NUM_F64)
     ret['S1'] = ctx.rsrc_dyn(src1_off, lane_uop, bits['s1'], literal, ops['s1'][0] == Fmt.FMT_NUM_F64)
     if 's2' in ops: ret['S2'] = ctx.rsrc_dyn(src2_off, lane_uop, bits['s2'], literal, ops['s2'][0] == Fmt.FMT_NUM_F64)
@@ -1056,7 +1079,7 @@ def _compile_vop3sd(inst: ir3.VOP3SD | ir4.VOP3SD | irc.VOP3SD, ctx: _Ctx) -> UO
     def get_vcc_bit(lane_uop) -> UOp:
       vcc_bit = _c(0)
       for dest, val in parse_pcode(pcode, load_srcs(lane_uop))[1]:
-        if dest.startswith('VCC') or (dest.startswith('D0.u64') and '[laneId]' in dest): vcc_bit = val.cast(dtypes.uint32)
+        if dest.startswith('VCC') or (dest.startswith('D0.u64') and '[laneId]' in dest): vcc_bit = val.cast(dtypes.uint64)
       return vcc_bit
     final_vcc = ctx.unroll_lanes(get_vcc_bit, exec_mask)
     # VGPR stores: RANGE gets axis ID second (higher ID = runs after VCC loop)
@@ -1079,14 +1102,13 @@ def _compile_vop3sd(inst: ir3.VOP3SD | ir4.VOP3SD | irc.VOP3SD, ctx: _Ctx) -> UO
         d0_u32 = d0_val.bitcast(dtypes.uint32) if d0_val.dtype in (dtypes.float32, dtypes.half) else d0_val.cast(dtypes.uint32)
         vgpr_stores.append(ctx.wvgpr_dyn(vdst_reg, lane3, d0_u32, exec_mask))
     # Write carry output (wsgpr_dyn handles NULL register 124)
-    vcc_write = ctx.wsgpr_dyn(sdst_off, final_vcc)
-    return UOp.sink(vcc_write, UOp.group(*vgpr_stores).end(lane3), *ctx.inc_pc())
+    return UOp.sink(*ctx.wmask_dyn(sdst_off, final_vcc), UOp.group(*vgpr_stores).end(lane3), *ctx.inc_pc())
   else:
     return ctx.compile_vop_pcode(inst.op, srcs, lane, vdst_reg, exec_mask, sdst_reg=inst.sdst.offset)
 
 def _compile_wmma(inst: ir3.VOP3P | ir4.VOP3P | irc.VOP3P, ctx: _Ctx) -> UOp:
   op_name = _op_name(inst)
-  exec_mask = ctx.rsgpr_dyn(_c(EXEC_LO.offset))
+  exec_mask = ctx.rexec()
   vdst_reg = ctx.inst_field(type(inst).vdst)
   src0_r = ctx.inst_field(type(inst).src0) - _c(256)
   src1_r = ctx.inst_field(type(inst).src1) - _c(256)
@@ -1137,12 +1159,18 @@ def _compile_wmma(inst: ir3.VOP3P | ir4.VOP3P | irc.VOP3P, ctx: _Ctx) -> UOp:
               for m in range(16) for n in range(16)]
   return UOp.sink(*stores, *ctx.inc_pc())
 
+def _compile_cdna_mfma(inst: irc.VOP3P, ctx: _Ctx) -> UOp | None:
+  # CDNA MFMA is executed by a Python fallback in run_asm to avoid huge UOp kernels.
+  del inst, ctx
+  return None
+
 def _compile_vop3p(inst: ir3.VOP3P | ir4.VOP3P | irc.VOP3P, ctx: _Ctx) -> UOp:
   op_name = _op_name(inst)
   if 'WMMA' in op_name and ('16X16X16_F16' in op_name or '16X16X16_BF16' in op_name): return _compile_wmma(inst, ctx)
+  if op_name.startswith('V_MFMA_') and (mfma := _compile_cdna_mfma(inst, ctx)) is not None: return mfma
 
   lane = ctx.range()
-  exec_mask = ctx.rsgpr_dyn(_c(EXEC_LO.offset))
+  exec_mask = ctx.rexec()
   vdst_reg = ctx.inst_field(type(inst).vdst)
   if op_name in ('V_ACCVGPR_READ', 'V_ACCVGPR_WRITE'):
     src0 = ctx.rsrc_dyn(ctx.inst_field(type(inst).src0), lane)
@@ -1163,10 +1191,12 @@ def _compile_vop3p(inst: ir3.VOP3P | ir4.VOP3P | irc.VOP3P, ctx: _Ctx) -> UOp:
       is_vgpr = src_off >= _c(256)
       vgpr_lo = ctx.rvgpr_dyn(src_off - _c(256), lane) if lane is not None else _c(0)
       vgpr_hi = ctx.rvgpr_dyn(src_off - _c(256) + _c(1), lane) if lane is not None else _c(0)
-      is_sgpr_pair = src_off < _c(128)
-      scalar_hi = ctx.rsgpr_dyn(src_off + _c(1), is_sgpr_pair)
+      # Scalar 64-bit packed sources use adjacent registers, including inline constants.
+      # Literal source (255) is a single 32-bit immediate and is broadcast to both halves.
+      scalar_hi_valid = src_off < _c(255)
+      scalar_hi = ctx.rsgpr_dyn(src_off + _c(1), scalar_hi_valid)
       lo = is_vgpr.where(vgpr_lo, src_lo)
-      hi = is_vgpr.where(vgpr_hi, is_sgpr_pair.where(scalar_hi, src_lo))
+      hi = is_vgpr.where(vgpr_hi, scalar_hi_valid.where(scalar_hi, src_lo))
       return lo, hi
     s0_lo, s0_hi = read_src_pair(src0, src_offs[0])
     s1_lo, s1_hi = read_src_pair(src1, src_offs[1])
@@ -1177,19 +1207,20 @@ def _compile_vop3p(inst: ir3.VOP3P | ir4.VOP3P | irc.VOP3P, ctx: _Ctx) -> UOp:
   elif is_pk_f32:
     # CDNA packed F32: read 32-bit sources, build 64-bit packed values using opsel.
     # For VGPRs: opsel selects between v[reg] (0) and v[reg+1] (1) for each half.
-    # For SGPR pairs (off < 128): s[N] = lo float32, s[N+1] = hi float32.
-    # For inline constants (128 <= off < 256): broadcast same value to both halves.
+    # For scalar sources (off < 255): low/high halves come from adjacent 32-bit sources.
+    # Literal source (255) is a single 32-bit immediate and is broadcast to both halves.
     src_offs = [ctx.inst_field(type(inst).src0), ctx.inst_field(type(inst).src1), ctx.inst_field(type(inst).src2)]
     def build_pk_f32(src_lo: UOp, src_off: UOp, opsel_lo: int, opsel_hi_bit: int, neg_lo: int, neg_hi_bit: int) -> UOp:
       is_vgpr = src_off >= _c(256)
       vgpr_lo = ctx.rvgpr_dyn(src_off - _c(256), lane) if lane is not None else _c(0)
       vgpr_hi = ctx.rvgpr_dyn(src_off - _c(256) + _c(1), lane) if lane is not None else _c(0)
-      # For SGPR pairs, opsel selects between s[N] (0) and s[N+1] (1); inline constants always broadcast.
-      is_sgpr_pair = src_off < _c(128)
-      sgpr_hi = ctx.rsgpr_dyn(src_off + _c(1), is_sgpr_pair)
-      scalar_hi_sel = src_lo if not opsel_hi_bit else is_sgpr_pair.where(sgpr_hi, src_lo)
-      # Low packed lane uses the low source lane; high lane may be remapped via opsel_hi.
-      lo = is_vgpr.where(vgpr_lo, src_lo)
+      scalar_hi_valid = src_off < _c(255)
+      sgpr_hi = ctx.rsgpr_dyn(src_off + _c(1), scalar_hi_valid)
+      # Low packed lane selection (opsel): 0->src_lo, 1->src_hi.
+      scalar_lo_sel = src_lo if not opsel_lo else scalar_hi_valid.where(sgpr_hi, src_lo)
+      lo = is_vgpr.where(vgpr_hi if opsel_lo else vgpr_lo, scalar_lo_sel)
+      # High packed lane selection (opsel_hi/opsel_hi2): same selection rule on high lane.
+      scalar_hi_sel = src_lo if not opsel_hi_bit else scalar_hi_valid.where(sgpr_hi, src_lo)
       hi = is_vgpr.where(vgpr_hi if opsel_hi_bit else vgpr_lo, scalar_hi_sel)
       if neg_lo: lo = lo ^ UOp.const(dtypes.uint32, 0x80000000)
       if neg_hi_bit: hi = hi ^ UOp.const(dtypes.uint32, 0x80000000)
@@ -1240,7 +1271,7 @@ def _compile_vop3p(inst: ir3.VOP3P | ir4.VOP3P | irc.VOP3P, ctx: _Ctx) -> UOp:
   return ctx.compile_vop_pcode(inst.op, srcs, lane, vdst_reg, exec_mask)
 
 def _compile_vopd(inst: ir3.VOPD | ir4.VOPD, ctx: _Ctx) -> UOp:
-  exec_mask = ctx.rsgpr_dyn(_c(EXEC_LO.offset))
+  exec_mask = ctx.rexec()
   # Read operands dynamically - use type(inst) to get correct field descriptors
   inst_type = type(inst)
   vdstx_reg = ctx.inst_field(inst_type.vdstx)
@@ -1266,9 +1297,9 @@ def _compile_vopd(inst: ir3.VOPD | ir4.VOPD, ctx: _Ctx) -> UOp:
     if vop in (ir3.VOP2Op.V_FMAAK_F32_E32, ir3.VOP2Op.V_FMAMK_F32_E32, ir3.VOP2Op.V_FMAAK_F32_E32, ir3.VOP2Op.V_FMAMK_F32_E32):
       assert literal is not None
       srcs['SIMM32'] = literal
-    if op in (ir3.VOPDOp.V_DUAL_CNDMASK_B32, ir4.VOPDOp.V_DUAL_CNDMASK_B32): srcs['VCC'] = ctx.rsgpr_dyn(_c(VCC_LO.offset))
+    if op in (ir3.VOPDOp.V_DUAL_CNDMASK_B32, ir4.VOPDOp.V_DUAL_CNDMASK_B32): srcs['VCC'] = ctx.rvcc()
     pcode = get_pcode(vop)
-    srcs.update({'VCC': ctx.rsgpr_dyn(_c(VCC_LO.offset)), 'EXEC': exec_mask, 'SCC': ctx.rsgpr_dyn(_c(SCC.offset)), 'laneId': lane})
+    srcs.update({'VCC': ctx.rvcc(), 'EXEC': exec_mask, 'SCC': ctx.rsgpr_dyn(_c(SCC.offset)), 'laneId': lane})
     for dest, val in parse_pcode(pcode, srcs)[1]:
       if dest.startswith('D0'): all_stores.append(ctx.wvgpr_dyn(vdst_reg, lane, _val_to_u32(val), exec_mask, after=srcy1))
   return UOp.sink(UOp.group(*all_stores).end(lane), *ctx.inc_pc())
@@ -1276,7 +1307,7 @@ def _compile_vopd(inst: ir3.VOPD | ir4.VOPD, ctx: _Ctx) -> UOp:
 def _compile_mem_op(inst: ir3.DS|ir3.FLAT|ir3.GLOBAL|ir3.SCRATCH|ir4.DS|ir4.VFLAT|ir4.VGLOBAL|ir4.VSCRATCH
                     |irc.DS|irc.FLAT|irc.GLOBAL|irc.SCRATCH, ctx: _Ctx) -> UOp:
   """Unified memory operation compiler for DS, FLAT, GLOBAL, SCRATCH."""
-  exec_mask, op_name = ctx.rsgpr_dyn(_c(EXEC_LO.offset)), _op_name(inst)
+  exec_mask, op_name = ctx.rexec(), _op_name(inst)
   pcode = get_pcode(inst.op)
   # CDNA pcode uses CalcGlobalAddr/CalcDsAddr to compute address from raw components, but make_addr already handles this.
   # Strip the addr computation line and use pre-computed ADDR directly (rename 'addr' -> 'ADDR' in remaining pcode).
@@ -1343,16 +1374,29 @@ def _compile_mem_op(inst: ir3.DS|ir3.FLAT|ir3.GLOBAL|ir3.SCRATCH|ir4.DS|ir4.VFLA
       saddr_contrib = use_saddr.where(ctx.rsgpr_dyn(saddr_reg).cast(dtypes.uint64), UOp.const(dtypes.uint64, 0)) \
         if saddr_reg is not None else UOp.const(dtypes.uint64, 0)
       return base + addr_offset + saddr_contrib + offset64
-    # FLAT/GLOBAL: choose between SGPR base (saddr) or VGPR pair (addr) based on saddr validity
+    # FLAT/GLOBAL: when saddr is valid, addr is a 32-bit offset; otherwise addr is a 64-bit VGPR pair.
     saddr_base = _u64(ctx.rsgpr_dyn(saddr_reg), ctx.rsgpr_dyn(saddr_reg + _c(1))) if saddr_reg is not None else UOp.const(dtypes.uint64, 0)
     vaddr_base = _u64(ctx.rvgpr_dyn(addr_reg, lane), ctx.rvgpr_dyn(addr_reg + _c(1), lane))
-    # When saddr is valid: base = saddr pair, vaddr is 32-bit offset; otherwise: base = 0, vaddr is 64-bit address
     base_addr = use_saddr.where(saddr_base + ctx.rvgpr_dyn(addr_reg, lane).cast(dtypes.uint64), vaddr_base)
     return base_addr + offset64
 
   def wmem(addr: UOp, val: UOp, active: UOp) -> UOp:
-    idx = mem.index((addr >> addr_shift).cast(dtypes.int))
+    safe_addr = active.where(addr, UOp.const(addr.dtype, 0))
+    idx = mem.index((safe_addr >> addr_shift).cast(dtypes.int))
     return idx.store(active.where(val, idx.load()))
+
+  access_bytes = max(data_bits_mem // 8, 1)
+  def _addr_in_valid_range(addr: UOp) -> UOp:
+    # Range-gating GPU memory accesses is useful for OOB debugging, but can over-prune
+    # legitimate accesses when virtual mappings are fragmented or stale.
+    if is_lds or is_scratch or not ENFORCE_MEM_RANGES or not _VALID_MEM_RANGES: return UOp.const(dtypes.bool, True)
+    last = addr + UOp.const(dtypes.uint64, access_bytes - 1)
+    valid = UOp.const(dtypes.bool, False)
+    for st, sz in _VALID_MEM_RANGES:
+      start = UOp.const(dtypes.uint64, st)
+      end = UOp.const(dtypes.uint64, st + sz)
+      valid = valid | ((addr >= start) & (last < end))
+    return valid
 
   def make_srcs(lane: UOp) -> dict:
     addr = make_addr(lane)
@@ -1371,27 +1415,28 @@ def _compile_mem_op(inst: ir3.DS|ir3.FLAT|ir3.GLOBAL|ir3.SCRATCH|ir4.DS|ir4.VFLA
       # RDNA3 uses ADDR/OFFSET, RDNA4 uses vgpr_a/offset (lowercase) + CalcDsAddr function
       return {'ADDR': addr, 'ADDR_BASE': addr, 'OFFSET': offset, 'OFFSET0': offset0, 'OFFSET1': offset1, '_lds': mem, 'laneId': lane,
               'vgpr_a': ctx.rvgpr_dyn(addr_reg, lane), 'offset': offset, **data}
-    active = _lane_active(exec_mask, lane)
+    active = _lane_active(exec_mask, lane) & _addr_in_valid_range(addr)
     # saddr < 124 means valid SGPR pair, otherwise use 0 (NULL means no saddr contribution)
     use_saddr = (saddr_reg < _c(124)) if saddr_reg is not None else UOp.const(dtypes.bool, False)
     saddr_raw = _u64(ctx.rsgpr_dyn(saddr_reg), ctx.rsgpr_dyn(saddr_reg + _c(1))) if saddr_reg is not None else UOp.const(dtypes.uint64, 0)
     saddr_base = use_saddr.where(saddr_raw, UOp.const(dtypes.uint64, 0))
     # Sign-extend offset to 64-bit for the final address calculation
     ioffset64 = offset.cast(dtypes.int64).cast(dtypes.uint64)
-    # v_addr for CalcGlobalAddr: when saddr valid, use low 32 bits as offset; otherwise full 64-bit address. Include ioffset.
+    # v_addr for CalcGlobalAddr: when saddr is valid use 32-bit vaddr offset; otherwise use full 64-bit address.
     vaddr_full = _u64(ctx.rvgpr_dyn(addr_reg, lane), ctx.rvgpr_dyn(addr_reg + _c(1), lane))
     vaddr_lo = ctx.rvgpr_dyn(addr_reg, lane).cast(dtypes.uint64)
     vaddr_base = use_saddr.where(vaddr_lo + ioffset64, vaddr_full + ioffset64)
+    addr_safe = active.where(addr, UOp.const(dtypes.uint64, 0))
     if is_atomic:
       atomic_data = _u64(ctx.rvgpr_dyn(vdata_reg, lane), ctx.rvgpr_dyn(vdata_reg + _c(1), lane)) \
         if data_bits_mem == 64 else ctx.rvgpr_dyn(vdata_reg, lane)
-      return {'ADDR': addr, 'DATA': atomic_data, '_vmem': mem, '_active': active,
+      return {'ADDR': addr_safe, 'DATA': atomic_data, '_vmem': mem, '_active': active,
               'laneId': lane, 'v_addr': vaddr_base, 's_saddr': saddr_base}
     vdata = ctx.rvgpr_dyn(vdata_reg, lane).cast(dtypes.uint64) if 'STORE' in op_name \
       else ctx.rvgpr_dyn(vdst_reg, lane) if 'D16' in op_name else UOp.const(dtypes.uint32, 0)
     if 'STORE' in op_name and data_bits_mem >= 64:
       vdata = vdata | (ctx.rvgpr_dyn(vdata_reg + _c(1), lane).cast(dtypes.uint64) << UOp.const(dtypes.uint64, 32))
-    srcs = {'ADDR': addr, 'laneId': lane, 'VDATA': vdata, 'v_addr': vaddr_base, 'v_addr_off': addr, '_vmem': mem,
+    srcs = {'ADDR': addr_safe, 'laneId': lane, 'VDATA': vdata, 'v_addr': vaddr_base, 'v_addr_off': addr_safe, '_vmem': mem,
             's_saddr': saddr_base, 'SADDR': saddr_base,'s_saddr_off': UOp.const(dtypes.uint64, 0), '_active': active, 'OFFSET': offset}
     for i in range(data_bits_mem // 32):
       srcs[f'VDATA{i}'] = ctx.rvgpr_dyn(vdata_reg + _c(i), lane) if 'STORE' in op_name else UOp.const(dtypes.uint32, 0)
@@ -1465,6 +1510,10 @@ _INST_HANDLERS: dict[type, Callable[..., UOp]] = {
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _canonical_runner_cache: list[tuple[int, int, int, object]] = []  # [(base, mask, size, runner), ...]
+_VALID_MEM_RANGES: tuple[tuple[int, int], ...] = ()
+_CUR_LIB_BASE: int = 0
+_SCRATCH_BASE_PTR: int = 0
+_SCRATCH_TOTAL_BYTES: int = 0
 
 @functools.cache
 def _get_runner(inst_bytes: bytes, arch: str = "rdna3"):
@@ -1499,7 +1548,7 @@ def _get_runner(inst_bytes: bytes, arch: str = "rdna3"):
   sink = sink.replace(arg=KernelInfo(name=canonical_name)).rtag(1)
 
   # NOTE: renderer output is not reproducible because of _MXCSRContext. PROFILE=0 prevents emulator instruction runners from polluting profiling.
-  check_oob = 1 if arch == "cdna" else 0
+  check_oob = int(getenv("MOCKGPU_CDNA_CHECK_OOB", 1 if arch == "cdna" else 0))
   with Context(NOOPT=1, CHECK_OOB=check_oob, TUPLE_ORDER=0, EMULATED_DTYPES="", CAPTURE_PROCESS_REPLAY=0, PROFILE=0):
     runner = get_runner('CPU', sink)
   if use_canonical_dedup: _canonical_runner_cache.append((base, mask, size, runner))
@@ -1529,29 +1578,36 @@ F32_INLINE = {240: 0x3f000000, 241: 0xbf000000, 242: 0x3f800000, 243: 0xbf800000
               244: 0x40000000, 245: 0xc0000000, 246: 0x40800000, 247: 0xc0800000, 248: 0x3e22f983}  # 2.0, -2.0, 4.0, -4.0, 1/(2*pi)
 
 class WaveState:
-  __slots__ = ('vgpr_buf', 'sgpr_buf', '_vgpr_mv', '_sgpr_mv', 'n_lanes')
+  __slots__ = ('vgpr_buf', 'sgpr_buf', 'accvgpr_buf', '_vgpr_mv', '_sgpr_mv', '_accvgpr_mv', 'n_lanes')
 
   def __init__(self, n_lanes: int = WAVE_SIZE):
     self.n_lanes = n_lanes
     self.vgpr_buf = Buffer('CPU', VGPR_SIZE, dtypes.uint32).ensure_allocated()
     self.sgpr_buf = Buffer('CPU', SGPR_COUNT, dtypes.uint32).ensure_allocated()
+    self.accvgpr_buf = Buffer('CPU', VGPR_SIZE, dtypes.uint32).ensure_allocated()
     self._vgpr_mv = self.vgpr_buf.as_memoryview(force_zero_copy=True).cast('I')
     self._sgpr_mv = self.sgpr_buf.as_memoryview(force_zero_copy=True).cast('I')
+    self._accvgpr_mv = self.accvgpr_buf.as_memoryview(force_zero_copy=True).cast('I')
     # Zero memory using ctypes memset (much faster than Python loops)
     ctypes.memset(self.vgpr_buf._buf.va_addr, 0, VGPR_SIZE * 4)
     ctypes.memset(self.sgpr_buf._buf.va_addr, 0, SGPR_COUNT * 4)
+    ctypes.memset(self.accvgpr_buf._buf.va_addr, 0, VGPR_SIZE * 4)
     # Pre-populate inline constants at indices 128-255
     for i in range(65): self._write_sgpr(128 + i, i)  # 128-192: integers 0-64
     for i in range(16): self._write_sgpr(193 + i, (-(i + 1)) & MASK32)  # 193-208: -1 to -16
     for off, val in F32_INLINE.items(): self._write_sgpr(off, val)  # 240-248: float constants
-    self._write_sgpr(EXEC_LO.offset, (1 << n_lanes) - 1)
+    exec_mask = (1 << n_lanes) - 1 if n_lanes < 64 else (1 << 64) - 1
+    self._write_sgpr(EXEC_LO.offset, exec_mask & MASK32)
+    if WAVE_SIZE == 64: self._write_sgpr(EXEC_LO.offset + 1, (exec_mask >> 32) & MASK32)
     self._write_sgpr(PC_LO_IDX, 0)
     self._write_sgpr(PC_HI_IDX, 0)
 
   def _write_sgpr(self, idx: int, val: int): self._sgpr_mv[idx] = val & MASK32
   def _read_sgpr(self, idx: int) -> int: return self._sgpr_mv[idx]
-  def _write_vgpr(self, reg: int, lane: int, val: int): self._vgpr_mv[reg * 32 + lane] = val & MASK32
-  def _read_vgpr(self, reg: int, lane: int) -> int: return self._vgpr_mv[reg * 32 + lane]
+  def _write_vgpr(self, reg: int, lane: int, val: int): self._vgpr_mv[reg * WAVE_SIZE + lane] = val & MASK32
+  def _read_vgpr(self, reg: int, lane: int) -> int: return self._vgpr_mv[reg * WAVE_SIZE + lane]
+  def _write_accvgpr(self, reg: int, lane: int, val: int): self._accvgpr_mv[reg * WAVE_SIZE + lane] = val & MASK32
+  def _read_accvgpr(self, reg: int, lane: int) -> int: return self._accvgpr_mv[reg * WAVE_SIZE + lane]
 
   @property
   def pc(self) -> int: return self._read_sgpr(PC_LO_IDX) | (self._read_sgpr(PC_HI_IDX) << 32)
@@ -1559,6 +1615,640 @@ class WaveState:
   def pc(self, val: int):
     self._write_sgpr(PC_LO_IDX, val & MASK32)
     self._write_sgpr(PC_HI_IDX, (val >> 32) & MASK32)
+
+_CDNA_MFMA_RE = re.compile(r'^V_MFMA_F32_16X16X(\d+)_(F16|BF16)$')
+
+def _read_src32_python(st: WaveState, src_off: int, lane: int) -> int:
+  if src_off >= 256: return st._read_vgpr(src_off - 256, lane)
+  return st._read_sgpr(src_off)
+
+def _exec_cdna_accvgpr_python(st: WaveState, inst) -> bool:
+  if getenv("MOCKGPU_DISABLE_CDNA_ACCVGPR_FALLBACK", 0): return False
+  opn = _op_name(inst)
+  if opn not in ('V_ACCVGPR_READ', 'V_ACCVGPR_WRITE'): return False
+  if any(not hasattr(getattr(inst, x), 'offset') for x in ('src0', 'vdst')): return False
+  src0_off, vdst_off = inst.src0.offset, inst.vdst.offset
+  src_off, dst_off = src0_off, vdst_off
+  if getenv("MOCKGPU_TRACE_ACC", 0):
+    print(f"[emu-acc] {opn} src0={src0_off} vdst={vdst_off} inst={inst!r}", flush=True)
+  if dst_off < 256: return False
+  dst_reg = dst_off - 256
+  exec_mask = st._read_sgpr(EXEC_LO.offset) | (st._read_sgpr(EXEC_LO.offset + 1) << 32)
+  if getenv("MOCKGPU_ACC_IGNORE_EXEC", 0): exec_mask = (1 << WAVE_SIZE) - 1
+  for lane in range(WAVE_SIZE):
+    if ((exec_mask >> lane) & 1) == 0: continue
+    acc_lane = lane & 31 if getenv("MOCKGPU_ACC_LANE32", 0) else lane
+    if opn == 'V_ACCVGPR_WRITE':
+      st._write_accvgpr(dst_reg, acc_lane, _read_src32_python(st, src_off, lane))
+    else:
+      if src_off < 256: continue
+      st._write_vgpr(dst_reg, lane, st._read_accvgpr(src_off - 256, acc_lane))
+  st.pc = st.pc + inst.size()
+  return True
+
+def _exec_cdna_mfma_python(st: WaveState, inst) -> bool:
+  m = _CDNA_MFMA_RE.match(_op_name(inst))
+  if m is None or WAVE_SIZE != 64: return False
+  if any(not hasattr(getattr(inst, x), 'offset') for x in ('src0', 'src1', 'src2', 'vdst')): return False
+  src0_off, src1_off, src2_off, vdst_off = inst.src0.offset, inst.src1.offset, inst.src2.offset, inst.vdst.offset
+  if min(src0_off, src1_off, src2_off, vdst_off) < 256: return False
+
+  op_info = CDNA_OPERANDS.get(inst.op, {})
+  src0_bits, src1_bits, src2_bits = op_info.get('src0', (None, 0, None))[1], op_info.get('src1', (None, 0, None))[1], op_info.get('src2', (None, 0, None))[1]
+  if src0_bits % 16 != 0 or src1_bits % 16 != 0 or src2_bits % 32 != 0: return False
+  num_a, num_b, num_c = src0_bits // 16, src1_bits // 16, src2_bits // 32
+  k_dim, is_bf16 = int(m.group(1)), m.group(2) == 'BF16'
+  if num_a != num_b or num_c != 4 or k_dim != num_a * 4: return False
+
+  import numpy as np
+  lanes, src_words = 64, src0_bits // 32
+  src0_base, src1_base, src2_base, vdst_base = src0_off - 256, src1_off - 256, src2_off - 256, vdst_off - 256
+
+  def load_ab_frag(base_reg: int):
+    words = np.empty((lanes, src_words), dtype=np.uint32)
+    for lane in range(lanes):
+      for wi in range(src_words): words[lane, wi] = st._read_vgpr(base_reg + wi, lane)
+    elems = np.empty((lanes, src_words * 2), dtype=np.uint16)
+    elems[:, 0::2], elems[:, 1::2] = (words & 0xFFFF).astype(np.uint16), ((words >> 16) & 0xFFFF).astype(np.uint16)
+    if is_bf16: return (elems.astype(np.uint32) << 16).view(np.float32)
+    return elems.view(np.float16).astype(np.float32)
+
+  a_frag, b_frag = load_ab_frag(src0_base), load_ab_frag(src1_base)  # [lane, elem]
+  a_mat, b_mat = np.empty((16, k_dim), dtype=np.float32), np.empty((16, k_dim), dtype=np.float32)
+  for k in range(k_dim):
+    grp, idx = (k // num_a) * 16, k % num_a
+    a_mat[:, k], b_mat[:, k] = a_frag[grp:grp+16, idx], b_frag[grp:grp+16, idx]
+
+  c_words = np.empty((lanes, num_c), dtype=np.uint32)
+  for lane in range(lanes):
+    for e in range(num_c): c_words[lane, e] = st._read_accvgpr(src2_base + e, lane)
+  c_frag, c_mat = c_words.view(np.float32), np.zeros((16, 16), dtype=np.float32)
+  for lane in range(lanes):
+    col, row_base = lane & 15, (lane >> 4) * 4
+    for e in range(num_c): c_mat[row_base + e, col] = c_frag[lane, e]
+
+  d_mat = a_mat @ b_mat.T + c_mat
+  exec_mask = st._read_sgpr(EXEC_LO.offset) | (st._read_sgpr(EXEC_LO.offset + 1) << 32)
+  for lane in range(lanes):
+    if ((exec_mask >> lane) & 1) == 0: continue
+    col, row_base = lane & 15, (lane >> 4) * 4
+    for e in range(num_c):
+      st._write_accvgpr(vdst_base + e, lane, int(np.float32(d_mat[row_base + e, col]).view(np.uint32)))
+
+  st.pc = st.pc + inst.size()
+  return True
+
+def _addr_in_valid_ranges(addr: int, nbytes: int) -> bool:
+  for st_addr, sz in _VALID_MEM_RANGES:
+    if st_addr <= addr and addr + nbytes <= st_addr + sz: return True
+  return not _VALID_MEM_RANGES
+
+def _exec_cdna_scratch_load_store_python(st: WaveState, inst) -> bool:
+  if not isinstance(inst, irc.SCRATCH): return False
+  if not hasattr(inst, 'op'): return False
+  opn = inst.op.name
+  if not (opn.startswith('SCRATCH_LOAD_') or opn.startswith('SCRATCH_STORE_')): return False
+  is_store = opn.startswith('SCRATCH_STORE_')
+  req = ('addr', 'data', 'saddr') if is_store else ('addr', 'vdst', 'saddr')
+  if any(not hasattr(getattr(inst, x), 'offset') for x in req): return False
+
+  nbytes, words, signed = 0, 1, False
+  if opn in ('SCRATCH_LOAD_UBYTE', 'SCRATCH_LOAD_SBYTE', 'SCRATCH_LOAD_UBYTE_D16', 'SCRATCH_LOAD_UBYTE_D16_HI',
+             'SCRATCH_LOAD_SBYTE_D16', 'SCRATCH_LOAD_SBYTE_D16_HI', 'SCRATCH_STORE_BYTE', 'SCRATCH_STORE_BYTE_D16_HI'):
+    nbytes, signed = 1, ('_SBYTE' in opn)
+  elif opn in ('SCRATCH_LOAD_USHORT', 'SCRATCH_LOAD_SSHORT', 'SCRATCH_LOAD_SHORT_D16', 'SCRATCH_LOAD_SHORT_D16_HI',
+               'SCRATCH_STORE_SHORT', 'SCRATCH_STORE_SHORT_D16_HI'):
+    nbytes, signed = 2, ('SCRATCH_LOAD_SSHORT' in opn)
+  elif opn in ('SCRATCH_LOAD_DWORD', 'SCRATCH_STORE_DWORD'):
+    nbytes = 4
+  elif opn in ('SCRATCH_LOAD_DWORDX2', 'SCRATCH_STORE_DWORDX2'):
+    nbytes, words = 8, 2
+  elif opn in ('SCRATCH_LOAD_DWORDX3', 'SCRATCH_STORE_DWORDX3'):
+    nbytes, words = 12, 3
+  elif opn in ('SCRATCH_LOAD_DWORDX4', 'SCRATCH_STORE_DWORDX4'):
+    nbytes, words = 16, 4
+  else:
+    return False
+
+  addr_off = inst.addr.offset
+  data_off = inst.data.offset if is_store else inst.vdst.offset
+  saddr_off = inst.saddr.offset
+  if min(addr_off, data_off) < 256: return False
+  addr_reg, data_reg = addr_off - 256, data_off - 256
+  acc_mode = int(getattr(inst, 'acc', 0) or 0)
+  use_saddr = saddr_off < 124
+  saddr_base = (st._read_sgpr(saddr_off) | (st._read_sgpr(saddr_off + 1) << 32)) if use_saddr else 0
+  sve = int(getattr(inst, 'sve', 0) or 0)
+  off_field = type(inst).offset
+  off_bits = off_field.hi - off_field.lo + 1
+  off_raw = int(inst.offset) & ((1 << off_bits) - 1)
+  ioff = off_raw - (1 << off_bits) if (off_raw & (1 << (off_bits - 1))) else off_raw
+  d16_hi = opn.endswith('D16_HI')
+  exec_mask = st._read_sgpr(EXEC_LO.offset) | (st._read_sgpr(EXEC_LO.offset + 1) << 32)
+  trace = int(getenv("MOCKGPU_TRACE_SCRATCH", 0))
+  trace_lane = int(getenv("MOCKGPU_TRACE_LANE", 0))
+  lane_private_bytes = st._read_sgpr(SCRATCH_STRIDE_IDX)
+  wave_base = st._read_sgpr(SCRATCH_BASE_IDX)
+  lane_dword_stride = WAVE_SIZE * 4
+
+  def _read_data(reg: int, lane_id: int) -> int:
+    return st._read_accvgpr(reg, lane_id) if acc_mode else st._read_vgpr(reg, lane_id)
+  def _write_data(reg: int, lane_id: int, val: int) -> None:
+    if acc_mode: st._write_accvgpr(reg, lane_id, val)
+    else: st._write_vgpr(reg, lane_id, val)
+
+  def _scratch_phys_off(lane_id: int, private_byte_off: int) -> int:
+    # CDNA scratch/private memory uses lane-interleaved dword layout:
+    #   wave_base + (dword_index * wave_size * 4) + lane*4 + byte_in_dword
+    dword_idx, byte_in_dword = private_byte_off >> 2, private_byte_off & 0x3
+    return int(wave_base + dword_idx * lane_dword_stride + lane_id * 4 + byte_in_dword)
+
+  for lane in range(WAVE_SIZE):
+    if ((exec_mask >> lane) & 1) == 0: continue
+    vaddr = st._read_vgpr(addr_reg, lane) if sve == 1 else 0
+    private_off = int(vaddr + saddr_base + ioff)
+    if private_off < 0 or private_off + nbytes > lane_private_bytes:
+      if not is_store:
+        for wi in range(words): _write_data(data_reg + wi, lane, 0)
+      continue
+
+    if is_store:
+      if trace and lane == trace_lane:
+        v0 = _read_data(data_reg, lane)
+        print(f"[emu-scratch] lane={lane} pc=0x{st.pc:x} off=0x{st.pc - _CUR_LIB_BASE:x} store {opn} poff={private_off} nbytes={nbytes} "
+              f"v0=0x{v0:x} acc={acc_mode} inst={inst!r}", flush=True)
+      data_bytes = bytearray(nbytes)
+      if nbytes == 1:
+        data = _read_data(data_reg, lane)
+        data_bytes[0] = ((data >> 8) if d16_hi else data) & 0xFF
+      elif nbytes == 2:
+        data = _read_data(data_reg, lane)
+        val16 = ((data >> 16) if d16_hi else data) & 0xFFFF
+        data_bytes[0], data_bytes[1] = val16 & 0xFF, (val16 >> 8) & 0xFF
+      else:
+        for wi in range(words):
+          wval = _read_data(data_reg + wi, lane)
+          bi = wi * 4
+          data_bytes[bi + 0], data_bytes[bi + 1] = wval & 0xFF, (wval >> 8) & 0xFF
+          data_bytes[bi + 2], data_bytes[bi + 3] = (wval >> 16) & 0xFF, (wval >> 24) & 0xFF
+      for bi, b in enumerate(data_bytes):
+        phys = _scratch_phys_off(lane, private_off + bi)
+        if phys < 0 or phys >= _SCRATCH_TOTAL_BYTES: continue
+        ctypes.c_uint8.from_address(_SCRATCH_BASE_PTR + phys).value = b
+    else:
+      raw_bytes = bytearray(nbytes)
+      in_range = True
+      for bi in range(nbytes):
+        phys = _scratch_phys_off(lane, private_off + bi)
+        if phys < 0 or phys >= _SCRATCH_TOTAL_BYTES:
+          in_range = False
+          break
+        raw_bytes[bi] = ctypes.c_uint8.from_address(_SCRATCH_BASE_PTR + phys).value
+      if not in_range:
+        for wi in range(words): _write_data(data_reg + wi, lane, 0)
+        continue
+      if trace and lane == trace_lane:
+        raw0 = (raw_bytes[0] | (raw_bytes[1] << 8) | (raw_bytes[2] << 16) | (raw_bytes[3] << 24)) if nbytes >= 4 else raw_bytes[0]
+        print(f"[emu-scratch] lane={lane} pc=0x{st.pc:x} off=0x{st.pc - _CUR_LIB_BASE:x} load {opn} poff={private_off} nbytes={nbytes} "
+              f"mem0=0x{raw0:x} acc={acc_mode} inst={inst!r}", flush=True)
+      if words > 1:
+        for wi in range(words):
+          bi = wi * 4
+          w = raw_bytes[bi] | (raw_bytes[bi + 1] << 8) | (raw_bytes[bi + 2] << 16) | (raw_bytes[bi + 3] << 24)
+          _write_data(data_reg + wi, lane, w)
+      elif nbytes == 1:
+        raw = raw_bytes[0]
+        if '_D16' in opn:
+          val16 = (ctypes.c_int8(raw).value & 0xFFFF) if signed else (raw & 0xFFFF)
+          _write_data(data_reg, lane, ((val16 << 16) if d16_hi else val16) & MASK32)
+        else:
+          _write_data(data_reg, lane, (ctypes.c_int8(raw).value if signed else raw) & MASK32)
+      elif nbytes == 2:
+        raw = raw_bytes[0] | (raw_bytes[1] << 8)
+        if '_D16' in opn:
+          _write_data(data_reg, lane, ((raw << 16) if d16_hi else raw) & MASK32)
+        else:
+          _write_data(data_reg, lane, (ctypes.c_int16(raw).value if signed else raw) & MASK32)
+      else:
+        raw = raw_bytes[0] | (raw_bytes[1] << 8) | (raw_bytes[2] << 16) | (raw_bytes[3] << 24)
+        _write_data(data_reg, lane, raw)
+
+  st.pc = st.pc + inst.size()
+  return True
+
+def _exec_cdna_global_load_python(st: WaveState, inst) -> bool:
+  if not isinstance(inst, irc.GLOBAL): return False
+  if not hasattr(inst, 'op') or not inst.op.name.startswith('GLOBAL_LOAD_'): return False
+  opn = inst.op.name
+  if opn.startswith('GLOBAL_LOAD_LDS_'): return False
+  if any(not hasattr(getattr(inst, x), 'offset') for x in ('addr', 'vdst', 'saddr')): return False
+
+  # Decode width/sign from opcode.
+  load_nbytes, load_words, signed = 0, 1, False
+  if opn in ('GLOBAL_LOAD_UBYTE', 'GLOBAL_LOAD_SBYTE', 'GLOBAL_LOAD_UBYTE_D16', 'GLOBAL_LOAD_UBYTE_D16_HI',
+             'GLOBAL_LOAD_SBYTE_D16', 'GLOBAL_LOAD_SBYTE_D16_HI'):
+    load_nbytes, signed = 1, opn.startswith('GLOBAL_LOAD_SBYTE')
+  elif opn in ('GLOBAL_LOAD_USHORT', 'GLOBAL_LOAD_SSHORT', 'GLOBAL_LOAD_SHORT_D16', 'GLOBAL_LOAD_SHORT_D16_HI'):
+    load_nbytes, signed = 2, opn in ('GLOBAL_LOAD_SSHORT',)
+  elif opn == 'GLOBAL_LOAD_DWORD':
+    load_nbytes = 4
+  elif opn == 'GLOBAL_LOAD_DWORDX2':
+    load_nbytes, load_words = 8, 2
+  elif opn == 'GLOBAL_LOAD_DWORDX3':
+    load_nbytes, load_words = 12, 3
+  elif opn == 'GLOBAL_LOAD_DWORDX4':
+    load_nbytes, load_words = 16, 4
+  else:
+    return False
+
+  addr_off, vdst_off, saddr_off = inst.addr.offset, inst.vdst.offset, inst.saddr.offset
+  if min(addr_off, vdst_off) < 256: return False
+  addr_reg, vdst_reg = addr_off - 256, vdst_off - 256
+  acc_mode = int(getattr(inst, 'acc', 0) or 0)
+
+  def _write_dst(reg: int, lane_id: int, val: int) -> None:
+    if acc_mode: st._write_accvgpr(reg, lane_id, val)
+    else: st._write_vgpr(reg, lane_id, val)
+  def _read_dst(reg: int, lane_id: int) -> int:
+    return st._read_accvgpr(reg, lane_id) if acc_mode else st._read_vgpr(reg, lane_id)
+
+  use_saddr = saddr_off < 124
+  saddr_base = (st._read_sgpr(saddr_off) | (st._read_sgpr(saddr_off + 1) << 32)) if use_saddr else 0
+
+  off_field = type(inst).offset
+  off_bits = off_field.hi - off_field.lo + 1
+  off_sign = 1 << (off_bits - 1)
+  off_mask = (1 << off_bits) - 1
+  off_raw = int(inst.offset) & off_mask
+  ioff = off_raw - (1 << off_bits) if (off_raw & off_sign) else off_raw
+
+  is_d16, load_hi = ('_D16' in opn), opn.endswith('_D16_HI')
+  exec_mask = st._read_sgpr(EXEC_LO.offset) | (st._read_sgpr(EXEC_LO.offset + 1) << 32)
+  trace = bool(getenv("MOCKGPU_TRACE_LOAD", 0))
+  loads, invalids = 0, 0
+  first = None
+
+  for lane in range(WAVE_SIZE):
+    if ((exec_mask >> lane) & 1) == 0: continue
+    if use_saddr:
+      vaddr = ctypes.c_int32(st._read_vgpr(addr_reg, lane)).value
+      addr = (saddr_base + vaddr + ioff) & 0xFFFFFFFFFFFFFFFF
+    else:
+      vaddr = st._read_vgpr(addr_reg, lane) | (st._read_vgpr(addr_reg + 1, lane) << 32)
+      addr = (vaddr + ioff) & 0xFFFFFFFFFFFFFFFF
+
+    if not _addr_in_valid_ranges(addr, load_nbytes):
+      invalids += 1
+      for wi in range(load_words): _write_dst(vdst_reg + wi, lane, 0)
+      continue
+
+    if load_words > 1:
+      for wi in range(load_words):
+        _write_dst(vdst_reg + wi, lane, ctypes.c_uint32.from_address(addr + wi * 4).value)
+      if first is None: first = (lane, addr, _read_dst(vdst_reg, lane))
+      loads += 1
+      continue
+
+    if load_nbytes == 1:
+      raw = ctypes.c_uint8.from_address(addr).value
+      if is_d16:
+        val16 = (ctypes.c_int8(raw).value & 0xFFFF) if signed else (raw & 0xFFFF)
+        _write_dst(vdst_reg, lane, ((val16 << 16) if load_hi else val16) & MASK32)
+      else:
+        val = ctypes.c_int8(raw).value if signed else raw
+        _write_dst(vdst_reg, lane, val & MASK32)
+      if first is None: first = (lane, addr, _read_dst(vdst_reg, lane))
+      loads += 1
+    elif load_nbytes == 2:
+      raw = ctypes.c_uint16.from_address(addr).value
+      if is_d16:
+        val16 = raw & 0xFFFF
+        _write_dst(vdst_reg, lane, ((val16 << 16) if load_hi else val16) & MASK32)
+      else:
+        val = ctypes.c_int16(raw).value if signed else raw
+        _write_dst(vdst_reg, lane, val & MASK32)
+      if first is None: first = (lane, addr, _read_dst(vdst_reg, lane))
+      loads += 1
+    else:
+      _write_dst(vdst_reg, lane, ctypes.c_uint32.from_address(addr).value)
+      if first is None: first = (lane, addr, _read_dst(vdst_reg, lane))
+      loads += 1
+
+  if trace:
+    print(f"[emu-gload] {opn} loads={loads} invalid={invalids} saddr={saddr_off} addr={addr_off} vdst={vdst_off} acc={acc_mode} off={inst.offset}", flush=True)
+    if first is not None: print(f"[emu-gload] first lane={first[0]} addr=0x{first[1]:x} val=0x{int(first[2]):x}", flush=True)
+
+  st.pc = st.pc + inst.size()
+  return True
+
+def _exec_cdna_global_store_python(st: WaveState, inst) -> bool:
+  if not isinstance(inst, irc.GLOBAL): return False
+  if not hasattr(inst, 'op') or not inst.op.name.startswith('GLOBAL_STORE_'): return False
+  if any(not hasattr(getattr(inst, x), 'offset') for x in ('addr', 'data', 'saddr')): return False
+
+  opn = inst.op.name
+  store_nbytes = 0
+  store_words = 1
+  if opn in ('GLOBAL_STORE_BYTE', 'GLOBAL_STORE_BYTE_D16_HI'): store_nbytes = 1
+  elif opn in ('GLOBAL_STORE_SHORT', 'GLOBAL_STORE_SHORT_D16_HI'): store_nbytes = 2
+  elif opn == 'GLOBAL_STORE_DWORD': store_nbytes = 4
+  elif opn == 'GLOBAL_STORE_DWORDX2': store_nbytes, store_words = 8, 2
+  elif opn == 'GLOBAL_STORE_DWORDX3': store_nbytes, store_words = 12, 3
+  elif opn == 'GLOBAL_STORE_DWORDX4': store_nbytes, store_words = 16, 4
+  else: return False
+
+  addr_off, data_off, saddr_off = inst.addr.offset, inst.data.offset, inst.saddr.offset
+  if min(addr_off, data_off) < 256: return False
+  addr_reg, data_reg = addr_off - 256, data_off - 256
+  acc_mode = int(getattr(inst, 'acc', 0) or 0)
+
+  def _read_data(reg: int, lane_id: int) -> int:
+    return st._read_accvgpr(reg, lane_id) if acc_mode else st._read_vgpr(reg, lane_id)
+
+  # GLOBAL address semantics: when saddr is valid, VADDR_LO is treated as 32-bit offset added to saddr base.
+  use_saddr = saddr_off < 124
+  saddr_base = (st._read_sgpr(saddr_off) | (st._read_sgpr(saddr_off + 1) << 32)) if use_saddr else 0
+  # Sign-extend ioffset using the instruction field width.
+  off_field = type(inst).offset
+  off_bits = off_field.hi - off_field.lo + 1
+  off_sign = 1 << (off_bits - 1)
+  off_mask = (1 << off_bits) - 1
+  off_raw = int(inst.offset) & off_mask
+  ioff = off_raw - (1 << off_bits) if (off_raw & off_sign) else off_raw
+  store_hi = opn.endswith('D16_HI')
+  exec_mask = st._read_sgpr(EXEC_LO.offset) | (st._read_sgpr(EXEC_LO.offset + 1) << 32)
+  trace = bool(getenv("MOCKGPU_TRACE_STORE", 0))
+
+  writes = 0
+  first = None
+  for lane in range(WAVE_SIZE):
+    if ((exec_mask >> lane) & 1) == 0: continue
+    if use_saddr:
+      vaddr = ctypes.c_int32(st._read_vgpr(addr_reg, lane)).value
+      addr = (saddr_base + vaddr + ioff) & 0xFFFFFFFFFFFFFFFF
+    else:
+      vaddr = st._read_vgpr(addr_reg, lane) | (st._read_vgpr(addr_reg + 1, lane) << 32)
+      addr = (vaddr + ioff) & 0xFFFFFFFFFFFFFFFF
+    if not _addr_in_valid_ranges(addr, store_nbytes): continue
+
+    if store_nbytes == 1:
+      data = _read_data(data_reg, lane)
+      val8 = ((data >> 8) if store_hi else data) & 0xFF
+      ctypes.c_uint8.from_address(addr).value = val8
+      if first is None: first = (lane, addr, val8)
+    elif store_nbytes == 2:
+      data = _read_data(data_reg, lane)
+      val16 = ((data >> 16) if store_hi else data) & 0xFFFF
+      ctypes.c_uint16.from_address(addr).value = val16
+      if first is None: first = (lane, addr, val16)
+    else:
+      for wi in range(store_words):
+        ctypes.c_uint32.from_address(addr + wi * 4).value = _read_data(data_reg + wi, lane)
+      if first is None: first = (lane, addr, _read_data(data_reg, lane))
+    writes += 1
+
+  if trace:
+    vdst_dbg = getattr(getattr(inst, 'vdst', None), 'offset', None)
+    print(f"[emu-gstore] pc=0x{st.pc:x} off=0x{(st.pc - _CUR_LIB_BASE):x} {opn} writes={writes} exec=0x{exec_mask:x} saddr={saddr_off} addr={addr_off} data={data_off} acc={acc_mode} "
+          f"vdst={vdst_dbg} off={inst.offset} inst={inst!r}", flush=True)
+    if first is not None: print(f"[emu-gstore] first lane={first[0]} addr=0x{first[1]:x} val=0x{int(first[2]):x}", flush=True)
+    elif writes == 0 and use_saddr:
+      raw0 = st._read_vgpr(addr_reg, 0)
+      raw1 = st._read_vgpr(addr_reg + 1, 0)
+      raw_vdst = st._read_vgpr(vdst_dbg - 256, 0) if (vdst_dbg is not None and vdst_dbg >= 256) else None
+      signed0 = ctypes.c_int32(raw0).value
+      addr_u = (saddr_base + raw0 + ioff) & 0xFFFFFFFFFFFFFFFF
+      addr_s = (saddr_base + signed0 + ioff) & 0xFFFFFFFFFFFFFFFF
+      addr_vdst = (saddr_base + (raw_vdst or 0) + ioff) & 0xFFFFFFFFFFFFFFFF if raw_vdst is not None else 0
+      addr_pair = (saddr_base + (raw0 | (raw1 << 32)) + ioff) & 0xFFFFFFFFFFFFFFFF
+      print(f"[emu-gstore] lane0 raw_lo=0x{raw0:x} raw_hi=0x{raw1:x} raw_vdst={None if raw_vdst is None else hex(raw_vdst)} signed={signed0} "
+            f"sbase=0x{saddr_base:x} addr_u=0x{addr_u:x} addr_s=0x{addr_s:x} addr_vdst=0x{addr_vdst:x} addr_pair=0x{addr_pair:x} "
+            f"sve={getattr(inst, 'sve', None)} sc0={getattr(inst, 'sc0', None)} sc1={getattr(inst, 'sc1', None)} nt={getattr(inst, 'nt', None)}",
+            flush=True)
+      lane_dump = []
+      for li in range(min(12, WAVE_SIZE)):
+        if ((exec_mask >> li) & 1) == 0: continue
+        r = st._read_vgpr(addr_reg, li)
+        rv = st._read_vgpr(vdst_dbg - 256, li) if (vdst_dbg is not None and vdst_dbg >= 256) else 0
+        lane_dump.append((li, r, rv))
+      print(f"[emu-gstore] lanes addr_reg/vdst={[(li, hex(r), hex(rv)) for li, r, rv in lane_dump]}", flush=True)
+
+  st.pc = st.pc + inst.size()
+  return True
+
+def _exec_cdna_flat_load_python(st: WaveState, inst) -> bool:
+  if not isinstance(inst, irc.FLAT): return False
+  if not hasattr(inst, 'op') or not inst.op.name.startswith('FLAT_LOAD_'): return False
+  opn = inst.op.name
+  if any(not hasattr(getattr(inst, x), 'offset') for x in ('addr', 'vdst', 'saddr')): return False
+
+  load_nbytes, load_words, signed = 0, 1, False
+  if opn in ('FLAT_LOAD_UBYTE', 'FLAT_LOAD_SBYTE', 'FLAT_LOAD_UBYTE_D16', 'FLAT_LOAD_UBYTE_D16_HI',
+             'FLAT_LOAD_SBYTE_D16', 'FLAT_LOAD_SBYTE_D16_HI'):
+    load_nbytes, signed = 1, opn.startswith('FLAT_LOAD_SBYTE')
+  elif opn in ('FLAT_LOAD_USHORT', 'FLAT_LOAD_SSHORT', 'FLAT_LOAD_SHORT_D16', 'FLAT_LOAD_SHORT_D16_HI'):
+    load_nbytes, signed = 2, opn in ('FLAT_LOAD_SSHORT',)
+  elif opn == 'FLAT_LOAD_DWORD':
+    load_nbytes = 4
+  elif opn == 'FLAT_LOAD_DWORDX2':
+    load_nbytes, load_words = 8, 2
+  elif opn == 'FLAT_LOAD_DWORDX3':
+    load_nbytes, load_words = 12, 3
+  elif opn == 'FLAT_LOAD_DWORDX4':
+    load_nbytes, load_words = 16, 4
+  else:
+    return False
+
+  addr_off, vdst_off, saddr_off = inst.addr.offset, inst.vdst.offset, inst.saddr.offset
+  if min(addr_off, vdst_off) < 256: return False
+  addr_reg, vdst_reg = addr_off - 256, vdst_off - 256
+  acc_mode = int(getattr(inst, 'acc', 0) or 0)
+
+  def _write_dst(reg: int, lane_id: int, val: int) -> None:
+    if acc_mode: st._write_accvgpr(reg, lane_id, val)
+    else: st._write_vgpr(reg, lane_id, val)
+  use_saddr = saddr_off < 124
+  saddr_base = (st._read_sgpr(saddr_off) | (st._read_sgpr(saddr_off + 1) << 32)) if use_saddr else 0
+  off_field = type(inst).offset
+  off_bits = off_field.hi - off_field.lo + 1
+  off_sign = 1 << (off_bits - 1)
+  off_mask = (1 << off_bits) - 1
+  off_raw = int(inst.offset) & off_mask
+  ioff = off_raw - (1 << off_bits) if (off_raw & off_sign) else off_raw
+  is_d16, load_hi = ('_D16' in opn), opn.endswith('_D16_HI')
+  exec_mask = st._read_sgpr(EXEC_LO.offset) | (st._read_sgpr(EXEC_LO.offset + 1) << 32)
+
+  for lane in range(WAVE_SIZE):
+    if ((exec_mask >> lane) & 1) == 0: continue
+    if use_saddr:
+      vaddr_lo_signed = ctypes.c_int32(st._read_vgpr(addr_reg, lane)).value
+      addr = (saddr_base + vaddr_lo_signed + ioff) & 0xFFFFFFFFFFFFFFFF
+    else:
+      vaddr = st._read_vgpr(addr_reg, lane) | (st._read_vgpr(addr_reg + 1, lane) << 32)
+      addr = (vaddr + ioff) & 0xFFFFFFFFFFFFFFFF
+
+    if not _addr_in_valid_ranges(addr, load_nbytes):
+      for wi in range(load_words): _write_dst(vdst_reg + wi, lane, 0)
+      continue
+
+    if load_words > 1:
+      for wi in range(load_words): _write_dst(vdst_reg + wi, lane, ctypes.c_uint32.from_address(addr + wi * 4).value)
+      continue
+
+    if load_nbytes == 1:
+      raw = ctypes.c_uint8.from_address(addr).value
+      if is_d16:
+        val16 = (ctypes.c_int8(raw).value & 0xFFFF) if signed else (raw & 0xFFFF)
+        _write_dst(vdst_reg, lane, ((val16 << 16) if load_hi else val16) & MASK32)
+      else:
+        _write_dst(vdst_reg, lane, (ctypes.c_int8(raw).value if signed else raw) & MASK32)
+    elif load_nbytes == 2:
+      raw = ctypes.c_uint16.from_address(addr).value
+      if is_d16:
+        val16 = raw & 0xFFFF
+        _write_dst(vdst_reg, lane, ((val16 << 16) if load_hi else val16) & MASK32)
+      else:
+        _write_dst(vdst_reg, lane, (ctypes.c_int16(raw).value if signed else raw) & MASK32)
+    else:
+      _write_dst(vdst_reg, lane, ctypes.c_uint32.from_address(addr).value)
+
+  st.pc = st.pc + inst.size()
+  return True
+
+def _exec_cdna_flat_store_python(st: WaveState, inst) -> bool:
+  if not isinstance(inst, irc.FLAT): return False
+  if not hasattr(inst, 'op') or not inst.op.name.startswith('FLAT_STORE_'): return False
+  if any(not hasattr(getattr(inst, x), 'offset') for x in ('addr', 'data', 'saddr')): return False
+  opn = inst.op.name
+  store_nbytes, store_words = 0, 1
+  if opn in ('FLAT_STORE_BYTE', 'FLAT_STORE_BYTE_D16_HI'): store_nbytes = 1
+  elif opn in ('FLAT_STORE_SHORT', 'FLAT_STORE_SHORT_D16_HI'): store_nbytes = 2
+  elif opn == 'FLAT_STORE_DWORD': store_nbytes = 4
+  elif opn == 'FLAT_STORE_DWORDX2': store_nbytes, store_words = 8, 2
+  elif opn == 'FLAT_STORE_DWORDX3': store_nbytes, store_words = 12, 3
+  elif opn == 'FLAT_STORE_DWORDX4': store_nbytes, store_words = 16, 4
+  else: return False
+
+  addr_off, data_off, saddr_off = inst.addr.offset, inst.data.offset, inst.saddr.offset
+  if min(addr_off, data_off) < 256: return False
+  addr_reg, data_reg = addr_off - 256, data_off - 256
+  acc_mode = int(getattr(inst, 'acc', 0) or 0)
+
+  def _read_data(reg: int, lane_id: int) -> int:
+    return st._read_accvgpr(reg, lane_id) if acc_mode else st._read_vgpr(reg, lane_id)
+  use_saddr = saddr_off < 124
+  saddr_base = (st._read_sgpr(saddr_off) | (st._read_sgpr(saddr_off + 1) << 32)) if use_saddr else 0
+  off_field = type(inst).offset
+  off_bits = off_field.hi - off_field.lo + 1
+  off_sign = 1 << (off_bits - 1)
+  off_mask = (1 << off_bits) - 1
+  off_raw = int(inst.offset) & off_mask
+  ioff = off_raw - (1 << off_bits) if (off_raw & off_sign) else off_raw
+  store_hi = opn.endswith('D16_HI')
+  exec_mask = st._read_sgpr(EXEC_LO.offset) | (st._read_sgpr(EXEC_LO.offset + 1) << 32)
+
+  for lane in range(WAVE_SIZE):
+    if ((exec_mask >> lane) & 1) == 0: continue
+    if use_saddr:
+      vaddr_lo_signed = ctypes.c_int32(st._read_vgpr(addr_reg, lane)).value
+      addr = (saddr_base + vaddr_lo_signed + ioff) & 0xFFFFFFFFFFFFFFFF
+    else:
+      vaddr = st._read_vgpr(addr_reg, lane) | (st._read_vgpr(addr_reg + 1, lane) << 32)
+      addr = (vaddr + ioff) & 0xFFFFFFFFFFFFFFFF
+    if not _addr_in_valid_ranges(addr, store_nbytes): continue
+
+    if store_nbytes == 1:
+      data = _read_data(data_reg, lane)
+      ctypes.c_uint8.from_address(addr).value = ((data >> 8) if store_hi else data) & 0xFF
+    elif store_nbytes == 2:
+      data = _read_data(data_reg, lane)
+      ctypes.c_uint16.from_address(addr).value = ((data >> 16) if store_hi else data) & 0xFFFF
+    else:
+      for wi in range(store_words):
+        ctypes.c_uint32.from_address(addr + wi * 4).value = _read_data(data_reg + wi, lane)
+
+  st.pc = st.pc + inst.size()
+  return True
+
+def _exec_cdna_pk_f32_python(st: WaveState, inst) -> bool:
+  # Prefer canonical pcode execution for packed FP32 ops; the Python fallback is
+  # kept as an opt-in debugging path.
+  if getenv("MOCKGPU_DISABLE_PK_FALLBACK", 0) or not getenv("MOCKGPU_ENABLE_PK_FALLBACK", 0): return False
+  opn = _op_name(inst)
+  base_op = opn[:-4] if opn.endswith('_E64') else opn
+  if base_op not in ('V_PK_ADD_F32', 'V_PK_MUL_F32', 'V_PK_FMA_F32', 'V_PK_MOV_B32'): return False
+  if getenv("MOCKGPU_TRACE_PK", 0):
+    tc = getattr(_exec_cdna_pk_f32_python, "_trace_cnt", 0)
+    off = st.pc - _CUR_LIB_BASE
+    if tc < 64 or 0x5800 <= off <= 0x5d00:
+      s0 = getattr(getattr(inst, 'src0', None), 'offset', None)
+      s1 = getattr(getattr(inst, 'src1', None), 'offset', None)
+      s2 = getattr(getattr(inst, 'src2', None), 'offset', None)
+      vd = getattr(getattr(inst, 'vdst', None), 'offset', None)
+      print(f"[emu-pk] off=0x{off:x} {base_op} s0={s0} s1={s1} s2={s2} vd={vd} opsel={getattr(inst, 'opsel', None)} opsel_hi={getattr(inst, 'opsel_hi', None)} "
+            f"opsel_hi2={getattr(inst, 'opsel_hi2', None)} neg={getattr(inst, 'neg', None)} neg_hi={getattr(inst, 'neg_hi', None)} inst={inst!r}",
+            flush=True)
+    setattr(_exec_cdna_pk_f32_python, "_trace_cnt", tc + 1)
+  need_src2 = (base_op == 'V_PK_FMA_F32')
+  req_fields = ('src0', 'src1', 'vdst', 'src2') if need_src2 else ('src0', 'src1', 'vdst')
+  if any(not hasattr(getattr(inst, x), 'offset') for x in req_fields): return False
+  src0_off, src1_off, vdst_off = inst.src0.offset, inst.src1.offset, inst.vdst.offset
+  src2_off = inst.src2.offset if need_src2 else 0
+  if vdst_off < 256: return False
+  vdst_reg = vdst_off - 256
+  exec_mask = st._read_sgpr(EXEC_LO.offset) | (st._read_sgpr(EXEC_LO.offset + 1) << 32)
+  opsel = int(getattr(inst, 'opsel', 0) or 0)
+  opsel_hi = int(getattr(inst, 'opsel_hi', 0) or 0)
+  opsel_hi2 = int(getattr(inst, 'opsel_hi2', 0) or 0)
+  neg = int(getattr(inst, 'neg', 0) or 0)
+  neg_hi = int(getattr(inst, 'neg_hi', 0) or 0)
+
+  def read_src32(src_off: int, lane: int, sel_hi: int) -> int:
+    if src_off >= 256: return st._read_vgpr(src_off - 256 + (1 if sel_hi else 0), lane)
+    if src_off < 255:
+      return st._read_sgpr(src_off + (1 if sel_hi else 0))
+    return st._read_sgpr(src_off)
+
+  for lane in range(WAVE_SIZE):
+    if ((exec_mask >> lane) & 1) == 0: continue
+    if base_op == 'V_PK_MOV_B32':
+      st._write_vgpr(vdst_reg, lane, read_src32(src0_off, lane, opsel & 1))
+      st._write_vgpr(vdst_reg + 1, lane, read_src32(src1_off, lane, (opsel >> 1) & 1))
+      continue
+    s0_lo = read_src32(src0_off, lane, opsel & 1)
+    s1_lo = read_src32(src1_off, lane, (opsel >> 1) & 1)
+    s0_hi = read_src32(src0_off, lane, opsel_hi & 1)
+    s1_hi = read_src32(src1_off, lane, (opsel_hi >> 1) & 1)
+    s2_lo = read_src32(src2_off, lane, (opsel >> 2) & 1) if need_src2 else 0
+    s2_hi = read_src32(src2_off, lane, 1 if opsel_hi2 else 0) if need_src2 else 0
+    if neg & 1: s0_lo ^= 0x80000000
+    if neg & 2: s1_lo ^= 0x80000000
+    if need_src2 and (neg & 4): s2_lo ^= 0x80000000
+    if neg_hi & 1: s0_hi ^= 0x80000000
+    if neg_hi & 2: s1_hi ^= 0x80000000
+    if need_src2 and (neg_hi & 4): s2_hi ^= 0x80000000
+
+    f0_lo, f1_lo = struct.unpack('<f', struct.pack('<I', s0_lo))[0], struct.unpack('<f', struct.pack('<I', s1_lo))[0]
+    f0_hi, f1_hi = struct.unpack('<f', struct.pack('<I', s0_hi))[0], struct.unpack('<f', struct.pack('<I', s1_hi))[0]
+    if base_op == 'V_PK_ADD_F32':
+      if getenv("MOCKGPU_PK_ADD_INT", 0):
+        lo = struct.unpack('<f', struct.pack('<I', (s0_lo + s1_lo) & 0xFFFFFFFF))[0]
+        hi = struct.unpack('<f', struct.pack('<I', (s0_hi + s1_hi) & 0xFFFFFFFF))[0]
+      else:
+        lo, hi = f0_lo + f1_lo, f0_hi + f1_hi
+    elif base_op == 'V_PK_MUL_F32':
+      lo, hi = f0_lo * f1_lo, f0_hi * f1_hi
+    else:
+      import numpy as np
+      f2_lo = struct.unpack('<f', struct.pack('<I', s2_lo))[0]
+      f2_hi = struct.unpack('<f', struct.pack('<I', s2_hi))[0]
+      lo = float(np.float32(np.float32(f0_lo) * np.float32(f1_lo) + np.float32(f2_lo)))
+      hi = float(np.float32(np.float32(f0_hi) * np.float32(f1_hi) + np.float32(f2_hi)))
+    st._write_vgpr(vdst_reg, lane, struct.unpack('<I', struct.pack('<f', lo))[0])
+    st._write_vgpr(vdst_reg + 1, lane, struct.unpack('<I', struct.pack('<f', hi))[0])
+
+  st.pc = st.pc + inst.size()
+  return True
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # EXECUTION
@@ -1593,9 +2283,17 @@ def _init_wave(lib: int, wave_start: int, total_threads: int, lx: int, ly: int, 
   return st
 
 def run_asm(lib: int, lib_sz: int, gx: int, gy: int, gz: int, lx: int, ly: int, lz: int, args_ptr: int, rsrc2: int = 0x19c,
-            scratch_size: int = 0, arch: str = "rdna3", user_data: list[int]|None = None) -> int:
+            scratch_size: int = 0, arch: str = "rdna3", user_data: list[int]|None = None,
+            valid_mem_ranges: set[tuple[int, int]]|None = None) -> int:
   """Execute AMD assembly program. scratch_size is private_segment_fixed_size from kernel descriptor (per-lane)."""
   from tinygrad.renderer.amd.dsl import Inst
+  global _VALID_MEM_RANGES, _CUR_LIB_BASE, _SCRATCH_BASE_PTR, _SCRATCH_TOTAL_BYTES
+  _CUR_LIB_BASE = lib
+  new_ranges = tuple(sorted(valid_mem_ranges)) if valid_mem_ranges is not None else tuple()
+  if new_ranges != _VALID_MEM_RANGES:
+    _VALID_MEM_RANGES = new_ranges
+    _canonical_runner_cache.clear()
+    _get_runner.cache_clear()
   program: dict[int, tuple[Callable, list[int], bool, Inst]] = {}  # pc -> (fxn, globals, is_barrier, inst)
   lds_size = ((rsrc2 & hsa.AMD_COMPUTE_PGM_RSRC_TWO_GRANULATED_LDS_SIZE) >> hsa.AMD_COMPUTE_PGM_RSRC_TWO_GRANULATED_LDS_SIZE_SHIFT) * 512
   total_threads = lx * ly * lz
@@ -1603,11 +2301,31 @@ def run_asm(lib: int, lib_sz: int, gx: int, gy: int, gz: int, lx: int, ly: int, 
   # Use Buffer objects with external_ptr=0 for vmem
   vmem_buf = Buffer('CPU', 1 << 40, dtypes.uint32, options=BufferSpec(external_ptr=0)).ensure_allocated()
   lds_buf = Buffer('CPU', max(lds_size // 4, 1), dtypes.uint32).ensure_allocated()
-  scratch_buf = Buffer('CPU', scratch_size * total_threads, dtypes.uint8).ensure_allocated() if scratch_size else None
+  num_waves = (total_threads + WAVE_SIZE - 1) // WAVE_SIZE
+  scratch_wave_bytes = scratch_size * WAVE_SIZE
+  scratch_total_bytes = scratch_wave_bytes * num_waves
+  scratch_buf = Buffer('CPU', scratch_total_bytes, dtypes.uint8).ensure_allocated() if scratch_size else None
+  if scratch_buf is not None and scratch_total_bytes > 0:
+    ctypes.memset(scratch_buf._buf.va_addr, 0, scratch_total_bytes)
+  _SCRATCH_BASE_PTR = scratch_buf._buf.va_addr if scratch_buf is not None else 0
+  _SCRATCH_TOTAL_BYTES = scratch_total_bytes if scratch_buf is not None else 0
 
   # Initialize SQTT encoder — emits packets inline as instructions execute (only when profiling)
   if PROFILE:
     sqtt_emit, sqtt_finish, sqtt_finalize = _init_sqtt_encoder()
+  trace_reg = int(getenv("MOCKGPU_TRACE_REG", -1))
+  trace_lane = int(getenv("MOCKGPU_TRACE_LANE", 0))
+  trace_off_lo = int(getenv("MOCKGPU_TRACE_OFF_LO", 0))
+  trace_off_hi = int(getenv("MOCKGPU_TRACE_OFF_HI", 0x7FFFFFFF))
+
+  def _trace_reg_change(st: WaveState, pc0: int, inst, before: int):
+    if trace_reg < 0: return
+    if trace_lane < 0 or trace_lane >= WAVE_SIZE: return
+    after = st._read_vgpr(trace_reg, trace_lane)
+    off0 = pc0 - lib
+    if after != before and trace_off_lo <= off0 <= trace_off_hi:
+      opn = getattr(getattr(inst, 'op', None), 'name', type(inst).__name__)
+      print(f"[emu-reg] lane={trace_lane} off=0x{off0:x} reg=v[{trace_reg}] 0x{before:x}->0x{after:x} op={opn} inst={inst!r}", flush=True)
 
   def _ensure_compiled(pc: int) -> tuple[Callable, list[int], bool, Inst]:
     if pc not in program:
@@ -1620,6 +2338,16 @@ def run_asm(lib: int, lib_sz: int, gx: int, gy: int, gz: int, lx: int, ly: int, 
         print(colored(msg, 'green') if len(_canonical_runner_cache) > prev_len else msg)
     return program[pc]
 
+  disable_cdna_mem_fallback = bool(getenv("MOCKGPU_DISABLE_CDNA_MEM_FALLBACK", 0))
+
+  def _trace_div_state(st: WaveState, inst) -> None:
+    if not getenv("MOCKGPU_TRACE_DIV", 0): return
+    opn = getattr(getattr(inst, 'op', None), 'name', '')
+    if 'DIV_SCALE_F32' not in opn and 'DIV_FMAS_F32' not in opn and 'DIV_FIXUP_F32' not in opn: return
+    vcc = st._read_sgpr(VCC_LO.offset) | (st._read_sgpr(VCC_LO.offset + 1) << 32)
+    s2 = st._read_sgpr(2) | (st._read_sgpr(3) << 32)
+    print(f"[emu-div] {opn} vcc=0x{vcc:x} s2=0x{s2:x}", flush=True)
+
   # Set DAZ+FTZ during emulator execution, restore afterward to avoid breaking hypothesis tests
   # Only trace the first workgroup (like real HW traces one CU/SIMD), subsequent workgroups run but don't add to trace
   tracing = bool(PROFILE)
@@ -1630,8 +2358,9 @@ def run_asm(lib: int, lib_sz: int, gx: int, gy: int, gz: int, lx: int, ly: int, 
           # Initialize all wavefronts for this workgroup
           waves: list[tuple[WaveState, list]] = []
           for wave_start in range(0, total_threads, WAVE_SIZE):
+            wave_id = wave_start // WAVE_SIZE
             st = _init_wave(lib, wave_start, total_threads, lx, ly, lz, args_ptr, rsrc2, scratch_size,
-                            wave_start * scratch_size, arch, gidx, gidy, gidz, user_data)
+                            wave_id * scratch_wave_bytes, arch, gidx, gidy, gidz, user_data)
             c_bufs = [ctypes.c_uint64(st.sgpr_buf._buf.va_addr), ctypes.c_uint64(st.vgpr_buf._buf.va_addr),
                       ctypes.c_uint64(vmem_buf._buf.va_addr), ctypes.c_uint64(lds_buf._buf.va_addr),
                       ctypes.c_uint64(scratch_buf._buf.va_addr if scratch_buf else 0)]
@@ -1647,12 +2376,76 @@ def run_asm(lib: int, lib_sz: int, gx: int, gy: int, gz: int, lx: int, ly: int, 
               # Run this wave until barrier or endpgm
               for _ in range(1_000_000):
                 pc = st.pc
+                reg_before = st._read_vgpr(trace_reg, trace_lane) if (trace_reg >= 0 and 0 <= trace_lane < WAVE_SIZE) else 0
                 if pc == ENDPGM_PC:
                   done[wi] = True
                   if tracing: sqtt_finish(wi)
                   break
+                inst = decode_inst(bytes((ctypes.c_char * 16).from_address(pc).raw), arch)
+                if getenv("MOCKGPU_TRACE_INST", 0): print(f"[emu-pre] pc={pc-lib:06x} op={inst.op.name if hasattr(inst, 'op') else type(inst).__name__}", flush=True)
+                if hasattr(inst, 'op') and 'GLOBAL_STORE' in inst.op.name and getenv("MOCKGPU_TRACE_INST", 0):
+                  print(f"[emu-inst] {inst!r}", flush=True)
+                if _exec_cdna_accvgpr_python(st, inst):
+                  _trace_reg_change(st, pc, inst, reg_before)
+                  _trace_div_state(st, inst)
+                  if tracing:
+                    inst_op = inst.op.value if hasattr(inst, 'op') else 0
+                    sqtt_emit(wi, inst, (st.pc != ENDPGM_PC and st.pc != pc + inst.size()) if inst_op in _BRANCH_OPS else None)
+                  continue
+                if not disable_cdna_mem_fallback and _exec_cdna_scratch_load_store_python(st, inst):
+                  _trace_reg_change(st, pc, inst, reg_before)
+                  _trace_div_state(st, inst)
+                  if tracing:
+                    inst_op = inst.op.value if hasattr(inst, 'op') else 0
+                    sqtt_emit(wi, inst, (st.pc != ENDPGM_PC and st.pc != pc + inst.size()) if inst_op in _BRANCH_OPS else None)
+                  continue
+                if not disable_cdna_mem_fallback and _exec_cdna_flat_load_python(st, inst):
+                  _trace_reg_change(st, pc, inst, reg_before)
+                  _trace_div_state(st, inst)
+                  if tracing:
+                    inst_op = inst.op.value if hasattr(inst, 'op') else 0
+                    sqtt_emit(wi, inst, (st.pc != ENDPGM_PC and st.pc != pc + inst.size()) if inst_op in _BRANCH_OPS else None)
+                  continue
+                if not disable_cdna_mem_fallback and _exec_cdna_flat_store_python(st, inst):
+                  _trace_reg_change(st, pc, inst, reg_before)
+                  _trace_div_state(st, inst)
+                  if tracing:
+                    inst_op = inst.op.value if hasattr(inst, 'op') else 0
+                    sqtt_emit(wi, inst, (st.pc != ENDPGM_PC and st.pc != pc + inst.size()) if inst_op in _BRANCH_OPS else None)
+                  continue
+                if not disable_cdna_mem_fallback and _exec_cdna_global_load_python(st, inst):
+                  _trace_reg_change(st, pc, inst, reg_before)
+                  _trace_div_state(st, inst)
+                  if tracing:
+                    inst_op = inst.op.value if hasattr(inst, 'op') else 0
+                    sqtt_emit(wi, inst, (st.pc != ENDPGM_PC and st.pc != pc + inst.size()) if inst_op in _BRANCH_OPS else None)
+                  continue
+                if not disable_cdna_mem_fallback and _exec_cdna_global_store_python(st, inst):
+                  _trace_reg_change(st, pc, inst, reg_before)
+                  _trace_div_state(st, inst)
+                  if tracing:
+                    inst_op = inst.op.value if hasattr(inst, 'op') else 0
+                    sqtt_emit(wi, inst, (st.pc != ENDPGM_PC and st.pc != pc + inst.size()) if inst_op in _BRANCH_OPS else None)
+                  continue
+                if _exec_cdna_pk_f32_python(st, inst):
+                  _trace_reg_change(st, pc, inst, reg_before)
+                  _trace_div_state(st, inst)
+                  if tracing:
+                    inst_op = inst.op.value if hasattr(inst, 'op') else 0
+                    sqtt_emit(wi, inst, (st.pc != ENDPGM_PC and st.pc != pc + inst.size()) if inst_op in _BRANCH_OPS else None)
+                  continue
+                if _exec_cdna_mfma_python(st, inst):
+                  _trace_reg_change(st, pc, inst, reg_before)
+                  _trace_div_state(st, inst)
+                  if tracing:
+                    inst_op = inst.op.value if hasattr(inst, 'op') else 0
+                    sqtt_emit(wi, inst, (st.pc != ENDPGM_PC and st.pc != pc + inst.size()) if inst_op in _BRANCH_OPS else None)
+                  continue
                 fxn, globals_list, is_barrier, inst = _ensure_compiled(pc)
+                if getenv("MOCKGPU_TRACE_INST", 0): print(f"[emu-exec] pc={pc-lib:06x}", flush=True)
                 fxn(*[c_bufs[g] for g in globals_list])
+                _trace_reg_change(st, pc, inst, reg_before)
+                _trace_div_state(st, inst)
                 if tracing:
                   inst_op = inst.op.value if hasattr(inst, 'op') else 0
                   sqtt_emit(wi, inst, (st.pc != ENDPGM_PC and st.pc != pc + inst.size()) if inst_op in _BRANCH_OPS else None)
