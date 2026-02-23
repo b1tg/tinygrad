@@ -1241,7 +1241,14 @@ def parse_block(lines: list[str], start: int, env: dict[str, VarVal], funcs: dic
         else_assigns = else_branch[1]
         all_vars = set().union(*[ba.keys() for _, ba in conditions if isinstance(ba, dict)], else_assigns.keys())
         for var in all_vars:
-          base: Any = block_assigns.get(var, env.get(var, _u32(0)))
+          base: Any = block_assigns.get(var, env.get(var))
+          if base is None:
+            # If this variable is introduced inside branches (common for declared arrays),
+            # infer type from branch values instead of defaulting to u32.
+            inferred: Any = else_assigns.get(var)
+            if inferred is None:
+              inferred = next((ba[var] for _, ba in conditions if isinstance(ba, dict) and var in ba), None)
+            base = inferred if inferred is not None else _u32(0)
           res: Any = else_assigns.get(var, base)
           for cond, ba in reversed(conditions):  # type: ignore[assignment]
             if isinstance(ba, dict) and var in ba:

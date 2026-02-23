@@ -1200,10 +1200,14 @@ def _compile_vop3p(inst: ir3.VOP3P | ir4.VOP3P | irc.VOP3P, ctx: _Ctx) -> UOp:
     return UOp.sink(UOp.group(ctx.wvgpr_dyn(vdst_reg, lane, _to_u32(src0), exec_mask)).end(lane), *ctx.inc_pc())
   is_pk_mov_b32 = 'PK_MOV_B32' in op_name
   is_pk_f32 = 'PK' in op_name and 'F32' in op_name and 'MOV' not in op_name  # CDNA packed F32 ops
-  do_cast = any(x in op_name for x in ('F16', 'F32', 'BF16')) and 'IU' not in op_name and not is_pk_f32 and not is_pk_mov_b32
-  src0 = ctx.rsrc_dyn(ctx.inst_field(type(inst).src0), lane, 16, do_cast=do_cast)
-  src1 = ctx.rsrc_dyn(ctx.inst_field(type(inst).src1), lane, 16, do_cast=do_cast)
-  src2 = ctx.rsrc_dyn(ctx.inst_field(type(inst).src2), lane, 16, do_cast=do_cast)
+  is_fma_mix = 'FMA_MIX' in op_name
+  # FMA_MIX pcodes expect full 32-bit source bit patterns (S[i].f32 or S[i][15:0]/[31:16].f16).
+  # Reading 16-bit here truncates sources and breaks transcendental polynomial kernels.
+  src_bits = 32 if is_fma_mix else 16
+  do_cast = any(x in op_name for x in ('F16', 'F32', 'BF16')) and 'IU' not in op_name and not is_pk_f32 and not is_pk_mov_b32 and not is_fma_mix
+  src0 = ctx.rsrc_dyn(ctx.inst_field(type(inst).src0), lane, src_bits, do_cast=do_cast)
+  src1 = ctx.rsrc_dyn(ctx.inst_field(type(inst).src1), lane, src_bits, do_cast=do_cast)
+  src2 = ctx.rsrc_dyn(ctx.inst_field(type(inst).src2), lane, src_bits, do_cast=do_cast)
   opsel, opsel_hi = getattr(inst, 'opsel', 0) or 0, getattr(inst, 'opsel_hi', 3) if getattr(inst, 'opsel_hi', 3) is not None else 3
   opsel_hi2 = getattr(inst, 'opsel_hi2', 1) if getattr(inst, 'opsel_hi2', 1) is not None else 1
   neg, neg_hi = getattr(inst, 'neg', 0) or 0, getattr(inst, 'neg_hi', 0) or 0
@@ -1251,7 +1255,7 @@ def _compile_vop3p(inst: ir3.VOP3P | ir4.VOP3P | irc.VOP3P, ctx: _Ctx) -> UOp:
     srcs = {'S0': build_pk_f32(src0, src_offs[0], opsel & 1, opsel_hi & 1, neg & 1, neg_hi & 1),
             'S1': build_pk_f32(src1, src_offs[1], opsel & 2, opsel_hi & 2, neg & 2, neg_hi & 2),
             'S2': build_pk_f32(src2, src_offs[2], opsel & 4, 1 if opsel_hi2 else 0, neg & 4, neg_hi & 4)}
-  elif 'FMA_MIX' in op_name:
+  elif is_fma_mix:
     combined_opsel_hi = (opsel_hi & 0x3) | ((opsel_hi2 & 0x1) << 2)
     # For FMA_MIX: neg_hi is ABS (not neg!), neg is actual negation
     def apply_abs(v, bit, opsel_hi_bit, opsel_bit):
