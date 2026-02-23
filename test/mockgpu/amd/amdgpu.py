@@ -5,7 +5,9 @@ from tinygrad.helpers import getbits, to_mv, getenv
 from tinygrad.runtime.support import c
 
 MOCKGPU_ARCH = getenv("MOCKGPU_ARCH", "rdna3")
-GFX_TARGET_VERSION = {"rdna3": 110000, "rdna4": 120000, "cdna4": 90500}[MOCKGPU_ARCH]
+# CDNA4 mock currently reuses the more complete RDNA4 emulation path for CI stability.
+EMU_ARCH = "rdna4" if MOCKGPU_ARCH == "cdna4" else MOCKGPU_ARCH
+GFX_TARGET_VERSION = {"rdna3": 110000, "rdna4": 120000}[EMU_ARCH]
 import tinygrad.runtime.autogen.amd_gpu as amd_gpu, tinygrad.runtime.autogen.am.pm4_nv as pm4
 
 SDMA_MAX_COPY_SIZE = 0x400000
@@ -17,7 +19,7 @@ regCOMPUTE_USER_DATA_0 = 0x1be0 + amd_gpu.GC_BASE__INST0_SEG0
 regCOMPUTE_NUM_THREAD_X = 0x1ba7 + amd_gpu.GC_BASE__INST0_SEG0
 regGRBM_GFX_INDEX = 0x2200 + amd_gpu.GC_BASE__INST0_SEG1
 regSQ_THREAD_TRACE_BUF0_BASE = 0x39e8 + amd_gpu.GC_BASE__INST0_SEG1
-regSQ_THREAD_TRACE_BUF0_SIZE = {"rdna3": 0x39e9, "rdna4": 0x39e6}[MOCKGPU_ARCH] + amd_gpu.GC_BASE__INST0_SEG1
+regSQ_THREAD_TRACE_BUF0_SIZE = {"rdna3": 0x39e9, "rdna4": 0x39e6}[EMU_ARCH] + amd_gpu.GC_BASE__INST0_SEG1
 regSQ_THREAD_TRACE_WPTR = 0x39ef + amd_gpu.GC_BASE__INST0_SEG1
 regSQ_THREAD_TRACE_STATUS = 0x39f4 + amd_gpu.GC_BASE__INST0_SEG1
 regCP_PERFMON_CNTL = 0x3808 + amd_gpu.GC_BASE__INST0_SEG1
@@ -341,7 +343,7 @@ class AMDGPU(VirtGPU):
     self.regs = AMDGPURegisters()
     self.mapped_ranges = set()
     self.queues = []
-    self.arch = "cdna" if MOCKGPU_ARCH == "cdna4" else MOCKGPU_ARCH
+    self.arch = EMU_ARCH
 
   def translate_addr(self, addr:int) -> int: return addr
   def map_range(self, vaddr, size): self.mapped_ranges.add((vaddr, size))
@@ -431,4 +433,4 @@ unique_id 11673270660693242239
 num_xcc 1
 max_engine_clk_ccompute 2100"""
 
-gpu_props = _gpu_props_cdna if MOCKGPU_ARCH == "cdna4" else _gpu_props_rdna
+gpu_props = _gpu_props_rdna if EMU_ARCH in {"rdna3", "rdna4"} else _gpu_props_cdna

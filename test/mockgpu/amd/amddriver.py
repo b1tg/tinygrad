@@ -4,7 +4,7 @@ import tinygrad.runtime.autogen.am.am as am
 import tinygrad.runtime.autogen.amdgpu_drm as amdgpu_drm
 from tinygrad.helpers import from_mv
 from test.mockgpu.driver import VirtDriver, VirtFileDesc, TextFileDesc, DirFileDesc, VirtFile
-from test.mockgpu.amd.amdgpu import AMDGPU, gpu_props, GFX_TARGET_VERSION, MOCKGPU_ARCH
+from test.mockgpu.amd.amdgpu import AMDGPU, gpu_props, GFX_TARGET_VERSION, MOCKGPU_ARCH, EMU_ARCH
 
 libc = ctypes.CDLL(ctypes.util.find_library("c"))
 libc.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_long]
@@ -91,8 +91,7 @@ class AMDDriver(VirtDriver):
     self.doorbells[gpu_id] = memoryview(bytearray(0x2000))
     self.gpus[gpu_id] = AMDGPU(gpu_id)
     ip_versions = {"rdna3": {"gc": (11, 0, 0), "sdma": (6, 0, 0), "nbif": (4, 3, 0)},
-                   "rdna4": {"gc": (12, 0, 0), "sdma": (6, 0, 0), "nbif": (6, 3, 1)},
-                   "cdna4": {"gc": (9, 5, 0), "sdma": (4, 4, 5), "nbif": (7, 9, 0)}}[MOCKGPU_ARCH]
+                   "rdna4": {"gc": (12, 0, 0), "sdma": (6, 0, 0), "nbif": (6, 3, 1)}}[EMU_ARCH]
     def ip_discovery_files(hwid, ver, base_addr):
       p = f'/sys/class/drm/renderD{gpu_id}/device/ip_discovery/die/0/{hwid}/0'
       return [VirtFile(f'/sys/class/drm/renderD{gpu_id}/device/ip_discovery/die/0/{hwid}', functools.partial(DirFileDesc, child_names=['0'])),

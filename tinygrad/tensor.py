@@ -2113,6 +2113,7 @@ class Tensor(OpMixin):
     print(t.argmax(axis=1).numpy()) # Returns the indices of the maximum values along axis 1.
     ```
     """
+    if self.dtype == dtypes.bool: return self.cast(dtypes.int32).realize().argmax(axis=axis, keepdim=keepdim)
     if axis is None: return self.flatten().argmax(0)
     axis = self._resolve_dim(axis)
     m = self == self.max(axis=axis, keepdim=True)
