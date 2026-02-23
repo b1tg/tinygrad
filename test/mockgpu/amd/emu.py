@@ -232,7 +232,11 @@ VOPD_TO_VOP2 = {
   ir4.VOPDOp.V_DUAL_FMAAK_F32: ir3.VOP2Op.V_FMAAK_F32_E32, ir4.VOPDOp.V_DUAL_FMAMK_F32: ir3.VOP2Op.V_FMAMK_F32_E32,
 }
 emu_arch = str(getenv("MOCKGPU_EMU_ARCH", getenv("MOCKGPU_ARCH", "")))
-WAVE_SIZE = int(getenv("MOCKGPU_WAVE_SIZE", 64 if emu_arch == "cdna" else 32))
+def _normalize_isa_arch(arch: str) -> str:
+  return "cdna" if arch == "cdna4" else arch
+def _is_cdna_arch(arch: str) -> bool:
+  return _normalize_isa_arch(arch) == "cdna"
+WAVE_SIZE = int(getenv("MOCKGPU_WAVE_SIZE", 64 if _is_cdna_arch(emu_arch) else 32))
 ENFORCE_MEM_RANGES = bool(getenv("MOCKGPU_ENFORCE_MEM_RANGES", 0))
 # Special registers stored after inline constants (256-260)
 PC_LO_IDX, PC_HI_IDX, SCRATCH_STRIDE_IDX, SCRATCH_BASE_IDX = 256, 257, 259, 260
@@ -1545,10 +1549,10 @@ _SCRATCH_TOTAL_BYTES: int = 0
 @functools.cache
 def _get_runner(inst_bytes: bytes, arch: str = "rdna3"):
   """Build and compile instruction to CompiledRunner. Cached by instruction bytes, with canonical dedup."""
-  inst = decode_inst(inst_bytes, arch)
+  inst = decode_inst(inst_bytes, _normalize_isa_arch(arch))
   inst_size = inst.size()
   inst_int = int.from_bytes(inst_bytes[:inst_size], 'little')
-  use_canonical_dedup = arch != "cdna"
+  use_canonical_dedup = not _is_cdna_arch(arch)
 
   # Check if instruction matches any cached canonical pattern
   if use_canonical_dedup:
@@ -1575,7 +1579,7 @@ def _get_runner(inst_bytes: bytes, arch: str = "rdna3"):
   sink = sink.replace(arg=KernelInfo(name=canonical_name)).rtag(1)
 
   # NOTE: renderer output is not reproducible because of _MXCSRContext. PROFILE=0 prevents emulator instruction runners from polluting profiling.
-  check_oob = int(getenv("MOCKGPU_CDNA_CHECK_OOB", 1 if arch == "cdna" else 0))
+  check_oob = int(getenv("MOCKGPU_CDNA_CHECK_OOB", 1 if _is_cdna_arch(arch) else 0))
   with Context(NOOPT=1, CHECK_OOB=check_oob, TUPLE_ORDER=0, EMULATED_DTYPES="", CAPTURE_PROCESS_REPLAY=0, PROFILE=0):
     runner = get_runner('CPU', sink)
   if use_canonical_dedup: _canonical_runner_cache.append((base, mask, size, runner))
@@ -1589,7 +1593,7 @@ _BRANCH_OPS: set[int] = {op.value for op in (ir3.SOPPOp.S_BRANCH, ir3.SOPPOp.S_C
 def _decode_at(pc: int, arch: str):
   """Decode and compile instruction at absolute address pc. Returns (runner, decoded_inst)."""
   inst_bytes = bytes((ctypes.c_char * 16).from_address(pc).raw)
-  inst = decode_inst(inst_bytes, arch)
+  inst = decode_inst(inst_bytes, _normalize_isa_arch(arch))
   try: return _get_runner(bytes(inst_bytes[:inst.size() + 4]), arch), inst
   except Exception as e:
     try: inst_str = repr(inst)
@@ -1886,7 +1890,7 @@ _MEM_LOAD_SPECS: dict[str, tuple[int, int, bool, bool, bool]] = {
   'UBYTE_D16': (1, 1, False, True, False), 'UBYTE_D16_HI': (1, 1, False, True, True),
   'SBYTE_D16': (1, 1, True, True, False), 'SBYTE_D16_HI': (1, 1, True, True, True),
   'SHORT_D16': (2, 1, False, True, False), 'SHORT_D16_HI': (2, 1, False, True, True),
-  # rdna4 naming used by MOCKGPU_ARCH=cdna4 path (EMU_ARCH=rdna4)
+  # RDNA4 naming variants seen in mixed codegen paths.
   'U8': (1, 1, False, False, False), 'I8': (1, 1, True, False, False),
   'U16': (2, 1, False, False, False), 'I16': (2, 1, True, False, False),
   'B32': (4, 1, False, False, False), 'B64': (8, 2, False, False, False),
@@ -1900,7 +1904,7 @@ _MEM_STORE_SPECS: dict[str, tuple[int, int, bool]] = {
   'BYTE': (1, 1, False), 'BYTE_D16_HI': (1, 1, True),
   'SHORT': (2, 1, False), 'SHORT_D16_HI': (2, 1, True),
   'DWORD': (4, 1, False), 'DWORDX2': (8, 2, False), 'DWORDX3': (12, 3, False), 'DWORDX4': (16, 4, False),
-  # rdna4 naming used by MOCKGPU_ARCH=cdna4 path (EMU_ARCH=rdna4)
+  # RDNA4 naming variants seen in mixed codegen paths.
   'B8': (1, 1, False), 'B16': (2, 1, False), 'B32': (4, 1, False), 'B64': (8, 2, False), 'B96': (12, 3, False), 'B128': (16, 4, False),
   'D16_HI_B8': (1, 1, True), 'D16_HI_B16': (2, 1, True),
 }
@@ -2446,7 +2450,7 @@ def run_asm(lib: int, lib_sz: int, gx: int, gy: int, gz: int, lx: int, ly: int, 
                   done[wi] = True
                   if tracing: sqtt_finish(wi)
                   break
-                inst = decode_inst(bytes((ctypes.c_char * 16).from_address(pc).raw), arch)
+                inst = decode_inst(bytes((ctypes.c_char * 16).from_address(pc).raw), _normalize_isa_arch(arch))
                 if getenv("MOCKGPU_TRACE_INST", 0): print(f"[emu-pre] pc={pc-lib:06x} op={inst.op.name if hasattr(inst, 'op') else type(inst).__name__}", flush=True)
                 if hasattr(inst, 'op') and 'GLOBAL_STORE' in inst.op.name and getenv("MOCKGPU_TRACE_INST", 0):
                   print(f"[emu-inst] {inst!r}", flush=True)

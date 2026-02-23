@@ -90,8 +90,12 @@ class AMDDriver(VirtDriver):
   def _prepare_gpu(self, gpu_id):
     self.doorbells[gpu_id] = memoryview(bytearray(0x2000))
     self.gpus[gpu_id] = AMDGPU(gpu_id)
-    ip_versions = {"rdna3": {"gc": (11, 0, 0), "sdma": (6, 0, 0), "nbif": (4, 3, 0)},
-                   "rdna4": {"gc": (12, 0, 0), "sdma": (6, 0, 0), "nbif": (6, 3, 1)}}[EMU_ARCH]
+    ip_versions = {
+      "rdna3": {"gc": (11, 0, 0), "sdma": (6, 0, 0), "nbif": (4, 3, 0)},
+      "rdna4": {"gc": (12, 0, 0), "sdma": (6, 0, 0), "nbif": (6, 3, 1)},
+      "cdna4": {"gc": (9, 5, 0), "sdma": (6, 0, 0), "nbif": (6, 3, 1)},
+      "cdna": {"gc": (9, 5, 0), "sdma": (6, 0, 0), "nbif": (6, 3, 1)},
+    }[EMU_ARCH]
     def ip_discovery_files(hwid, ver, base_addr):
       p = f'/sys/class/drm/renderD{gpu_id}/device/ip_discovery/die/0/{hwid}/0'
       return [VirtFile(f'/sys/class/drm/renderD{gpu_id}/device/ip_discovery/die/0/{hwid}', functools.partial(DirFileDesc, child_names=['0'])),
