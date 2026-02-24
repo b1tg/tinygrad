@@ -7,7 +7,9 @@ from tinygrad.runtime.support import c
 MOCKGPU_ARCH = getenv("MOCKGPU_ARCH", "rdna3")
 EMU_ARCH = MOCKGPU_ARCH
 os.environ["MOCKGPU_EMU_ARCH"] = EMU_ARCH
-GFX_TARGET_VERSION = {"rdna3": 110000, "rdna4": 120000, "cdna4": 95000, "cdna": 95000}[EMU_ARCH]
+# gfx_target_version encoding is major*10000 + minor*100 + stepping.
+# CDNA4 (gfx950) => (9, 5, 0) => 90500.
+GFX_TARGET_VERSION = {"rdna3": 110000, "rdna4": 120000, "cdna4": 90500, "cdna": 90500}[EMU_ARCH]
 import tinygrad.runtime.autogen.amd_gpu as amd_gpu, tinygrad.runtime.autogen.am.pm4_nv as pm4
 
 SDMA_MAX_COPY_SIZE = 0x400000

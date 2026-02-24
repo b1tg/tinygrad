@@ -93,8 +93,9 @@ class AMDDriver(VirtDriver):
     ip_versions = {
       "rdna3": {"gc": (11, 0, 0), "sdma": (6, 0, 0), "nbif": (4, 3, 0)},
       "rdna4": {"gc": (12, 0, 0), "sdma": (6, 0, 0), "nbif": (6, 3, 1)},
-      "cdna4": {"gc": (9, 5, 0), "sdma": (6, 0, 0), "nbif": (6, 3, 1)},
-      "cdna": {"gc": (9, 5, 0), "sdma": (6, 0, 0), "nbif": (6, 3, 1)},
+      # For gfx9 targets runtime uses NBIO register tables; pick a NBIF version that maps to available NBIO headers.
+      "cdna4": {"gc": (9, 5, 0), "sdma": (6, 0, 0), "nbif": (7, 3, 1)},
+      "cdna": {"gc": (9, 5, 0), "sdma": (6, 0, 0), "nbif": (7, 3, 1)},
     }[EMU_ARCH]
     def ip_discovery_files(hwid, ver, base_addr):
       p = f'/sys/class/drm/renderD{gpu_id}/device/ip_discovery/die/0/{hwid}/0'

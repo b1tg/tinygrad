@@ -152,6 +152,75 @@ def _abs(val: UOp) -> UOp:
 
 def _f_to_u(f, dt): return UOp(Ops.TRUNC, f.dtype, ((f < _const(f.dtype, 0.0)).where(_const(f.dtype, 0.0), f),)).cast(dt)
 
+def _f32_to_fp8_bits(v: UOp, is_bf8: bool) -> UOp:
+  """Convert f32 to fp8/bf8 bit payload (u8 in low bits) with round-to-nearest-even."""
+  fv = v.bitcast(dtypes.float32) if v.dtype == dtypes.uint32 else v.cast(dtypes.float32)
+  bits = fv.bitcast(dtypes.uint32)
+  sign = ((bits >> _u32(31)) & _u32(1)) << _u32(7)
+  exp, mant = (bits >> _u32(23)) & _u32(0xFF), bits & _u32(0x7FFFFF)
+  exp_i = exp.cast(dtypes.int)
+
+  mant_bits, bias = (2, 15) if is_bf8 else (3, 7)
+  max_norm, inf_code = (_u32(0x7B), _u32(0x7C)) if is_bf8 else (_u32(0x7E), _u32(0x7F))
+  nan_code = _u32(0x7F)
+  max_mant = _u32((1 << mant_bits) - 1)
+
+  # Normal numbers (target exponent > 0)
+  rshift = 23 - mant_bits
+  mant_hi = mant >> _u32(rshift)
+  rb = mant & _u32((1 << rshift) - 1)
+  half = _u32(1 << (rshift - 1))
+  inc = (rb > half) | ((rb == half) & ((mant_hi & _u32(1)).ne(_u32(0))))
+  mant_r = mant_hi + _to_u32(inc)
+  carry = mant_r >> _u32(mant_bits)
+  mant_n = mant_r & max_mant
+  exp_t = exp_i - _const(dtypes.int, 127 - bias)
+  exp_n = exp_t + carry.cast(dtypes.int)
+  norm_bits = (exp_n.cast(dtypes.uint32) << _u32(mant_bits)) | mant_n
+  norm_res = (norm_bits > max_norm).where(max_norm, norm_bits)
+
+  # Subnormals (target exponent <= 0): shift significand into mantissa field with RNE.
+  sig = mant | _u32(1 << 23)
+  sub_shift = (_const(dtypes.int, 1 + 23 - mant_bits) - exp_t).cast(dtypes.uint32)
+  mant_s = sig >> sub_shift
+  half_s = _u32(1) << (sub_shift - _u32(1))
+  rb_s = sig & ((_u32(1) << sub_shift) - _u32(1))
+  inc_s = (rb_s > half_s) | ((rb_s == half_s) & ((mant_s & _u32(1)).ne(_u32(0))))
+  mant_sr = mant_s + _to_u32(inc_s)
+  sub_res = (mant_sr > max_mant).where(_u32(1 << mant_bits), mant_sr)
+
+  is_special = exp.eq(_u32(0xFF))
+  is_nan = is_special & mant.ne(_u32(0))
+  is_inf = is_special & mant.eq(_u32(0))
+  finite_nonzero = exp.ne(_u32(0)) & exp.ne(_u32(0xFF))
+  use_norm = finite_nonzero & (exp_t > _const(dtypes.int, 0))
+  use_sub = finite_nonzero & (exp_t <= _const(dtypes.int, 0))
+  finite_res = use_norm.where(norm_res, use_sub.where(sub_res, _u32(0)))
+  special_res = is_nan.where(nan_code, is_inf.where(inf_code, _u32(0)))
+  return ((sign | is_special.where(special_res, finite_res)) & _u32(0xFF)).cast(dtypes.uint8)
+
+def _fp8_bits_to_f32(v: UOp, is_bf8: bool) -> UOp:
+  bits = v.cast(dtypes.uint32) if v.dtype != dtypes.uint32 else v
+  bits = bits & _u32(0xFF)
+  mant_bits, exp_bits, bias = (2, 5, 15) if is_bf8 else (3, 4, 7)
+  exp_mask, mant_mask = (1 << exp_bits) - 1, (1 << mant_bits) - 1
+  sign = (bits >> _u32(7)) & _u32(1)
+  exp = (bits >> _u32(mant_bits)) & _u32(exp_mask)
+  mant = bits & _u32(mant_mask)
+  mant_f = mant.cast(dtypes.float32) * _const(dtypes.float32, 1.0 / (1 << mant_bits))
+
+  sub_val = _ldexp(mant_f, _const(dtypes.int, 1 - bias))
+  norm_val = _ldexp(_const(dtypes.float32, 1.0) + mant_f, exp.cast(dtypes.int) - _const(dtypes.int, bias))
+  finite = exp.eq(_u32(0)).where(sub_val, norm_val)
+  if is_bf8:
+    # e5m2: exp=max is inf/nan.
+    special = mant.eq(_u32(0)).where(_const(dtypes.float32, float('inf')), _const(dtypes.float32, float('nan')))
+    val = exp.eq(_u32(exp_mask)).where(special, finite)
+  else:
+    # e4m3fn: only exp=max,mant=max is NaN; all other exp=max values are finite.
+    val = (exp.eq(_u32(exp_mask)) & mant.eq(_u32(mant_mask))).where(_const(dtypes.float32, float('nan')), finite)
+  return sign.eq(_u32(0)).where(val, val.neg())
+
 def _cvt_quiet(val: UOp) -> UOp:
   bits, _, _, qb, _ = _float_info(val)
   bt, ft = (dtypes.uint64, dtypes.float64) if val.dtype == dtypes.float64 else \
@@ -268,6 +337,10 @@ _FUNCS: dict[str, Callable[..., UOp]] = {
   'f32_to_u32': lambda a: _f_to_u(a.bitcast(dtypes.float32), dtypes.uint32),
   'f64_to_i32': lambda a: UOp(Ops.TRUNC, dtypes.float64, (a.bitcast(dtypes.float64),)).cast(dtypes.int),
   'f64_to_u32': lambda a: _f_to_u(a.bitcast(dtypes.float64), dtypes.uint32),
+  'f32_to_fp8': lambda a: _f32_to_fp8_bits(a, False),
+  'f32_to_bf8': lambda a: _f32_to_fp8_bits(a, True),
+  'fp8_to_f32': lambda a: _fp8_bits_to_f32(a, False),
+  'bf8_to_f32': lambda a: _fp8_bits_to_f32(a, True),
   'f16_to_f32': lambda a: _f16_extract(a).cast(dtypes.float32),
   'f32_to_f16': lambda a: a.cast(dtypes.half),
   'f32_to_f64': lambda a: a.bitcast(dtypes.float32).cast(dtypes.float64),
@@ -450,7 +523,11 @@ class Parser:
       case '||' | '|': return left | right
       case '&&' | '&': return left & right
       case '^': return left ^ right
-      case '==' | '<>': return left.eq(right) if op == '==' else left.ne(right)
+      case '==': return left.eq(right)
+      case '<>':
+        # AMD pcode uses "<>" as ordered-not-equal for float compares.
+        # For ints this is plain "!=".
+        return self._cmp_nan(left, right, lambda a, b: a.ne(b))
       case '!=': return left.ne(right)
       case '>=' | '<=' | '>' | '<':
         ops = {'>=':(lambda a,b:a>=b),'<=':(lambda a,b:a<=b),'>':(lambda a,b:a>b),'<':(lambda a,b:a<b)}
@@ -803,8 +880,19 @@ class Parser:
       idx = (addr >> _const(addr.dtype, 2)).cast(dtypes.int)
       val = mem.index(idx, *gate)
       if dt in (dtypes.uint64, dtypes.int64, dtypes.float64):
+        byte_off = (addr & _const(adt, 3)).cast(dtypes.uint32)
+        sh = byte_off * _u32(8)
+        inv_sh = (_u32(32) - sh) & _u32(31)
         idx2 = ((addr + _const(adt, 4)) >> _const(adt, 2)).cast(dtypes.int)
-        val = val.cast(dtypes.uint64) | (mem.index(idx2, *gate).cast(dtypes.uint64) << _u64(32))
+        w0 = val.cast(dtypes.uint64)
+        w1 = mem.index(idx2, *gate).cast(dtypes.uint64)
+        aligned = w0 | (w1 << _u64(32))
+        idx3 = ((addr + _const(adt, 8)) >> _const(adt, 2)).cast(dtypes.int)
+        w2 = mem.index(idx3, *gate).cast(dtypes.uint64)
+        lo = (w0 >> sh.cast(dtypes.uint64)) | (w1 << inv_sh.cast(dtypes.uint64))
+        hi = (w1 >> sh.cast(dtypes.uint64)) | (w2 << inv_sh.cast(dtypes.uint64))
+        unaligned = lo | (hi << _u64(32))
+        val = byte_off.eq(_u32(0)).where(aligned, unaligned)
       elif dt in (dtypes.uint8, dtypes.int8):
         byte = (val >> ((addr & _const(adt, 3)).cast(dtypes.uint32) * _u32(8))) & _u32(0xFF)
         val = byte.cast(dtypes.int8).cast(dtypes.int32).bitcast(dtypes.uint32) if dt == dtypes.int8 else byte
@@ -817,6 +905,14 @@ class Parser:
         hi8 = (nxt & _u32(0xFF)) << _u32(8)
         u16 = byte_off.eq(_u32(3)).where(((val >> _u32(24)) & _u32(0xFF)) | hi8, lo16)
         val = u16.cast(dtypes.int16).cast(dtypes.int32).bitcast(dtypes.uint32) if dt == dtypes.int16 else u16
+      elif dt.itemsize == 4:
+        byte_off = (addr & _const(adt, 3)).cast(dtypes.uint32)
+        sh = byte_off * _u32(8)
+        inv_sh = (_u32(32) - sh) & _u32(31)
+        idx2 = ((addr + _const(adt, 4)) >> _const(adt, 2)).cast(dtypes.int)
+        nxt = mem.index(idx2, *gate)
+        unaligned = (val >> sh) | (nxt << inv_sh)
+        val = byte_off.eq(_u32(0)).where(val, unaligned)
     return val
 
   def _coerce_cmp(self, l: UOp, r: UOp) -> tuple[UOp, UOp]:
