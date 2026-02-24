@@ -1,0 +1,17 @@
+[book]
+title = "Tinygrad Internals: A First-Principles Guide"
+authors = ["tinygrad contributors"]
+language = "en"
+multilingual = false
+src = "."
+
+[build]
+build-dir = "build"
+
+[output.html]
+default-theme = "light"
+preferred-dark-theme = "navy"
+git-repository-url = "https://github.com/tinygrad/tinygrad"
+
+[output.html.search]
+enable = true
