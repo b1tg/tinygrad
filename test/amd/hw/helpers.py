@@ -47,11 +47,14 @@ ISA_ARCH = "rdna3"
 if USE_HW:
   try:
     from tinygrad.device import Device
-    if Device["AMD"].arch.split(":")[0].startswith("gfx9"):  # type: ignore[attr-defined]
+    if Device["AMD"].arch.split(":")[0].startswith("gfx9"):
       from tinygrad.runtime.autogen.amd.cdna.ins import *  # noqa: F403
       ISA_ARCH = "cdna"
   except Exception:
     pass
+if ISA_ARCH == "cdna":
+  global_store_b32 = global_store_dword  # type: ignore[assignment,name-defined]
+  def s_load_b64(sdst, sbase, offset, soffset=NULL): return s_load_dwordx2(sdata=sdst, sbase=sbase, soffset=soffset, offset=offset, imm=1)  # type: ignore[misc]
 
 def get_gpu_target() -> tuple[int, int, int]:
   """Get the GPU target as (major, minor, stepping) tuple."""
@@ -96,9 +99,6 @@ class WaveState:
 
 def get_prologue_epilogue(n_lanes: int) -> tuple[list, list]:
   """Generate prologue and epilogue instructions for state capture."""
-  is_cdna = ISA_ARCH == "cdna"
-  store_dword = global_store_dword if is_cdna else global_store_b32
-  exec_full_mask = (1 << min(n_lanes, WAVE_SIZE)) - 1
   prologue = [
     s_mov_b32(s[80], s[0]),
     s_mov_b32(s[81], s[1]),
@@ -116,16 +116,15 @@ def get_prologue_epilogue(n_lanes: int) -> tuple[list, list]:
     # Save EXEC early (before we modify it for VGPR stores)
     s_mov_b32(s[95], EXEC_LO),
     # Restore EXEC to all active lanes for VGPR stores (test may have modified EXEC)
-    (s_mov_b64(EXEC64, exec_full_mask) if is_cdna else s_mov_b32(EXEC_LO, exec_full_mask)),
-    (s_load_dwordx2(sdata=s[92:93], sbase=s[80:81], soffset=NULL, offset=0, imm=1)
-      if is_cdna else s_load_b64(s[92:93], s[80:81], 0, soffset=NULL)),
+    (s_mov_b64(EXEC64, (1 << min(n_lanes, WAVE_SIZE)) - 1) if ISA_ARCH == "cdna" else s_mov_b32(EXEC_LO, (1 << min(n_lanes, WAVE_SIZE)) - 1)),
+    s_load_b64(s[92:93], s[80:81], 0, soffset=NULL),
     s_waitcnt(0),  # simm16=0 waits for all
     v_lshlrev_b32_e32(v[240], 2, v[255]),
   ]
   vgpr_bytes = N_VGPRS * n_lanes * 4
   for i in range(N_VGPRS):
-    epilogue.append(store_dword(addr=v[240], data=v[i], saddr=s[92:93], offset=i * n_lanes * 4))
-  if is_cdna:
+    epilogue.append(global_store_b32(addr=v[240], data=v[i], saddr=s[92:93], offset=i * n_lanes * 4))
+  if ISA_ARCH == "cdna":
     epilogue.append(s_mov_b64(EXEC64, 1))
   else:
     epilogue += [v_mov_b32_e32(v[241], 0), v_cmp_eq_u32_e32(v[255], v[241]), s_and_saveexec_b32(s[94], VCC_LO)]
@@ -133,15 +132,15 @@ def get_prologue_epilogue(n_lanes: int) -> tuple[list, list]:
   epilogue.append(v_mov_b32_e32(v[240], vgpr_bytes))
   for i in range(N_SGPRS):
     epilogue.append(v_mov_b32_e32(v[243], s[i]))
-    epilogue.append(store_dword(addr=v[240], data=v[243], saddr=s[92:93], offset=i * 4))
+    epilogue.append(global_store_b32(addr=v[240], data=v[243], saddr=s[92:93], offset=i * 4))
   epilogue.append(v_mov_b32_e32(v[243], s[90]))
-  epilogue.append(store_dword(addr=v[240], data=v[243], saddr=s[92:93], offset=SGPR_BYTES))
+  epilogue.append(global_store_b32(addr=v[240], data=v[243], saddr=s[92:93], offset=SGPR_BYTES))
   epilogue.append(v_mov_b32_e32(v[243], s[91]))
-  epilogue.append(store_dword(addr=v[240], data=v[243], saddr=s[92:93], offset=SGPR_BYTES + 4))
+  epilogue.append(global_store_b32(addr=v[240], data=v[243], saddr=s[92:93], offset=SGPR_BYTES + 4))
   # Store EXEC (saved earlier in s[95])
   epilogue.append(v_mov_b32_e32(v[243], s[95]))
-  epilogue.append(store_dword(addr=v[240], data=v[243], saddr=s[92:93], offset=SGPR_BYTES + 8))
-  if not is_cdna: epilogue.append(s_mov_b32(EXEC_LO, s[94]))
+  epilogue.append(global_store_b32(addr=v[240], data=v[243], saddr=s[92:93], offset=SGPR_BYTES + 8))
+  if ISA_ARCH != "cdna": epilogue.append(s_mov_b32(EXEC_LO, s[94]))
   epilogue.append(s_endpgm())
   return prologue, epilogue
 
@@ -200,33 +199,10 @@ def run_program_hw(instructions: list, n_lanes: int = 1) -> WaveState:
   code = assemble(prologue + instructions + epilogue)
 
   byte_str = ', '.join(f'0x{b:02x}' for b in code)
-  kernel_head = [
-    ".amdhsa_next_free_vgpr 256",
-    ".amdhsa_next_free_sgpr 96",
-  ]
-  kernel_common = [
-    ".amdhsa_user_sgpr_kernarg_segment_ptr 1",
-    ".amdhsa_kernarg_size 8",
-    ".amdhsa_group_segment_fixed_size 65536",
-    ".amdhsa_private_segment_fixed_size 65536",
-  ]
-  kernel_tail = [
-    ".amdhsa_enable_private_segment 1",
-  ]
+  kernel_arch = [".amdhsa_user_sgpr_count 2", ".amdhsa_system_sgpr_workgroup_id_x 1"] if is_cdna else [".amdhsa_wavefront_size32 1"]
+  if is_cdna and needs_accum_offset: kernel_arch.append(".amdhsa_accum_offset 256")
   asm_prefix = ".amdhsa_code_object_version 6\n" if is_cdna else ""
-  asm_suffix = ""
-  if is_cdna:
-    kernel_directives = [
-      *kernel_head,
-      ".amdhsa_user_sgpr_count 2",
-      ".amdhsa_system_sgpr_workgroup_id_x 1",
-      *kernel_common,
-      *([".amdhsa_accum_offset 256"] if needs_accum_offset else []),
-      *kernel_tail,
-    ]
-  else:
-    kernel_directives = [*kernel_head, ".amdhsa_wavefront_size32 1", *kernel_common, *kernel_tail]
-    asm_suffix = """
+  asm_suffix = "" if is_cdna else """
 
 .amdgpu_metadata
 ---
@@ -258,7 +234,13 @@ test:
 .rodata
 .p2align 6
 .amdhsa_kernel test
-{chr(10).join(f"  {x}" for x in kernel_directives)}
+  .amdhsa_next_free_vgpr 256
+  .amdhsa_next_free_sgpr 96
+{''.join(f"  {x}\n" for x in kernel_arch)}  .amdhsa_user_sgpr_kernarg_segment_ptr 1
+  .amdhsa_kernarg_size 8
+  .amdhsa_group_segment_fixed_size 65536
+  .amdhsa_private_segment_fixed_size 65536
+  .amdhsa_enable_private_segment 1
 .end_amdhsa_kernel
 {asm_suffix}"""
 
