@@ -7,7 +7,7 @@ import ctypes, math, os, struct
 from tinygrad.runtime.autogen.amd.rdna3.ins import *
 
 from test.mockgpu.amd.emu import run_asm
-from tinygrad.renderer.amd.dsl import NULL, SCC, VCC_LO, VCC_HI, EXEC_LO, EXEC_HI, EXEC as EXEC64, M0
+from tinygrad.renderer.amd.dsl import NULL, SCC, VCC_LO, VCC_HI, EXEC_LO, EXEC_HI, M0
 
 def _i32(f: float) -> int: return struct.unpack('<I', struct.pack('<f', f))[0]
 def _f32(i: int) -> float: return struct.unpack('<f', struct.pack('<I', i & 0xFFFFFFFF))[0]
@@ -45,16 +45,12 @@ FLOAT_TOLERANCE = 1e-5
 
 ISA_ARCH = "rdna3"
 if USE_HW:
-  try:
-    from tinygrad.device import Device
-    if Device["AMD"].arch.split(":")[0].startswith("gfx9"):
-      from tinygrad.runtime.autogen.amd.cdna.ins import *  # noqa: F403
-      ISA_ARCH = "cdna"
-  except Exception:
-    pass
-if ISA_ARCH == "cdna":
-  global_store_b32 = global_store_dword  # type: ignore[assignment,name-defined]
-  def s_load_b64(sdst, sbase, offset, soffset=NULL): return s_load_dwordx2(sdata=sdst, sbase=sbase, soffset=soffset, offset=offset, imm=1)  # type: ignore[misc]
+  from tinygrad.device import Device
+  if Device["AMD"].arch.split(":")[0].startswith("gfx9"):
+    from tinygrad.runtime.autogen.amd.cdna.ins import *  # noqa: F403
+    ISA_ARCH = "cdna"
+    global_store_b32 = global_store_dword  # type: ignore[assignment,name-defined]
+    s_load_b64 = lambda sdst, sbase, offset, soffset=NULL: s_load_dwordx2(sdata=sdst, sbase=sbase, soffset=soffset, offset=offset, imm=1)  # type: ignore[misc,assignment,name-defined]
 
 def get_gpu_target() -> tuple[int, int, int]:
   """Get the GPU target as (major, minor, stepping) tuple."""
@@ -116,7 +112,7 @@ def get_prologue_epilogue(n_lanes: int) -> tuple[list, list]:
     # Save EXEC early (before we modify it for VGPR stores)
     s_mov_b32(s[95], EXEC_LO),
     # Restore EXEC to all active lanes for VGPR stores (test may have modified EXEC)
-    (s_mov_b64(EXEC64, (1 << min(n_lanes, WAVE_SIZE)) - 1) if ISA_ARCH == "cdna" else s_mov_b32(EXEC_LO, (1 << min(n_lanes, WAVE_SIZE)) - 1)),
+    s_mov_b32(EXEC_LO, (1 << min(n_lanes, WAVE_SIZE)) - 1),
     s_load_b64(s[92:93], s[80:81], 0, soffset=NULL),
     s_waitcnt(0),  # simm16=0 waits for all
     v_lshlrev_b32_e32(v[240], 2, v[255]),
@@ -124,10 +120,9 @@ def get_prologue_epilogue(n_lanes: int) -> tuple[list, list]:
   vgpr_bytes = N_VGPRS * n_lanes * 4
   for i in range(N_VGPRS):
     epilogue.append(global_store_b32(addr=v[240], data=v[i], saddr=s[92:93], offset=i * n_lanes * 4))
-  if ISA_ARCH == "cdna":
-    epilogue.append(s_mov_b64(EXEC64, 1))
-  else:
-    epilogue += [v_mov_b32_e32(v[241], 0), v_cmp_eq_u32_e32(v[255], v[241]), s_and_saveexec_b32(s[94], VCC_LO)]
+  epilogue.append(v_mov_b32_e32(v[241], 0))
+  epilogue.append(v_cmp_eq_u32_e32(v[255], v[241]))
+  epilogue.append(s_and_saveexec_b32(s[94], VCC_LO))
   # Scalar stores: only thread 0. Use v[240]=vgpr_bytes as base offset so immediate offsets stay small.
   epilogue.append(v_mov_b32_e32(v[240], vgpr_bytes))
   for i in range(N_SGPRS):
@@ -140,7 +135,7 @@ def get_prologue_epilogue(n_lanes: int) -> tuple[list, list]:
   # Store EXEC (saved earlier in s[95])
   epilogue.append(v_mov_b32_e32(v[243], s[95]))
   epilogue.append(global_store_b32(addr=v[240], data=v[243], saddr=s[92:93], offset=SGPR_BYTES + 8))
-  if ISA_ARCH != "cdna": epilogue.append(s_mov_b32(EXEC_LO, s[94]))
+  epilogue.append(s_mov_b32(EXEC_LO, s[94]))
   epilogue.append(s_endpgm())
   return prologue, epilogue
 
@@ -190,19 +185,32 @@ def run_program_hw(instructions: list, n_lanes: int = 1) -> WaveState:
   from tinygrad.helpers import flat_mv
 
   dev = Device["AMD"]
-  arch = dev.arch.split(":")[0]  # type: ignore[attr-defined]
-  is_cdna = arch.startswith("gfx9")
-  needs_accum_offset = arch in ("gfx90a", "gfx942")
+  arch = dev.arch.split(":")[0]; is_cdna = arch.startswith("gfx9")  # type: ignore[attr-defined]
   compiler = HIPCompiler(dev.arch)  # type: ignore[attr-defined]
 
   prologue, epilogue = get_prologue_epilogue(n_lanes)
   code = assemble(prologue + instructions + epilogue)
 
   byte_str = ', '.join(f'0x{b:02x}' for b in code)
-  kernel_arch = [".amdhsa_user_sgpr_count 2", ".amdhsa_system_sgpr_workgroup_id_x 1"] if is_cdna else [".amdhsa_wavefront_size32 1"]
-  if is_cdna and needs_accum_offset: kernel_arch.append(".amdhsa_accum_offset 256")
-  asm_prefix = ".amdhsa_code_object_version 6\n" if is_cdna else ""
-  asm_suffix = "" if is_cdna else """
+  kernel_arch = ([".amdhsa_user_sgpr_count 2", ".amdhsa_system_sgpr_workgroup_id_x 1"] + ([".amdhsa_accum_offset 256"] if arch in ("gfx90a", "gfx942") else [])) if is_cdna else [".amdhsa_wavefront_size32 1"]
+  asm_src = f""".text
+.globl test
+.p2align 8
+.type test,@function
+test:
+.byte {byte_str}
+
+.rodata
+.p2align 6
+.amdhsa_kernel test
+  .amdhsa_next_free_vgpr 256
+  .amdhsa_next_free_sgpr 96
+{''.join(f"  {x}\n" for x in kernel_arch)}  .amdhsa_user_sgpr_kernarg_segment_ptr 1
+  .amdhsa_kernarg_size 8
+  .amdhsa_group_segment_fixed_size 65536
+  .amdhsa_private_segment_fixed_size 65536
+  .amdhsa_enable_private_segment 1
+.end_amdhsa_kernel
 
 .amdgpu_metadata
 ---
@@ -223,26 +231,6 @@ amdhsa.kernels:
 ...
 .end_amdgpu_metadata
 """
-
-  asm_src = f""".text
-{asm_prefix}.globl test
-.p2align 8
-.type test,@function
-test:
-.byte {byte_str}
-
-.rodata
-.p2align 6
-.amdhsa_kernel test
-  .amdhsa_next_free_vgpr 256
-  .amdhsa_next_free_sgpr 96
-{''.join(f"  {x}\n" for x in kernel_arch)}  .amdhsa_user_sgpr_kernarg_segment_ptr 1
-  .amdhsa_kernarg_size 8
-  .amdhsa_group_segment_fixed_size 65536
-  .amdhsa_private_segment_fixed_size 65536
-  .amdhsa_enable_private_segment 1
-.end_amdhsa_kernel
-{asm_suffix}"""
 
   lib = compiler.compile(asm_src)
   prg = AMDProgram(dev, "test", lib)  # type: ignore[arg-type]
