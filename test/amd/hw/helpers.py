@@ -49,8 +49,7 @@ if USE_HW:
   if Device["AMD"].arch.split(":")[0].startswith("gfx9"):
     from tinygrad.runtime.autogen.amd.cdna.ins import *  # noqa: F403
     ISA_ARCH = "cdna"
-    global_store_b32 = global_store_dword  # type: ignore[assignment,name-defined]
-    s_load_b64 = lambda sdst, sbase, offset, soffset=NULL: s_load_dwordx2(sdata=sdst, sbase=sbase, soffset=soffset, offset=offset, imm=1)  # type: ignore[misc,assignment,name-defined]
+    global_store_b32 = global_store_dword; s_load_b64 = lambda sdst, sbase, offset, soffset=NULL: s_load_dwordx2(sdata=sdst, sbase=sbase, soffset=soffset, offset=offset, imm=1)  # type: ignore[assignment,name-defined,misc]
 
 def get_gpu_target() -> tuple[int, int, int]:
   """Get the GPU target as (major, minor, stepping) tuple."""
@@ -185,14 +184,14 @@ def run_program_hw(instructions: list, n_lanes: int = 1) -> WaveState:
   from tinygrad.helpers import flat_mv
 
   dev = Device["AMD"]
-  arch = dev.arch.split(":")[0]; is_cdna = arch.startswith("gfx9")  # type: ignore[attr-defined]
+  arch = dev.arch.split(":")[0]  # type: ignore[attr-defined]
   compiler = HIPCompiler(dev.arch)  # type: ignore[attr-defined]
 
   prologue, epilogue = get_prologue_epilogue(n_lanes)
   code = assemble(prologue + instructions + epilogue)
 
   byte_str = ', '.join(f'0x{b:02x}' for b in code)
-  kernel_arch = ([".amdhsa_user_sgpr_count 2", ".amdhsa_system_sgpr_workgroup_id_x 1"] + ([".amdhsa_accum_offset 256"] if arch in ("gfx90a", "gfx942") else [])) if is_cdna else [".amdhsa_wavefront_size32 1"]
+  arch_directive = "  .amdhsa_accum_offset 256" if arch in ("gfx90a", "gfx942") else ("" if arch.startswith("gfx9") else "  .amdhsa_wavefront_size32 1")
   asm_src = f""".text
 .globl test
 .p2align 8
@@ -205,7 +204,8 @@ test:
 .amdhsa_kernel test
   .amdhsa_next_free_vgpr 256
   .amdhsa_next_free_sgpr 96
-{''.join(f"  {x}\n" for x in kernel_arch)}  .amdhsa_user_sgpr_kernarg_segment_ptr 1
+{arch_directive}
+  .amdhsa_user_sgpr_kernarg_segment_ptr 1
   .amdhsa_kernarg_size 8
   .amdhsa_group_segment_fixed_size 65536
   .amdhsa_private_segment_fixed_size 65536
