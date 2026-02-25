@@ -191,7 +191,6 @@ def run_program_hw(instructions: list, n_lanes: int = 1) -> WaveState:
   code = assemble(prologue + instructions + epilogue)
 
   byte_str = ', '.join(f'0x{b:02x}' for b in code)
-  arch_directive = "  .amdhsa_accum_offset 256" if arch in ("gfx90a", "gfx942") else ("" if arch.startswith("gfx9") else "  .amdhsa_wavefront_size32 1")
   asm_src = f""".text
 .globl test
 .p2align 8
@@ -204,7 +203,8 @@ test:
 .amdhsa_kernel test
   .amdhsa_next_free_vgpr 256
   .amdhsa_next_free_sgpr 96
-{arch_directive}
+{("" if arch.startswith("gfx9") else "  .amdhsa_wavefront_size32 1\n")}
+{("  .amdhsa_accum_offset 256\n" if arch in ("gfx90a", "gfx942") else "")}
   .amdhsa_user_sgpr_kernarg_segment_ptr 1
   .amdhsa_kernarg_size 8
   .amdhsa_group_segment_fixed_size 65536

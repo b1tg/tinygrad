@@ -113,6 +113,14 @@ class TestParseExpr(unittest.TestCase):
     result = parse_expr('cond ? a : b', vrs)
     self.assertEqual(result.op, Ops.WHERE)
 
+  def test_ordered_not_equal_vs_not_equal_with_nan(self):
+    """`<>` is ordered not-equal while `!=` is unordered not-equal for float pcode."""
+    nan = UOp.const(dtypes.float32, float('nan'))
+    one = UOp.const(dtypes.float32, 1.0)
+    vrs = {'S0': nan, 'S1': one}
+    self.assertFalse(parse_expr('S0 <> S1', vrs).simplify().arg)
+    self.assertTrue(parse_expr('S0 != S1', vrs).simplify().arg)
+
 class TestForLoopParsing(unittest.TestCase):
   """Test for loop parsing (CLZ/CTZ patterns)."""
 
