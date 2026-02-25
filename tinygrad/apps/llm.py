@@ -1,12 +1,12 @@
 from __future__ import annotations
-import sys, argparse, typing, re, unicodedata, json, uuid, time, functools
+import sys, argparse, typing, re, unicodedata, json, uuid, time, functools, math
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function
 from tinygrad.helpers import partition, DEBUG, Timing, GlobalCounters, stderr_log, colored
 from tinygrad.viz.serve import TCPServerWithReuse, HTTPRequestHandler
 
 class SimpleTokenizer:
   def __init__(self, normal_tokens:dict[str, int], special_tokens:dict[str, int], preset:str="llama3"):
-    if preset not in ("llama3","llama-v3","llama-bpe","qwen2","olmo"): raise ValueError(f"Invalid tokenizer preset '{preset}'")
+    if preset not in ("llama3","llama-v3","llama-bpe","qwen2","olmo","default"): raise ValueError(f"Invalid tokenizer preset '{preset}'")
     # https://github.com/openai/gpt-2/blob/9b63575ef42771a015060c964af2c3da4cf7c8ab/src/encoder.py#L9
     bs = [*range(33, 127), *range(161, 173), *range(174, 256)]  # bytes that map to themselves
     self._byte_decoder = {chr(b): b for b in bs} | {chr(256+i): b for i,b in enumerate(b for b in range(256) if b not in bs)}
@@ -19,9 +19,20 @@ class SimpleTokenizer:
       f"[^\\r\\n{r_p_N}{r_p_L}]?[{r_p_L}]+|[{r_p_N}]{{1,3}}| ?[^{r_ws}{r_p_N}{r_p_L}]+[\\r\\n]*|[{r_ws}]*[\\r\\n]+|[{r_ws}]+(?![^{r_ws}])|[{r_ws}]+")
     self._split_to_sentence = re.compile("|".join(re.escape(tok) for tok in special_tokens.keys()) if special_tokens else r"(?!)")
 
-    self._normal_tokens = {bytes(self._byte_decoder[c] for c in tok): tid for tok, tid in normal_tokens.items()}
+    if preset == 'default':
+      # SentencePiece: tokens are raw UTF-8; byte fallbacks like <0xHH> are in special_tokens but needed for encoding
+      self._normal_tokens = {tok.encode('utf-8'): tid for tok, tid in normal_tokens.items()}
+      for stok, sid in special_tokens.items():
+        if len(stok) == 6 and stok[:3] == '<0x' and stok[5] == '>':
+          self._normal_tokens.setdefault(bytes([int(stok[3:5], 16)]), sid)  # don't overwrite existing single-byte tokens
+      # build tok2bytes: start with all normal tokens (bytes->tid reversed), then fill remaining from special tokens
+      self._tok2bytes = {tid: tok_str.encode('utf-8') for tok_str, tid in normal_tokens.items()}
+      for stok, sid in special_tokens.items():
+        self._tok2bytes[sid] = bytes([int(stok[3:5], 16)]) if (len(stok) == 6 and stok[:3] == '<0x' and stok[5] == '>') else stok.encode('utf-8')
+    else:
+      self._normal_tokens = {bytes(self._byte_decoder[c] for c in tok): tid for tok, tid in normal_tokens.items()}
+      self._tok2bytes = {tid: tok for tok, tid in self._normal_tokens.items()} | {tid: tok.encode() for tok, tid in special_tokens.items()}
     self._special_tokens = special_tokens
-    self._tok2bytes = {tid: tok for tok, tid in self._normal_tokens.items()} | {tid: tok.encode() for tok, tid in self._special_tokens.items()}
     self.preset = preset
 
   @staticmethod
@@ -42,6 +53,7 @@ class SimpleTokenizer:
     try: return [self._normal_tokens[p] for p in parts]
     except KeyError: raise RuntimeError("token not found")
   def _encode_sentence(self, chunk:str) -> list[int]:
+    if self.preset == 'default': return self._encode_word(chunk.replace(' ', '\u2581').encode('utf-8'))  # SentencePiece: ▁ = space
     return [tok for word in self._split_to_word.findall(chunk) for tok in self._encode_word(word.encode())]
   def encode(self, text:str) -> list[int]:
     tokens: list[int] = []
@@ -51,20 +63,25 @@ class SimpleTokenizer:
       pos = match.end(0)
     return tokens + self._encode_sentence(text[pos:])
 
-  def decode(self, ids:list[int]) -> str: return b''.join(self._tok2bytes[tid] for tid in ids).decode(errors='replace')
+  def decode(self, ids:list[int]) -> str:
+    out = b''.join(self._tok2bytes[tid] for tid in ids).decode(errors='replace')
+    return out.replace('\u2581', ' ') if self.preset == 'default' else out  # SentencePiece: ▁ -> space
   def role(self, role:str):
     if self.preset == 'olmo': return self.encode("<|" + role + "|>\n")  # OLMoE Instruct format
     if self.preset == 'qwen2': return self.encode("<|im_start|>" + role + "\n")
+    if self.preset == 'default': return self.encode("<start_of_turn>" + role + "\n")  # gemma3
     return self.encode("<|start_header_id|>" + role + "<|end_header_id|>\n\n")
   def end_turn(self, eos_id:int):
     if self.preset == 'olmo': return self.encode("\n")
     if self.preset == 'qwen2': return [eos_id] + self.encode("\n")
+    if self.preset == 'default': return self.encode("<end_of_turn>\n")  # gemma3
     return [eos_id]
 
 @functools.cache
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> Tensor:
+def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, rope_scale: float = 1.0) -> Tensor:
   freqs = 1.0 / (theta ** (Tensor.arange(0, dim, 2)[:(dim // 2)] / dim))
-  freqs = Tensor.arange(end).unsqueeze(dim=1) * freqs.unsqueeze(dim=0)
+  positions = Tensor.arange(end) / rope_scale if rope_scale != 1.0 else Tensor.arange(end)
+  freqs = positions.unsqueeze(dim=1) * freqs.unsqueeze(dim=0)
   return freqs.cos().cat(freqs.sin(), dim=-1).contiguous()
 
 class ExpertWeights:
@@ -83,13 +100,17 @@ def apply_rope(x:Tensor, freqs_cis:Tensor) -> Tensor:
 
 class TransformerBlock:
   def __init__(self, dim:int, hidden_dim:int, n_heads:int, n_kv_heads:int, norm_eps:float, head_dim:int, rope_theta:float,
-               max_context:int=0, qk_norm:int=0, num_experts:int=0, num_experts_per_tok:int=0):
+               max_context:int=0, qk_norm:int=0, num_experts:int=0, num_experts_per_tok:int=0,
+               post_norm:bool=False, act:str="silu", sliding_window:int=0, rope_scale:float=1.0):
     self.n_heads      = n_heads
     self.n_kv_heads   = n_kv_heads
     self.head_dim     = head_dim
     self.rope_theta   = rope_theta
+    self.rope_scale   = rope_scale
     self.max_context  = max_context
     self.qk_norm      = qk_norm
+    self.act          = act
+    self.sliding_window = sliding_window
 
     # --- attention projections (all linear, bias-free) ------------------
     q_proj_out       = self.head_dim * n_heads
@@ -102,6 +123,7 @@ class TransformerBlock:
     # --- RMSNorms --------------------------------------------------------
     self.attn_norm   = nn.RMSNorm(dim, norm_eps)
     self.ffn_norm    = nn.RMSNorm(dim, norm_eps)
+    if post_norm: self.post_attention_norm, self.post_ffw_norm = nn.RMSNorm(dim, norm_eps), nn.RMSNorm(dim, norm_eps)
     if qk_norm: self.attn_q_norm, self.attn_k_norm = nn.RMSNorm(qk_norm, norm_eps), nn.RMSNorm(qk_norm, norm_eps)
 
     # --- feed-forward (MoE or dense) -------------------------------------
@@ -127,7 +149,7 @@ class TransformerBlock:
     v = v.reshape(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)  # (B,KvH,T,Hd)
     if self.qk_norm == self.head_dim: q, k = self.attn_q_norm(q), self.attn_k_norm(k)
 
-    freqs_cis = precompute_freqs_cis(self.head_dim, self.max_context, self.rope_theta)[start_pos:start_pos+T]
+    freqs_cis = precompute_freqs_cis(self.head_dim, self.max_context, self.rope_theta, self.rope_scale)[start_pos:start_pos+T]
     q = apply_rope(q, freqs_cis)
     k = apply_rope(k, freqs_cis)
 
@@ -139,9 +161,13 @@ class TransformerBlock:
 
     # NOTE: this mask is causal_lower_right, not the causal_upper_left generated by is_casual = True
     mask = Tensor.full((1, 1, T, start_pos+T), float("-inf"), dtype=x.dtype, device=x.device).triu(int(start_pos)+1) if T > 1 else None
+    if self.sliding_window and isinstance(start_pos, int):
+      sw_mask = Tensor.full((1, 1, T, start_pos+T), float("-inf"), dtype=x.dtype, device=x.device).tril(start_pos-self.sliding_window)
+      mask = sw_mask if mask is None else mask + sw_mask
     attn = q.scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)     # (B,H,T,Hd)
     attn = attn.transpose(1, 2).reshape(B, T, -1)                                    # back to (B,T,D)
     attn = self.attn_output(attn)
+    if hasattr(self, 'post_attention_norm'): attn = self.post_attention_norm(attn)
     return x + attn
 
   @function
@@ -153,17 +179,28 @@ class TransformerBlock:
       x_down = self.ffn_down_exps(sel, self.ffn_gate_exps(sel, x).silu() * self.ffn_up_exps(sel, x))  # (B, T, k, D)
       return h + (x_down * probs.unsqueeze(-1)).sum(axis=2)  # (B, T, D)
     # TODO: remove the need for this contiguous
-    gated  = self.ffn_gate(h_norm).silu().contiguous() * self.ffn_up(h_norm)
-    return h + self.ffn_down(gated)
+    gated  = (self.ffn_gate(h_norm).gelu() if self.act == "gelu" else self.ffn_gate(h_norm).silu()).contiguous() * self.ffn_up(h_norm)
+    out = self.ffn_down(gated)
+    if hasattr(self, 'post_ffw_norm'): out = self.post_ffw_norm(out)
+    return h + out
 
   def __call__(self, x: Tensor, start_pos: int|UOp):
     return self._feed_forward(self._attention(x, start_pos)).contiguous()
 
 class Transformer:
   def __init__(self, *, num_blocks, dim, hidden_dim, n_heads, n_kv_heads, norm_eps, vocab_size, head_dim:int, rope_theta:float,
-               max_context:int=0, qk_norm:int=0, num_experts:int=0, num_experts_per_tok:int=0):
-    self.blk = [TransformerBlock(dim, hidden_dim, n_heads, n_kv_heads, norm_eps, head_dim, rope_theta, max_context, qk_norm,
-                                 num_experts, num_experts_per_tok) for _ in range(num_blocks)]
+               max_context:int=0, qk_norm:int=0, num_experts:int=0, num_experts_per_tok:int=0,
+               embed_scale:float=0.0, post_norm:bool=False, act:str="silu",
+               sliding_window:int=0, sliding_window_pattern:int=0, rope_theta_swa:float=0.0, rope_scale:float=1.0):
+    self.embed_scale = embed_scale
+    block_args = []
+    for i in range(num_blocks):
+      is_sliding = sliding_window_pattern > 0 and bool((i + 1) % sliding_window_pattern)
+      block_args.append(dict(rope_theta=rope_theta_swa if (is_sliding and rope_theta_swa) else rope_theta,
+                             sliding_window=sliding_window if is_sliding else 0,
+                             rope_scale=1.0 if is_sliding else rope_scale))
+    self.blk = [TransformerBlock(dim, hidden_dim, n_heads, n_kv_heads, norm_eps, head_dim, ba['rope_theta'], max_context, qk_norm,
+                                 num_experts, num_experts_per_tok, post_norm, act, ba['sliding_window'], ba['rope_scale']) for ba in block_args]
     self.token_embd  = nn.Embedding(vocab_size, dim)
     self.output_norm = nn.RMSNorm(dim, norm_eps)
     self.output = nn.Linear(dim, vocab_size, bias=False)
@@ -173,6 +210,7 @@ class Transformer:
 
   def forward(self, tokens:Tensor, start_pos:int|UOp) -> Tensor:
     x = self.token_embd(tokens)                           # (B, T, D)
+    if self.embed_scale: x = x * self.embed_scale
     for block in self.blk: x = block(x, start_pos)
     # TODO: add temperature
     return self.output(self.output_norm(x))[:, -1, :].softmax(-1, dtype="float").argmax(-1, keepdim=True)
@@ -201,14 +239,24 @@ class Transformer:
         if 'attn_q.weight' in name: state_dict[name] = state_dict[name].rearrange("(n h two) d -> (n two h) d", n=n_heads, two=2)
         if 'attn_k.weight' in name: state_dict[name] = state_dict[name].rearrange("(n h two) d -> (n two h) d", n=n_kv_heads, two=2)
 
-    model = Transformer(num_blocks=kv[f'{arch}.block_count'], dim=kv[f'{arch}.embedding_length'],
+    # gemma3-specific: embedding scale, post-norms, gelu activation, sliding window attention
+    dim = kv[f'{arch}.embedding_length']
+    gemma3_args = {}
+    if arch == 'gemma3':
+      gemma3_args = dict(embed_scale=math.sqrt(dim), post_norm=True, act="gelu",
+                         sliding_window=kv.get(f'{arch}.attention.sliding_window', 1024),
+                         sliding_window_pattern=6, rope_theta_swa=10000.0,
+                         rope_scale=kv.get(f'{arch}.rope.scaling.factor', 1.0))
+
+    model = Transformer(num_blocks=kv[f'{arch}.block_count'], dim=dim,
                         hidden_dim=kv.get(f'{arch}.expert_feed_forward_length', kv[f'{arch}.feed_forward_length']),
                         n_heads=n_heads, n_kv_heads=n_kv_heads, norm_eps=kv[f'{arch}.attention.layer_norm_rms_epsilon'],
                         vocab_size=len(kv['tokenizer.ggml.tokens']),
-                        head_dim=kv.get(f'{arch}.attention.key_length', kv[f'{arch}.embedding_length'] // n_heads),
+                        head_dim=kv.get(f'{arch}.attention.key_length', dim // n_heads),
                         rope_theta=kv[f'{arch}.rope.freq_base'], max_context=max_context,
                         qk_norm=int(state_dict['blk.0.attn_q_norm.weight'].shape[0]) if 'blk.0.attn_q_norm.weight' in state_dict else 0,
-                        num_experts=kv.get(f'{arch}.expert_count', 0), num_experts_per_tok=kv.get(f'{arch}.expert_used_count', 0))
+                        num_experts=kv.get(f'{arch}.expert_count', 0), num_experts_per_tok=kv.get(f'{arch}.expert_used_count', 0),
+                        **gemma3_args)
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     for s in (params:=nn.state.get_parameters(model)): s.replace(s.contiguous())
@@ -236,6 +284,7 @@ models = {
   "qwen3:8b": "https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf",
   "qwen3:30b-a3b": "https://huggingface.co/Qwen/Qwen3-30B-A3B-GGUF/resolve/main/Qwen3-30B-A3B-Q4_K_M.gguf",
   "olmoe": "https://huggingface.co/allenai/OLMoE-1B-7B-0924-Instruct-GGUF/resolve/main/olmoe-1b-7b-0924-instruct-q4_k_m.gguf",
+  "translategemma": "https://huggingface.co/mradermacher/translategemma-4b-it-GGUF/resolve/main/translategemma-4b-it.Q4_K_M.gguf",
 }
 
 # *** simple OpenAI compatible server on 11434 to match ollama ***
@@ -284,12 +333,19 @@ class Handler(HTTPRequestHandler):
     tmpl = {"id":f"chatcmpl-{uuid.uuid4().hex[:24]}", "object":"chat.completion.chunk", "created":int(time.time()), "model":model_name}
     yield {"choices": [{"index":0, "delta":{"role":"assistant","content":""}, "finish_reason":None}], **tmpl}
     out: list[int] = []
+    buf = b''
     st = time.perf_counter()
     for next_id in model.generate(ids):
       if len(out) == 0: stderr_log(f"prefill:{len(ids)/((pt:=time.perf_counter())-st):4.0f} tok/s  {colored('--', 'BLACK')}  ")
       if next_id == eos_id: break
       out.append(next_id)
-      yield {"choices": [{"index":0, "delta":{"content":tok.decode([next_id])}, "finish_reason":None}], **tmpl}
+      buf += tok._tok2bytes[next_id]
+      try:
+        text = buf.decode('utf-8')
+        text = text.replace('\u2581', ' ') if tok.preset == 'default' else text
+        yield {"choices": [{"index":0, "delta":{"content":text}, "finish_reason":None}], **tmpl}
+        buf = b''
+      except UnicodeDecodeError: pass  # incomplete UTF-8, buffer until complete
     yield {"choices": [{"index":0, "delta":{},"finish_reason":"stop"}], **tmpl}
     if include_usage:
       yield {"choices": [], "usage": {"prompt_tokens": len(ids), "completion_tokens": len(out), "total_tokens": len(ids) + len(out)}, **tmpl}
@@ -355,6 +411,8 @@ if __name__ == "__main__":
   tok = SimpleTokenizer.from_gguf_kv(kv)
   bos_id: int|None = kv.get('tokenizer.ggml.bos_token_id') if kv.get('tokenizer.ggml.add_bos_token', True) else None
   eos_id: int = kv['tokenizer.ggml.eos_token_id']
+  # gemma3 stops on <end_of_turn>, not <eos>
+  if kv['general.architecture'] == 'gemma3': eos_id = tok._special_tokens.get('<end_of_turn>', eos_id)
 
   # start server
   if args.serve: TCPServerWithReuse(('', args.serve), Handler).serve_forever()
@@ -366,7 +424,14 @@ if __name__ == "__main__":
       ids += tok.role("user") + tok.encode(input('>>> ')) + tok.end_turn(eos_id) + tok.role("assistant")
     except EOFError:
       break
+    buf = b''
     for next_id in model.generate(ids, start_pos):
-      sys.stdout.write(tok.decode([next_id]) if next_id != eos_id else "\n\n")
-      sys.stdout.flush()
-      if next_id == eos_id: break
+      if next_id == eos_id:
+        if buf: sys.stdout.write(buf.decode(errors='replace')); buf = b''
+        sys.stdout.write("\n\n"); sys.stdout.flush(); break
+      buf += tok._tok2bytes[next_id]
+      try:
+        text = buf.decode('utf-8')
+        sys.stdout.write(text.replace('\u2581', ' ') if tok.preset == 'default' else text)
+        sys.stdout.flush(); buf = b''
+      except UnicodeDecodeError: pass  # incomplete UTF-8 sequence, keep buffering
