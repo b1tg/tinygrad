@@ -1,5 +1,5 @@
 from __future__ import annotations
-import sys, argparse, typing, re, unicodedata, json, uuid, time, functools
+import sys, argparse, typing, re, unicodedata, json, uuid, time, functools, numpy as np
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function
 from tinygrad.helpers import partition, DEBUG, Timing, GlobalCounters, stderr_log, colored
 from tinygrad.viz.serve import TCPServerWithReuse, HTTPRequestHandler
@@ -327,17 +327,166 @@ class Handler(HTTPRequestHandler):
     else:
       raise RuntimeError(f"unhandled path {self.path}")
 
+# *** abliteration: remove safety refusal behavior from GGUF models ***
+# Usage:
+#   python -m tinygrad.apps.llm --model llama3.2:1b --abliterate \
+#     --harmful-path harmful.jsonl --harmless-path harmless.jsonl
+#
+# JSONL files should have one JSON object per line with a "text" field containing a prompt.
+# Options:
+#   --abliterate-num-prompts N   number of prompt pairs to use (default: 64, lower = faster)
+#   --abliterate-strength F      projection strength (default: 2.5)
+#   --abliterate-threshold F     min explained variance to modify a layer (default: 0.25)
+#   --abliterate-skip-layers N   skip first/last N layers (default: 2)
+#
+# Use DEBUG=1 to see per-layer explained variance ratios.
+
+def load_prompts(path: str) -> list[str]:
+  prompts: list[str] = []
+  with open(path, "r", encoding="utf-8") as f:
+    for line in f:
+      if not line.strip(): continue
+      item = json.loads(line)
+      prompt = item.get("text", item.get("prompt", ""))
+      if prompt: prompts.append(prompt)
+  return prompts
+
+def capture_activations(model: Transformer, tok: SimpleTokenizer, prompts: list[str], bos_id: int|None, eos_id: int,
+                         num_prompts: int) -> dict[str, list[Tensor]]:
+  activations: dict[str, list[Tensor]] = {}
+  for prompt in prompts[:num_prompts]:
+    tokens = ([bos_id] if bos_id is not None else []) + tok.role("user") + tok.encode(prompt) + tok.end_turn(eos_id) + tok.role("assistant")
+    x = model.token_embd(Tensor([tokens], dtype="int32")).cast("float32")
+    T = x.shape[1]
+    for i, blk in enumerate(model.blk):
+      # --- attention (no KV cache, plain SDPA) ---
+      x_norm = blk.attn_norm(x)
+      q, k, v = blk.attn_q(x_norm), blk.attn_k(x_norm), blk.attn_v(x_norm)
+      if blk.qk_norm and blk.qk_norm != blk.head_dim: q, k = blk.attn_q_norm(q), blk.attn_k_norm(k)
+      q = q.reshape(1, T, blk.n_heads, blk.head_dim).transpose(1, 2)
+      k = k.reshape(1, T, blk.n_kv_heads, blk.head_dim).transpose(1, 2)
+      v = v.reshape(1, T, blk.n_kv_heads, blk.head_dim).transpose(1, 2)
+      if blk.qk_norm == blk.head_dim: q, k = blk.attn_q_norm(q), blk.attn_k_norm(k)
+      freqs_cis = precompute_freqs_cis(blk.head_dim, blk.max_context, blk.rope_theta)[:T]
+      q, k = apply_rope(q, freqs_cis), apply_rope(k, freqs_cis)
+      mask = Tensor.full((1, 1, T, T), float("-inf"), dtype=x.dtype).triu(1) if T > 1 else None
+      attn = q.scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)
+      attn = attn.transpose(1, 2).reshape(1, T, -1)
+      attn_out = blk.attn_output(attn)
+      activations.setdefault(f"{i}.attn", []).append(attn_out[0, -1].realize())
+      x = x + attn_out
+
+      # --- feed-forward ---
+      h_norm = blk.ffn_norm(x)
+      if hasattr(blk, 'ffn_gate_exps'):
+        # MoE path
+        x_exp = h_norm.unsqueeze(2)
+        probs, sel = blk.ffn_gate_inp(h_norm).softmax(-1).topk(blk.num_experts_per_tok)
+        x_down = blk.ffn_down_exps(sel, blk.ffn_gate_exps(sel, x_exp).silu() * blk.ffn_up_exps(sel, x_exp))
+        ffn_out = (x_down * probs.unsqueeze(-1)).sum(axis=2)
+      else:
+        gated = blk.ffn_gate(h_norm).silu().contiguous() * blk.ffn_up(h_norm)
+        ffn_out = blk.ffn_down(gated)
+        activations.setdefault(f"{i}.ffn", []).append(ffn_out[0, -1].realize())
+      x = (x + ffn_out).contiguous()
+  return activations
+
+def pca_direction(harmless_acts: list[Tensor], harmful_acts: list[Tensor]) -> tuple[Tensor, float]:
+  # move to numpy for SVD — tinygrad's SVD hits codegen bugs on small matrices
+  harmless_np = np.stack([a.numpy() for a in harmless_acts])  # (N1, D)
+  harmful_np = np.stack([a.numpy() for a in harmful_acts])    # (N2, D)
+  all_np = np.concatenate([harmless_np, harmful_np], axis=0)
+  global_mean = all_np.mean(axis=0)
+  M = all_np - global_mean
+  _, S, Vt = np.linalg.svd(M, full_matrices=False)
+  direction = Vt[0].astype(np.float32)
+  explained_variance = float((S[0] ** 2) / (S ** 2).sum())
+  # orient so it points from harmless to harmful
+  mean_diff = harmful_np.mean(axis=0) - harmless_np.mean(axis=0)
+  if np.dot(direction, mean_diff) < 0: direction = -direction
+  # orthogonalize against harmless mean direction
+  hm = harmless_np.mean(axis=0)
+  hm_norm = np.linalg.norm(hm)
+  if hm_norm > 0:
+    hm_dir = hm / hm_norm
+    direction = direction - np.dot(direction, hm_dir) * hm_dir
+  return Tensor(direction), explained_variance
+
+def abliterate_weight(weight: Tensor, direction: Tensor, strength: float) -> Tensor:
+  eps = 1e-12
+  orig_dtype = weight.dtype
+  w = weight.cast("float32")
+  d = (direction / (direction * direction).sum().sqrt().maximum(eps)).cast("float32")  # unit direction, shape (out,)
+  row_norms = (w * w).sum(axis=-1).sqrt()  # (out,)
+  w_dirs = w / row_norms.maximum(eps).unsqueeze(-1)  # unit direction per row, (out, in)
+  # norm-preserving biprojected abliteration: project out refusal direction from output space
+  proj = d @ w_dirs  # (in,)
+  w_dirs = w_dirs - strength * d.unsqueeze(-1) * proj.unsqueeze(0)  # subtract outer(d, proj)
+  updated_norms = (w_dirs * w_dirs).sum(axis=-1).sqrt().maximum(eps)
+  result = (w_dirs / updated_norms.unsqueeze(-1)) * row_norms.unsqueeze(-1)
+  return result.cast(orig_dtype)
+
+def abliterate_model(model: Transformer, tok: SimpleTokenizer, bos_id: int|None, eos_id: int, args):
+  harmful_prompts = load_prompts(args.harmful_path)
+  harmless_prompts = load_prompts(args.harmless_path)
+  print(f"Loaded {len(harmful_prompts)} harmful and {len(harmless_prompts)} harmless prompts")
+
+  print("Collecting activations...")
+  harmful_acts = capture_activations(model, tok, harmful_prompts, bos_id, eos_id, args.abliterate_num_prompts)
+  harmless_acts = capture_activations(model, tok, harmless_prompts, bos_id, eos_id, args.abliterate_num_prompts)
+
+  print("Applying abliteration...")
+  num_layers = len(model.blk)
+  skip = args.abliterate_skip_layers
+  updates = 0
+  for i in range(skip, num_layers - skip):
+    # attention
+    key = f"{i}.attn"
+    if key in harmful_acts and key in harmless_acts:
+      direction, evr = pca_direction(harmless_acts[key], harmful_acts[key])
+      if evr > args.abliterate_threshold:
+        model.blk[i].attn_output.weight.replace(abliterate_weight(model.blk[i].attn_output.weight, direction, args.abliterate_strength))
+        updates += 1
+        if DEBUG >= 1: print(f"  layer {i} attn: evr={evr:.4f}")
+    # ffn (skip MoE)
+    key = f"{i}.ffn"
+    if key in harmful_acts and key in harmless_acts:
+      direction, evr = pca_direction(harmless_acts[key], harmful_acts[key])
+      if evr > args.abliterate_threshold:
+        model.blk[i].ffn_down.weight.replace(abliterate_weight(model.blk[i].ffn_down.weight, direction, args.abliterate_strength))
+        updates += 1
+        if DEBUG >= 1: print(f"  layer {i} ffn:  evr={evr:.4f}")
+
+  # realize all modified parameters
+  Tensor.realize(*nn.state.get_parameters(model))
+  print(f"Abliteration complete: {updates} weight matrices modified across layers {skip}-{num_layers - skip - 1}")
+
 if __name__ == "__main__":
   parser = argparse.ArgumentParser()
   parser.add_argument("--model", choices=list(models.keys()), default=list(models.keys())[0], help="Model choice")
   parser.add_argument("--max_context", type=int, default=4096, help="Max Context Length")
   parser.add_argument("--serve", nargs='?', type=int, const=11434, metavar="PORT", help="Run OpenAI compatible API (optional port, default 11434)")
   parser.add_argument("--benchmark", nargs='?', type=int, const=20, metavar="COUNT", help="Benchmark tok/s (optional count, default 20)")
+  parser.add_argument("--abliterate", action="store_true", help="Enable abliteration to remove refusal behavior")
+  parser.add_argument("--harmful-path", default="harmful.jsonl", help="Path to harmful prompts JSONL")
+  parser.add_argument("--harmless-path", default="harmless.jsonl", help="Path to harmless prompts JSONL")
+  parser.add_argument("--abliterate-strength", type=float, default=2.5, help="Abliteration strength")
+  parser.add_argument("--abliterate-threshold", type=float, default=0.25, help="Explained variance threshold")
+  parser.add_argument("--abliterate-skip-layers", type=int, default=2, help="Layers to skip at start/end")
+  parser.add_argument("--abliterate-num-prompts", type=int, default=64, help="Number of prompt pairs to use")
   args = parser.parse_args()
 
   # load the model
   model, kv = Transformer.from_gguf(Tensor.from_url(models[args.model]), args.max_context)
   if DEBUG >= 1: print(f"using model {args.model}")
+
+  # extract some metadata
+  tok = SimpleTokenizer.from_gguf_kv(kv)
+  bos_id: int|None = kv.get('tokenizer.ggml.bos_token_id') if kv.get('tokenizer.ggml.add_bos_token', True) else None
+  eos_id: int = kv['tokenizer.ggml.eos_token_id']
+
+  # abliterate if requested
+  if args.abliterate: abliterate_model(model, tok, bos_id, eos_id, args)
 
   # do benchmark
   if args.benchmark:
@@ -351,11 +500,6 @@ if __name__ == "__main__":
       GlobalCounters.reset()
       with Timing(on_exit=lambda x: f", {1e9/x:6.2f} tok/s, {GlobalCounters.global_mem/x:7.2f} GB/s, param {param_bytes/x:7.2f} GB/s"): next(gen)
     exit(0)
-
-  # extract some metadata
-  tok = SimpleTokenizer.from_gguf_kv(kv)
-  bos_id: int|None = kv.get('tokenizer.ggml.bos_token_id') if kv.get('tokenizer.ggml.add_bos_token', True) else None
-  eos_id: int = kv['tokenizer.ggml.eos_token_id']
 
   # start server
   if args.serve: TCPServerWithReuse(('', args.serve), Handler).serve_forever()
