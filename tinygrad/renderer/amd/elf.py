@@ -37,7 +37,7 @@ def do_assemble_amd(ctx, prg:UOp, lin:UOp) -> UOp:
   sink, n_bufs, n_vars, lds_size, gids = prg.src[0], 0, 0, 0, set()
   for u in sink.toposort():
     if u.op is Ops.PARAM: n_bufs += 1
-    elif u.op is Ops.DEFINE_VAR: n_vars += 1
+    elif u.op is Ops.DEFINE_VAR: n_vars += u.dtype.itemsize
     elif u.op is Ops.DEFINE_LOCAL: lds_size += u.ptrdtype.size * u.ptrdtype.base.itemsize
     elif u.op is Ops.SPECIAL and u.arg.startswith("gidx"): gids.add(int(u.arg[-1]))
   src = "\n".join(str(inst) for inst in insts)
@@ -60,7 +60,7 @@ def do_assemble_amd(ctx, prg:UOp, lin:UOp) -> UOp:
   sgpr_granule = max(0, ceildiv(next_free_sgpr + 6, 8) - 1) if is_cdna else 0
   desc = amdgpu_kd.llvm_amdhsa_kernel_descriptor_t()
   desc.group_segment_fixed_size = lds_size
-  desc.kernarg_size = n_bufs * 8 + n_vars * 4
+  desc.kernarg_size = n_bufs * 8 + n_vars
   desc.kernel_code_entry_byte_offset = -len(text)
 
   # https://llvm.org/docs/AMDGPUUsage.html#amdgpu-amdhsa-compute-pgm-rsrc1-gfx6-gfx12-table

@@ -553,6 +553,7 @@ class AMDProgram(HCQProgram):
   def __init__(self, dev:AMDDevice, name:str, lib:bytes, **kwargs):
     # TODO; this API needs the type signature of the function and global_size/local_size
     self.dev, self.name, self.lib = dev, name, lib
+    self.var_fmts = kwargs.get('var_fmts', None)
 
     image, sections, relocs = elf_loader(self.lib)
 

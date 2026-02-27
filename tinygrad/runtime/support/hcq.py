@@ -299,7 +299,14 @@ class CLikeArgsState(HCQArgsState[ProgramType]):
 
     self.bind_sints_to_buf(*[b.va_addr for b in bufs], buf=self.buf, fmt='Q', offset=len(prefix or []) * 4)
     assert None not in vals
-    self.bind_sints_to_buf(*cast(tuple[sint, ...], vals), buf=self.buf, fmt='I', offset=len(prefix or []) * 4 + len(bufs) * 8)
+    var_fmts = getattr(prg, 'var_fmts', None)
+    vals_offset = len(prefix or []) * 4 + len(bufs) * 8
+    if var_fmts is not None and any(f == 'Q' for f in var_fmts):
+      for val, fmt in zip(cast(tuple[sint, ...], vals), var_fmts):
+        self.bind_sints_to_buf(val, buf=self.buf, fmt=fmt, offset=vals_offset)
+        vals_offset += 8 if fmt == 'Q' else 4
+    else:
+      self.bind_sints_to_buf(*cast(tuple[sint, ...], vals), buf=self.buf, fmt='I', offset=vals_offset)
 
 class HCQProgram(Generic[HCQDeviceType]):
   def __init__(self, args_state_t:Type[HCQArgsState], dev:HCQDeviceType, name:str, kernargs_alloc_size:int, lib:bytes|None=None, base:int|None=None):

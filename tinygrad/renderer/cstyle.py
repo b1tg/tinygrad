@@ -139,7 +139,7 @@ class CStyleLanguage(Renderer):
     if any(isinstance(dtype, ImageDType) for _,(dtype,_) in bufs):
       tmp = "const sampler_t smp = CLK_NORMALIZED_COORDS_FALSE | CLK_ADDRESS_CLAMP | CLK_FILTER_NEAREST;\n"
     buftypes = [(name, self.render_dtype(dtype, mutable)+self.buffer_suffix if isinstance(dtype, (ImageDType, PtrDType)) else
-                self.arg_int_prefix if dtype == dtypes.int else None) for name,(dtype,mutable) in bufs]
+                self.arg_int_prefix.replace("int", self.render_dtype(dtype)) if dtypes.is_int(dtype) else None) for name,(dtype,mutable) in bufs]
     local_dims = [u.src[0] for u in uops if u.op is Ops.SPECIAL and u.arg[0] == "l"]
     launch_bounds = prod([d.vmax for d in local_dims])
     prg = ''.join([f"{self.kernel_typedef.format(launch_bounds=launch_bounds)} {function_name}(",] +
