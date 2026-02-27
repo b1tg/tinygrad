@@ -22,12 +22,13 @@ class TestStunning(unittest.TestCase):
   def test_indexing_two_bind(self):
     a = Tensor.arange(100*10).reshape(100, 10).contiguous()
 
-    nv = a[12].cat(a[76]).tolist()
-
+    # per-kernel vars allows the same variable bound to different values across independent tensors
     vi = Variable('i', 0, a.shape[0]-1)
-    with self.assertRaisesRegex(AssertionError, "bind mismatch on"):
-      wv = a[vi.bind(12)].cat(a[vi.bind(76)]).tolist()
-      self.assertListEqual(nv, wv)
+    t1 = a[vi.bind(12)]
+    t2 = a[vi.bind(76)]
+    Tensor.realize(t1, t2)
+    self.assertListEqual(t1.tolist(), a[12].tolist())
+    self.assertListEqual(t2.tolist(), a[76].tolist())
 
   @unittest.skipIf(Device.DEFAULT in {"WEBGPU", "NV", "CUDA"}, "Too many buffers / too slow")
   @unittest.skip("This is binding a Variable to two different values")
