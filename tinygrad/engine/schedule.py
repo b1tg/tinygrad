@@ -141,17 +141,32 @@ def complete_create_schedule_with_vars(big_sink:UOp) -> tuple[list[ExecItem], di
 
   # vars used in the schedule
   used_vars = set().union(*[{v.expr for v in si.src[0].variables()} for si in linear.src])
-  # get var_vals
+  # get var_vals, collecting per-kernel bindings for variables with multiple different values
   var_vals: dict[str, int] = {}
+  per_kernel_vars: dict[str, list[int]] = {}
   for b in big_sink.src[1:]:
     if b.op is Ops.BIND:
       nm = b.src[0].expr
       if nm not in used_vars: continue
       val = b.src[1].arg
-      assert nm not in var_vals or var_vals[nm] == val, f"bind mismatch on {nm}, {var_vals[nm]} != {val}"
-      var_vals[nm] = val
+      if nm in per_kernel_vars:
+        per_kernel_vars[nm].append(val)
+      elif nm in var_vals and var_vals[nm] != val:
+        per_kernel_vars[nm] = [var_vals.pop(nm), val]
+      else:
+        var_vals[nm] = val
 
   # convert LINEAR to ExecItems
   schedule: list[ExecItem] = linear_to_schedule(linear)
   with cpu_profile(TracingKey("memory planner")): schedule = memory_planner(schedule)
+
+  # assign per-kernel variable values as fixedvars on each ExecItem
+  if per_kernel_vars:
+    for nm, vals in per_kernel_vars.items():
+      vi = 0
+      for ei in schedule:
+        if any(v.expr == nm for v in ei.ast.variables()):
+          if vi < len(vals): ei.fixedvars[nm] = vals[vi]
+          vi += 1
+
   return schedule, var_vals

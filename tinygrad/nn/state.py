@@ -3,6 +3,7 @@ from collections import OrderedDict
 from typing import Any, Callable, BinaryIO, Iterable, cast
 from tinygrad.tensor import Tensor
 from tinygrad.dtype import dtypes
+from tinygrad.uop.ops import UOp
 from tinygrad.helpers import prod, argsort, DEBUG, Timing, CI, GlobalCounters, tqdm, round_up, T, strides_for_shape
 
 class TensorIO(io.RawIOBase, BinaryIO):
@@ -377,6 +378,9 @@ def gguf_load(tensor: Tensor) -> tuple[dict, dict[str, Tensor]]:
   alignment, pos = kv_data.get("general.alignment", 32), reader.tell()
   data_start = round_up(pos, alignment)
 
-  for name, dims, typ, off in t_infos: state_dict[name] = ggml_data_to_tensor(tensor[data_start + off:], prod(dims), typ).reshape(*reversed(dims))
+  tensor_size = tensor.shape[0]
+  off_var = UOp.variable("_gguf_off", 0, tensor_size - 1)
+  for name, dims, typ, off in t_infos:
+    state_dict[name] = ggml_data_to_tensor(tensor[off_var.bind(data_start + off):], prod(dims), typ).reshape(*reversed(dims))
 
   return kv_data, state_dict
