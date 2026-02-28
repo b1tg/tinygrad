@@ -94,8 +94,10 @@ def full_rewrite_to_sink(sink:UOp, ren:Renderer|None=None, optimize:bool=True) -
   sink = graph_rewrite(sink, pm_decomp, ctx=ren.device, name="decompositions")
   if not is_dtype_supported(dtypes.long, ren.device) or dtypes.long in EMULATED_DTYPES.tolist(dtypes):
     sink = graph_rewrite(sink, pm_long_decomp, name="decomp long -> int", bottom_up=True)
-  for fr, to in [(fr, next((to for to in promo_lattice[fr] if is_dtype_supported(to, ren.device)), dtypes.float))
-                 for fr in EMULATED_DTYPES.tolist(dtypes) if fr in dtypes.floats]:
+  # emulate float dtypes explicitly requested via EMULATED_DTYPES, or natively unsupported on this backend
+  emulated_floats = [fr for fr in dtypes.floats if fr in EMULATED_DTYPES.tolist(dtypes) or not is_dtype_supported(fr, ren.device)]
+  for fr, to in [(fr, next((to for to in promo_lattice.get(fr, [dtypes.float]) if is_dtype_supported(to, ren.device)), dtypes.float))
+                 for fr in emulated_floats]:
     sink = graph_rewrite(sink, pm_float_decomp, ctx=(fr, to), name=f"decomp {fr} -> {to}", bottom_up=True)
   sink = graph_rewrite(sink, pm_transcendental, ctx=ren.device, name="transcendental")
 

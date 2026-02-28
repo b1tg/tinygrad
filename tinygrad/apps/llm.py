@@ -1,12 +1,16 @@
 from __future__ import annotations
-import sys, argparse, typing, re, unicodedata, json, uuid, time, functools
+import sys, argparse, typing, re, unicodedata, json, uuid, time, functools, math
+from datetime import date
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function
 from tinygrad.helpers import partition, DEBUG, Timing, GlobalCounters, stderr_log, colored
 from tinygrad.viz.serve import TCPServerWithReuse, HTTPRequestHandler
-
+from tinygrad import Tensor, nn, UOp, TinyJit, getenv
+from tinygrad.dtype import dtypes
 class SimpleTokenizer:
-  def __init__(self, normal_tokens:dict[str, int], special_tokens:dict[str, int], preset:str="llama3"):
-    if preset not in ("llama3","llama-v3","llama-bpe","qwen2","olmo"): raise ValueError(f"Invalid tokenizer preset '{preset}'")
+  def __init__(self, normal_tokens:dict[str, int], special_tokens:dict[str, int], preset:str="llama3",
+               merges:list[str]|None=None):
+    if preset in ("gpt-oss", "gpt_oss", "o200k_harmony", "gpt-4o"): preset = "gpt-oss"
+    if preset not in ("llama3","llama-v3","llama-bpe","qwen2","olmo","gpt-oss"): raise ValueError(f"Invalid tokenizer preset '{preset}'")
     # https://github.com/openai/gpt-2/blob/9b63575ef42771a015060c964af2c3da4cf7c8ab/src/encoder.py#L9
     bs = [*range(33, 127), *range(161, 173), *range(174, 256)]  # bytes that map to themselves
     self._byte_decoder = {chr(b): b for b in bs} | {chr(256+i): b for i,b in enumerate(b for b in range(256) if b not in bs)}
@@ -15,11 +19,26 @@ class SimpleTokenizer:
     # 0x323b0 is one past the max codepoint in unicode categories L/N/Z (0x323af is max L)
     def ucat_range(pre: str): return "".join(re.escape(chr(cp)) for cp in range(0x323b0) if unicodedata.category(chr(cp)).startswith(pre))
     r_ws, r_p_N, r_p_L = r"\t\n\x0b\x0c\r\x85" + ucat_range("Z"), ucat_range("N"), ucat_range("L")
-    self._split_to_word = re.compile("(?i:'s|'t|'re|'ve|'m|'ll|'d)|" + \
-      f"[^\\r\\n{r_p_N}{r_p_L}]?[{r_p_L}]+|[{r_p_N}]{{1,3}}| ?[^{r_ws}{r_p_N}{r_p_L}]+[\\r\\n]*|[{r_ws}]*[\\r\\n]+|[{r_ws}]+(?![^{r_ws}])|[{r_ws}]+")
+    if preset == "gpt-oss":
+      # matches llama.cpp LLAMA_VOCAB_PRE_TYPE_GPT4O used by GPT-OSS gguf tokenizer pre
+      self._split_to_word = re.compile(
+        f"[^\\r\\n{r_p_L}{r_p_N}]?((?=[{r_p_L}])([^a-z]))*((?=[{r_p_L}])([^A-Z]))+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|"
+        + f"[^\\r\\n{r_p_L}{r_p_N}]?((?=[{r_p_L}])([^a-z]))+((?=[{r_p_L}])([^A-Z]))*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|"
+        + f"[{r_p_N}]{{1,3}}| ?[^{r_ws}{r_p_L}{r_p_N}]+[\\r\\n/]*|[{r_ws}]*[\\r\\n]+|[{r_ws}]+(?![^{r_ws}])|[{r_ws}]+")
+    else:
+      self._split_to_word = re.compile("(?i:'s|'t|'re|'ve|'m|'ll|'d)|" + \
+        f"[^\\r\\n{r_p_N}{r_p_L}]?[{r_p_L}]+|[{r_p_N}]{{1,3}}| ?[^{r_ws}{r_p_N}{r_p_L}]+[\\r\\n]*|[{r_ws}]*[\\r\\n]+|[{r_ws}]+(?![^{r_ws}])|[{r_ws}]+")
     self._split_to_sentence = re.compile("|".join(re.escape(tok) for tok in special_tokens.keys()) if special_tokens else r"(?!)")
 
     self._normal_tokens = {bytes(self._byte_decoder[c] for c in tok): tid for tok, tid in normal_tokens.items()}
+    self._bpe_ranks: dict[tuple[bytes, bytes], int]|None = None
+    if merges is not None:
+      def str2bytes(tok:str) -> bytes: return bytes(self._byte_decoder[c] for c in tok)
+      # GPT-2/o200k BPE uses explicit merge ranks.
+      self._bpe_ranks = {}
+      for i, merge in enumerate(merges):
+        a, b = merge.split(" ", 1)
+        self._bpe_ranks[(str2bytes(a), str2bytes(b))] = i
     self._special_tokens = special_tokens
     self._tok2bytes = {tid: tok for tok, tid in self._normal_tokens.items()} | {tid: tok.encode() for tok, tid in self._special_tokens.items()}
     self.preset = preset
@@ -29,20 +48,28 @@ class SimpleTokenizer:
     # https://github.com/ggml-org/llama.cpp/blob/94933c8c2eeaa9a7983e3f6c08af76bd86724094/src/llama-vocab.cpp#L1818-L1820
     vocab: typing.Iterable[tuple[str, int]] = ((tok, idx) for idx, tok in enumerate(kv["tokenizer.ggml.tokens"]))
     normal_tokens, special_tokens = partition(vocab, lambda e: kv["tokenizer.ggml.token_type"][e[1]] == 1)
-    return SimpleTokenizer(dict(normal_tokens), dict(special_tokens), kv["tokenizer.ggml.pre"])
+    return SimpleTokenizer(dict(normal_tokens), dict(special_tokens), kv.get("tokenizer.ggml.pre", "llama3"),
+                           kv.get("tokenizer.ggml.merges") if kv.get("tokenizer.ggml.model") == "gpt2" else None)
 
   def _encode_word(self, word:bytes) -> list[int]:
     if (early_token:=self._normal_tokens.get(word)) is not None: return [early_token]
     parts = [bytes([b]) for b in word]
-    # greedily merge any parts that we can
-    while True:
-      i = min([(sys.maxsize, -1)] + [(self._normal_tokens.get(parts[j]+parts[j+1], sys.maxsize), j) for j in range(len(parts)-1)])[1]
-      if i == -1: break
-      parts[i:i+2] = [parts[i] + parts[i+1]]
+    if self._bpe_ranks is not None:
+      # GPT-2/o200k style BPE: merge by explicit rank table, not token id.
+      while True:
+        i = min([(sys.maxsize, -1)] + [(self._bpe_ranks.get((parts[j], parts[j+1]), sys.maxsize), j) for j in range(len(parts)-1)])[1]
+        if i == -1: break
+        parts[i:i+2] = [parts[i] + parts[i+1]]
+    else:
+      # fallback: greedily merge based on token id order.
+      while True:
+        i = min([(sys.maxsize, -1)] + [(self._normal_tokens.get(parts[j]+parts[j+1], sys.maxsize), j) for j in range(len(parts)-1)])[1]
+        if i == -1: break
+        parts[i:i+2] = [parts[i] + parts[i+1]]
     try: return [self._normal_tokens[p] for p in parts]
     except KeyError: raise RuntimeError("token not found")
   def _encode_sentence(self, chunk:str) -> list[int]:
-    return [tok for word in self._split_to_word.findall(chunk) for tok in self._encode_word(word.encode())]
+    return [tok for m in self._split_to_word.finditer(chunk) for tok in self._encode_word(m.group(0).encode())]
   def encode(self, text:str) -> list[int]:
     tokens: list[int] = []
     pos = 0
@@ -53,51 +80,168 @@ class SimpleTokenizer:
 
   def decode(self, ids:list[int]) -> str: return b''.join(self._tok2bytes[tid] for tid in ids).decode(errors='replace')
   def role(self, role:str):
+    if self.preset == 'gpt-oss':
+      if role == "assistant": return self.encode("<|start|>assistant<|channel|>final<|message|>")
+      return self.encode("<|start|>" + role + "<|message|>")
     if self.preset == 'olmo': return self.encode("<|" + role + "|>\n")  # OLMoE Instruct format
     if self.preset == 'qwen2': return self.encode("<|im_start|>" + role + "\n")
     return self.encode("<|start_header_id|>" + role + "<|end_header_id|>\n\n")
   def end_turn(self, eos_id:int):
+    if self.preset == 'gpt-oss': return self.encode("<|end|>")
     if self.preset == 'olmo': return self.encode("\n")
     if self.preset == 'qwen2': return [eos_id] + self.encode("\n")
     return [eos_id]
 
 @functools.cache
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> Tensor:
-  freqs = 1.0 / (theta ** (Tensor.arange(0, dim, 2)[:(dim // 2)] / dim))
-  freqs = Tensor.arange(end).unsqueeze(dim=1) * freqs.unsqueeze(dim=0)
-  return freqs.cos().cat(freqs.sin(), dim=-1).contiguous()
+def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, rope_scaling_type:str|None=None,
+                         rope_scaling_factor:float=1.0, rope_original_context_length:int=0) -> Tensor:
+  freq = theta ** (Tensor.arange(0, dim, 2)[:(dim // 2)] / dim)
+  concentration = 1.0
+  if rope_scaling_type == "yarn" and rope_scaling_factor > 1.0:
+    concentration = 0.1 * math.log(rope_scaling_factor) + 1.0
+    d_half = dim / 2
+    # GPT-OSS defaults in reference implementation.
+    ntk_alpha, ntk_beta = 1.0, 32.0
+    low = d_half * math.log(rope_original_context_length / (ntk_beta * 2 * math.pi)) / math.log(theta)
+    high = d_half * math.log(rope_original_context_length / (ntk_alpha * 2 * math.pi)) / math.log(theta)
+    ramp = (Tensor.arange(dim // 2) - low) / (high - low)
+    mask = 1.0 - ramp.clip(0, 1)
+    inv_freq = (1.0 / (rope_scaling_factor * freq)) * (1.0 - mask) + (1.0 / freq) * mask
+  else:
+    inv_freq = 1.0 / freq
+  freqs = Tensor.arange(end).unsqueeze(dim=1) * inv_freq.unsqueeze(dim=0)
+  return (freqs.cos() * concentration).cat(freqs.sin() * concentration, dim=-1).contiguous()
 
 class ExpertWeights:
   """Like nn.Linear but with num_experts dimension. Weight shape: (num_experts, out_features, in_features)."""
-  def __init__(self, num_experts:int, in_features:int, out_features:int):
+  def __init__(self, num_experts:int, in_features:int, out_features:int, bias:bool=False):
     self.weight = Tensor.zeros(num_experts, out_features, in_features)
+    if bias: self.bias = Tensor.zeros(num_experts, out_features)
   def __call__(self, sel:Tensor, x:Tensor) -> Tensor:
     # sel: (B, T, k), x: (B, T, 1, in) or (B, T, k, in) -> output: (B, T, k, out)
-    return (x.unsqueeze(-2) @ self.weight[sel].transpose(-1, -2)).squeeze(-2)
+    ret = (x.unsqueeze(-2) @ self.weight[sel].transpose(-1, -2)).squeeze(-2)
+    return ret + self.bias[sel] if hasattr(self, "bias") else ret
+
+class WeightHolder:
+  def __init__(self, n:int): self.weight = Tensor.zeros(n)
 
 def apply_rope(x:Tensor, freqs_cis:Tensor) -> Tensor:
   assert x.shape[-1] % 2 == 0
   cos, sin = freqs_cis.reshape(1, 1, x.shape[2], -1).chunk(2, dim=-1)
   x1, x2 = x.chunk(2, dim=-1)
   return (x1 * cos - x2 * sin).cat(x2 * cos + x1 * sin, dim=-1)
+def _fp8_packed_enabled() -> bool:
+  return bool(getenv("FP8_PACKED_ONLY_METAL", 1))
+
+def _fp8_packed_linear(x:Tensor, linear:nn.Linear) -> Tensor|None:
+  w_bits = getattr(linear, "_fp8_packed_weight", None)
+  if w_bits is None and getattr(linear, "_fp8_packed_only", False): w_bits = linear.weight
+  if w_bits is None or len(w_bits.shape) != 2: return None
+  out_features, in_features = w_bits.shape
+  if x.shape[-1] != in_features: return None
+
+  # if (y:=_fp8_packed_linear_fused(x, linear, w_bits)) is not None: return y
+
+  # calm-style e5m2: reinterpret each fp8 byte as half bits << 8.
+  w_half = (w_bits.cast(dtypes.uint16) << 8).bitcast(dtypes.half)
+  xh = x if x.dtype == dtypes.half else x.cast(dtypes.half)
+  biash = None if linear.bias is None else linear.bias.cast(dtypes.half)
+  y = xh.linear(w_half.transpose(), biash)
+  return y.cast(x.dtype) if x.dtype != y.dtype else y
+
+def _linear_decode_fp8_packed_graph(x:Tensor, linear:nn.Linear) -> Tensor|None:
+  if not _fp8_packed_enabled(): return None
+  if not isinstance(x.device, str) or not x.device.startswith("METAL"): return None
+  if x.ndim != 3: return None
+  if x.shape[0] != 1 or x.shape[1] != 1: return None
+  if not all(isinstance(s, int) for s in x.shape): return None
+  return _fp8_packed_linear(x, linear)
+
+def _linear_with_fastpath(x:Tensor, linear:nn.Linear) -> Tensor:
+  if (y:=_linear_decode_fp8_packed_graph(x, linear)) is not None: return y
+  if getattr(linear, "_fp8_packed_only", False):
+    # Packed-only mode has no fp16 master weight. Use on-demand dequant for non-decode paths.
+    y = _fp8_packed_linear(x, linear)
+    assert y is not None
+    return y
+  return linear(x)
+
+def _prepare_fp8_packed_linear_weights(model:"Transformer", packed_only:bool=False) -> list[Tensor]:
+  packed: list[Tensor] = []
+  if not _fp8_packed_enabled(): return packed
+
+  def add_linear(lin:nn.Linear|None):
+    if lin is None: return
+    if hasattr(lin, "_fp8_packed_weight") or getattr(lin, "_fp8_packed_only", False): return
+    w = lin.weight
+    if len(w.shape) != 2: return
+    # store raw fp8 e5m2 bytes as uint8 for graph-time dequant (<<8 bitcast to half).
+    packed_w = w.cast(dtypes.fp8e5m2).bitcast(dtypes.uint8).contiguous()
+    if packed_only:
+      lin.weight = packed_w
+      lin._fp8_packed_only = True
+    else:
+      lin._fp8_packed_weight = packed_w
+    packed.append(packed_w)
+
+  for block in model.blk:
+    add_linear(getattr(block, "attn_qkv", None))
+    add_linear(getattr(block, "attn_q", None))
+    add_linear(getattr(block, "attn_k", None))
+    add_linear(getattr(block, "attn_v", None))
+    add_linear(getattr(block, "attn_output", None))
+    add_linear(getattr(block, "ffn_upgate", None))
+    add_linear(getattr(block, "ffn_gate", None))
+    add_linear(getattr(block, "ffn_up", None))
+    add_linear(getattr(block, "ffn_down", None))
+  add_linear(getattr(model, "output", None))
+  return packed
+
+def topk_pairwise(scores: Tensor, k: int) -> tuple[Tensor, Tensor]:
+  """Pairwise rank topk for small last-dim sizes (fewer kernels than bitonic sort)."""
+  n = scores.shape[-1]
+  assert n is not None and k <= n
+  s_col = scores.unsqueeze(-1)  # (..., n, 1)
+  s_row = scores.unsqueeze(-2)  # (..., 1, n)
+  gt, eq = (s_row > s_col), (s_row == s_col)
+  expand_shape = (1,) * (scores.ndim - 1) + (n,)
+  j_idx = Tensor.arange(n).reshape(*expand_shape).unsqueeze(-2)
+  i_idx = Tensor.arange(n).reshape(*expand_shape).unsqueeze(-1)
+  ranks = (gt | (eq & (j_idx < i_idx))).sum(-1)  # (..., n), 0=largest
+  target = Tensor.arange(k).reshape(*((1,) * (scores.ndim - 1)), k)
+  match = (ranks.unsqueeze(-1) == target.unsqueeze(-2))
+  idx_f = Tensor.arange(n).reshape(*expand_shape).unsqueeze(-1).cast(scores.dtype)
+  indices = (match.where(idx_f, 0).sum(-2)).cast("int")
+  values = scores.gather(-1, indices)
+  return values, indices
 
 class TransformerBlock:
   def __init__(self, dim:int, hidden_dim:int, n_heads:int, n_kv_heads:int, norm_eps:float, head_dim:int, rope_theta:float,
-               max_context:int=0, qk_norm:int=0, num_experts:int=0, num_experts_per_tok:int=0):
+               max_context:int=0, qk_norm:int=0, num_experts:int=0, num_experts_per_tok:int=0, attn_qkv_bias=False,
+               attn_output_bias=False, moe_router_bias=False, moe_expert_bias=False, moe_swiglu_limit:float|None=None,
+               moe_swiglu_alpha:float=1.702, rope_scaling_type:str|None=None, rope_scaling_factor:float=1.0,
+               rope_original_context_length:int=0, attn_sinks:bool=False, sliding_window:int=0):
     self.n_heads      = n_heads
     self.n_kv_heads   = n_kv_heads
     self.head_dim     = head_dim
     self.rope_theta   = rope_theta
     self.max_context  = max_context
     self.qk_norm      = qk_norm
+    self.moe_swiglu_limit = moe_swiglu_limit
+    self.moe_swiglu_alpha = moe_swiglu_alpha
+    self.rope_scaling_type = rope_scaling_type
+    self.rope_scaling_factor = rope_scaling_factor
+    self.rope_original_context_length = rope_original_context_length
+    self.sliding_window = sliding_window
 
-    # --- attention projections (all linear, bias-free) ------------------
+    # --- attention projections -------------------------------------------
     q_proj_out       = self.head_dim * n_heads
     kv_proj_out      = self.head_dim * n_kv_heads
-    self.attn_q      = nn.Linear(dim, q_proj_out,  bias=False)
-    self.attn_k      = nn.Linear(dim, kv_proj_out, bias=False)
-    self.attn_v      = nn.Linear(dim, kv_proj_out, bias=False)
-    self.attn_output = nn.Linear(q_proj_out, dim,  bias=False)
+    self.attn_q      = nn.Linear(dim, q_proj_out,  bias=attn_qkv_bias)
+    self.attn_k      = nn.Linear(dim, kv_proj_out, bias=attn_qkv_bias)
+    self.attn_v      = nn.Linear(dim, kv_proj_out, bias=attn_qkv_bias)
+    self.attn_output = nn.Linear(q_proj_out, dim,  bias=attn_output_bias)
+    if attn_sinks: self.attn_sinks = WeightHolder(n_heads)
 
     # --- RMSNorms --------------------------------------------------------
     self.attn_norm   = nn.RMSNorm(dim, norm_eps)
@@ -107,19 +251,19 @@ class TransformerBlock:
     # --- feed-forward (MoE or dense) -------------------------------------
     if num_experts > 0:
       self.num_experts_per_tok = num_experts_per_tok
-      self.ffn_gate_inp = nn.Linear(dim, num_experts, bias=False)  # router
-      self.ffn_gate_exps = ExpertWeights(num_experts, dim, hidden_dim)
-      self.ffn_up_exps = ExpertWeights(num_experts, dim, hidden_dim)
-      self.ffn_down_exps = ExpertWeights(num_experts, hidden_dim, dim)
+      self.ffn_gate_inp = nn.Linear(dim, num_experts, bias=moe_router_bias)  # router
+      self.ffn_gate_exps = ExpertWeights(num_experts, dim, hidden_dim, bias=moe_expert_bias)
+      self.ffn_up_exps = ExpertWeights(num_experts, dim, hidden_dim, bias=moe_expert_bias)
+      self.ffn_down_exps = ExpertWeights(num_experts, hidden_dim, dim, bias=moe_expert_bias)
     else:
       self.ffn_gate    = nn.Linear(dim, hidden_dim, bias=False)
       self.ffn_up      = nn.Linear(dim, hidden_dim, bias=False)
       self.ffn_down    = nn.Linear(hidden_dim, dim, bias=False)
 
   @function
-  def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
+  def _attention(self, x:Tensor, start_pos:int|UOp, freqs_cis:Tensor|None=None, attn_mask:Tensor|None=None) -> Tensor:
     x_norm = self.attn_norm(x)                       # (B,T,D)
-    q, k, v = self.attn_q(x_norm), self.attn_k(x_norm), self.attn_v(x_norm)
+    q, k, v = _linear_with_fastpath(x_norm, self.attn_q), _linear_with_fastpath(x_norm, self.attn_k), _linear_with_fastpath(x_norm, self.attn_v)
     if self.qk_norm and self.qk_norm != self.head_dim: q, k = self.attn_q_norm(q), self.attn_k_norm(k)
 
     B, T, _ = x.shape
@@ -128,50 +272,94 @@ class TransformerBlock:
     v = v.reshape(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)  # (B,KvH,T,Hd)
     if self.qk_norm == self.head_dim: q, k = self.attn_q_norm(q), self.attn_k_norm(k)
 
-    freqs_cis = precompute_freqs_cis(self.head_dim, self.max_context, self.rope_theta)[start_pos:start_pos+T]
+    freqs_cis = precompute_freqs_cis(self.head_dim, self.max_context, self.rope_theta, self.rope_scaling_type,
+                                     self.rope_scaling_factor, self.rope_original_context_length)[start_pos:start_pos+T]
     q = apply_rope(q, freqs_cis)
     k = apply_rope(k, freqs_cis)
 
     # TODO: fix assign to behave like this
     assigned_kv = self.cache_kv.uop.after(self.cache_kv[:, :, :, start_pos:start_pos+T, :].uop.assign(Tensor.stack(k, v).contiguous().uop))
     tensor_assigned_kv = Tensor(assigned_kv, device=assigned_kv.device)
-    k = tensor_assigned_kv[0, :, :, 0:start_pos+T, :]
-    v = tensor_assigned_kv[1, :, :, 0:start_pos+T, :]
-
-    #self.cache_kv[:, :, :, start_pos:start_pos+T, :].assign(Tensor.stack(k, v))
-    #k = self.cache_kv[0, :, :, 0:start_pos+T, :]
-    #v = self.cache_kv[1, :, :, 0:start_pos+T, :]
-
-    # NOTE: this mask is causal_lower_right, not the causal_upper_left generated by is_casual = True
-    mask = Tensor.full((1, 1, T, start_pos+T), float("-inf"), dtype=x.dtype, device=x.device).triu(start_pos+1)
-    attn = q.scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)     # (B,H,T,Hd)
+    if T == 1:
+      # Keep decode shapes static so symbolic start_pos can reuse compiled kernels.
+      k = tensor_assigned_kv[0]
+      v = tensor_assigned_kv[1]
+      pos = Tensor.arange(self.max_context, device=x.device)
+      valid = pos <= start_pos
+      if self.sliding_window > 0: valid = valid * (pos >= start_pos - self.sliding_window + 1)
+      mask = valid.reshape(1, 1, 1, self.max_context).where(0, float("-inf")).cast(x.dtype)
+    else:
+      key_start = max(int(start_pos) - self.sliding_window + 1, 0) if self.sliding_window > 0 else 0
+      k = tensor_assigned_kv[0, :, :, key_start:start_pos+T, :]
+      v = tensor_assigned_kv[1, :, :, key_start:start_pos+T, :]
+      # NOTE: this mask is causal_lower_right, not the causal_upper_left generated by is_casual = True
+      mask = Tensor.full((1, 1, T, k.shape[-2]), float("-inf"), dtype=x.dtype, device=x.device).triu(int(start_pos)-key_start+1) if T > 1 else None
+    if hasattr(self, "attn_sinks"):
+      if self.n_heads != self.n_kv_heads:
+        k = k.repeat_interleave(self.n_heads // self.n_kv_heads, dim=1)
+        v = v.repeat_interleave(self.n_heads // self.n_kv_heads, dim=1)
+      logits = q.cast("float32").matmul(k.cast("float32").transpose(-2, -1)) / math.sqrt(self.head_dim)
+      if mask is not None: logits = logits + mask
+      sinks = self.attn_sinks.weight.cast("float32").reshape(1, self.n_heads, 1, 1)
+      logits_max = logits.max(axis=-1, keepdim=True)
+      logits_or_sinks_max = logits_max.maximum(sinks)
+      sinks = (sinks - logits_or_sinks_max).exp()
+      unnormalized_scores = (logits - logits_or_sinks_max).exp()
+      scores = unnormalized_scores / (unnormalized_scores.sum(axis=-1, keepdim=True) + sinks)
+      attn = scores.cast(q.dtype) @ v
+    else:
+      attn = q.scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)   # (B,H,T,Hd)
     attn = attn.transpose(1, 2).reshape(B, T, -1)                                    # back to (B,T,D)
-    attn = self.attn_output(attn)
+    attn = _linear_with_fastpath(attn, self.attn_output)
     return x + attn
 
   @function
   def _feed_forward(self, h: Tensor) -> Tensor:
     h_norm = self.ffn_norm(h)
-    if hasattr(self, 'ffn_gate_exps'):
+    if hasattr(self, 'ffn_gate_exps') or hasattr(self, 'ffn_gate_up_exps'):
       x = h_norm.unsqueeze(2)  # (B, T, 1, D) - add expert dim for broadcasting
-      probs, sel = self.ffn_gate_inp(h_norm).softmax(-1).topk(self.num_experts_per_tok)  # (B, T, k) each
-      x_down = self.ffn_down_exps(sel, self.ffn_gate_exps(sel, x).silu() * self.ffn_up_exps(sel, x))  # (B, T, k, D)
+      router_probs = self.ffn_gate_inp(h_norm).softmax(-1)
+      probs, sel = topk_pairwise(router_probs, self.num_experts_per_tok) if router_probs.shape[-1] <= 128 else router_probs.topk(self.num_experts_per_tok)
+      if hasattr(self, 'ffn_gate_up_exps'):
+        gate, up = self.ffn_gate_up_exps(sel, x).chunk(2, dim=-1)
+      else:
+        gate, up = self.ffn_gate_exps(sel, x), self.ffn_up_exps(sel, x)
+      if self.moe_swiglu_limit is not None:
+        gate = gate.clip(max_=self.moe_swiglu_limit)
+        up = up.clip(min_=-self.moe_swiglu_limit, max_=self.moe_swiglu_limit)
+        act = gate * (gate * self.moe_swiglu_alpha).sigmoid() * (up + 1)
+      else:
+        act = gate.silu() * up
+      x_down = self.ffn_down_exps(sel, act)  # (B, T, k, D)
       return h + (x_down * probs.unsqueeze(-1)).sum(axis=2)  # (B, T, D)
     # TODO: remove the need for this contiguous
-    gated  = self.ffn_gate(h_norm).silu().contiguous() * self.ffn_up(h_norm)
-    return h + self.ffn_down(gated)
+    if hasattr(self, 'ffn_upgate'):
+      gate, up = _linear_with_fastpath(h_norm, self.ffn_upgate).chunk(2, dim=-1)
+      gated = gate.silu().contiguous() * up
+    else:
+      gated = _linear_with_fastpath(h_norm, self.ffn_gate).silu().contiguous() * _linear_with_fastpath(h_norm, self.ffn_up)
+    return h + _linear_with_fastpath(gated, self.ffn_down)
 
-  def __call__(self, x: Tensor, start_pos: int|UOp):
+  def __call__(self, x: Tensor, start_pos: int|UOp, freqs_cis:Tensor|None=None, attn_mask:Tensor|None=None):
     if not hasattr(self, "cache_kv"):
       # TODO: how is the dtype of this determined?
       self.cache_kv = Tensor.zeros(2, x.shape[0], self.n_kv_heads, self.max_context, self.head_dim, device=x.device).contiguous().realize()
-    return self._feed_forward(self._attention(x, start_pos)).contiguous()
+    return self._feed_forward(self._attention(x, start_pos, freqs_cis, attn_mask)).contiguous()
 
 class Transformer:
   def __init__(self, *, num_blocks, dim, hidden_dim, n_heads, n_kv_heads, norm_eps, vocab_size, head_dim:int, rope_theta:float,
-               max_context:int=0, qk_norm:int=0, num_experts:int=0, num_experts_per_tok:int=0):
-    self.blk = [TransformerBlock(dim, hidden_dim, n_heads, n_kv_heads, norm_eps, head_dim, rope_theta, max_context, qk_norm,
-                                 num_experts, num_experts_per_tok) for _ in range(num_blocks)]
+               max_context:int=0, qk_norm:int=0, num_experts:int=0, num_experts_per_tok:int=0, attn_qkv_bias=False,
+               attn_output_bias=False, moe_router_bias=False, moe_expert_bias=False, moe_swiglu_limit:float|None=None,
+               moe_swiglu_alpha:float=1.702, rope_scaling_type:str|None=None, rope_scaling_factor:float=1.0,
+               rope_original_context_length:int=0, attn_sinks:bool=False, sliding_window:int=0):
+    self.blk = [TransformerBlock(dim, hidden_dim, n_heads, n_kv_heads, norm_eps, head_dim, rope_theta, max_context=max_context, qk_norm=qk_norm,
+                                 num_experts=num_experts, num_experts_per_tok=num_experts_per_tok, attn_qkv_bias=attn_qkv_bias,
+                                 attn_output_bias=attn_output_bias, moe_router_bias=moe_router_bias, moe_expert_bias=moe_expert_bias,
+                                 moe_swiglu_limit=moe_swiglu_limit, moe_swiglu_alpha=moe_swiglu_alpha,
+                                 rope_scaling_type=rope_scaling_type, rope_scaling_factor=rope_scaling_factor,
+                                 rope_original_context_length=rope_original_context_length, attn_sinks=attn_sinks,
+                                 sliding_window=(sliding_window if sliding_window > 0 and i % 2 == 0 else 0))
+                for i in range(num_blocks)]
     self.token_embd  = nn.Embedding(vocab_size, dim)
     self.output_norm = nn.RMSNorm(dim, norm_eps)
     self.output = nn.Linear(dim, vocab_size, bias=False)
@@ -179,14 +367,32 @@ class Transformer:
     # JIT is used if T=1 and start_pos is a UOp. TODO: make this not needed by including T in the JIT and making start_pos always a UOp
     self.forward_jit = TinyJit(self.forward)
 
-  def forward(self, tokens:Tensor, start_pos:int|UOp) -> Tensor:
+  def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:float=0.0, top_k:int=0) -> Tensor:
+    freqs_cis = precompute_freqs_cis(self.blk[0].head_dim, self.max_context, self.blk[0].rope_theta)[start_pos:start_pos+tokens.shape[1]]
     x = self.token_embd(tokens)                           # (B, T, D)
+    T = tokens.shape[1]
+    if T == 1:
+      for block in self.blk: x = block(x, start_pos, freqs_cis)
+    else:
+      mask = Tensor.full((1, 1, T, start_pos+T), float("-inf"), dtype=x.dtype, device=x.device).triu(int(start_pos)+1)
+      for block in self.blk: x = block(x, start_pos, freqs_cis, mask)
+    # Greedy decode needs logits only for the last token.
+    x_last = self.output_norm(x[:, -1:, :])
+    return _linear_with_fastpath(self.output_norm(x[:, -1:, :]), self.output)[:, 0, :].argmax(-1, keepdim=True)
     for block in self.blk: x = block(x, start_pos)
-    # TODO: add temperature
-    return self.output(self.output_norm(x))[:, -1, :].softmax(-1, dtype="float").argmax(-1, keepdim=True)
+    logits = self.output(self.output_norm(x))[:, -1, :]
+    if temperature <= 0:
+      return logits.softmax(-1, dtype="float").argmax(-1, keepdim=True)
+    probs = (logits / temperature).softmax(-1, dtype="float")
+    if 0 < top_k < probs.shape[-1]:
+      vals, idx = probs.topk(top_k)
+      sampled = (vals / vals.sum(-1, keepdim=True)).multinomial()
+      return idx.gather(-1, sampled)
+    return probs.multinomial()
 
-  def __call__(self, tokens:Tensor, start_pos:int|UOp=0) -> Tensor:
-    return (self.forward_jit if getenv("JIT", 1) and tokens.shape[1] == 1 and isinstance(start_pos, UOp) else self.forward)(tokens, start_pos)
+  def __call__(self, tokens:Tensor, start_pos:int|UOp=0, temperature:float=0.0, top_k:int=0) -> Tensor:
+    use_jit = getenv("JIT", 1) and top_k == 0 and tokens.shape[1] == 1 and isinstance(start_pos, UOp)
+    return (self.forward_jit if use_jit else self.forward)(tokens, start_pos, temperature, top_k)
 
   @staticmethod
   def from_gguf(gguf:Tensor, max_context:int|None=None, realize=bool(getenv("REALIZE", 1))) -> tuple[Transformer, dict]:
@@ -200,6 +406,21 @@ class Transformer:
     if 'output.weight' not in state_dict: state_dict['output.weight'] = state_dict['token_embd.weight']
 
     arch = kv['general.architecture']
+    if arch in ('gpt-oss', 'gpt_oss'):
+      # GPT-OSS gguf names this norm as post_attention_norm, map to llm.py block naming.
+      for name in list(state_dict.keys()):
+        if '.post_attention_norm.' in name:
+          state_dict[name.replace('.post_attention_norm.', '.ffn_norm.')] = state_dict.pop(name)
+
+    attn_qkv_bias = 'blk.0.attn_q.bias' in state_dict
+    attn_output_bias = 'blk.0.attn_output.bias' in state_dict
+    moe_router_bias = 'blk.0.ffn_gate_inp.bias' in state_dict
+    moe_expert_bias = 'blk.0.ffn_gate_exps.bias' in state_dict
+    moe_swiglu_limit = kv.get(f'{arch}.swiglu_limit', 7.0 if arch in ('gpt-oss', 'gpt_oss') else None)
+    rope_scaling_type = kv.get(f'{arch}.rope.scaling.type')
+    rope_scaling_factor = kv.get(f'{arch}.rope.scaling.factor', 1.0)
+    rope_original_context_length = int(kv.get(f'{arch}.rope.scaling.original_context_length', 0))
+    attn_sinks = 'blk.0.attn_sinks.weight' in state_dict
     max_context = min(max_context, kv[f'{arch}.context_length']) if max_context is not None else kv[f'{arch}.context_length']
     n_heads, n_kv_heads = kv[f'{arch}.attention.head_count'], kv[f'{arch}.attention.head_count_kv']
 
@@ -216,22 +437,72 @@ class Transformer:
                         head_dim=kv.get(f'{arch}.attention.key_length', kv[f'{arch}.embedding_length'] // n_heads),
                         rope_theta=kv[f'{arch}.rope.freq_base'], max_context=max_context,
                         qk_norm=int(state_dict['blk.0.attn_q_norm.weight'].shape[0]) if 'blk.0.attn_q_norm.weight' in state_dict else 0,
-                        num_experts=kv.get(f'{arch}.expert_count', 0), num_experts_per_tok=kv.get(f'{arch}.expert_used_count', 0))
+                        num_experts=kv.get(f'{arch}.expert_count', 0), num_experts_per_tok=kv.get(f'{arch}.expert_used_count', 0),
+                        attn_qkv_bias=attn_qkv_bias, attn_output_bias=attn_output_bias, moe_router_bias=moe_router_bias,
+                        moe_expert_bias=moe_expert_bias, moe_swiglu_limit=moe_swiglu_limit, rope_scaling_type=rope_scaling_type,
+                        rope_scaling_factor=rope_scaling_factor, rope_original_context_length=rope_original_context_length, attn_sinks=attn_sinks,
+                        sliding_window=int(kv.get(f'{arch}.attention.sliding_window', 0)))
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
+    # Fuse gate+up expert projections to reduce MoE decode compute without changing math.
+    for b in model.blk:
+      if hasattr(b, 'ffn_gate_exps') and hasattr(b, 'ffn_up_exps'):
+        fused = ExpertWeights(b.ffn_gate_exps.weight.shape[0], b.ffn_gate_exps.weight.shape[2], b.ffn_gate_exps.weight.shape[1] * 2,
+                              bias=hasattr(b.ffn_gate_exps, 'bias') and hasattr(b.ffn_up_exps, 'bias'))
+        fused.weight = b.ffn_gate_exps.weight.cat(b.ffn_up_exps.weight, dim=1)
+        if hasattr(fused, 'bias'): fused.bias = b.ffn_gate_exps.bias.cat(b.ffn_up_exps.bias, dim=1)
+        b.ffn_gate_up_exps = fused
+        del b.ffn_gate_exps, b.ffn_up_exps
+    if packed_only:=_fp8_packed_enabled():
+      # In packed-only mode, this replaces linear master weights with packed fp8 storage.
+      packed_params = _prepare_fp8_packed_linear_weights(model, packed_only=packed_only)
+    params = nn.state.get_parameters(model)
+    if not _fp8_packed_enabled(): packed_params: list[Tensor] = []
+    def replace_param(p:Tensor, v:Tensor):
+      p.replace(v)
+      # Realize incrementally to avoid large one-shot materialization corruption on big embedding tables.
+      if realize: p.realize()
+    if _fp8_packed_enabled():
+      for s in params: replace_param(s, s.contiguous())
+    else:
+      for s in params: replace_param(s, s.contiguous())
+    if realize and packed_params: Tensor.realize(*packed_params)
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
-    if realize:
-      for s in (params:=nn.state.get_parameters(model)): s.replace(s.contiguous())
-      Tensor.realize(*params)
+    # if realize:
+    #   for s in (params:=nn.state.get_parameters(model)): s.replace(s.contiguous())
+    #   Tensor.realize(*params)
     return model, kv
 
-  def generate(self, tokens:list[int], start_pos=0):
+  def generate(self, tokens:list[int], start_pos=0, temperature:float=0.0, top_k:int=0, anti_repeat:bool=True):
+    def repeats_ngram(seq:list[int]) -> bool:
+      # detect short loops early (A B A B or A B C A B C) and hard token stutter.
+      if len(seq) >= 4 and len(set(seq[-4:])) == 1: return True
+      for p in range(1, min(16, len(seq)//2) + 1):
+        if seq[-p:] == seq[-2*p:-p]: return True
+      for p in range(1, min(8, len(seq)//3) + 1):
+        if seq[-p:] == seq[-2*p:-p] == seq[-3*p:-2*p]: return True
+      return False
+
     v_start_pos = UOp.variable("start_pos", 1, self.max_context-1)
     t = Tensor([tokens[start_pos:]], dtype="int32")
+    gen_ids: list[int] = []
     while len(tokens) < self.max_context:
-      t = self(t, v_start_pos.bind(start_pos) if getenv("SYM", 1) and start_pos != 0 and t.shape[-1] == 1 else start_pos)
+      use_sym = getenv("SYM", 1) and top_k == 0 and start_pos != 0 and t.shape[-1] == 1
+      in_t = t
+      sp = v_start_pos.bind(start_pos) if use_sym else start_pos
+      t = self(in_t, sp, temperature, top_k)
       next_id = int(t.item())
+      # Escape short loops by resampling with higher temperature and no topk sort.
+      if anti_repeat:
+        recent = gen_ids[-48:]
+        retry_temp = max(temperature, 0.9)
+        for _ in range(8):
+          if recent.count(next_id) < 2 and not repeats_ngram(gen_ids + [next_id]): break
+          next_id = int(self(in_t, sp, retry_temp, 0).item())
+          retry_temp = min(retry_temp + 0.1, 1.4)
+      gen_ids.append(next_id)
       tokens.append(next_id)
       start_pos = len(tokens) - 1
+      t = Tensor([[next_id]], dtype="int32")
       yield next_id
 
 models = {
@@ -245,7 +516,18 @@ models = {
   "qwen3:8b": "https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf",
   "qwen3:30b-a3b": "https://huggingface.co/Qwen/Qwen3-30B-A3B-GGUF/resolve/main/Qwen3-30B-A3B-Q4_K_M.gguf",
   "olmoe": "https://huggingface.co/allenai/OLMoE-1B-7B-0924-Instruct-GGUF/resolve/main/olmoe-1b-7b-0924-instruct-q4_k_m.gguf",
+  # "gpt-oss:20b": "https://huggingface.co/unsloth/gpt-oss-20b-GGUF/resolve/main/gpt-oss-20b-Q4_K_M.gguf",
+  "gpt-oss:20b": "/Users/ch/.cache/huggingface/hub/models--Qwen--Qwen3-8B-GGUF/snapshots/7c41481f57cb95916b40956ab2f0b139b296d974/Qwen3-8B-Q4_K_M.gguf",
+  "gpt-oss:20b-q8": "https://huggingface.co/unsloth/gpt-oss-20b-GGUF/resolve/main/gpt-oss-20b-Q8_0.gguf",
 }
+
+def gpt_oss_default_system_prompt() -> str:
+  return ("You are ChatGPT, a large language model trained by OpenAI.\n"
+          "Knowledge cutoff: 2024-06\n"
+          f"Current date: {date.today().isoformat()}\n\n"
+          "Prefer direct, concise answers. For coding requests, output runnable code first.\n\n"
+          "reasoning effort high\n\n"
+          "# Valid channels: analysis, final. Channel must be included for every message.")
 
 # *** simple OpenAI compatible server on 11434 to match ollama ***
 # OPENAI_BASE_URL=http://localhost:11434/v1 OPENAI_API_KEY=ollama uvx --from gpt-command-line gpt
@@ -294,9 +576,9 @@ class Handler(HTTPRequestHandler):
     yield {"choices": [{"index":0, "delta":{"role":"assistant","content":""}, "finish_reason":None}], **tmpl}
     out: list[int] = []
     st = time.perf_counter()
-    for next_id in model.generate(ids):
+    for next_id in model.generate(ids, temperature=decode_temperature, top_k=decode_top_k):
       if len(out) == 0: stderr_log(f"prefill:{len(ids)/((pt:=time.perf_counter())-st):4.0f} tok/s  {colored('--', 'BLACK')}  ")
-      if next_id == eos_id: break
+      if next_id in stop_ids: break
       out.append(next_id)
       yield {"choices": [{"index":0, "delta":{"content":tok.decode([next_id])}, "finish_reason":None}], **tmpl}
     yield {"choices": [{"index":0, "delta":{},"finish_reason":"stop"}], **tmpl}
@@ -311,7 +593,10 @@ class Handler(HTTPRequestHandler):
     if self.path == "/v1/chat/completions":
       # extract tokens
       ids: list[int] = [bos_id] if bos_id is not None else []
-      for msg in body["messages"]:
+      msgs = list(body["messages"])
+      if tok.preset == "gpt-oss" and not any(msg.get("role") == "system" for msg in msgs):
+        msgs = [{"role":"system", "content":gpt_oss_default_system_prompt()}] + msgs
+      for msg in msgs:
         ids += tok.role(msg["role"])
         # content can be a str or a list
         content = msg["content"]
@@ -339,6 +624,9 @@ if __name__ == "__main__":
   parser = argparse.ArgumentParser()
   parser.add_argument("--model", "-m", choices=list(models.keys()), default=list(models.keys())[0], help="Model choice")
   parser.add_argument("--max_context", type=int, default=4096, help="Max Context Length")
+  parser.add_argument("--fast", action="store_true", help="Warm up JIT before benchmark/serve")
+  parser.add_argument("--temperature", type=float, default=None, help="Sampling temperature (default: 0.0)")
+  parser.add_argument("--top_k", type=int, default=None, help="Top-k sampling (default: 0)")
   parser.add_argument("--serve", nargs='?', type=int, const=11434, metavar="PORT", help="Run OpenAI compatible API (optional port, default 11434)")
   parser.add_argument("--benchmark", nargs='?', type=int, const=20, metavar="COUNT", help="Benchmark tok/s (optional count, default 20)")
   args = parser.parse_args()
@@ -356,7 +644,17 @@ if __name__ == "__main__":
 
   # do benchmark
   if args.benchmark:
-    gen = model.generate([0], 0)
+    param_bytes = sum(x.nbytes() for x in nn.state.get_parameters(model))
+    for b in model.blk:
+      if hasattr(b, 'ffn_gate_up_exps'):
+        expert_bytes = b.ffn_gate_up_exps.weight.nbytes() + b.ffn_down_exps.weight.nbytes()
+        param_bytes -= int(expert_bytes * (1 - b.num_experts_per_tok / b.ffn_gate_up_exps.weight.shape[0]))
+      elif hasattr(b, 'ffn_gate_exps'):
+        expert_bytes = b.ffn_gate_exps.weight.nbytes() + b.ffn_up_exps.weight.nbytes() + b.ffn_down_exps.weight.nbytes()
+        param_bytes -= int(expert_bytes * (1 - b.num_experts_per_tok / b.ffn_gate_exps.weight.shape[0]))
+    gen = model.generate([0], 0, anti_repeat=False)
+    if args.fast and args.model.startswith("gpt-oss"):
+      for _ in range(4): next(gen)  # warmup + JIT capture for steady-state speed numbers
     for _ in range(args.benchmark):
       GlobalCounters.reset()
       with Timing(on_exit=lambda x: f", {1e9/x:6.2f} tok/s, {GlobalCounters.global_mem/x:7.2f} GB/s,"
@@ -365,20 +663,30 @@ if __name__ == "__main__":
 
   # extract some metadata
   tok = SimpleTokenizer.from_gguf_kv(kv)
+  decode_temperature: float = 0.0 if args.temperature is None else args.temperature
+  decode_top_k: int = 0 if args.top_k is None else args.top_k
   bos_id: int|None = kv.get('tokenizer.ggml.bos_token_id') if kv.get('tokenizer.ggml.add_bos_token', True) else None
   eos_id: int = kv['tokenizer.ggml.eos_token_id']
+  stop_ids: set[int] = {eos_id}
+  if tok.preset == "gpt-oss":
+    for stop_tok in ("<|end|>", "<|return|>", "<|call|>", "<|endoftext|>"):
+      if stop_tok in tok._special_tokens: stop_ids.add(tok._special_tokens[stop_tok])
 
   # start server
   if args.serve: TCPServerWithReuse(('', args.serve), Handler).serve_forever()
 
   ids: list[int] = [bos_id] if bos_id is not None else []
+  if tok.preset == "gpt-oss":
+    ids += tok.role("system") + tok.encode(gpt_oss_default_system_prompt()) + tok.end_turn(eos_id)
+  first_turn = True
   while 1:
-    start_pos = max(len(ids) - 1, 0)
+    start_pos = 0 if first_turn else max(len(ids) - 1, 0)
     try:
       ids += tok.role("user") + tok.encode(input('>>> ')) + tok.end_turn(eos_id) + tok.role("assistant")
     except EOFError:
       break
-    for next_id in model.generate(ids, start_pos):
-      sys.stdout.write(tok.decode([next_id]) if next_id != eos_id else "\n\n")
+    for next_id in model.generate(ids, start_pos, temperature=decode_temperature, top_k=decode_top_k):
+      sys.stdout.write(tok.decode([next_id]) if next_id not in stop_ids else "\n\n")
       sys.stdout.flush()
-      if next_id == eos_id: break
+      if next_id in stop_ids: break
+    first_turn = False
