@@ -1,6 +1,7 @@
 from __future__ import annotations
 import sys, argparse, typing, re, unicodedata, json, uuid, time, functools
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv
+from tinygrad.dtype import dtypes
 from tinygrad.helpers import partition, DEBUG, Timing, GlobalCounters, stderr_log, colored
 from tinygrad.viz.serve import TCPServerWithReuse, HTTPRequestHandler
 
@@ -27,9 +28,20 @@ class SimpleTokenizer:
   @staticmethod
   def from_gguf_kv(kv:dict):
     # https://github.com/ggml-org/llama.cpp/blob/94933c8c2eeaa9a7983e3f6c08af76bd86724094/src/llama-vocab.cpp#L1818-L1820
-    vocab: typing.Iterable[tuple[str, int]] = ((tok, idx) for idx, tok in enumerate(kv["tokenizer.ggml.tokens"]))
-    normal_tokens, special_tokens = partition(vocab, lambda e: kv["tokenizer.ggml.token_type"][e[1]] == 1)
-    return SimpleTokenizer(dict(normal_tokens), dict(special_tokens), kv["tokenizer.ggml.pre"])
+    vocab_tokens:list[str] = kv["tokenizer.ggml.tokens"]
+    token_types:list[int] = kv["tokenizer.ggml.token_type"]
+    vocab: typing.Iterable[tuple[str, int]] = ((tok, idx) for idx, tok in enumerate(vocab_tokens))
+    normal_tokens, special_tokens = partition(vocab, lambda e: token_types[e[1]] == 1)
+    ret = SimpleTokenizer(dict(normal_tokens), dict(special_tokens), kv["tokenizer.ggml.pre"])
+    # Preserve full id -> bytes mapping (even if multiple ids share identical token strings).
+    tok2bytes: dict[int, bytes] = {}
+    for idx, tok in enumerate(vocab_tokens):
+      if token_types[idx] == 1:
+        try: tok2bytes[idx] = bytes(ret._byte_decoder[c] for c in tok)
+        except KeyError: tok2bytes[idx] = tok.encode(errors='replace')
+      else: tok2bytes[idx] = tok.encode()
+    ret._tok2bytes = tok2bytes
+    return ret
 
   def _encode_word(self, word:bytes) -> list[int]:
     if (early_token:=self._normal_tokens.get(word)) is not None: return [early_token]
@@ -51,7 +63,9 @@ class SimpleTokenizer:
       pos = match.end(0)
     return tokens + self._encode_sentence(text[pos:])
 
-  def decode(self, ids:list[int]) -> str: return b''.join(self._tok2bytes[tid] for tid in ids).decode(errors='replace')
+  def decode(self, ids:list[int]) -> str:
+    # Keep generation robust in case model produces an out-of-vocab id.
+    return b''.join(self._tok2bytes.get(tid, f"<|unk_{tid}|>".encode()) for tid in ids).decode(errors='replace')
   def role(self, role:str):
     if self.preset == 'olmo': return self.encode("<|" + role + "|>\n")  # OLMoE Instruct format
     if self.preset == 'qwen2': return self.encode("<|im_start|>" + role + "\n")
@@ -81,6 +95,53 @@ def apply_rope(x:Tensor, freqs_cis:Tensor) -> Tensor:
   x1, x2 = x.chunk(2, dim=-1)
   return (x1 * cos - x2 * sin).cat(x2 * cos + x1 * sin, dim=-1)
 
+def _linear_decode_fp8_packed_graph(x:Tensor, linear:nn.Linear) -> Tensor|None:
+  if not getenv("FP8_PACKED_METAL", 0): return None
+  if not isinstance(x.device, str) or not x.device.startswith("METAL"): return None
+  if x.ndim != 3: return None
+  if x.shape[0] != 1 or x.shape[1] != 1: return None
+  if not all(isinstance(s, int) for s in x.shape): return None
+  w_bits = getattr(linear, "_fp8_packed_weight", None)
+  if w_bits is None or len(w_bits.shape) != 2: return None
+  out_features, in_features = w_bits.shape
+  if x.shape[2] != in_features: return None
+
+  # calm-style decode for e5m2: reinterpret each fp8 byte as half bits << 8.
+  w_half = (w_bits.cast(dtypes.uint16) << 8).bitcast(dtypes.half)
+  xh = x if x.dtype == dtypes.half else x.cast(dtypes.half)
+  biash = None if linear.bias is None else linear.bias.cast(dtypes.half)
+  y = xh.linear(w_half.transpose(), biash)
+  return y.cast(x.dtype) if x.dtype != y.dtype else y
+
+def _linear_with_fastpath(x:Tensor, linear:nn.Linear) -> Tensor:
+  return y if (y:=_linear_decode_fp8_packed_graph(x, linear)) is not None else linear(x)
+
+def _prepare_fp8_packed_linear_weights(model:"Transformer") -> list[Tensor]:
+  packed: list[Tensor] = []
+  if not getenv("FP8_PACKED_METAL", 0): return packed
+
+  def add_linear(lin:nn.Linear|None):
+    if lin is None: return
+    if hasattr(lin, "_fp8_packed_weight"): return
+    w = lin.weight
+    if len(w.shape) != 2: return
+    # store raw fp8 e5m2 bytes as uint8 for graph-time dequant (<<8 bitcast to half).
+    lin._fp8_packed_weight = w.cast(dtypes.fp8e5m2).bitcast(dtypes.uint8).contiguous()
+    packed.append(lin._fp8_packed_weight)
+
+  for block in model.blk:
+    add_linear(getattr(block, "attn_qkv", None))
+    add_linear(getattr(block, "attn_q", None))
+    add_linear(getattr(block, "attn_k", None))
+    add_linear(getattr(block, "attn_v", None))
+    add_linear(getattr(block, "attn_output", None))
+    add_linear(getattr(block, "ffn_upgate", None))
+    add_linear(getattr(block, "ffn_gate", None))
+    add_linear(getattr(block, "ffn_up", None))
+    add_linear(getattr(block, "ffn_down", None))
+  add_linear(getattr(model, "output", None))
+  return packed
+
 class TransformerBlock:
   def __init__(self, dim:int, hidden_dim:int, n_heads:int, n_kv_heads:int, norm_eps:float, head_dim:int, rope_theta:float,
                max_context:int=0, qk_norm:int=0, num_experts:int=0, num_experts_per_tok:int=0):
@@ -92,12 +153,17 @@ class TransformerBlock:
     self.qk_norm      = qk_norm
 
     # --- attention projections (all linear, bias-free) ------------------
-    q_proj_out       = self.head_dim * n_heads
-    kv_proj_out      = self.head_dim * n_kv_heads
-    self.attn_q      = nn.Linear(dim, q_proj_out,  bias=False)
-    self.attn_k      = nn.Linear(dim, kv_proj_out, bias=False)
-    self.attn_v      = nn.Linear(dim, kv_proj_out, bias=False)
-    self.attn_output = nn.Linear(q_proj_out, dim,  bias=False)
+    self.q_proj_out  = self.head_dim * n_heads
+    self.kv_proj_out = self.head_dim * n_kv_heads
+    self.use_wqkv    = bool(getenv("WQKV", 0))
+    self.attn_fp32   = bool(getenv("ATTN_FP32", 0))
+    if self.use_wqkv:
+      self.attn_qkv = nn.Linear(dim, self.q_proj_out + self.kv_proj_out * 2, bias=False)
+    else:
+      self.attn_q = nn.Linear(dim, self.q_proj_out,  bias=False)
+      self.attn_k = nn.Linear(dim, self.kv_proj_out, bias=False)
+      self.attn_v = nn.Linear(dim, self.kv_proj_out, bias=False)
+    self.attn_output = nn.Linear(self.q_proj_out, dim,  bias=False)
 
     # --- RMSNorms --------------------------------------------------------
     self.attn_norm   = nn.RMSNorm(dim, norm_eps)
@@ -112,13 +178,29 @@ class TransformerBlock:
       self.ffn_up_exps = ExpertWeights(num_experts, dim, hidden_dim)
       self.ffn_down_exps = ExpertWeights(num_experts, hidden_dim, dim)
     else:
-      self.ffn_gate    = nn.Linear(dim, hidden_dim, bias=False)
-      self.ffn_up      = nn.Linear(dim, hidden_dim, bias=False)
+      self.use_wffn = bool(getenv("WFFN", 0))
+      if self.use_wffn:
+        self.ffn_upgate = nn.Linear(dim, hidden_dim * 2, bias=False)
+      else:
+        self.ffn_gate    = nn.Linear(dim, hidden_dim, bias=False)
+        self.ffn_up      = nn.Linear(dim, hidden_dim, bias=False)
       self.ffn_down    = nn.Linear(hidden_dim, dim, bias=False)
 
-  def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
+  def _ensure_kv_cache(self, batch:int, device:str, k_dtype, v_dtype) -> None:
+    if (not hasattr(self, "cache_k")) or self.cache_k.shape[0] != batch or self.cache_k.device != device or self.cache_k.dtype != k_dtype:
+      self.cache_k = Tensor.zeros(batch, self.n_kv_heads, self.max_context, self.head_dim, device=device, dtype=k_dtype).contiguous().realize()
+    if (not hasattr(self, "cache_v")) or self.cache_v.shape[0] != batch or self.cache_v.device != device or self.cache_v.dtype != v_dtype:
+      self.cache_v = Tensor.zeros(batch, self.n_kv_heads, self.max_context, self.head_dim, device=device, dtype=v_dtype).contiguous().realize()
+
+  def _attention(self, x:Tensor, start_pos:int|UOp, freqs_cis:Tensor|None=None, attn_mask:Tensor|None=None) -> Tensor:
     x_norm = self.attn_norm(x)                       # (B,T,D)
-    q, k, v = self.attn_q(x_norm), self.attn_k(x_norm), self.attn_v(x_norm)
+    if self.use_wqkv:
+      qkv = _linear_with_fastpath(x_norm, self.attn_qkv)
+      q_end = self.q_proj_out
+      k_end = q_end + self.kv_proj_out
+      q, k, v = qkv[..., :q_end], qkv[..., q_end:k_end], qkv[..., k_end:]
+    else:
+      q, k, v = _linear_with_fastpath(x_norm, self.attn_q), _linear_with_fastpath(x_norm, self.attn_k), _linear_with_fastpath(x_norm, self.attn_v)
     if self.qk_norm and self.qk_norm != self.head_dim: q, k = self.attn_q_norm(q), self.attn_k_norm(k)
 
     B, T, _ = x.shape
@@ -127,21 +209,38 @@ class TransformerBlock:
     v = v.reshape(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)  # (B,KvH,T,Hd)
     if self.qk_norm == self.head_dim: q, k = self.attn_q_norm(q), self.attn_k_norm(k)
 
-    freqs_cis = precompute_freqs_cis(self.head_dim, self.max_context, self.rope_theta)[start_pos:start_pos+T]
+    if freqs_cis is None:
+      freqs_cis = precompute_freqs_cis(self.head_dim, self.max_context, self.rope_theta)[start_pos:start_pos+T]
     q = apply_rope(q, freqs_cis)
     k = apply_rope(k, freqs_cis)
 
-    if not hasattr(self, "cache_kv"):
-      self.cache_kv = Tensor.zeros(2, B, self.n_kv_heads, self.max_context, self.head_dim, dtype=k.dtype, device=k.device).contiguous().realize()
-    self.cache_kv[:, :, :, start_pos:start_pos+T, :].assign(Tensor.stack(k, v))
-    k = self.cache_kv[0, :, :, 0:start_pos+T, :]
-    v = self.cache_kv[1, :, :, 0:start_pos+T, :]
+    self._ensure_kv_cache(B, x.device, k.dtype, v.dtype)
+    self.cache_k[:, :, start_pos:start_pos+T, :].assign(k)
+    self.cache_v[:, :, start_pos:start_pos+T, :].assign(v)
+    k = self.cache_k[:, :, 0:start_pos+T, :]
+    v = self.cache_v[:, :, 0:start_pos+T, :]
 
-    # NOTE: this mask is causal_lower_right, not the causal_upper_left generated by is_casual = True
-    mask = Tensor.full((1, 1, T, start_pos+T), float("-inf"), dtype=x.dtype, device=x.device).triu(int(start_pos)+1) if T > 1 else None
-    attn = q.scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)     # (B,H,T,Hd)
+    if T == 1:
+      # Decode path: avoid enable_gqa repeat_interleave by attending in kv-head groups directly.
+      scale = self.head_dim ** -0.5
+      kv_len = start_pos + T
+      acc_dtype = "float32" if self.attn_fp32 else q.dtype
+      if self.n_heads == self.n_kv_heads:
+        scores = q.matmul(k.transpose(-2, -1), dtype=acc_dtype) * scale
+        attn = (scores.cast(q.dtype) if self.attn_fp32 else scores).softmax(-1) @ v
+      else:
+        kv_mul = self.n_heads // self.n_kv_heads
+        qg = q.reshape(B, self.n_kv_heads, kv_mul, T, self.head_dim)
+        kg = k.reshape(B, self.n_kv_heads, 1, kv_len, self.head_dim)
+        vg = v.reshape(B, self.n_kv_heads, 1, kv_len, self.head_dim)
+        scores = qg.matmul(kg.transpose(-2, -1), dtype=acc_dtype) * scale
+        attn = (((scores.cast(q.dtype) if self.attn_fp32 else scores).softmax(-1) @ vg)).reshape(B, self.n_heads, T, self.head_dim)
+    else:
+      # NOTE: this mask is causal_lower_right, not the causal_upper_left generated by is_casual = True
+      mask = attn_mask if attn_mask is not None else Tensor.full((1, 1, T, start_pos+T), float("-inf"), dtype=x.dtype, device=x.device).triu(int(start_pos)+1)
+      attn = q.scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)   # (B,H,T,Hd)
     attn = attn.transpose(1, 2).reshape(B, T, -1)                                    # back to (B,T,D)
-    attn = self.attn_output(attn)
+    attn = _linear_with_fastpath(attn, self.attn_output)
     return x + attn
 
   def _feed_forward(self, h: Tensor) -> Tensor:
@@ -152,11 +251,15 @@ class TransformerBlock:
       x_down = self.ffn_down_exps(sel, self.ffn_gate_exps(sel, x).silu() * self.ffn_up_exps(sel, x))  # (B, T, k, D)
       return h + (x_down * probs.unsqueeze(-1)).sum(axis=2)  # (B, T, D)
     # TODO: remove the need for this contiguous
-    gated  = self.ffn_gate(h_norm).silu().contiguous() * self.ffn_up(h_norm)
-    return h + self.ffn_down(gated)
+    if hasattr(self, 'ffn_upgate'):
+      gate, up = _linear_with_fastpath(h_norm, self.ffn_upgate).chunk(2, dim=-1)
+      gated = gate.silu().contiguous() * up
+    else:
+      gated = _linear_with_fastpath(h_norm, self.ffn_gate).silu().contiguous() * _linear_with_fastpath(h_norm, self.ffn_up)
+    return h + _linear_with_fastpath(gated, self.ffn_down)
 
-  def __call__(self, x: Tensor, start_pos: int|UOp):
-    return self._feed_forward(self._attention(x, start_pos)).contiguous()
+  def __call__(self, x: Tensor, start_pos: int|UOp, freqs_cis:Tensor|None=None, attn_mask:Tensor|None=None):
+    return self._feed_forward(self._attention(x, start_pos, freqs_cis, attn_mask)).contiguous()
 
 class Transformer:
   def __init__(self, *, num_blocks, dim, hidden_dim, n_heads, n_kv_heads, norm_eps, vocab_size, head_dim:int, rope_theta:float,
@@ -171,10 +274,17 @@ class Transformer:
     self.forward_jit = TinyJit(self.forward)
 
   def forward(self, tokens:Tensor, start_pos:int|UOp) -> Tensor:
+    freqs_cis = precompute_freqs_cis(self.blk[0].head_dim, self.max_context, self.blk[0].rope_theta)[start_pos:start_pos+tokens.shape[1]]
     x = self.token_embd(tokens)                           # (B, T, D)
-    for block in self.blk: x = block(x, start_pos)
-    # TODO: add temperature
-    return self.output(self.output_norm(x))[:, -1, :].softmax(-1, dtype="float").argmax(-1, keepdim=True)
+    T = tokens.shape[1]
+    if T == 1:
+      for block in self.blk: x = block(x, start_pos, freqs_cis)
+    else:
+      mask = Tensor.full((1, 1, T, start_pos+T), float("-inf"), dtype=x.dtype, device=x.device).triu(int(start_pos)+1)
+      for block in self.blk: x = block(x, start_pos, freqs_cis, mask)
+    # Greedy decode needs logits only for the last token.
+    x_last = self.output_norm(x[:, -1:, :])
+    return _linear_with_fastpath(x_last, self.output)[:, 0, :].argmax(-1, keepdim=True)
 
   def __call__(self, tokens:Tensor, start_pos:int|UOp=0) -> Tensor:
     return (self.forward_jit if getenv("JIT", 1) and tokens.shape[1] == 1 and isinstance(start_pos, UOp) else self.forward)(tokens, start_pos)
@@ -200,6 +310,19 @@ class Transformer:
         if 'attn_q.weight' in name: state_dict[name] = state_dict[name].rearrange("(n h two) d -> (n two h) d", n=n_heads, two=2)
         if 'attn_k.weight' in name: state_dict[name] = state_dict[name].rearrange("(n h two) d -> (n two h) d", n=n_kv_heads, two=2)
 
+    if getenv("WQKV", 0):
+      for l in range(kv[f'{arch}.block_count']):
+        qk, kk, vk = f'blk.{l}.attn_q.weight', f'blk.{l}.attn_k.weight', f'blk.{l}.attn_v.weight'
+        if qk in state_dict and kk in state_dict and vk in state_dict:
+          state_dict[f'blk.{l}.attn_qkv.weight'] = state_dict[qk].cat(state_dict[kk], dim=0).cat(state_dict[vk], dim=0)
+          del state_dict[qk], state_dict[kk], state_dict[vk]
+    if getenv("WFFN", 0):
+      for l in range(kv[f'{arch}.block_count']):
+        gk, uk = f'blk.{l}.ffn_gate.weight', f'blk.{l}.ffn_up.weight'
+        if gk in state_dict and uk in state_dict:
+          state_dict[f'blk.{l}.ffn_upgate.weight'] = state_dict[gk].cat(state_dict[uk], dim=0)
+          del state_dict[gk], state_dict[uk]
+
     model = Transformer(num_blocks=kv[f'{arch}.block_count'], dim=kv[f'{arch}.embedding_length'],
                         hidden_dim=kv.get(f'{arch}.expert_feed_forward_length', kv[f'{arch}.feed_forward_length']),
                         n_heads=n_heads, n_kv_heads=n_kv_heads, norm_eps=kv[f'{arch}.attention.layer_norm_rms_epsilon'],
@@ -209,17 +332,39 @@ class Transformer:
                         qk_norm=int(state_dict['blk.0.attn_q_norm.weight'].shape[0]) if 'blk.0.attn_q_norm.weight' in state_dict else 0,
                         num_experts=kv.get(f'{arch}.expert_count', 0), num_experts_per_tok=kv.get(f'{arch}.expert_used_count', 0))
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
+    params = nn.state.get_parameters(model)
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
-    for s in (params:=nn.state.get_parameters(model)): s.replace(s.contiguous())
-    if realize: Tensor.realize(*params)
+    packed_params: list[Tensor] = []
+    def replace_param(p:Tensor, v:Tensor):
+      p.replace(v)
+      # Realize incrementally to avoid large one-shot materialization corruption on big embedding tables.
+      if realize: p.realize()
+    if getenv("FP8_PACKED_METAL", 0):
+      for s in params: replace_param(s, s.contiguous())
+      # keep model weights in fp16 for prefill; attach separate packed fp8 copies for decode-only fastpath
+      packed_params = _prepare_fp8_packed_linear_weights(model)
+    elif getenv("FP8", 0):
+      fp8_dtype = dtypes.fp8e5m2 if getenv("FP8E5M2", 0) else dtypes.fp8e4m3
+      for s in params:
+        replace_param(s, s.cast(fp8_dtype).contiguous() if len(s.shape) >= 2 and s.dtype in dtypes.floats else s.contiguous())
+    else:
+      for s in params: replace_param(s, s.contiguous())
+    if realize and packed_params: Tensor.realize(*packed_params)
     return model, kv
 
   def generate(self, tokens:list[int], start_pos=0):
     v_start_pos = UOp.variable("start_pos", 1, self.max_context-1)
+    vocab_size = int(self.output.weight.shape[0])
+    warned_oob = False
     t = Tensor([tokens[start_pos:]], dtype="int32")
     while len(tokens) < self.max_context:
       t = self(t, v_start_pos.bind(start_pos) if getenv("SYM", 1) and start_pos != 0 and t.shape[-1] == 1 else start_pos)
       next_id = int(t.item())
+      if next_id < 0 or next_id >= vocab_size:
+        if DEBUG >= 1 and not warned_oob:
+          stderr_log(f"warning: generated out-of-vocab token id {next_id}, clamping to [0, {vocab_size-1}]")
+          warned_oob = True
+        next_id = min(max(next_id, 0), vocab_size-1)
       tokens.append(next_id)
       start_pos = len(tokens) - 1
       yield next_id

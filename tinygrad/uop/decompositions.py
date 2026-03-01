@@ -1,6 +1,6 @@
 from typing import Callable
 import math, functools
-from tinygrad.dtype import dtypes, DType, promo_lattice, truncate
+from tinygrad.dtype import dtypes, DType, PtrDType, AddrSpace, promo_lattice, truncate
 from tinygrad.device import is_dtype_supported
 from tinygrad.helpers import flatten, polyN
 from tinygrad.uop import GroupOp
@@ -503,7 +503,7 @@ pm_long_decomp = PatternMatcher([
 # float decomposition patterns - ctx is (fr, to) tuple
 pm_float_decomp = PatternMatcher([
   (UPat((*GroupOp.Defines, Ops.INDEX), name="x"), lambda ctx,x:
-   x.replace(dtype=f2f_dt[ctx[0]].ptr(x.dtype.size), tag=ctx[0]) if x.dtype.base == ctx[0] else None),
+   x.replace(dtype=f2f_dt[ctx[0]].ptr(x.dtype.size, x.dtype.addrspace if isinstance(x.dtype, PtrDType) else AddrSpace.GLOBAL), tag=ctx[0]) if x.dtype.base == ctx[0] else None),
   (UPat(Ops.LOAD, dtypes.floats, name="x"), lambda ctx,x: f2f_load(x, *ctx) if x.dtype.scalar() == ctx[0] else None),
   (UPat(Ops.BITCAST, src=(UPat(Ops.LOAD, name="ld"),), name="bc"), lambda ctx,bc,ld:
    ld.replace(dtype=f2f_dt[ctx[0]]).bitcast(bc.dtype) if ld.dtype.bitsize == ctx[0].bitsize else None),
