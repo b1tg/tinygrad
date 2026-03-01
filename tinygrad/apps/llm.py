@@ -95,39 +95,57 @@ def apply_rope(x:Tensor, freqs_cis:Tensor) -> Tensor:
   x1, x2 = x.chunk(2, dim=-1)
   return (x1 * cos - x2 * sin).cat(x2 * cos + x1 * sin, dim=-1)
 
-def _linear_decode_fp8_packed_graph(x:Tensor, linear:nn.Linear) -> Tensor|None:
-  if not getenv("FP8_PACKED_METAL", 0): return None
-  if not isinstance(x.device, str) or not x.device.startswith("METAL"): return None
-  if x.ndim != 3: return None
-  if x.shape[0] != 1 or x.shape[1] != 1: return None
-  if not all(isinstance(s, int) for s in x.shape): return None
+def _fp8_packed_enabled() -> bool:
+  return bool(getenv("FP8_PACKED_METAL", 0) or getenv("FP8_PACKED_ONLY_METAL", 0))
+
+def _fp8_packed_linear(x:Tensor, linear:nn.Linear) -> Tensor|None:
   w_bits = getattr(linear, "_fp8_packed_weight", None)
+  if w_bits is None and getattr(linear, "_fp8_packed_only", False): w_bits = linear.weight
   if w_bits is None or len(w_bits.shape) != 2: return None
   out_features, in_features = w_bits.shape
-  if x.shape[2] != in_features: return None
+  if x.shape[-1] != in_features: return None
 
-  # calm-style decode for e5m2: reinterpret each fp8 byte as half bits << 8.
+  # calm-style e5m2: reinterpret each fp8 byte as half bits << 8.
   w_half = (w_bits.cast(dtypes.uint16) << 8).bitcast(dtypes.half)
   xh = x if x.dtype == dtypes.half else x.cast(dtypes.half)
   biash = None if linear.bias is None else linear.bias.cast(dtypes.half)
   y = xh.linear(w_half.transpose(), biash)
   return y.cast(x.dtype) if x.dtype != y.dtype else y
 
-def _linear_with_fastpath(x:Tensor, linear:nn.Linear) -> Tensor:
-  return y if (y:=_linear_decode_fp8_packed_graph(x, linear)) is not None else linear(x)
+def _linear_decode_fp8_packed_graph(x:Tensor, linear:nn.Linear) -> Tensor|None:
+  if not _fp8_packed_enabled(): return None
+  if not isinstance(x.device, str) or not x.device.startswith("METAL"): return None
+  if x.ndim != 3: return None
+  if x.shape[0] != 1 or x.shape[1] != 1: return None
+  if not all(isinstance(s, int) for s in x.shape): return None
+  return _fp8_packed_linear(x, linear)
 
-def _prepare_fp8_packed_linear_weights(model:"Transformer") -> list[Tensor]:
+def _linear_with_fastpath(x:Tensor, linear:nn.Linear) -> Tensor:
+  if (y:=_linear_decode_fp8_packed_graph(x, linear)) is not None: return y
+  if getattr(linear, "_fp8_packed_only", False):
+    # Packed-only mode has no fp16 master weight. Use on-demand dequant for non-decode paths.
+    y = _fp8_packed_linear(x, linear)
+    assert y is not None
+    return y
+  return linear(x)
+
+def _prepare_fp8_packed_linear_weights(model:"Transformer", packed_only:bool=False) -> list[Tensor]:
   packed: list[Tensor] = []
-  if not getenv("FP8_PACKED_METAL", 0): return packed
+  if not _fp8_packed_enabled(): return packed
 
   def add_linear(lin:nn.Linear|None):
     if lin is None: return
-    if hasattr(lin, "_fp8_packed_weight"): return
+    if hasattr(lin, "_fp8_packed_weight") or getattr(lin, "_fp8_packed_only", False): return
     w = lin.weight
     if len(w.shape) != 2: return
     # store raw fp8 e5m2 bytes as uint8 for graph-time dequant (<<8 bitcast to half).
-    lin._fp8_packed_weight = w.cast(dtypes.fp8e5m2).bitcast(dtypes.uint8).contiguous()
-    packed.append(lin._fp8_packed_weight)
+    packed_w = w.cast(dtypes.fp8e5m2).bitcast(dtypes.uint8).contiguous()
+    if packed_only:
+      lin.weight = packed_w
+      lin._fp8_packed_only = True
+    else:
+      lin._fp8_packed_weight = packed_w
+    packed.append(packed_w)
 
   for block in model.blk:
     add_linear(getattr(block, "attn_qkv", None))
@@ -332,17 +350,19 @@ class Transformer:
                         qk_norm=int(state_dict['blk.0.attn_q_norm.weight'].shape[0]) if 'blk.0.attn_q_norm.weight' in state_dict else 0,
                         num_experts=kv.get(f'{arch}.expert_count', 0), num_experts_per_tok=kv.get(f'{arch}.expert_used_count', 0))
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
+    packed_only = bool(getenv("FP8_PACKED_ONLY_METAL", 0))
+    if _fp8_packed_enabled():
+      # In packed-only mode, this replaces linear master weights with packed fp8 storage.
+      packed_params = _prepare_fp8_packed_linear_weights(model, packed_only=packed_only)
     params = nn.state.get_parameters(model)
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
-    packed_params: list[Tensor] = []
+    if not _fp8_packed_enabled(): packed_params: list[Tensor] = []
     def replace_param(p:Tensor, v:Tensor):
       p.replace(v)
       # Realize incrementally to avoid large one-shot materialization corruption on big embedding tables.
       if realize: p.realize()
-    if getenv("FP8_PACKED_METAL", 0):
+    if _fp8_packed_enabled():
       for s in params: replace_param(s, s.contiguous())
-      # keep model weights in fp16 for prefill; attach separate packed fp8 copies for decode-only fastpath
-      packed_params = _prepare_fp8_packed_linear_weights(model)
     elif getenv("FP8", 0):
       fp8_dtype = dtypes.fp8e5m2 if getenv("FP8E5M2", 0) else dtypes.fp8e4m3
       for s in params:
