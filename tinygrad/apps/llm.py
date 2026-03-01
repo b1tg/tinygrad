@@ -3,6 +3,7 @@ import sys, argparse, typing, re, unicodedata, json, uuid, time, functools
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv
 from tinygrad.dtype import dtypes
 from tinygrad.helpers import partition, DEBUG, Timing, GlobalCounters, stderr_log, colored
+from tinygrad.uop.ops import KernelInfo, AxisType
 from tinygrad.viz.serve import TCPServerWithReuse, HTTPRequestHandler
 
 class SimpleTokenizer:
@@ -98,12 +99,40 @@ def apply_rope(x:Tensor, freqs_cis:Tensor) -> Tensor:
 def _fp8_packed_enabled() -> bool:
   return bool(getenv("FP8_PACKED_METAL", 0) or getenv("FP8_PACKED_ONLY_METAL", 0))
 
+def _fp8_packed_fused_linear_uop(out:UOp, x:UOp, w_bits:UOp) -> UOp:
+  # out: (B, T, O), x: (B, T, I), w_bits: (O, I)
+  B, T, O = out.shape
+  I = x.shape[-1]
+  b = UOp.range(B, 0)
+  t = UOp.range(T, 1)
+  o = UOp.range(O, 2)
+  r = UOp.range(I, 3, axis_type=AxisType.REDUCE)
+  acc = out[b, t, o].set(0.0)
+  w_half = ((w_bits[o, r].cast(dtypes.uint16) << 8).bitcast(dtypes.half)).cast(dtypes.float)
+  x_float = x[b, t, r].cast(dtypes.float)
+  acc = out[b, t, o].set(acc.after(r)[b, t, o] + (x_float * w_half), end=r)
+  return acc.end(b, t, o).sink(arg=KernelInfo(name=f"fp8_packed_linear_{B}_{T}_{O}_{I}", opts_to_apply=()))
+
+def _fp8_packed_linear_fused(x:Tensor, linear:nn.Linear, w_bits:Tensor) -> Tensor|None:
+  if not getenv("FP8_PACKED_FUSED", 0): return None
+  if x.ndim != 3: return None
+  if not isinstance(x.device, str) or not x.device.startswith("METAL"): return None
+  out_features, in_features = w_bits.shape
+  if x.shape[-1] != in_features: return None
+  xh = x if x.dtype == dtypes.half else x.cast(dtypes.half)
+  y = Tensor.empty(x.shape[0], x.shape[1], out_features, dtype=dtypes.float, device=x.device)
+  y = Tensor.custom_kernel(y, xh, w_bits, fxn=_fp8_packed_fused_linear_uop)[0]
+  if linear.bias is not None: y = y + linear.bias.cast(dtypes.float)
+  return y.cast(x.dtype) if x.dtype != y.dtype else y
+
 def _fp8_packed_linear(x:Tensor, linear:nn.Linear) -> Tensor|None:
   w_bits = getattr(linear, "_fp8_packed_weight", None)
   if w_bits is None and getattr(linear, "_fp8_packed_only", False): w_bits = linear.weight
   if w_bits is None or len(w_bits.shape) != 2: return None
   out_features, in_features = w_bits.shape
   if x.shape[-1] != in_features: return None
+
+  if (y:=_fp8_packed_linear_fused(x, linear, w_bits)) is not None: return y
 
   # calm-style e5m2: reinterpret each fp8 byte as half bits << 8.
   w_half = (w_bits.cast(dtypes.uint16) << 8).bitcast(dtypes.half)
