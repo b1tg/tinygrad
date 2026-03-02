@@ -6,6 +6,7 @@ from tinygrad.helpers import partition, DEBUG, Timing, GlobalCounters, stderr_lo
 from tinygrad.viz.serve import TCPServerWithReuse, HTTPRequestHandler
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv
 from tinygrad.dtype import dtypes
+from tinygrad.device import is_dtype_supported
 class SimpleTokenizer:
   def __init__(self, normal_tokens:dict[str, int], special_tokens:dict[str, int], preset:str="llama3",
                merges:list[str]|None=None):
@@ -131,7 +132,22 @@ def apply_rope(x:Tensor, freqs_cis:Tensor) -> Tensor:
   x1, x2 = x.chunk(2, dim=-1)
   return (x1 * cos - x2 * sin).cat(x2 * cos + x1 * sin, dim=-1)
 def _fp8_packed_enabled() -> bool:
-  return bool(getenv("FP8_PACKED_ONLY_METAL", 1))
+  return bool(getenv("FP8_PACKED_ONLY_METAL", 0))
+
+def _device_type(device:str|None) -> str:
+  return device.split(":")[0] if isinstance(device, str) else ""
+
+def _device_supports_fp8_cast(device:str|None) -> bool:
+  # Metal path is emulated, AMD path is native only on gfx942/gfx950.
+  dev = _device_type(device)
+  return dev == "METAL" or is_dtype_supported(dtypes.fp8e5m2, dev)
+
+def _pack_linear_weight_fp8_bytes(w:Tensor) -> Tensor:
+  if _device_supports_fp8_cast(w.device):
+    return w.cast(dtypes.fp8e5m2).bitcast(dtypes.uint8).contiguous()
+  # Fallback for unsupported targets (for example AMD gfx842): convert on PYTHON and copy back.
+  1/0
+  return w.to("PYTHON").cast(dtypes.fp8e5m2).bitcast(dtypes.uint8).to(w.device).contiguous()
 
 def _fp8_packed_linear(x:Tensor, linear:nn.Linear) -> Tensor|None:
   w_bits = getattr(linear, "_fp8_packed_weight", None)
@@ -151,7 +167,7 @@ def _fp8_packed_linear(x:Tensor, linear:nn.Linear) -> Tensor|None:
 
 def _linear_decode_fp8_packed_graph(x:Tensor, linear:nn.Linear) -> Tensor|None:
   if not _fp8_packed_enabled(): return None
-  if not isinstance(x.device, str) or not x.device.startswith("METAL"): return None
+  if _device_type(x.device) not in {"METAL", "AMD"}: return None
   if x.ndim != 3: return None
   if x.shape[0] != 1 or x.shape[1] != 1: return None
   if not all(isinstance(s, int) for s in x.shape): return None
@@ -176,7 +192,7 @@ def _prepare_fp8_packed_linear_weights(model:"Transformer", packed_only:bool=Fal
     w = lin.weight
     if len(w.shape) != 2: return
     # store raw fp8 e5m2 bytes as uint8 for graph-time dequant (<<8 bitcast to half).
-    packed_w = w.cast(dtypes.fp8e5m2).bitcast(dtypes.uint8).contiguous()
+    packed_w = _pack_linear_weight_fp8_bytes(w)
     if packed_only:
       lin.weight = packed_w
       lin._fp8_packed_only = True
