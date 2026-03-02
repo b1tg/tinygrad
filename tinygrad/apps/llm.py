@@ -1,6 +1,8 @@
 from __future__ import annotations
 import sys, argparse, typing, re, unicodedata, json, uuid, time, functools
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function
+from tinygrad import Tensor, nn, UOp, TinyJit, getenv
+from tinygrad.dtype import dtypes
 from tinygrad.helpers import partition, DEBUG, Timing, GlobalCounters, stderr_log, colored
 from tinygrad.viz.serve import TCPServerWithReuse, HTTPRequestHandler
 
@@ -81,6 +83,73 @@ def apply_rope(x:Tensor, freqs_cis:Tensor) -> Tensor:
   x1, x2 = x.chunk(2, dim=-1)
   return (x1 * cos - x2 * sin).cat(x2 * cos + x1 * sin, dim=-1)
 
+def _fp8_packed_enabled() -> bool:
+  return bool(getenv("FP8_PACKED_METAL", 0) or getenv("FP8_PACKED_ONLY_METAL", 0))
+
+def _fp8_packed_linear(x:Tensor, linear:nn.Linear) -> Tensor|None:
+  w_bits = getattr(linear, "_fp8_packed_weight", None)
+  if w_bits is None and getattr(linear, "_fp8_packed_only", False): w_bits = linear.weight
+  if w_bits is None or len(w_bits.shape) != 2: return None
+  out_features, in_features = w_bits.shape
+  if x.shape[-1] != in_features: return None
+
+  # if (y:=_fp8_packed_linear_fused(x, linear, w_bits)) is not None: return y
+
+  # calm-style e5m2: reinterpret each fp8 byte as half bits << 8.
+  w_half = (w_bits.cast(dtypes.uint16) << 8).bitcast(dtypes.half)
+  xh = x if x.dtype == dtypes.half else x.cast(dtypes.half)
+  biash = None if linear.bias is None else linear.bias.cast(dtypes.half)
+  y = xh.linear(w_half.transpose(), biash)
+  return y.cast(x.dtype) if x.dtype != y.dtype else y
+
+def _linear_decode_fp8_packed_graph(x:Tensor, linear:nn.Linear) -> Tensor|None:
+  if not _fp8_packed_enabled(): return None
+  if not isinstance(x.device, str) or not x.device.startswith("METAL"): return None
+  if x.ndim != 3: return None
+  if x.shape[0] != 1 or x.shape[1] != 1: return None
+  if not all(isinstance(s, int) for s in x.shape): return None
+  return _fp8_packed_linear(x, linear)
+
+def _linear_with_fastpath(x:Tensor, linear:nn.Linear) -> Tensor:
+  if (y:=_linear_decode_fp8_packed_graph(x, linear)) is not None: return y
+  if getattr(linear, "_fp8_packed_only", False):
+    # Packed-only mode has no fp16 master weight. Use on-demand dequant for non-decode paths.
+    y = _fp8_packed_linear(x, linear)
+    assert y is not None
+    return y
+  return linear(x)
+
+def _prepare_fp8_packed_linear_weights(model:"Transformer", packed_only:bool=False) -> list[Tensor]:
+  packed: list[Tensor] = []
+  if not _fp8_packed_enabled(): return packed
+
+  def add_linear(lin:nn.Linear|None):
+    if lin is None: return
+    if hasattr(lin, "_fp8_packed_weight") or getattr(lin, "_fp8_packed_only", False): return
+    w = lin.weight
+    if len(w.shape) != 2: return
+    # store raw fp8 e5m2 bytes as uint8 for graph-time dequant (<<8 bitcast to half).
+    packed_w = w.cast(dtypes.fp8e5m2).bitcast(dtypes.uint8).contiguous()
+    if packed_only:
+      lin.weight = packed_w
+      lin._fp8_packed_only = True
+    else:
+      lin._fp8_packed_weight = packed_w
+    packed.append(packed_w)
+
+  for block in model.blk:
+    add_linear(getattr(block, "attn_qkv", None))
+    add_linear(getattr(block, "attn_q", None))
+    add_linear(getattr(block, "attn_k", None))
+    add_linear(getattr(block, "attn_v", None))
+    add_linear(getattr(block, "attn_output", None))
+    add_linear(getattr(block, "ffn_upgate", None))
+    add_linear(getattr(block, "ffn_gate", None))
+    add_linear(getattr(block, "ffn_up", None))
+    add_linear(getattr(block, "ffn_down", None))
+  add_linear(getattr(model, "output", None))
+  return packed
+
 class TransformerBlock:
   def __init__(self, dim:int, hidden_dim:int, n_heads:int, n_kv_heads:int, norm_eps:float, head_dim:int, rope_theta:float,
                max_context:int=0, qk_norm:int=0, num_experts:int=0, num_experts_per_tok:int=0):
@@ -116,10 +185,9 @@ class TransformerBlock:
       self.ffn_up      = nn.Linear(dim, hidden_dim, bias=False)
       self.ffn_down    = nn.Linear(hidden_dim, dim, bias=False)
 
-  @function
-  def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
+  def _attention(self, x:Tensor, start_pos:int|UOp, freqs_cis:Tensor|None=None, attn_mask:Tensor|None=None) -> Tensor:
     x_norm = self.attn_norm(x)                       # (B,T,D)
-    q, k, v = self.attn_q(x_norm), self.attn_k(x_norm), self.attn_v(x_norm)
+    q, k, v = _linear_with_fastpath(x_norm, self.attn_q), _linear_with_fastpath(x_norm, self.attn_k), _linear_with_fastpath(x_norm, self.attn_v)
     if self.qk_norm and self.qk_norm != self.head_dim: q, k = self.attn_q_norm(q), self.attn_k_norm(k)
 
     B, T, _ = x.shape
@@ -146,7 +214,7 @@ class TransformerBlock:
     mask = Tensor.full((1, 1, T, start_pos+T), float("-inf"), dtype=x.dtype, device=x.device).triu(start_pos+1)
     attn = q.scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)     # (B,H,T,Hd)
     attn = attn.transpose(1, 2).reshape(B, T, -1)                                    # back to (B,T,D)
-    attn = self.attn_output(attn)
+    attn = _linear_with_fastpath(attn, self.attn_output)
     return x + attn
 
   @function
@@ -158,14 +226,22 @@ class TransformerBlock:
       x_down = self.ffn_down_exps(sel, self.ffn_gate_exps(sel, x).silu() * self.ffn_up_exps(sel, x))  # (B, T, k, D)
       return h + (x_down * probs.unsqueeze(-1)).sum(axis=2)  # (B, T, D)
     # TODO: remove the need for this contiguous
-    gated  = self.ffn_gate(h_norm).silu().contiguous() * self.ffn_up(h_norm)
-    return h + self.ffn_down(gated)
+    if hasattr(self, 'ffn_upgate'):
+      gate, up = _linear_with_fastpath(h_norm, self.ffn_upgate).chunk(2, dim=-1)
+      gated = gate.silu().contiguous() * up
+    else:
+      gated = _linear_with_fastpath(h_norm, self.ffn_gate).silu().contiguous() * _linear_with_fastpath(h_norm, self.ffn_up)
+    return h + _linear_with_fastpath(gated, self.ffn_down)
 
-  def __call__(self, x: Tensor, start_pos: int|UOp):
+  # def __call__(self, x: Tensor, start_pos: int|UOp):
+  def __call__(self, x: Tensor, start_pos: int|UOp, freqs_cis:Tensor|None=None, attn_mask:Tensor|None=None):
     if not hasattr(self, "cache_kv"):
       # TODO: how is the dtype of this determined?
       self.cache_kv = Tensor.zeros(2, x.shape[0], self.n_kv_heads, self.max_context, self.head_dim, device=x.device).contiguous().realize()
-    return self._feed_forward(self._attention(x, start_pos)).contiguous()
+    return self._feed_forward(self._attention(x, start_pos, freqs_cis, attn_mask)).contiguous()
+  #   return self._feed_forward(self._attention(x, start_pos)).contiguous()
+  # def __call__(self, x: Tensor, start_pos: int|UOp, freqs_cis:Tensor|None=None, attn_mask:Tensor|None=None):
+  #   return self._feed_forward(self._attention(x, start_pos, freqs_cis, attn_mask)).contiguous()
 
 class Transformer:
   def __init__(self, *, num_blocks, dim, hidden_dim, n_heads, n_kv_heads, norm_eps, vocab_size, head_dim:int, rope_theta:float,
@@ -180,10 +256,17 @@ class Transformer:
     self.forward_jit = TinyJit(self.forward)
 
   def forward(self, tokens:Tensor, start_pos:int|UOp) -> Tensor:
+    freqs_cis = precompute_freqs_cis(self.blk[0].head_dim, self.max_context, self.blk[0].rope_theta)[start_pos:start_pos+tokens.shape[1]]
     x = self.token_embd(tokens)                           # (B, T, D)
-    for block in self.blk: x = block(x, start_pos)
-    # TODO: add temperature
-    return self.output(self.output_norm(x))[:, -1, :].softmax(-1, dtype="float").argmax(-1, keepdim=True)
+    T = tokens.shape[1]
+    if T == 1:
+      for block in self.blk: x = block(x, start_pos, freqs_cis)
+    else:
+      mask = Tensor.full((1, 1, T, start_pos+T), float("-inf"), dtype=x.dtype, device=x.device).triu(int(start_pos)+1)
+      for block in self.blk: x = block(x, start_pos, freqs_cis, mask)
+    # Greedy decode needs logits only for the last token.
+    x_last = self.output_norm(x[:, -1:, :])
+    return _linear_with_fastpath(self.output_norm(x[:, -1:, :]), self.output)[:, 0, :].argmax(-1, keepdim=True)
 
   def __call__(self, tokens:Tensor, start_pos:int|UOp=0) -> Tensor:
     return (self.forward_jit if getenv("JIT", 1) and tokens.shape[1] == 1 and isinstance(start_pos, UOp) else self.forward)(tokens, start_pos)
@@ -218,10 +301,22 @@ class Transformer:
                         qk_norm=int(state_dict['blk.0.attn_q_norm.weight'].shape[0]) if 'blk.0.attn_q_norm.weight' in state_dict else 0,
                         num_experts=kv.get(f'{arch}.expert_count', 0), num_experts_per_tok=kv.get(f'{arch}.expert_used_count', 0))
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
+    packed_only = bool(getenv("FP8_PACKED_ONLY_METAL", 0))
+    if packed_only:=_fp8_packed_enabled():
+      # In packed-only mode, this replaces linear master weights with packed fp8 storage.
+      packed_params = _prepare_fp8_packed_linear_weights(model, packed_only=packed_only)
+    params = nn.state.get_parameters(model)
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
-    if realize:
-      for s in (params:=nn.state.get_parameters(model)): s.replace(s.contiguous())
-      Tensor.realize(*params)
+    if not _fp8_packed_enabled(): packed_params: list[Tensor] = []
+    def replace_param(p:Tensor, v:Tensor):
+      p.replace(v)
+      # Realize incrementally to avoid large one-shot materialization corruption on big embedding tables.
+      if realize: p.realize()
+    if _fp8_packed_enabled():
+      for s in params: replace_param(s, s.contiguous())
+    else:
+      for s in params: replace_param(s, s.contiguous())
+    if realize and packed_params: Tensor.realize(*packed_params)
     return model, kv
 
   def generate(self, tokens:list[int], start_pos=0):
@@ -242,7 +337,8 @@ models = {
   "llama3.1:8b": "https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/resolve/main/Meta-Llama-3.1-8B-Instruct-Q8_0.gguf",
   "qwen3:0.6b": "https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf",
   "qwen3:1.7b": "https://huggingface.co/unsloth/Qwen3-1.7B-GGUF/resolve/main/Qwen3-1.7B-Q4_K_M.gguf",
-  "qwen3:8b": "https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf",
+  # "qwen3:8b": "https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf",
+  "qwen3:8b": "/Users/ch/.cache/huggingface/hub/models--Qwen--Qwen3-8B-GGUF/snapshots/7c41481f57cb95916b40956ab2f0b139b296d974/Qwen3-8B-Q4_K_M.gguf",
   "qwen3:30b-a3b": "https://huggingface.co/Qwen/Qwen3-30B-A3B-GGUF/resolve/main/Qwen3-30B-A3B-Q4_K_M.gguf",
   "olmoe": "https://huggingface.co/allenai/OLMoE-1B-7B-0924-Instruct-GGUF/resolve/main/olmoe-1b-7b-0924-instruct-q4_k_m.gguf",
 }
