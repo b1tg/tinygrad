@@ -1,6 +1,7 @@
 import unittest
 from tinygrad import Device, Tensor, dtypes
 from tinygrad.codegen.opt import Opt, OptOps, KernelOptError
+from tinygrad.engine.realize import get_program
 
 # TODO: write a clean version of this
 from test.backend.test_linearizer import helper_linearizer_opt
@@ -83,6 +84,17 @@ class TestKernelOpts(unittest.TestCase):
       # Full global upcast + local
       [Opt(OptOps.LOCAL, 0, 4), Opt(OptOps.LOCAL, 0, 4), Opt(OptOps.GROUPTOP, 0, 8), Opt(OptOps.UNROLL, 0, 4), Opt(OptOps.UPCAST, 0, 8)],
     ])
+
+  @unittest.skipUnless(Device[Device.DEFAULT].renderer.has_local, "test requires locals")
+  @unittest.skipUnless(Device[Device.DEFAULT].renderer.has_shared, "test requires shared")
+  def test_handcoded_matvec_fused_input(self):
+    x = Tensor.rand(1, 128)
+    w = Tensor.rand(128, 256)
+    # LLM-style fused input (normalization before matmul): only one MUL side is INDEX.
+    r = (x * (x.square().mean(-1, keepdim=True) + 1e-5).rsqrt()) @ w
+    ast = helper_linearizer_opt(r)
+    prg = get_program(ast, renderer=Device[Device.DEFAULT].renderer, opts=None)
+    self.assertTrue(any(opt.op is OptOps.GROUP for opt in prg.applied_opts), prg.applied_opts)
 
   @unittest.skipUnless(Device[Device.DEFAULT].renderer.has_local, "test requires locals")
   @unittest.skipUnless(Device[Device.DEFAULT].renderer.has_shared, "test requires shared")
