@@ -53,7 +53,7 @@ class SimpleTokenizer:
 
   def decode(self, ids:list[int]) -> str: return b''.join(self._tok2bytes[tid] for tid in ids).decode(errors='replace')
   def role(self, role:str):
-    if self.preset == 'olmo': return self.encode("<|" + role + "|>\n")
+    if self.preset == 'olmo': return self.encode("<|" + role + "|>\n")  # OLMoE Instruct format
     if self.preset in ('qwen2', 'qwen35'): return self.encode("<|im_start|>" + role + "\n")
     return self.encode("<|start_header_id|>" + role + "<|end_header_id|>\n\n")
   def end_turn(self, eos_id:int):
