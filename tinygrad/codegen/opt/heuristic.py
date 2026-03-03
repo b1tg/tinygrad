@@ -64,33 +64,24 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   MV_BLOCKSIZE, MV_THREADS_PER_ROW, MV_ROWS_PER_THREAD = getenv("MV_BLOCKSIZE", 4), getenv("MV_THREADS_PER_ROW", 32), getenv("MV_ROWS_PER_THREAD", 4)
   if k.ren.has_local and getenv("MV",1) != 0 and (MV_BLOCKSIZE > 1 or MV_THREADS_PER_ROW > 1 or MV_ROWS_PER_THREAD > 1) and  \
     k.reduceop is not None and k.reduceop.arg[0] is Ops.ADD and len(k.full_shape) >= 2 and k.ren.has_shared:
-    # walk through CASTs to find the MUL (e.g. half->float accumulation wraps MUL in CAST)
-    mulop = k.reduceop.src[0]
-    while mulop.op is Ops.CAST: mulop = mulop.src[0]
-    if mulop.op is Ops.MUL:
-      # walk through CASTs on MUL sources to find INDEXes (e.g. fused RMSNorm wraps INDEX in CAST)
-      src0, src1 = mulop.src[0], mulop.src[1]
-      while src0.op is Ops.CAST: src0 = src0.src[0]
-      while src1.op is Ops.CAST: src1 = src1.src[0]
-      if k.ranges_of(AxisType.REDUCE):
-        first_reduce_rng = k.ranges_of(AxisType.REDUCE)[0]
-        idx0 = src0.src[1].get_idx() if src0.op is Ops.INDEX else None
-        idx1 = src1.src[1].get_idx() if src1.op is Ops.INDEX else None
-        check_pass = any(idx_mat is not None and any(u is first_reduce_rng for u in idx_mat.split_uop(Ops.ADD)) and
-                         (idx_other is None or all(r in idx_other.ranges for r in idx_mat.ranges))
-                         for idx_mat, idx_other in ((idx0, idx1), (idx1, idx0)))
-
-        if check_pass:
-          for global_idx in k.axes_of(AxisType.GLOBAL):
-            if first_reduce_rng.src[0].divides(MV_THREADS_PER_ROW) is not None and k.full_shape[global_idx]%(MV_BLOCKSIZE*MV_ROWS_PER_THREAD) == 0:
-              if DEBUG >= 3:
-                print(f"MATVEC: {k.full_shape=} {first_reduce_rng.render()} {MV_BLOCKSIZE=} {MV_THREADS_PER_ROW=} {MV_ROWS_PER_THREAD=}")
-              try:
-                if MV_THREADS_PER_ROW > 1: k.apply_opt(Opt(OptOps.GROUP, 0, MV_THREADS_PER_ROW))
-              except KernelOptError: pass
-              if MV_BLOCKSIZE > 1: k.apply_opt(Opt(OptOps.LOCAL, global_idx, MV_BLOCKSIZE))
-              if MV_ROWS_PER_THREAD > 1: k.apply_opt(Opt(OptOps.UPCAST, global_idx, MV_ROWS_PER_THREAD))
-              return k
+    uncast = lambda x: x.src[0] if x.op is Ops.CAST else x
+    mulop = uncast(k.reduceop.src[0])
+    if mulop.op is Ops.MUL and k.ranges_of(AxisType.REDUCE):
+      src0, src1 = uncast(mulop.src[0]), uncast(mulop.src[1])
+      idx0, idx1 = (src0.src[1].get_idx() if src0.op is Ops.INDEX else None), (src1.src[1].get_idx() if src1.op is Ops.INDEX else None)
+      first_reduce_rng = k.ranges_of(AxisType.REDUCE)[0]
+      if any(idx_mat is not None and any(u is first_reduce_rng for u in idx_mat.split_uop(Ops.ADD)) and
+             (idx_other is None or all(r in idx_other.ranges for r in idx_mat.ranges)) for idx_mat, idx_other in ((idx0, idx1), (idx1, idx0))):
+        for global_idx in k.axes_of(AxisType.GLOBAL):
+          if first_reduce_rng.src[0].divides(MV_THREADS_PER_ROW) is not None and k.full_shape[global_idx]%(MV_BLOCKSIZE*MV_ROWS_PER_THREAD) == 0:
+            if DEBUG >= 3:
+              print(f"MATVEC: {k.full_shape=} {first_reduce_rng.render()} {MV_BLOCKSIZE=} {MV_THREADS_PER_ROW=} {MV_ROWS_PER_THREAD=}")
+            try:
+              if MV_THREADS_PER_ROW > 1: k.apply_opt(Opt(OptOps.GROUP, 0, MV_THREADS_PER_ROW))
+            except KernelOptError: pass
+            if MV_BLOCKSIZE > 1: k.apply_opt(Opt(OptOps.LOCAL, global_idx, MV_BLOCKSIZE))
+            if MV_ROWS_PER_THREAD > 1: k.apply_opt(Opt(OptOps.UPCAST, global_idx, MV_ROWS_PER_THREAD))
+            return k
 
   # are we grouping? (requires local shape support)
   if resolve(prod(k.output_shape[i] for i in k.upcastable_dims) <= (240 if NOLOCALS else 2048), False):
