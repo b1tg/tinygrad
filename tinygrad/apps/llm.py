@@ -175,25 +175,16 @@ class Qwen35Block:
   def __init__(self, dim:int, hidden_dim:int, n_heads:int, n_kv_heads:int, norm_eps:float, head_dim:int, rope_theta:float, rope_dim:int,
                max_context:int, is_recurrent:bool, ssm_conv_kernel:int, ssm_state_size:int, ssm_group_count:int, ssm_time_step_rank:int,
                ssm_inner_size:int):
-    self.n_heads, self.n_kv_heads, self.head_dim = n_heads, n_kv_heads, head_dim
-    self.rope_theta, self.rope_dim, self.max_context = rope_theta, rope_dim, max_context
-    self.is_recurrent, self.norm_eps = is_recurrent, norm_eps
-    self.attn_norm, self.post_attention_norm = nn.RMSNorm(dim, norm_eps), nn.RMSNorm(dim, norm_eps)
-    self.ffn_gate, self.ffn_up = nn.Linear(dim, hidden_dim, bias=False), nn.Linear(dim, hidden_dim, bias=False)
-    self.ffn_down = nn.Linear(hidden_dim, dim, bias=False)
+    self.n_heads, self.n_kv_heads, self.head_dim, self.rope_theta, self.rope_dim, self.max_context, self.is_recurrent, self.norm_eps = n_heads, n_kv_heads, head_dim, rope_theta, rope_dim, max_context, is_recurrent, norm_eps  # noqa: E501
+    self.attn_norm, self.post_attention_norm, self.ffn_gate, self.ffn_up, self.ffn_down = nn.RMSNorm(dim, norm_eps), nn.RMSNorm(dim, norm_eps), nn.Linear(dim, hidden_dim, bias=False), nn.Linear(dim, hidden_dim, bias=False), nn.Linear(hidden_dim, dim, bias=False)  # noqa: E501
     if is_recurrent:
-      self.head_k_dim, self.num_k_heads, self.num_v_heads = ssm_state_size, ssm_group_count, ssm_time_step_rank
-      self.head_v_dim, self.ssm_conv_kernel = ssm_inner_size // self.num_v_heads, ssm_conv_kernel
+      self.head_k_dim, self.num_k_heads, self.num_v_heads, self.head_v_dim, self.ssm_conv_kernel = ssm_state_size, ssm_group_count, ssm_time_step_rank, ssm_inner_size // ssm_time_step_rank, ssm_conv_kernel  # noqa: E501
       self.conv_channels, self.q_dim = ssm_inner_size + 2*self.num_k_heads*self.head_k_dim, self.head_k_dim * self.num_k_heads
-      self.attn_qkv, self.attn_gate = nn.Linear(dim, self.conv_channels, bias=False), nn.Linear(dim, ssm_inner_size, bias=False)
-      self.ssm_alpha, self.ssm_beta = nn.Linear(dim, self.num_v_heads, bias=False), nn.Linear(dim, self.num_v_heads, bias=False)
-      self.ssm_conv1d_weight = Tensor.zeros(self.conv_channels, ssm_conv_kernel)
-      self.ssm_dt_bias, self.ssm_a = Tensor.zeros(self.num_v_heads), Tensor.zeros(self.num_v_heads)
+      self.attn_qkv, self.attn_gate, self.ssm_alpha, self.ssm_beta = nn.Linear(dim, self.conv_channels, bias=False), nn.Linear(dim, ssm_inner_size, bias=False), nn.Linear(dim, self.num_v_heads, bias=False), nn.Linear(dim, self.num_v_heads, bias=False)  # noqa: E501
+      self.ssm_conv1d_weight, self.ssm_dt_bias, self.ssm_a = Tensor.zeros(self.conv_channels, ssm_conv_kernel), Tensor.zeros(self.num_v_heads), Tensor.zeros(self.num_v_heads)  # noqa: E501
       self.ssm_norm, self.ssm_out = nn.RMSNorm(self.head_v_dim, norm_eps), nn.Linear(ssm_inner_size, dim, bias=False)
     else:
-      self.attn_q = nn.Linear(dim, n_heads * head_dim * 2, bias=False)
-      self.attn_k, self.attn_v = nn.Linear(dim, n_kv_heads * head_dim, bias=False), nn.Linear(dim, n_kv_heads * head_dim, bias=False)
-      self.attn_output = nn.Linear(n_heads * head_dim, dim, bias=False)
+      self.attn_q, self.attn_k, self.attn_v, self.attn_output = nn.Linear(dim, n_heads * head_dim * 2, bias=False), nn.Linear(dim, n_kv_heads * head_dim, bias=False), nn.Linear(dim, n_kv_heads * head_dim, bias=False), nn.Linear(n_heads * head_dim, dim, bias=False)  # noqa: E501
       self.attn_q_norm, self.attn_k_norm = nn.RMSNorm(head_dim, norm_eps), nn.RMSNorm(head_dim, norm_eps)
 
   def __call__(self, x:Tensor, start_pos:int|UOp) -> Tensor:
@@ -203,44 +194,32 @@ class Qwen35Block:
       if not hasattr(self, "conv_cache") or self.conv_cache.shape[0] != B:
         self.conv_cache = Tensor.zeros(B, self.ssm_conv_kernel-1, self.conv_channels, device=x.device).contiguous().realize()
         self.ssm_state = Tensor.zeros(B, self.num_v_heads, self.head_v_dim, self.head_v_dim, device=x.device).contiguous().realize()
-      if isinstance(start_pos, int) and start_pos == 0:
-        self.conv_cache = Tensor.zeros(*self.conv_cache.shape, device=x.device).contiguous().realize()
-        self.ssm_state = Tensor.zeros(*self.ssm_state.shape, device=x.device).contiguous().realize()
+      if isinstance(start_pos, int) and start_pos == 0: self.conv_cache, self.ssm_state = Tensor.zeros(*self.conv_cache.shape, device=x.device).contiguous().realize(), Tensor.zeros(*self.ssm_state.shape, device=x.device).contiguous().realize()  # noqa: E501
       qkv, z = self.attn_qkv(x_norm).float(), self.attn_gate(x_norm).float().reshape(B, T, self.num_v_heads, self.head_v_dim)
       ab = self.ssm_alpha(x_norm).float().cat(self.ssm_beta(x_norm).float(), dim=-1)
-      alpha, beta = (ab[..., :self.num_v_heads] + self.ssm_dt_bias).softplus(), ab[..., self.num_v_heads:].sigmoid()
-      gate = alpha * self.ssm_a
-      conv_w = self.ssm_conv1d_weight.transpose().float().reshape(1, self.ssm_conv_kernel, self.conv_channels)
-      state, conv_cache, outs = self.ssm_state.float(), self.conv_cache.float(), []
-      q_scale, k_repeat = self.head_k_dim**-0.5, self.num_v_heads // self.num_k_heads
+      beta, gate = ab[..., self.num_v_heads:].sigmoid(), (ab[..., :self.num_v_heads] + self.ssm_dt_bias).softplus() * self.ssm_a  # noqa: E501
+      conv_w, state, conv_cache, outs, q_scale, k_repeat = self.ssm_conv1d_weight.transpose().float().reshape(1, self.ssm_conv_kernel, self.conv_channels), self.ssm_state.float(), self.conv_cache.float(), [], self.head_k_dim**-0.5, self.num_v_heads // self.num_k_heads  # noqa: E501
       for i in range(T):
         conv_out = (conv_cache.cat(qkv[:, i:i+1, :], dim=1) * conv_w).sum(axis=1).silu()
         conv_cache = conv_cache.cat(qkv[:, i:i+1, :], dim=1)[:, 1:, :]
-        q = conv_out[:, :self.q_dim].reshape(B, self.num_k_heads, self.head_k_dim)
-        k = conv_out[:, self.q_dim:2*self.q_dim].reshape(B, self.num_k_heads, self.head_k_dim)
-        v = conv_out[:, 2*self.q_dim:].reshape(B, self.num_v_heads, self.head_v_dim)
+        q, k, v = conv_out[:, :self.q_dim].reshape(B, self.num_k_heads, self.head_k_dim), conv_out[:, self.q_dim:2*self.q_dim].reshape(B, self.num_k_heads, self.head_k_dim), conv_out[:, 2*self.q_dim:].reshape(B, self.num_v_heads, self.head_v_dim)  # noqa: E501
         q, k = q * (q.square().sum(-1, keepdim=True) + self.norm_eps).rsqrt(), k * (k.square().sum(-1, keepdim=True) + self.norm_eps).rsqrt()
         if k_repeat > 1:
-          q = q.unsqueeze(1).expand(B, k_repeat, self.num_k_heads, self.head_k_dim).reshape(B, self.num_v_heads, self.head_k_dim)
-          k = k.unsqueeze(1).expand(B, k_repeat, self.num_k_heads, self.head_k_dim).reshape(B, self.num_v_heads, self.head_k_dim)
+          q, k = q.unsqueeze(1).expand(B, k_repeat, self.num_k_heads, self.head_k_dim).reshape(B, self.num_v_heads, self.head_k_dim), k.unsqueeze(1).expand(B, k_repeat, self.num_k_heads, self.head_k_dim).reshape(B, self.num_v_heads, self.head_k_dim)  # noqa: E501
         q, k, v = (q*q_scale).unsqueeze(-1), k.unsqueeze(-1), v.unsqueeze(-1)
         state = state * gate[:, i, :].reshape(B, self.num_v_heads, 1, 1).exp()
         state = state + ((v - state@k) * beta[:, i, :].reshape(B, self.num_v_heads, 1, 1))@k.transpose(-1, -2)
         out = (state@q).squeeze(-1).reshape(B, 1, self.num_v_heads, self.head_v_dim)
         outs.append(self.ssm_out((self.ssm_norm(out) * z[:, i:i+1].silu()).reshape(B, 1, -1).cast(x.dtype)))
-      conv_uop = self.conv_cache.uop.assign(conv_cache.cast(self.conv_cache.dtype).uop)
-      assigned_conv = Tensor(self.conv_cache.uop.after(conv_uop), device=self.conv_cache.device)
-      state_uop = self.ssm_state.uop.assign(state.cast(self.ssm_state.dtype).uop)
-      assigned_state = Tensor(self.ssm_state.uop.after(state_uop), device=self.ssm_state.device)
+      conv_uop, state_uop = self.conv_cache.uop.assign(conv_cache.cast(self.conv_cache.dtype).uop), self.ssm_state.uop.assign(state.cast(self.ssm_state.dtype).uop)  # noqa: E501
+      assigned_conv, assigned_state = Tensor(self.conv_cache.uop.after(conv_uop), device=self.conv_cache.device), Tensor(self.ssm_state.uop.after(state_uop), device=self.ssm_state.device)  # noqa: E501
       attn_out = (outs[0] if len(outs) == 1 else outs[0].cat(*outs[1:], dim=1))
       attn_out = attn_out + (assigned_conv[:, :1, :1].sum() + assigned_state[:, :, :1, :1].sum()).cast(x.dtype) * 0
     else:
-      if not hasattr(self, "cache_kv"):
-        self.cache_kv = Tensor.zeros(2, B, self.n_kv_heads, self.max_context, self.head_dim, device=x.device).contiguous().realize()
+      if not hasattr(self, "cache_kv"): self.cache_kv = Tensor.zeros(2, B, self.n_kv_heads, self.max_context, self.head_dim, device=x.device).contiguous().realize()  # noqa: E501
       qg = self.attn_q(x_norm).reshape(B, T, self.n_heads, 2, self.head_dim)
       q, gate = self.attn_q_norm(qg[:, :, :, 0, :].transpose(1, 2)), qg[:, :, :, 1, :].reshape(B, T, self.n_heads * self.head_dim)
-      k = self.attn_k_norm(self.attn_k(x_norm).reshape(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2))
-      v = self.attn_v(x_norm).reshape(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
+      k, v = self.attn_k_norm(self.attn_k(x_norm).reshape(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)), self.attn_v(x_norm).reshape(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)  # noqa: E501
       freqs_cis = precompute_freqs_cis(self.rope_dim, self.max_context, self.rope_theta)[start_pos:start_pos+T]
       q, k = apply_rope_partial(q, freqs_cis, self.rope_dim), apply_rope_partial(k, freqs_cis, self.rope_dim)
       kv_uop = self.cache_kv[:, :, :, start_pos:start_pos+T, :].uop.assign(Tensor.stack(k, v).contiguous().uop)
@@ -254,20 +233,10 @@ class Qwen35Block:
     return h + ffn
 
 class Transformer:
-  def __init__(self, *, num_blocks, dim, hidden_dim, n_heads, n_kv_heads, norm_eps, vocab_size, head_dim:int, rope_theta:float,
-               max_context:int=0, qk_norm:int=0, num_experts:int=0, num_experts_per_tok:int=0, qwen35:bool=False, qwen35_rope_dim:int=0,
-               qwen35_full_attention_interval:int=0, qwen35_ssm_conv_kernel:int=0, qwen35_ssm_state_size:int=0,
-               qwen35_ssm_group_count:int=0, qwen35_ssm_time_step_rank:int=0, qwen35_ssm_inner_size:int=0):
+  def __init__(self, *, num_blocks, dim, hidden_dim, n_heads, n_kv_heads, norm_eps, vocab_size, head_dim:int, rope_theta:float, max_context:int=0, qk_norm:int=0, num_experts:int=0, num_experts_per_tok:int=0, qwen35:bool=False, qwen35_rope_dim:int=0, qwen35_full_attention_interval:int=0, qwen35_ssm_conv_kernel:int=0, qwen35_ssm_state_size:int=0, qwen35_ssm_group_count:int=0, qwen35_ssm_time_step_rank:int=0, qwen35_ssm_inner_size:int=0):  # noqa: E501
     self.qwen35 = qwen35
-    if qwen35:
-      self.blk = [Qwen35Block(dim, hidden_dim, n_heads, n_kv_heads, norm_eps, head_dim, rope_theta, qwen35_rope_dim, max_context,
-                              (i+1) % qwen35_full_attention_interval != 0, qwen35_ssm_conv_kernel, qwen35_ssm_state_size,
-                              qwen35_ssm_group_count, qwen35_ssm_time_step_rank, qwen35_ssm_inner_size) for i in range(num_blocks)]
-    else:
-      self.blk = [TransformerBlock(dim, hidden_dim, n_heads, n_kv_heads, norm_eps, head_dim, rope_theta, max_context, qk_norm,
-                                   num_experts, num_experts_per_tok) for _ in range(num_blocks)]
-    self.token_embd, self.output_norm, self.output = nn.Embedding(vocab_size, dim), nn.RMSNorm(dim, norm_eps), nn.Linear(dim, vocab_size, bias=False)
-    self.max_context, self.forward_jit = max_context, TinyJit(self.forward)
+    self.blk = [Qwen35Block(dim, hidden_dim, n_heads, n_kv_heads, norm_eps, head_dim, rope_theta, qwen35_rope_dim, max_context, (i+1) % qwen35_full_attention_interval != 0, qwen35_ssm_conv_kernel, qwen35_ssm_state_size, qwen35_ssm_group_count, qwen35_ssm_time_step_rank, qwen35_ssm_inner_size) for i in range(num_blocks)] if qwen35 else [TransformerBlock(dim, hidden_dim, n_heads, n_kv_heads, norm_eps, head_dim, rope_theta, max_context, qk_norm, num_experts, num_experts_per_tok) for _ in range(num_blocks)]  # noqa: E501
+    self.token_embd, self.output_norm, self.output, self.max_context, self.forward_jit = nn.Embedding(vocab_size, dim), nn.RMSNorm(dim, norm_eps), nn.Linear(dim, vocab_size, bias=False), max_context, TinyJit(self.forward)  # noqa: E501
 
   def forward(self, tokens:Tensor, start_pos:int|UOp) -> Tensor:
     x = self.token_embd(tokens)
@@ -279,13 +248,8 @@ class Transformer:
 
   @staticmethod
   def from_gguf(gguf:Tensor, max_context:int|None=None, realize=bool(getenv("REALIZE", 1))) -> tuple[Transformer, dict]:
-    # TODO: remove the need for copy to default device
     kv, state_dict = nn.state.gguf_load(gguf.to(None).realize())
-
-    # all state items should be float16, not float32
     state_dict = {k:v.cast('float16') if getenv("HALF", 1) else v for k,v in state_dict.items()}
-
-    # some models like Llama 3.2 don't have an output.weight, they just tie to the token_embd.weight
     if 'output.weight' not in state_dict: state_dict['output.weight'] = state_dict['token_embd.weight']
 
     arch = kv['general.architecture']
@@ -294,36 +258,17 @@ class Transformer:
 
     if arch == 'qwen35':
       for name in list(state_dict.keys()):
-        if 'ssm_conv1d.weight' in name: state_dict[name.replace('ssm_conv1d.weight', 'ssm_conv1d_weight')] = state_dict.pop(name)
-        if 'ssm_dt.bias' in name: state_dict[name.replace('ssm_dt.bias', 'ssm_dt_bias')] = state_dict.pop(name)
-
-    if arch == 'qwen35':
-      model = Transformer(num_blocks=kv[f'{arch}.block_count'], dim=kv[f'{arch}.embedding_length'],
-                          hidden_dim=kv[f'{arch}.feed_forward_length'], n_heads=n_heads, n_kv_heads=n_kv_heads,
-                          norm_eps=kv[f'{arch}.attention.layer_norm_rms_epsilon'], vocab_size=len(kv['tokenizer.ggml.tokens']),
-                          head_dim=kv[f'{arch}.attention.key_length'], rope_theta=kv[f'{arch}.rope.freq_base'],
-                          max_context=max_context, qwen35=True, qwen35_rope_dim=kv[f'{arch}.rope.dimension_count'],
-                          qwen35_full_attention_interval=kv[f'{arch}.full_attention_interval'],
-                          qwen35_ssm_conv_kernel=kv[f'{arch}.ssm.conv_kernel'], qwen35_ssm_state_size=kv[f'{arch}.ssm.state_size'],
-                          qwen35_ssm_group_count=kv[f'{arch}.ssm.group_count'], qwen35_ssm_time_step_rank=kv[f'{arch}.ssm.time_step_rank'],
-                          qwen35_ssm_inner_size=kv[f'{arch}.ssm.inner_size'])
+        if 'ssm_conv1d.weight' in name or 'ssm_dt.bias' in name:
+          new_name = name.replace('.weight', '_weight').replace('.bias', '_bias')
+          state_dict[new_name] = state_dict.pop(name)
+      model = Transformer(num_blocks=kv[f'{arch}.block_count'], dim=kv[f'{arch}.embedding_length'], hidden_dim=kv[f'{arch}.feed_forward_length'], n_heads=n_heads, n_kv_heads=n_kv_heads, norm_eps=kv[f'{arch}.attention.layer_norm_rms_epsilon'], vocab_size=len(kv['tokenizer.ggml.tokens']), head_dim=kv[f'{arch}.attention.key_length'], rope_theta=kv[f'{arch}.rope.freq_base'], max_context=max_context, qwen35=True, qwen35_rope_dim=kv[f'{arch}.rope.dimension_count'], qwen35_full_attention_interval=kv[f'{arch}.full_attention_interval'], qwen35_ssm_conv_kernel=kv[f'{arch}.ssm.conv_kernel'], qwen35_ssm_state_size=kv[f'{arch}.ssm.state_size'], qwen35_ssm_group_count=kv[f'{arch}.ssm.group_count'], qwen35_ssm_time_step_rank=kv[f'{arch}.ssm.time_step_rank'], qwen35_ssm_inner_size=kv[f'{arch}.ssm.inner_size'])  # noqa: E501
     else:
-      # Permute Q/K weights from interleaved to half-split RoPE layout (llama-style models only)
       if arch == 'llama':
         for name in state_dict:
           if 'attn_q.weight' in name: state_dict[name] = state_dict[name].rearrange("(n h two) d -> (n two h) d", n=n_heads, two=2)
           if 'attn_k.weight' in name: state_dict[name] = state_dict[name].rearrange("(n h two) d -> (n two h) d", n=n_kv_heads, two=2)
-
-      model = Transformer(num_blocks=kv[f'{arch}.block_count'], dim=kv[f'{arch}.embedding_length'],
-                          hidden_dim=kv.get(f'{arch}.expert_feed_forward_length', kv[f'{arch}.feed_forward_length']),
-                          n_heads=n_heads, n_kv_heads=n_kv_heads, norm_eps=kv[f'{arch}.attention.layer_norm_rms_epsilon'],
-                          vocab_size=len(kv['tokenizer.ggml.tokens']),
-                          head_dim=kv.get(f'{arch}.attention.key_length', kv[f'{arch}.embedding_length'] // n_heads),
-                          rope_theta=kv[f'{arch}.rope.freq_base'], max_context=max_context,
-                          qk_norm=int(state_dict['blk.0.attn_q_norm.weight'].shape[0]) if 'blk.0.attn_q_norm.weight' in state_dict else 0,
-                          num_experts=kv.get(f'{arch}.expert_count', 0), num_experts_per_tok=kv.get(f'{arch}.expert_used_count', 0))
-    nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
-    # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
+      model = Transformer(num_blocks=kv[f'{arch}.block_count'], dim=kv[f'{arch}.embedding_length'], hidden_dim=kv.get(f'{arch}.expert_feed_forward_length', kv[f'{arch}.feed_forward_length']), n_heads=n_heads, n_kv_heads=n_kv_heads, norm_eps=kv[f'{arch}.attention.layer_norm_rms_epsilon'], vocab_size=len(kv['tokenizer.ggml.tokens']), head_dim=kv.get(f'{arch}.attention.key_length', kv[f'{arch}.embedding_length'] // n_heads), rope_theta=kv[f'{arch}.rope.freq_base'], max_context=max_context, qk_norm=int(state_dict['blk.0.attn_q_norm.weight'].shape[0]) if 'blk.0.attn_q_norm.weight' in state_dict else 0, num_experts=kv.get(f'{arch}.expert_count', 0), num_experts_per_tok=kv.get(f'{arch}.expert_used_count', 0))  # noqa: E501
+    nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)
     if realize:
       for s in (params:=nn.state.get_parameters(model)): s.replace(s.contiguous())
       Tensor.realize(*params)
@@ -331,12 +276,10 @@ class Transformer:
 
   def generate(self, tokens:list[int], start_pos=0):
     if self.qwen35 and start_pos > 0: start_pos += 1
-    v_start_pos = UOp.variable("start_pos", 1, self.max_context-1)
-    t = Tensor([tokens[start_pos:]], dtype="int32")
+    v_start_pos, t = UOp.variable("start_pos", 1, self.max_context-1), Tensor([tokens[start_pos:]], dtype="int32")
     while len(tokens) < self.max_context:
       t = self(t, v_start_pos.bind(start_pos) if getenv("SYM", 1) and start_pos != 0 and t.shape[-1] == 1 else start_pos)
-      next_id = int(t.item())
-      tokens.append(next_id)
+      tokens.append(next_id := int(t.item()))
       start_pos = len(tokens) - 1
       yield next_id
 
