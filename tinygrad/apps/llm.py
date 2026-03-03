@@ -324,7 +324,8 @@ class Transformer:
     v_start_pos, t = UOp.variable("start_pos", 1, self.max_context-1), Tensor([tokens[start_pos:]], dtype="int32")
     while len(tokens) < self.max_context:
       t = self(t, v_start_pos.bind(start_pos) if getenv("SYM", 1) and start_pos != 0 and t.shape[-1] == 1 else start_pos)
-      tokens.append(next_id := int(t.item()))
+      next_id = int(t.item())
+      tokens.append(next_id)
       start_pos = len(tokens) - 1
       yield next_id
 
