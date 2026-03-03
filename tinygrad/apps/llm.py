@@ -311,6 +311,7 @@ class Transformer:
                           qwen35_ssm_group_count=kv[f'{arch}.ssm.group_count'], qwen35_ssm_time_step_rank=kv[f'{arch}.ssm.time_step_rank'],
                           qwen35_ssm_inner_size=kv[f'{arch}.ssm.inner_size'])
     else:
+      # Permute Q/K weights from interleaved to half-split RoPE layout (llama-style models only)
       if arch == 'llama':
         for name in state_dict:
           if 'attn_q.weight' in name: state_dict[name] = state_dict[name].rearrange("(n h two) d -> (n two h) d", n=n_heads, two=2)
@@ -323,7 +324,8 @@ class Transformer:
                           rope_theta=kv[f'{arch}.rope.freq_base'], max_context=max_context,
                           qk_norm=int(state_dict['blk.0.attn_q_norm.weight'].shape[0]) if 'blk.0.attn_q_norm.weight' in state_dict else 0,
                           num_experts=kv.get(f'{arch}.expert_count', 0), num_experts_per_tok=kv.get(f'{arch}.expert_used_count', 0))
-    nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)
+    nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
+    # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:
       for s in (params:=nn.state.get_parameters(model)): s.replace(s.contiguous())
       Tensor.realize(*params)
