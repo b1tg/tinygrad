@@ -286,8 +286,9 @@ class Qwen35Block:
       v = conv_out[:, 2*self.q_dim:].reshape(B, self.num_v_heads, self.head_v_dim)
       q, k = l2_normalize(q, self.norm_eps), l2_normalize(k, self.norm_eps)
       if self.num_k_heads != self.num_v_heads:
-        q = q.repeat_interleave(k_repeat, dim=1)
-        k = k.repeat_interleave(k_repeat, dim=1)
+        # GGUF qwen3.5 linear-attn weights use tiled V-head order when num_v_heads > num_k_heads.
+        q = q.unsqueeze(1).expand(B, k_repeat, self.num_k_heads, self.head_k_dim).reshape(B, self.num_v_heads, self.head_k_dim)
+        k = k.unsqueeze(1).expand(B, k_repeat, self.num_k_heads, self.head_k_dim).reshape(B, self.num_v_heads, self.head_k_dim)
 
       q, k, v = (q*q_scale).unsqueeze(-1), k.unsqueeze(-1), v.unsqueeze(-1)
       state = state * gate[:, i, :].reshape(B, self.num_v_heads, 1, 1).exp()
