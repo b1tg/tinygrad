@@ -269,8 +269,9 @@ class Transformer:
     self.output, self.max_context, self.forward_jit = nn.Linear(dim, vocab_size, bias=False), max_context, TinyJit(self.forward)
 
   def forward(self, tokens:Tensor, start_pos:int|UOp) -> Tensor:
-    x = self.token_embd(tokens)
+    x = self.token_embd(tokens)                           # (B, T, D)
     for block in self.blk: x = block(x, start_pos)
+    # TODO: add temperature
     return self.output(self.output_norm(x))[:, -1, :].softmax(-1, dtype="float").argmax(-1, keepdim=True)
 
   def __call__(self, tokens:Tensor, start_pos:int|UOp=0) -> Tensor:
