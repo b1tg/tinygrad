@@ -265,8 +265,12 @@ class Transformer:
     else:
       self.blk = [TransformerBlock(dim, hidden_dim, n_heads, n_kv_heads, norm_eps, head_dim, rope_theta, max_context,
                                    qk_norm, num_experts, num_experts_per_tok) for _ in range(num_blocks)]
-    self.token_embd, self.output_norm = nn.Embedding(vocab_size, dim), nn.RMSNorm(dim, norm_eps)
-    self.output, self.max_context, self.forward_jit = nn.Linear(dim, vocab_size, bias=False), max_context, TinyJit(self.forward)
+    self.token_embd  = nn.Embedding(vocab_size, dim)
+    self.output_norm = nn.RMSNorm(dim, norm_eps)
+    self.output = nn.Linear(dim, vocab_size, bias=False)
+    self.max_context = max_context
+    # JIT is used if T=1 and start_pos is a UOp. TODO: make this not needed by including T in the JIT and making start_pos always a UOp
+    self.forward_jit = TinyJit(self.forward)
 
   def forward(self, tokens:Tensor, start_pos:int|UOp) -> Tensor:
     x = self.token_embd(tokens)                           # (B, T, D)
