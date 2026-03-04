@@ -258,11 +258,19 @@ class Transformer:
                qwen35_rope_dim:int=0, qwen35_full_attention_interval:int=0, qwen35_ssm_conv_kernel:int=0,
                qwen35_ssm_state_size:int=0, qwen35_ssm_group_count:int=0, qwen35_ssm_time_step_rank:int=0, qwen35_ssm_inner_size:int=0):
     self.qwen35 = qwen35
+    def block_param(v, i:int, name:str) -> int:
+      if isinstance(v, list):
+        if len(v) != num_blocks: raise ValueError(f"{name} list length {len(v)} != block_count {num_blocks}")
+        return int(v[i])
+      return int(v)
     if qwen35:
-      self.blk = [Qwen35Block(dim, hidden_dim, n_heads, n_kv_heads, norm_eps, head_dim, rope_theta, qwen35_rope_dim, max_context,
+      self.blk = [Qwen35Block(dim, hidden_dim, block_param(n_heads, i, "n_heads"), block_param(n_kv_heads, i, "n_kv_heads"),
+                              norm_eps, head_dim, rope_theta, qwen35_rope_dim, max_context,
                               (i+1) % qwen35_full_attention_interval != 0, qwen35_ssm_conv_kernel, qwen35_ssm_state_size,
                               qwen35_ssm_group_count, qwen35_ssm_time_step_rank, qwen35_ssm_inner_size) for i in range(num_blocks)]
     else:
+      if isinstance(n_heads, list) or isinstance(n_kv_heads, list):
+        raise ValueError("per-block head configuration is only supported for qwen35")
       self.blk = [TransformerBlock(dim, hidden_dim, n_heads, n_kv_heads, norm_eps, head_dim, rope_theta, max_context,
                                    qk_norm, num_experts, num_experts_per_tok) for _ in range(num_blocks)]
     self.token_embd  = nn.Embedding(vocab_size, dim)
@@ -298,9 +306,14 @@ class Transformer:
 
     if arch == 'qwen35':
       for name in list(state_dict.keys()):
-        if 'ssm_conv1d.weight' in name or 'ssm_dt.bias' in name:
-          new_name = name.replace('.weight', '_weight').replace('.bias', '_bias')
-          state_dict[new_name] = state_dict.pop(name)
+        if 'ssm_conv1d.weight' in name:
+          state_dict[name.replace('.weight', '_weight')] = state_dict.pop(name)
+        elif name.endswith('.ssm_dt'):
+          # newer qwen3.5 GGUF stores this key as "...ssm_dt"
+          state_dict[name.replace('.ssm_dt', '.ssm_dt_bias')] = state_dict.pop(name)
+        elif 'ssm_dt.bias' in name:
+          # older variants may still use "...ssm_dt.bias"
+          state_dict[name.replace('.bias', '_bias')] = state_dict.pop(name)
       model = Transformer(num_blocks=kv[f'{arch}.block_count'], dim=kv[f'{arch}.embedding_length'],
                           hidden_dim=kv[f'{arch}.feed_forward_length'], n_heads=n_heads, n_kv_heads=n_kv_heads,
                           norm_eps=kv[f'{arch}.attention.layer_norm_rms_epsilon'], vocab_size=len(kv['tokenizer.ggml.tokens']),
