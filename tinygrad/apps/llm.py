@@ -235,6 +235,8 @@ class Transformer:
   def generate(self, tokens:list[int], chunk_size:int=32):
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
     v_toks = UOp.variable("toks", 1, chunk_size)
+    # truncate to last max_context tokens if the prompt exceeds the context window
+    if len(tokens) > self.max_context: tokens = tokens[-self.max_context:]
     # assign all input tokens once, then slice from start_pos for the model call
     t = Tensor(tokens + [0] * (self.max_context - len(tokens)), dtype="int32").reshape(1, self.max_context)
     # recompute start_pos from what's currently valid in the kv cache
