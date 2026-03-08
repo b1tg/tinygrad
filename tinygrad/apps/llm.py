@@ -1,13 +1,15 @@
 from __future__ import annotations
-import sys, argparse, typing, re, unicodedata, json, uuid, time, functools, itertools
+import sys, argparse, typing, re, unicodedata, json, uuid, time, functools, itertools, math
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function
 from tinygrad.uop.ops import resolve
 from tinygrad.helpers import partition, DEBUG, Timing, GlobalCounters, stderr_log, colored, Context
 from tinygrad.viz.serve import TCPServerWithReuse, HTTPRequestHandler
 
 class SimpleTokenizer:
-  def __init__(self, normal_tokens:dict[str, int], special_tokens:dict[str, int], preset:str="llama3"):
-    if preset not in ("llama3","llama-v3","llama-bpe","qwen2","olmo"): raise ValueError(f"Invalid tokenizer preset '{preset}'")
+  def __init__(self, normal_tokens:dict[str, int], special_tokens:dict[str, int], preset:str="llama3",
+               merges:list[str]|None=None):
+    if preset in ("gpt-oss", "gpt_oss", "o200k_harmony", "gpt-4o"): preset = "gpt-oss"
+    if preset not in ("llama3","llama-v3","llama-bpe","qwen2","olmo","gpt-oss"): raise ValueError(f"Invalid tokenizer preset '{preset}'")
     # https://github.com/openai/gpt-2/blob/9b63575ef42771a015060c964af2c3da4cf7c8ab/src/encoder.py#L9
     bs = [*range(33, 127), *range(161, 173), *range(174, 256)]  # bytes that map to themselves
     self._byte_decoder = {chr(b): b for b in bs} | {chr(256+i): b for i,b in enumerate(b for b in range(256) if b not in bs)}
@@ -16,11 +18,22 @@ class SimpleTokenizer:
     # 0x323b0 is one past the max codepoint in unicode categories L/N/Z (0x323af is max L)
     def ucat_range(pre: str): return "".join(re.escape(chr(cp)) for cp in range(0x323b0) if unicodedata.category(chr(cp)).startswith(pre))
     r_ws, r_p_N, r_p_L = r"\t\n\x0b\x0c\r\x85" + ucat_range("Z"), ucat_range("N"), ucat_range("L")
-    self._split_to_word = re.compile("(?i:'s|'t|'re|'ve|'m|'ll|'d)|" + \
-      f"[^\\r\\n{r_p_N}{r_p_L}]?[{r_p_L}]+|[{r_p_N}]{{1,3}}| ?[^{r_ws}{r_p_N}{r_p_L}]+[\\r\\n]*|[{r_ws}]*[\\r\\n]+|[{r_ws}]+(?![^{r_ws}])|[{r_ws}]+")
+    if preset == "gpt-oss":
+      # matches llama.cpp LLAMA_VOCAB_PRE_TYPE_GPT4O used by GPT-OSS gguf tokenizer pre
+      self._split_to_word = re.compile(
+        f"[^\\\\r\\\\n{r_p_L}{r_p_N}]?((?=[{r_p_L}])([^a-z]))*((?=[{r_p_L}])([^A-Z]))+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|"
+        + f"[^\\\\r\\\\n{r_p_L}{r_p_N}]?((?=[{r_p_L}])([^a-z]))+((?=[{r_p_L}])([^A-Z]))*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|"
+        + f"[{r_p_N}]{{1,3}}| ?[^{r_ws}{r_p_L}{r_p_N}]+[\\\\r\\\\n/]*|[{r_ws}]*[\\\\r\\\\n]+|[{r_ws}]+(?![^{r_ws}])|[{r_ws}]+")
+    else:
+      self._split_to_word = re.compile("(?i:'s|'t|'re|'ve|'m|'ll|'d)|" + \
+        f"[^\\\\r\\\\n{r_p_N}{r_p_L}]?[{r_p_L}]+|[{r_p_N}]{{1,3}}| ?[^{r_ws}{r_p_N}{r_p_L}]+[\\\\r\\\\n]*|[{r_ws}]*[\\\\r\\\\n]+|[{r_ws}]+(?![^{r_ws}])|[{r_ws}]+")
     self._split_to_sentence = re.compile("|".join(re.escape(tok) for tok in special_tokens.keys()) if special_tokens else r"(?!)")
 
     self._normal_tokens = {bytes(self._byte_decoder[c] for c in tok): tid for tok, tid in normal_tokens.items()}
+    self._bpe_ranks: dict[tuple[bytes, bytes], int]|None = None
+    if merges is not None:
+      def str2bytes(tok:str) -> bytes: return bytes(self._byte_decoder[c] for c in tok)
+      self._bpe_ranks = {(str2bytes(a), str2bytes(b)): i for i, merge in enumerate(merges) for a, b in [merge.split(" ", 1)]}
     self._special_tokens = special_tokens
     self._tok2bytes = {tid: tok for tok, tid in self._normal_tokens.items()} | {tid: tok.encode() for tok, tid in self._special_tokens.items()}
     self.preset = preset
@@ -30,20 +43,23 @@ class SimpleTokenizer:
     # https://github.com/ggml-org/llama.cpp/blob/94933c8c2eeaa9a7983e3f6c08af76bd86724094/src/llama-vocab.cpp#L1818-L1820
     vocab: typing.Iterable[tuple[str, int]] = ((tok, idx) for idx, tok in enumerate(kv["tokenizer.ggml.tokens"]))
     normal_tokens, special_tokens = partition(vocab, lambda e: kv["tokenizer.ggml.token_type"][e[1]] == 1)
-    return SimpleTokenizer(dict(normal_tokens), dict(special_tokens), kv["tokenizer.ggml.pre"])
+    return SimpleTokenizer(dict(normal_tokens), dict(special_tokens), kv["tokenizer.ggml.pre"],
+                           kv.get("tokenizer.ggml.merges") if kv.get("tokenizer.ggml.model") == "gpt2" else None)
 
   def _encode_word(self, word:bytes) -> list[int]:
     if (early_token:=self._normal_tokens.get(word)) is not None: return [early_token]
     parts = [bytes([b]) for b in word]
-    # greedily merge any parts that we can
+    ranks = self._bpe_ranks if self._bpe_ranks is not None else self._normal_tokens
     while True:
-      i = min([(sys.maxsize, -1)] + [(self._normal_tokens.get(parts[j]+parts[j+1], sys.maxsize), j) for j in range(len(parts)-1)])[1]
+      i = min([(sys.maxsize, -1)] + [(ranks.get((parts[j], parts[j+1]) if self._bpe_ranks is not None
+               else parts[j]+parts[j+1], sys.maxsize), j) for j in range(len(parts)-1)])[1]
       if i == -1: break
       parts[i:i+2] = [parts[i] + parts[i+1]]
     try: return [self._normal_tokens[p] for p in parts]
     except KeyError: raise RuntimeError("token not found")
   def _encode_sentence(self, chunk:str) -> list[int]:
-    return [tok for word in self._split_to_word.findall(chunk) for tok in self._encode_word(word.encode())]
+    # NOTE: finditer is needed instead of findall because gpt-oss regex has capturing groups
+    return [tok for m in self._split_to_word.finditer(chunk) for tok in self._encode_word(m.group(0).encode())]
   def encode(self, text:str) -> list[int]:
     tokens: list[int] = []
     pos = 0
@@ -54,27 +70,47 @@ class SimpleTokenizer:
 
   def decode(self, ids:list[int]) -> str: return b''.join(self._tok2bytes[tid] for tid in ids).decode(errors='replace')
   def role(self, role:str):
+    if self.preset == 'gpt-oss':
+      if role == "assistant": return self.encode("<|start|>assistant<|channel|>final<|message|>")
+      return self.encode("<|start|>" + role + "<|message|>")
     if self.preset == 'olmo': return self.encode("<|" + role + "|>\n")  # OLMoE Instruct format
     if self.preset == 'qwen2': return self.encode("<|im_start|>" + role + "\n")
     return self.encode("<|start_header_id|>" + role + "<|end_header_id|>\n\n")
   def end_turn(self, eos_id:int):
+    if self.preset == 'gpt-oss': return self.encode("<|end|>")
     if self.preset == 'olmo': return self.encode("\n")
     if self.preset == 'qwen2': return [eos_id] + self.encode("\n")
     return [eos_id]
 
 @functools.cache
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> Tensor:
-  freqs = 1.0 / (theta ** (Tensor.arange(0, dim, 2)[:(dim // 2)] / dim))
-  freqs = Tensor.arange(end).unsqueeze(dim=1) * freqs.unsqueeze(dim=0)
-  return freqs.cos().cat(freqs.sin(), dim=-1).contiguous()
+def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, rope_scaling_type:str|None=None,
+                         rope_scaling_factor:float=1.0, rope_original_context_length:int=0) -> Tensor:
+  inv_freq = 1.0 / (theta ** (Tensor.arange(0, dim, 2)[:(dim // 2)] / dim))
+  concentration = 1.0
+  if rope_scaling_type == "yarn" and rope_scaling_factor > 1.0:
+    concentration = 0.1 * math.log(rope_scaling_factor) + 1.0
+    d_half = dim / 2
+    ntk_alpha, ntk_beta = 1.0, 32.0
+    low = d_half * math.log(rope_original_context_length / (ntk_beta * 2 * math.pi)) / math.log(theta)
+    high = d_half * math.log(rope_original_context_length / (ntk_alpha * 2 * math.pi)) / math.log(theta)
+    ramp = (Tensor.arange(dim // 2) - low) / (high - low)
+    mask = 1.0 - ramp.clip(0, 1)
+    inv_freq = (1.0 / (rope_scaling_factor / inv_freq)) * (1.0 - mask) + inv_freq * mask
+  freqs = Tensor.arange(end).unsqueeze(dim=1) * inv_freq.unsqueeze(dim=0)
+  return (freqs.cos() * concentration).cat(freqs.sin() * concentration, dim=-1).contiguous()
 
 class ExpertWeights:
   """Like nn.Linear but with num_experts dimension. Weight shape: (num_experts, out_features, in_features)."""
-  def __init__(self, num_experts:int, in_features:int, out_features:int):
+  def __init__(self, num_experts:int, in_features:int, out_features:int, bias:bool=False):
     self.weight = Tensor.zeros(num_experts, out_features, in_features)
+    if bias: self.bias = Tensor.zeros(num_experts, out_features)
   def __call__(self, sel:Tensor, x:Tensor) -> Tensor:
     # sel: (B, T, k), x: (B, T, 1, in) or (B, T, k, in) -> output: (B, T, k, out)
-    return (x.unsqueeze(-2) @ self.weight[sel].transpose(-1, -2)).squeeze(-2)
+    ret = (x.unsqueeze(-2) @ self.weight[sel].transpose(-1, -2)).squeeze(-2)
+    return ret + self.bias[sel] if hasattr(self, "bias") else ret
+
+class WeightHolder:
+  def __init__(self, n:int): self.weight = Tensor.zeros(n)
 
 def apply_rope(x:Tensor, freqs_cis:Tensor) -> Tensor:
   assert x.shape[-1] % 2 == 0
@@ -84,21 +120,31 @@ def apply_rope(x:Tensor, freqs_cis:Tensor) -> Tensor:
 
 class TransformerBlock:
   def __init__(self, dim:int, hidden_dim:int, n_heads:int, n_kv_heads:int, norm_eps:float, head_dim:int, rope_theta:float,
-               max_context:int=0, qk_norm:int=0, num_experts:int=0, num_experts_per_tok:int=0):
+               max_context:int=0, qk_norm:int=0, num_experts:int=0, num_experts_per_tok:int=0, attn_qkv_bias=False,
+               attn_output_bias=False, moe_router_bias=False, moe_expert_bias=False, moe_swiglu_limit:float|None=None,
+               moe_swiglu_alpha:float=1.702, rope_scaling_type:str|None=None, rope_scaling_factor:float=1.0,
+               rope_original_context_length:int=0, attn_sinks:bool=False, sliding_window:int=0):
     self.n_heads      = n_heads
     self.n_kv_heads   = n_kv_heads
     self.head_dim     = head_dim
     self.rope_theta   = rope_theta
     self.max_context  = max_context
     self.qk_norm      = qk_norm
+    self.moe_swiglu_limit = moe_swiglu_limit
+    self.moe_swiglu_alpha = moe_swiglu_alpha
+    self.rope_scaling_type = rope_scaling_type
+    self.rope_scaling_factor = rope_scaling_factor
+    self.rope_original_context_length = rope_original_context_length
+    self.sliding_window = sliding_window
 
-    # --- attention projections (all linear, bias-free) ------------------
+    # --- attention projections -------------------------------------------
     q_proj_out       = self.head_dim * n_heads
     kv_proj_out      = self.head_dim * n_kv_heads
-    self.attn_q      = nn.Linear(dim, q_proj_out,  bias=False)
-    self.attn_k      = nn.Linear(dim, kv_proj_out, bias=False)
-    self.attn_v      = nn.Linear(dim, kv_proj_out, bias=False)
-    self.attn_output = nn.Linear(q_proj_out, dim,  bias=False)
+    self.attn_q      = nn.Linear(dim, q_proj_out,  bias=attn_qkv_bias)
+    self.attn_k      = nn.Linear(dim, kv_proj_out, bias=attn_qkv_bias)
+    self.attn_v      = nn.Linear(dim, kv_proj_out, bias=attn_qkv_bias)
+    self.attn_output = nn.Linear(q_proj_out, dim,  bias=attn_output_bias)
+    if attn_sinks: self.attn_sinks = WeightHolder(n_heads)
 
     # --- RMSNorms --------------------------------------------------------
     self.attn_norm   = nn.RMSNorm(dim, norm_eps)
@@ -108,10 +154,10 @@ class TransformerBlock:
     # --- feed-forward (MoE or dense) -------------------------------------
     if num_experts > 0:
       self.num_experts_per_tok = num_experts_per_tok
-      self.ffn_gate_inp = nn.Linear(dim, num_experts, bias=False)  # router
-      self.ffn_gate_exps = ExpertWeights(num_experts, dim, hidden_dim)
-      self.ffn_up_exps = ExpertWeights(num_experts, dim, hidden_dim)
-      self.ffn_down_exps = ExpertWeights(num_experts, hidden_dim, dim)
+      self.ffn_gate_inp = nn.Linear(dim, num_experts, bias=moe_router_bias)  # router
+      self.ffn_gate_exps = ExpertWeights(num_experts, dim, hidden_dim, bias=moe_expert_bias)
+      self.ffn_up_exps = ExpertWeights(num_experts, dim, hidden_dim, bias=moe_expert_bias)
+      self.ffn_down_exps = ExpertWeights(num_experts, hidden_dim, dim, bias=moe_expert_bias)
     else:
       self.ffn_gate    = nn.Linear(dim, hidden_dim, bias=False)
       self.ffn_up      = nn.Linear(dim, hidden_dim, bias=False)
@@ -129,7 +175,8 @@ class TransformerBlock:
     v = v.reshape(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)  # (B,KvH,T,Hd)
     if self.qk_norm == self.head_dim: q, k = self.attn_q_norm(q), self.attn_k_norm(k)
 
-    freqs_cis = precompute_freqs_cis(self.head_dim, self.max_context, self.rope_theta)[start_pos:start_pos+T]
+    freqs_cis = precompute_freqs_cis(self.head_dim, self.max_context, self.rope_theta, self.rope_scaling_type,
+                                     self.rope_scaling_factor, self.rope_original_context_length)[start_pos:start_pos+T]
     q = apply_rope(q, freqs_cis)
     k = apply_rope(k, freqs_cis)
 
@@ -146,7 +193,21 @@ class TransformerBlock:
     # NOTE: this mask is causal_lower_right, not the causal_upper_left generated by is_casual = True
     # TODO: this if statement should be removed and it shouldn't generate extra kernels
     mask = Tensor.full((1, 1, T, start_pos+T), float("-inf"), dtype=x.dtype, device=x.device).triu(start_pos+1) if resolve(T != 1) else None
-    attn = q.scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)     # (B,H,T,Hd)
+    if hasattr(self, "attn_sinks"):
+      if self.n_heads != self.n_kv_heads:
+        k = k.repeat_interleave(self.n_heads // self.n_kv_heads, dim=1)
+        v = v.repeat_interleave(self.n_heads // self.n_kv_heads, dim=1)
+      logits = q.cast("float32").matmul(k.cast("float32").transpose(-2, -1)) / math.sqrt(self.head_dim)
+      if mask is not None: logits = logits + mask
+      sinks = self.attn_sinks.weight.cast("float32").reshape(1, self.n_heads, 1, 1)
+      logits_max = logits.max(axis=-1, keepdim=True)
+      logits_or_sinks_max = logits_max.maximum(sinks)
+      sinks = (sinks - logits_or_sinks_max).exp()
+      unnormalized_scores = (logits - logits_or_sinks_max).exp()
+      scores = unnormalized_scores / (unnormalized_scores.sum(axis=-1, keepdim=True) + sinks)
+      attn = scores.cast(q.dtype) @ v
+    else:
+      attn = q.scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)     # (B,H,T,Hd)
     attn = attn.transpose(1, 2).reshape(B, T, -1)                                    # back to (B,T,D)
     attn = self.attn_output(attn)
     return x + attn
@@ -154,10 +215,20 @@ class TransformerBlock:
   @function(precompile=bool(getenv("PRECOMPILE", 0)))
   def _feed_forward(self, h: Tensor) -> Tensor:
     h_norm = self.ffn_norm(h)
-    if hasattr(self, 'ffn_gate_exps'):
+    if hasattr(self, 'ffn_gate_exps') or hasattr(self, 'ffn_gate_up_exps'):
       x = h_norm.unsqueeze(2)  # (B, T, 1, D) - add expert dim for broadcasting
       probs, sel = self.ffn_gate_inp(h_norm).softmax(-1).topk(self.num_experts_per_tok)  # (B, T, k) each
-      x_down = self.ffn_down_exps(sel, self.ffn_gate_exps(sel, x).silu() * self.ffn_up_exps(sel, x))  # (B, T, k, D)
+      if hasattr(self, 'ffn_gate_up_exps'):
+        gate, up = self.ffn_gate_up_exps(sel, x).chunk(2, dim=-1)
+      else:
+        gate, up = self.ffn_gate_exps(sel, x), self.ffn_up_exps(sel, x)
+      if self.moe_swiglu_limit is not None:
+        gate = gate.clip(max_=self.moe_swiglu_limit)
+        up = up.clip(min_=-self.moe_swiglu_limit, max_=self.moe_swiglu_limit)
+        act = gate * (gate * self.moe_swiglu_alpha).sigmoid() * (up + 1)
+      else:
+        act = gate.silu() * up
+      x_down = self.ffn_down_exps(sel, act)  # (B, T, k, D)
       return h + (x_down * probs.unsqueeze(-1)).sum(axis=2)  # (B, T, D)
     # TODO: remove the need for this contiguous
     gated  = self.ffn_gate(h_norm).silu().contiguous() * self.ffn_up(h_norm)
@@ -172,9 +243,18 @@ class TransformerBlock:
 
 class Transformer:
   def __init__(self, *, num_blocks, dim, hidden_dim, n_heads, n_kv_heads, norm_eps, vocab_size, head_dim:int, rope_theta:float,
-               max_context:int=0, qk_norm:int=0, num_experts:int=0, num_experts_per_tok:int=0):
-    self.blk = [TransformerBlock(dim, hidden_dim, n_heads, n_kv_heads, norm_eps, head_dim, rope_theta, max_context, qk_norm,
-                                 num_experts, num_experts_per_tok) for _ in range(num_blocks)]
+               max_context:int=0, qk_norm:int=0, num_experts:int=0, num_experts_per_tok:int=0, attn_qkv_bias=False,
+               attn_output_bias=False, moe_router_bias=False, moe_expert_bias=False, moe_swiglu_limit:float|None=None,
+               moe_swiglu_alpha:float=1.702, rope_scaling_type:str|None=None, rope_scaling_factor:float=1.0,
+               rope_original_context_length:int=0, attn_sinks:bool=False, sliding_window:int=0):
+    self.blk = [TransformerBlock(dim, hidden_dim, n_heads, n_kv_heads, norm_eps, head_dim, rope_theta, max_context=max_context, qk_norm=qk_norm,
+                                 num_experts=num_experts, num_experts_per_tok=num_experts_per_tok, attn_qkv_bias=attn_qkv_bias,
+                                 attn_output_bias=attn_output_bias, moe_router_bias=moe_router_bias, moe_expert_bias=moe_expert_bias,
+                                 moe_swiglu_limit=moe_swiglu_limit, moe_swiglu_alpha=moe_swiglu_alpha,
+                                 rope_scaling_type=rope_scaling_type, rope_scaling_factor=rope_scaling_factor,
+                                 rope_original_context_length=rope_original_context_length, attn_sinks=attn_sinks,
+                                 sliding_window=(sliding_window if sliding_window > 0 and i % 2 == 0 else 0))
+                for i in range(num_blocks)]
     self.token_embd  = nn.Embedding(vocab_size, dim)
     self.output_norm = nn.RMSNorm(dim, norm_eps)
     self.output = nn.Linear(dim, vocab_size, bias=False)
@@ -187,7 +267,6 @@ class Transformer:
   def forward(self, tokens:Tensor, start_pos:int|UOp) -> Tensor:
     x = self.token_embd(tokens)                           # (B, T, D)
     for block in self.blk: x = block(x, start_pos)
-    # TODO: add temperature
     return self.output(self.output_norm(x))[:, -1, :].softmax(-1, dtype="float").argmax(-1, keepdim=True)
 
   def __call__(self, tokens:Tensor, start_pos:int|UOp=0) -> Tensor:
@@ -205,6 +284,19 @@ class Transformer:
     if 'output.weight' not in state_dict: state_dict['output.weight'] = state_dict['token_embd.weight']
 
     arch = kv['general.architecture']
+    if arch in ('gpt-oss', 'gpt_oss'):
+      for name in list(state_dict.keys()):
+        if '.post_attention_norm.' in name: state_dict[name.replace('.post_attention_norm.', '.ffn_norm.')] = state_dict.pop(name)
+
+    attn_qkv_bias = 'blk.0.attn_q.bias' in state_dict
+    attn_output_bias = 'blk.0.attn_output.bias' in state_dict
+    moe_router_bias = 'blk.0.ffn_gate_inp.bias' in state_dict
+    moe_expert_bias = 'blk.0.ffn_gate_exps.bias' in state_dict
+    moe_swiglu_limit = kv.get(f'{arch}.swiglu_limit', 7.0 if arch in ('gpt-oss', 'gpt_oss') else None)
+    rope_scaling_type = kv.get(f'{arch}.rope.scaling.type')
+    rope_scaling_factor = kv.get(f'{arch}.rope.scaling.factor', 1.0)
+    rope_original_context_length = int(kv.get(f'{arch}.rope.scaling.original_context_length', 0))
+    attn_sinks = 'blk.0.attn_sinks.weight' in state_dict
     max_context = min(max_context, kv[f'{arch}.context_length']) if max_context is not None else kv[f'{arch}.context_length']
     n_heads, n_kv_heads = kv[f'{arch}.attention.head_count'], kv[f'{arch}.attention.head_count_kv']
 
@@ -215,14 +307,27 @@ class Transformer:
         if 'attn_k.weight' in name: state_dict[name] = state_dict[name].rearrange("(n h two) d -> (n two h) d", n=n_kv_heads, two=2)
 
     model = Transformer(num_blocks=kv[f'{arch}.block_count'], dim=kv[f'{arch}.embedding_length'],
-                        hidden_dim=kv.get(f'{arch}.expert_feed_forward_length', kv[f'{arch}.feed_forward_length']),
+                        hidden_dim=kv.get(f'{arch}.expert_feed_forward_length', kv.get(f'{arch}.feed_forward_length', 0)),
                         n_heads=n_heads, n_kv_heads=n_kv_heads, norm_eps=kv[f'{arch}.attention.layer_norm_rms_epsilon'],
                         vocab_size=len(kv['tokenizer.ggml.tokens']),
                         head_dim=kv.get(f'{arch}.attention.key_length', kv[f'{arch}.embedding_length'] // n_heads),
                         rope_theta=kv[f'{arch}.rope.freq_base'], max_context=max_context,
                         qk_norm=int(state_dict['blk.0.attn_q_norm.weight'].shape[0]) if 'blk.0.attn_q_norm.weight' in state_dict else 0,
-                        num_experts=kv.get(f'{arch}.expert_count', 0), num_experts_per_tok=kv.get(f'{arch}.expert_used_count', 0))
+                        num_experts=kv.get(f'{arch}.expert_count', 0), num_experts_per_tok=kv.get(f'{arch}.expert_used_count', 0),
+                        attn_qkv_bias=attn_qkv_bias, attn_output_bias=attn_output_bias, moe_router_bias=moe_router_bias,
+                        moe_expert_bias=moe_expert_bias, moe_swiglu_limit=moe_swiglu_limit, rope_scaling_type=rope_scaling_type,
+                        rope_scaling_factor=rope_scaling_factor, rope_original_context_length=rope_original_context_length,
+                        attn_sinks=attn_sinks, sliding_window=int(kv.get(f'{arch}.attention.sliding_window', 0)))
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
+    # Fuse gate+up expert projections to reduce MoE decode compute without changing math.
+    for b in model.blk:
+      if hasattr(b, 'ffn_gate_exps') and hasattr(b, 'ffn_up_exps'):
+        fused = ExpertWeights(b.ffn_gate_exps.weight.shape[0], b.ffn_gate_exps.weight.shape[2], b.ffn_gate_exps.weight.shape[1] * 2,
+                              bias=hasattr(b.ffn_gate_exps, 'bias') and hasattr(b.ffn_up_exps, 'bias'))
+        fused.weight = b.ffn_gate_exps.weight.cat(b.ffn_up_exps.weight, dim=1)
+        if hasattr(fused, 'bias'): fused.bias = b.ffn_gate_exps.bias.cat(b.ffn_up_exps.bias, dim=1)
+        b.ffn_gate_up_exps = fused
+        del b.ffn_gate_exps, b.ffn_up_exps
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:
       for s in (params:=nn.state.get_parameters(model)): s.replace(s.contiguous())
@@ -261,6 +366,8 @@ models = {
   "qwen3:8b": "https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf",
   "qwen3:30b-a3b": "https://huggingface.co/Qwen/Qwen3-30B-A3B-GGUF/resolve/main/Qwen3-30B-A3B-Q4_K_M.gguf",
   "olmoe": "https://huggingface.co/allenai/OLMoE-1B-7B-0924-Instruct-GGUF/resolve/main/olmoe-1b-7b-0924-instruct-q4_k_m.gguf",
+  "gpt-oss:20b": "https://huggingface.co/unsloth/gpt-oss-20b-GGUF/resolve/main/gpt-oss-20b-Q4_K_M.gguf",
+  "gpt-oss:20b-q8": "https://huggingface.co/unsloth/gpt-oss-20b-GGUF/resolve/main/gpt-oss-20b-Q8_0.gguf",
 }
 
 # *** simple OpenAI compatible server on 11434 to match ollama ***
@@ -314,7 +421,7 @@ class Handler(HTTPRequestHandler):
     st = time.perf_counter()
     for next_id in model.generate(ids):
       if len(out) == 0: stderr_log(f"prefill:{(len(ids)-cache_start_pos)/((pt:=time.perf_counter())-st):4.0f} tok/s  {colored('--', 'BLACK')}  ")
-      if next_id == eos_id: break
+      if next_id in stop_ids: break
       out.append(next_id)
       yield {"choices": [{"index":0, "delta":{"content":tok.decode([next_id])}, "finish_reason":None}], **tmpl}
     yield {"choices": [{"index":0, "delta":{},"finish_reason":"stop"}], **tmpl}
@@ -329,7 +436,10 @@ class Handler(HTTPRequestHandler):
     if self.path == "/v1/chat/completions":
       # extract tokens
       ids: list[int] = [bos_id] if bos_id is not None else []
-      for msg in body["messages"]:
+      msgs = list(body["messages"])
+      if tok.preset == "gpt-oss" and not any(msg.get("role") == "system" for msg in msgs):
+        msgs = [{"role":"system", "content":gpt_oss_system_prompt}] + msgs
+      for msg in msgs:
         ids += tok.role(msg["role"])
         # content can be a str or a list
         content = msg["content"]
@@ -352,6 +462,11 @@ class Handler(HTTPRequestHandler):
           "choices":[{"index":0, "message":{"role":"assistant","content":"".join(out)}, "finish_reason":"stop"}]}).encode())
     else:
       raise RuntimeError(f"unhandled path {self.path}")
+
+gpt_oss_system_prompt = ("You are ChatGPT, a large language model trained by OpenAI.\n"
+  "Knowledge cutoff: 2024-06\nCurrent date: 2025-07-04\n\n"
+  "Prefer direct, concise answers. For coding requests, output runnable code first.\n\n"
+  "reasoning effort high\n\n# Valid channels: analysis, final. Channel must be included for every message.")
 
 if __name__ == "__main__":
   parser = argparse.ArgumentParser()
@@ -376,6 +491,10 @@ if __name__ == "__main__":
   tok = SimpleTokenizer.from_gguf_kv(kv)
   bos_id: int|None = kv.get('tokenizer.ggml.bos_token_id') if kv.get('tokenizer.ggml.add_bos_token', True) else None
   eos_id: int = kv['tokenizer.ggml.eos_token_id']
+  stop_ids: set[int] = {eos_id}
+  if tok.preset == "gpt-oss":
+    for stop_tok in ("<|end|>", "<|return|>", "<|call|>", "<|endoftext|>"):
+      if stop_tok in tok._special_tokens: stop_ids.add(tok._special_tokens[stop_tok])
 
   # do benchmark
   if args.benchmark:
@@ -396,12 +515,13 @@ if __name__ == "__main__":
 
   # interactive chat
   ids: list[int] = [bos_id] if bos_id is not None else []
+  if tok.preset == "gpt-oss": ids += tok.role("system") + tok.encode(gpt_oss_system_prompt) + tok.end_turn(eos_id)
   while 1:
     try:
       ids += tok.role("user") + tok.encode(input('>>> ')) + tok.end_turn(eos_id) + tok.role("assistant")
     except EOFError:
       break
     for next_id in model.generate(ids):
-      sys.stdout.write(tok.decode([next_id]) if next_id != eos_id else "\n\n")
+      sys.stdout.write(tok.decode([next_id]) if next_id not in stop_ids else "\n\n")
       sys.stdout.flush()
-      if next_id == eos_id: break
+      if next_id in stop_ids: break
