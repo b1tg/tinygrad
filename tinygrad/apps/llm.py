@@ -120,10 +120,9 @@ def apply_rope(x:Tensor, freqs_cis:Tensor) -> Tensor:
 
 class TransformerBlock:
   def __init__(self, dim:int, hidden_dim:int, n_heads:int, n_kv_heads:int, norm_eps:float, head_dim:int, rope_theta:float,
-               max_context:int=0, qk_norm:int=0, num_experts:int=0, num_experts_per_tok:int=0, attn_qkv_bias=False,
-               attn_output_bias=False, moe_router_bias=False, moe_expert_bias=False, moe_swiglu_limit:float|None=None,
-               moe_swiglu_alpha:float=1.702, rope_scaling_type:str|None=None, rope_scaling_factor:float=1.0,
-               rope_original_context_length:int=0, attn_sinks:bool=False, sliding_window:int=0):
+               max_context:int=0, qk_norm:int=0, num_experts:int=0, num_experts_per_tok:int=0, bias:bool=False,
+               moe_swiglu_limit:float|None=None, moe_swiglu_alpha:float=1.702, rope_scaling_type:str|None=None,
+               rope_scaling_factor:float=1.0, rope_original_context_length:int=0, attn_sinks:bool=False):
     self.n_heads      = n_heads
     self.n_kv_heads   = n_kv_heads
     self.head_dim     = head_dim
@@ -135,15 +134,14 @@ class TransformerBlock:
     self.rope_scaling_type = rope_scaling_type
     self.rope_scaling_factor = rope_scaling_factor
     self.rope_original_context_length = rope_original_context_length
-    self.sliding_window = sliding_window
 
     # --- attention projections -------------------------------------------
     q_proj_out       = self.head_dim * n_heads
     kv_proj_out      = self.head_dim * n_kv_heads
-    self.attn_q      = nn.Linear(dim, q_proj_out,  bias=attn_qkv_bias)
-    self.attn_k      = nn.Linear(dim, kv_proj_out, bias=attn_qkv_bias)
-    self.attn_v      = nn.Linear(dim, kv_proj_out, bias=attn_qkv_bias)
-    self.attn_output = nn.Linear(q_proj_out, dim,  bias=attn_output_bias)
+    self.attn_q      = nn.Linear(dim, q_proj_out,  bias=bias)
+    self.attn_k      = nn.Linear(dim, kv_proj_out, bias=bias)
+    self.attn_v      = nn.Linear(dim, kv_proj_out, bias=bias)
+    self.attn_output = nn.Linear(q_proj_out, dim,  bias=bias)
     if attn_sinks: self.attn_sinks = WeightHolder(n_heads)
 
     # --- RMSNorms --------------------------------------------------------
@@ -154,10 +152,10 @@ class TransformerBlock:
     # --- feed-forward (MoE or dense) -------------------------------------
     if num_experts > 0:
       self.num_experts_per_tok = num_experts_per_tok
-      self.ffn_gate_inp = nn.Linear(dim, num_experts, bias=moe_router_bias)  # router
-      self.ffn_gate_exps = ExpertWeights(num_experts, dim, hidden_dim, bias=moe_expert_bias)
-      self.ffn_up_exps = ExpertWeights(num_experts, dim, hidden_dim, bias=moe_expert_bias)
-      self.ffn_down_exps = ExpertWeights(num_experts, hidden_dim, dim, bias=moe_expert_bias)
+      self.ffn_gate_inp = nn.Linear(dim, num_experts, bias=bias)  # router
+      self.ffn_gate_exps = ExpertWeights(num_experts, dim, hidden_dim, bias=bias)
+      self.ffn_up_exps = ExpertWeights(num_experts, dim, hidden_dim, bias=bias)
+      self.ffn_down_exps = ExpertWeights(num_experts, hidden_dim, dim, bias=bias)
     else:
       self.ffn_gate    = nn.Linear(dim, hidden_dim, bias=False)
       self.ffn_up      = nn.Linear(dim, hidden_dim, bias=False)
@@ -243,18 +241,15 @@ class TransformerBlock:
 
 class Transformer:
   def __init__(self, *, num_blocks, dim, hidden_dim, n_heads, n_kv_heads, norm_eps, vocab_size, head_dim:int, rope_theta:float,
-               max_context:int=0, qk_norm:int=0, num_experts:int=0, num_experts_per_tok:int=0, attn_qkv_bias=False,
-               attn_output_bias=False, moe_router_bias=False, moe_expert_bias=False, moe_swiglu_limit:float|None=None,
-               moe_swiglu_alpha:float=1.702, rope_scaling_type:str|None=None, rope_scaling_factor:float=1.0,
-               rope_original_context_length:int=0, attn_sinks:bool=False, sliding_window:int=0):
+               max_context:int=0, qk_norm:int=0, num_experts:int=0, num_experts_per_tok:int=0, bias:bool=False,
+               moe_swiglu_limit:float|None=None, moe_swiglu_alpha:float=1.702, rope_scaling_type:str|None=None,
+               rope_scaling_factor:float=1.0, rope_original_context_length:int=0, attn_sinks:bool=False):
     self.blk = [TransformerBlock(dim, hidden_dim, n_heads, n_kv_heads, norm_eps, head_dim, rope_theta, max_context=max_context, qk_norm=qk_norm,
-                                 num_experts=num_experts, num_experts_per_tok=num_experts_per_tok, attn_qkv_bias=attn_qkv_bias,
-                                 attn_output_bias=attn_output_bias, moe_router_bias=moe_router_bias, moe_expert_bias=moe_expert_bias,
+                                 num_experts=num_experts, num_experts_per_tok=num_experts_per_tok, bias=bias,
                                  moe_swiglu_limit=moe_swiglu_limit, moe_swiglu_alpha=moe_swiglu_alpha,
                                  rope_scaling_type=rope_scaling_type, rope_scaling_factor=rope_scaling_factor,
-                                 rope_original_context_length=rope_original_context_length, attn_sinks=attn_sinks,
-                                 sliding_window=(sliding_window if sliding_window > 0 and i % 2 == 0 else 0))
-                for i in range(num_blocks)]
+                                 rope_original_context_length=rope_original_context_length, attn_sinks=attn_sinks)
+                for _ in range(num_blocks)]
     self.token_embd  = nn.Embedding(vocab_size, dim)
     self.output_norm = nn.RMSNorm(dim, norm_eps)
     self.output = nn.Linear(dim, vocab_size, bias=False)
@@ -288,15 +283,6 @@ class Transformer:
       for name in list(state_dict.keys()):
         if '.post_attention_norm.' in name: state_dict[name.replace('.post_attention_norm.', '.ffn_norm.')] = state_dict.pop(name)
 
-    attn_qkv_bias = 'blk.0.attn_q.bias' in state_dict
-    attn_output_bias = 'blk.0.attn_output.bias' in state_dict
-    moe_router_bias = 'blk.0.ffn_gate_inp.bias' in state_dict
-    moe_expert_bias = 'blk.0.ffn_gate_exps.bias' in state_dict
-    moe_swiglu_limit = kv.get(f'{arch}.swiglu_limit', 7.0 if arch in ('gpt-oss', 'gpt_oss') else None)
-    rope_scaling_type = kv.get(f'{arch}.rope.scaling.type')
-    rope_scaling_factor = kv.get(f'{arch}.rope.scaling.factor', 1.0)
-    rope_original_context_length = int(kv.get(f'{arch}.rope.scaling.original_context_length', 0))
-    attn_sinks = 'blk.0.attn_sinks.weight' in state_dict
     max_context = min(max_context, kv[f'{arch}.context_length']) if max_context is not None else kv[f'{arch}.context_length']
     n_heads, n_kv_heads = kv[f'{arch}.attention.head_count'], kv[f'{arch}.attention.head_count_kv']
 
@@ -314,10 +300,11 @@ class Transformer:
                         rope_theta=kv[f'{arch}.rope.freq_base'], max_context=max_context,
                         qk_norm=int(state_dict['blk.0.attn_q_norm.weight'].shape[0]) if 'blk.0.attn_q_norm.weight' in state_dict else 0,
                         num_experts=kv.get(f'{arch}.expert_count', 0), num_experts_per_tok=kv.get(f'{arch}.expert_used_count', 0),
-                        attn_qkv_bias=attn_qkv_bias, attn_output_bias=attn_output_bias, moe_router_bias=moe_router_bias,
-                        moe_expert_bias=moe_expert_bias, moe_swiglu_limit=moe_swiglu_limit, rope_scaling_type=rope_scaling_type,
-                        rope_scaling_factor=rope_scaling_factor, rope_original_context_length=rope_original_context_length,
-                        attn_sinks=attn_sinks, sliding_window=int(kv.get(f'{arch}.attention.sliding_window', 0)))
+                        bias='blk.0.attn_q.bias' in state_dict,
+                        moe_swiglu_limit=kv.get(f'{arch}.swiglu_limit', 7.0 if arch in ('gpt-oss', 'gpt_oss') else None),
+                        rope_scaling_type=kv.get(f'{arch}.rope.scaling.type'), rope_scaling_factor=kv.get(f'{arch}.rope.scaling.factor', 1.0),
+                        rope_original_context_length=int(kv.get(f'{arch}.rope.scaling.original_context_length', 0)),
+                        attn_sinks='blk.0.attn_sinks.weight' in state_dict)
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
     # Fuse gate+up expert projections to reduce MoE decode compute without changing math.
     for b in model.blk:
@@ -436,10 +423,7 @@ class Handler(HTTPRequestHandler):
     if self.path == "/v1/chat/completions":
       # extract tokens
       ids: list[int] = [bos_id] if bos_id is not None else []
-      msgs = list(body["messages"])
-      if tok.preset == "gpt-oss" and not any(msg.get("role") == "system" for msg in msgs):
-        msgs = [{"role":"system", "content":gpt_oss_system_prompt}] + msgs
-      for msg in msgs:
+      for msg in body["messages"]:
         ids += tok.role(msg["role"])
         # content can be a str or a list
         content = msg["content"]
@@ -462,11 +446,6 @@ class Handler(HTTPRequestHandler):
           "choices":[{"index":0, "message":{"role":"assistant","content":"".join(out)}, "finish_reason":"stop"}]}).encode())
     else:
       raise RuntimeError(f"unhandled path {self.path}")
-
-gpt_oss_system_prompt = ("You are ChatGPT, a large language model trained by OpenAI.\n"
-  "Knowledge cutoff: 2024-06\nCurrent date: 2025-07-04\n\n"
-  "Prefer direct, concise answers. For coding requests, output runnable code first.\n\n"
-  "reasoning effort high\n\n# Valid channels: analysis, final. Channel must be included for every message.")
 
 if __name__ == "__main__":
   parser = argparse.ArgumentParser()
@@ -491,10 +470,7 @@ if __name__ == "__main__":
   tok = SimpleTokenizer.from_gguf_kv(kv)
   bos_id: int|None = kv.get('tokenizer.ggml.bos_token_id') if kv.get('tokenizer.ggml.add_bos_token', True) else None
   eos_id: int = kv['tokenizer.ggml.eos_token_id']
-  stop_ids: set[int] = {eos_id}
-  if tok.preset == "gpt-oss":
-    for stop_tok in ("<|end|>", "<|return|>", "<|call|>", "<|endoftext|>"):
-      if stop_tok in tok._special_tokens: stop_ids.add(tok._special_tokens[stop_tok])
+  stop_ids = {eos_id} | {tok._special_tokens[s] for s in ("<|end|>", "<|endoftext|>") if s in tok._special_tokens}
 
   # do benchmark
   if args.benchmark:
@@ -515,7 +491,6 @@ if __name__ == "__main__":
 
   # interactive chat
   ids: list[int] = [bos_id] if bos_id is not None else []
-  if tok.preset == "gpt-oss": ids += tok.role("system") + tok.encode(gpt_oss_system_prompt) + tok.end_turn(eos_id)
   while 1:
     try:
       ids += tok.role("user") + tok.encode(input('>>> ')) + tok.end_turn(eos_id) + tok.role("assistant")
