@@ -7,7 +7,7 @@ from tinygrad.viz.serve import TCPServerWithReuse, HTTPRequestHandler
 
 class SimpleTokenizer:
   def __init__(self, normal_tokens:dict[str, int], special_tokens:dict[str, int], preset:str="llama3"):
-    if preset in ("gpt-oss", "gpt_oss", "o200k_harmony", "gpt-4o"): preset = "gpt-oss"
+    if preset == "gpt-4o": preset = "gpt-oss"
     if preset not in ("llama3","llama-v3","llama-bpe","qwen2","olmo","gpt-oss"): raise ValueError(f"Invalid tokenizer preset '{preset}'")
     # https://github.com/openai/gpt-2/blob/9b63575ef42771a015060c964af2c3da4cf7c8ab/src/encoder.py#L9
     bs = [*range(33, 127), *range(161, 173), *range(174, 256)]  # bytes that map to themselves
@@ -43,6 +43,7 @@ class SimpleTokenizer:
   def _encode_word(self, word:bytes) -> list[int]:
     if (early_token:=self._normal_tokens.get(word)) is not None: return [early_token]
     parts = [bytes([b]) for b in word]
+    # greedily merge any parts that we can
     while True:
       i = min([(sys.maxsize, -1)] + [(self._normal_tokens.get(parts[j]+parts[j+1], sys.maxsize), j) for j in range(len(parts)-1)])[1]
       if i == -1: break
@@ -112,20 +113,17 @@ def apply_rope(x:Tensor, freqs_cis:Tensor) -> Tensor:
 
 class TransformerBlock:
   def __init__(self, dim:int, hidden_dim:int, n_heads:int, n_kv_heads:int, norm_eps:float, head_dim:int, rope_theta:float,
-               max_context:int=0, qk_norm:int=0, num_experts:int=0, num_experts_per_tok:int=0, bias:bool=False,
-               moe_swiglu_limit:float|None=None, moe_swiglu_alpha:float=1.702, rope_scaling_type:str|None=None,
-               rope_scaling_factor:float=1.0, rope_original_context_length:int=0, attn_sinks:bool=False):
+               max_context:int=0, qk_norm:int=0, num_experts:int=0, num_experts_per_tok:int=0, bias:bool=False):
     self.n_heads      = n_heads
     self.n_kv_heads   = n_kv_heads
     self.head_dim     = head_dim
     self.rope_theta   = rope_theta
     self.max_context  = max_context
     self.qk_norm      = qk_norm
-    self.moe_swiglu_limit = moe_swiglu_limit
-    self.moe_swiglu_alpha = moe_swiglu_alpha
-    self.rope_scaling_type = rope_scaling_type
-    self.rope_scaling_factor = rope_scaling_factor
-    self.rope_original_context_length = rope_original_context_length
+    self.moe_swiglu_limit: float|None = None
+    self.rope_scaling_type: str|None = None
+    self.rope_scaling_factor = 1.0
+    self.rope_original_context_length = 0
 
     # --- attention projections -------------------------------------------
     q_proj_out       = self.head_dim * n_heads
@@ -134,7 +132,6 @@ class TransformerBlock:
     self.attn_k      = nn.Linear(dim, kv_proj_out, bias=bias)
     self.attn_v      = nn.Linear(dim, kv_proj_out, bias=bias)
     self.attn_output = nn.Linear(q_proj_out, dim,  bias=bias)
-    if attn_sinks: self.attn_sinks = WeightHolder(n_heads)
 
     # --- RMSNorms --------------------------------------------------------
     self.attn_norm   = nn.RMSNorm(dim, norm_eps)
@@ -165,8 +162,8 @@ class TransformerBlock:
     v = v.reshape(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)  # (B,KvH,T,Hd)
     if self.qk_norm == self.head_dim: q, k = self.attn_q_norm(q), self.attn_k_norm(k)
 
-    freqs_cis = precompute_freqs_cis(self.head_dim, self.max_context, self.rope_theta, self.rope_scaling_type,
-                                     self.rope_scaling_factor, self.rope_original_context_length)[start_pos:start_pos+T]
+    freqs_cis = precompute_freqs_cis(self.head_dim, self.max_context, self.rope_theta,
+                                     self.rope_scaling_type, self.rope_scaling_factor, self.rope_original_context_length)[start_pos:start_pos+T]
     q = apply_rope(q, freqs_cis)
     k = apply_rope(k, freqs_cis)
 
@@ -205,23 +202,21 @@ class TransformerBlock:
   @function(precompile=bool(getenv("PRECOMPILE", 0)))
   def _feed_forward(self, h: Tensor) -> Tensor:
     h_norm = self.ffn_norm(h)
-    if hasattr(self, 'ffn_gate_exps') or hasattr(self, 'ffn_gate_up_exps'):
+    if hasattr(self, 'ffn_gate_exps'):
       x = h_norm.unsqueeze(2)  # (B, T, 1, D) - add expert dim for broadcasting
-      probs, sel = self.ffn_gate_inp(h_norm).softmax(-1).topk(self.num_experts_per_tok)  # (B, T, k) each
-      if hasattr(self, 'ffn_gate_up_exps'):
-        gate, up = self.ffn_gate_up_exps(sel, x).chunk(2, dim=-1)
-      else:
-        gate, up = self.ffn_gate_exps(sel, x), self.ffn_up_exps(sel, x)
+      probs, sel = self.ffn_gate_inp(h_norm).topk(self.num_experts_per_tok)  # (B, T, k) each
+      probs = probs.softmax(-1)
+      gate, up = self.ffn_gate_exps(sel, x), self.ffn_up_exps(sel, x)
       if self.moe_swiglu_limit is not None:
         gate = gate.clip(max_=self.moe_swiglu_limit)
         up = up.clip(min_=-self.moe_swiglu_limit, max_=self.moe_swiglu_limit)
-        act = gate * (gate * self.moe_swiglu_alpha).sigmoid() * (up + 1)
+        act = gate * (gate * 1.702).sigmoid() * (up + 1)
       else:
         act = gate.silu() * up
       x_down = self.ffn_down_exps(sel, act)  # (B, T, k, D)
       return h + (x_down * probs.unsqueeze(-1)).sum(axis=2)  # (B, T, D)
     # TODO: remove the need for this contiguous
-    gated  = self.ffn_gate(h_norm).silu().contiguous() * self.ffn_up(h_norm)
+    gated = self.ffn_gate(h_norm).silu().contiguous() * self.ffn_up(h_norm)
     return h + self.ffn_down(gated)
 
   def __call__(self, x: Tensor, start_pos: int|UOp):
@@ -233,14 +228,9 @@ class TransformerBlock:
 
 class Transformer:
   def __init__(self, *, num_blocks, dim, hidden_dim, n_heads, n_kv_heads, norm_eps, vocab_size, head_dim:int, rope_theta:float,
-               max_context:int=0, qk_norm:int=0, num_experts:int=0, num_experts_per_tok:int=0, bias:bool=False,
-               moe_swiglu_limit:float|None=None, moe_swiglu_alpha:float=1.702, rope_scaling_type:str|None=None,
-               rope_scaling_factor:float=1.0, rope_original_context_length:int=0, attn_sinks:bool=False):
+               max_context:int=0, qk_norm:int=0, num_experts:int=0, num_experts_per_tok:int=0, bias:bool=False):
     self.blk = [TransformerBlock(dim, hidden_dim, n_heads, n_kv_heads, norm_eps, head_dim, rope_theta, max_context=max_context, qk_norm=qk_norm,
-                                 num_experts=num_experts, num_experts_per_tok=num_experts_per_tok, bias=bias,
-                                 moe_swiglu_limit=moe_swiglu_limit, moe_swiglu_alpha=moe_swiglu_alpha,
-                                 rope_scaling_type=rope_scaling_type, rope_scaling_factor=rope_scaling_factor,
-                                 rope_original_context_length=rope_original_context_length, attn_sinks=attn_sinks)
+                                 num_experts=num_experts, num_experts_per_tok=num_experts_per_tok, bias=bias)
                 for _ in range(num_blocks)]
     self.token_embd  = nn.Embedding(vocab_size, dim)
     self.output_norm = nn.RMSNorm(dim, norm_eps)
@@ -254,6 +244,7 @@ class Transformer:
   def forward(self, tokens:Tensor, start_pos:int|UOp) -> Tensor:
     x = self.token_embd(tokens)                           # (B, T, D)
     for block in self.blk: x = block(x, start_pos)
+    # TODO: add temperature
     return self.output(self.output_norm(x))[:, -1, :].softmax(-1, dtype="float").argmax(-1, keepdim=True)
 
   def __call__(self, tokens:Tensor, start_pos:int|UOp=0) -> Tensor:
@@ -271,7 +262,7 @@ class Transformer:
     if 'output.weight' not in state_dict: state_dict['output.weight'] = state_dict['token_embd.weight']
 
     arch = kv['general.architecture']
-    if arch in ('gpt-oss', 'gpt_oss'):
+    if arch == 'gpt-oss':
       for name in list(state_dict.keys()):
         if '.post_attention_norm.' in name: state_dict[name.replace('.post_attention_norm.', '.ffn_norm.')] = state_dict.pop(name)
 
@@ -285,28 +276,22 @@ class Transformer:
         if 'attn_k.weight' in name: state_dict[name] = state_dict[name].rearrange("(n h two) d -> (n two h) d", n=n_kv_heads, two=2)
 
     model = Transformer(num_blocks=kv[f'{arch}.block_count'], dim=kv[f'{arch}.embedding_length'],
-                        hidden_dim=kv.get(f'{arch}.expert_feed_forward_length', kv.get(f'{arch}.feed_forward_length', 0)),
+                        hidden_dim=kv.get(f'{arch}.expert_feed_forward_length', kv[f'{arch}.feed_forward_length']),
                         n_heads=n_heads, n_kv_heads=n_kv_heads, norm_eps=kv[f'{arch}.attention.layer_norm_rms_epsilon'],
                         vocab_size=len(kv['tokenizer.ggml.tokens']),
                         head_dim=kv.get(f'{arch}.attention.key_length', kv[f'{arch}.embedding_length'] // n_heads),
                         rope_theta=kv[f'{arch}.rope.freq_base'], max_context=max_context,
                         qk_norm=int(state_dict['blk.0.attn_q_norm.weight'].shape[0]) if 'blk.0.attn_q_norm.weight' in state_dict else 0,
                         num_experts=kv.get(f'{arch}.expert_count', 0), num_experts_per_tok=kv.get(f'{arch}.expert_used_count', 0),
-                        bias='blk.0.attn_q.bias' in state_dict,
-                        moe_swiglu_limit=kv.get(f'{arch}.swiglu_limit', 7.0 if arch in ('gpt-oss', 'gpt_oss') else None),
-                        rope_scaling_type=kv.get(f'{arch}.rope.scaling.type'), rope_scaling_factor=kv.get(f'{arch}.rope.scaling.factor', 1.0),
-                        rope_original_context_length=int(kv.get(f'{arch}.rope.scaling.original_context_length', 0)),
-                        attn_sinks='blk.0.attn_sinks.weight' in state_dict)
+                        bias='blk.0.attn_q.bias' in state_dict)
+    if arch == 'gpt-oss':
+      for b in model.blk:
+        b.moe_swiglu_limit = kv.get(f'{arch}.swiglu_limit', 7.0)
+        b.rope_scaling_type = kv.get(f'{arch}.rope.scaling.type')
+        b.rope_scaling_factor = kv.get(f'{arch}.rope.scaling.factor', 1.0)
+        b.rope_original_context_length = int(kv.get(f'{arch}.rope.scaling.original_context_length', 0))
+        if 'blk.0.attn_sinks.weight' in state_dict: b.attn_sinks = WeightHolder(n_heads)
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
-    # Fuse gate+up expert projections to reduce MoE decode compute without changing math.
-    for b in model.blk:
-      if hasattr(b, 'ffn_gate_exps') and hasattr(b, 'ffn_up_exps'):
-        fused = ExpertWeights(b.ffn_gate_exps.weight.shape[0], b.ffn_gate_exps.weight.shape[2], b.ffn_gate_exps.weight.shape[1] * 2,
-                              bias=hasattr(b.ffn_gate_exps, 'bias') and hasattr(b.ffn_up_exps, 'bias'))
-        fused.weight = b.ffn_gate_exps.weight.cat(b.ffn_up_exps.weight, dim=1)
-        if hasattr(fused, 'bias'): fused.bias = b.ffn_gate_exps.bias.cat(b.ffn_up_exps.bias, dim=1)
-        b.ffn_gate_up_exps = fused
-        del b.ffn_gate_exps, b.ffn_up_exps
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:
       for s in (params:=nn.state.get_parameters(model)): s.replace(s.contiguous())
@@ -400,7 +385,7 @@ class Handler(HTTPRequestHandler):
     st = time.perf_counter()
     for next_id in model.generate(ids):
       if len(out) == 0: stderr_log(f"prefill:{(len(ids)-cache_start_pos)/((pt:=time.perf_counter())-st):4.0f} tok/s  {colored('--', 'BLACK')}  ")
-      if next_id in stop_ids: break
+      if next_id == eos_id: break
       out.append(next_id)
       yield {"choices": [{"index":0, "delta":{"content":tok.decode([next_id])}, "finish_reason":None}], **tmpl}
     yield {"choices": [{"index":0, "delta":{},"finish_reason":"stop"}], **tmpl}
@@ -462,7 +447,6 @@ if __name__ == "__main__":
   tok = SimpleTokenizer.from_gguf_kv(kv)
   bos_id: int|None = kv.get('tokenizer.ggml.bos_token_id') if kv.get('tokenizer.ggml.add_bos_token', True) else None
   eos_id: int = kv['tokenizer.ggml.eos_token_id']
-  stop_ids = {eos_id} | {tok._special_tokens[s] for s in ("<|end|>", "<|endoftext|>") if s in tok._special_tokens}
 
   # do benchmark
   if args.benchmark:
@@ -489,6 +473,6 @@ if __name__ == "__main__":
     except EOFError:
       break
     for next_id in model.generate(ids):
-      sys.stdout.write(tok.decode([next_id]) if next_id not in stop_ids else "\n\n")
+      sys.stdout.write(tok.decode([next_id]) if next_id != eos_id else "\n\n")
       sys.stdout.flush()
-      if next_id in stop_ids: break
+      if next_id == eos_id: break
