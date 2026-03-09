@@ -107,6 +107,7 @@ class TransformerBlock:
 
     # --- feed-forward (MoE or dense) -------------------------------------
     if num_experts > 0:
+      self.norm_topk_prob = False
       self.num_experts_per_tok = num_experts_per_tok
       self.ffn_gate_inp = nn.Linear(dim, num_experts, bias=False)  # router
       self.ffn_gate_exps = ExpertWeights(num_experts, dim, hidden_dim)
@@ -157,6 +158,7 @@ class TransformerBlock:
     if hasattr(self, 'ffn_gate_exps'):
       x = h_norm.unsqueeze(2)  # (B, T, 1, D) - add expert dim for broadcasting
       probs, sel = self.ffn_gate_inp(h_norm).softmax(-1).topk(self.num_experts_per_tok)  # (B, T, k) each
+      if self.norm_topk_prob: probs = probs / probs.sum(axis=-1, keepdim=True)
       x_down = self.ffn_down_exps(sel, self.ffn_gate_exps(sel, x).silu() * self.ffn_up_exps(sel, x))  # (B, T, k, D)
       return h + (x_down * probs.unsqueeze(-1)).sum(axis=2)  # (B, T, D)
     # TODO: remove the need for this contiguous
@@ -222,6 +224,8 @@ class Transformer:
                         rope_theta=kv[f'{arch}.rope.freq_base'], max_context=max_context,
                         qk_norm=int(state_dict['blk.0.attn_q_norm.weight'].shape[0]) if 'blk.0.attn_q_norm.weight' in state_dict else 0,
                         num_experts=kv.get(f'{arch}.expert_count', 0), num_experts_per_tok=kv.get(f'{arch}.expert_used_count', 0))
+    if arch == 'qwen3moe':
+      for b in model.blk: b.norm_topk_prob = True
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:
