@@ -76,16 +76,16 @@ class SimpleTokenizer:
     return [eos_id]
 
 @functools.cache
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, rope_scaling_type:str="default", rope_scaling_factor:float=1.0,
-                         rope_original_context_length:int=0, ntk_alpha:float=1.0, ntk_beta:float=32.0) -> Tensor:
+def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, type:str="default", factor:float=1.0,
+                         original_context_length:int=0, ntk_alpha:float=1.0, ntk_beta:float=32.0) -> Tensor:
   freqs = 1.0 / (theta ** (Tensor.arange(0, dim, 2)[:(dim // 2)] / dim))
   concentration = 1.0
-  if rope_scaling_type == "yarn" and rope_scaling_factor > 1.0:
-    concentration = 0.1 * math.log(rope_scaling_factor) + 1.0
-    low, high = (dim / 2 * math.log(rope_original_context_length / (x * 2 * math.pi)) / math.log(theta) for x in (ntk_beta, ntk_alpha))
+  if type == "yarn" and factor > 1.0:
+    concentration = 0.1 * math.log(factor) + 1.0
+    low, high = (dim / 2 * math.log(original_context_length / (x * 2 * math.pi)) / math.log(theta) for x in (ntk_beta, ntk_alpha))
     ramp = (Tensor.arange(dim // 2) - low) / (high - low)
     mask = 1.0 - ramp.clip(0, 1)
-    freqs = (1.0 / (rope_scaling_factor / freqs)) * (1.0 - mask) + freqs * mask
+    freqs = (1.0 / (factor / freqs)) * (1.0 - mask) + freqs * mask
   freqs = Tensor.arange(end).unsqueeze(dim=1) * freqs.unsqueeze(dim=0)
   return (freqs.cos() * concentration).cat(freqs.sin() * concentration, dim=-1).contiguous()
 
@@ -106,15 +106,13 @@ def apply_rope(x:Tensor, freqs_cis:Tensor) -> Tensor:
   return (x1 * cos - x2 * sin).cat(x2 * cos + x1 * sin, dim=-1)
 
 class TransformerBlock:
-  def __init__(self, dim:int, hidden_dim:int, n_heads:int, n_kv_heads:int, norm_eps:float, head_dim:int, rope_theta:float,
-               max_context:int=0, qk_norm:int=0, num_experts:int=0, num_experts_per_tok:int=0, bias:bool=False, attn_sink:bool=False,
-               rope_scaling_type:str="default", rope_scaling_factor:float=1.0, rope_original_context_length:int=0, moe_norm_topk_prob:bool=False):
+  def __init__(self, dim:int, hidden_dim:int, n_heads:int, n_kv_heads:int, norm_eps:float, head_dim:int, max_context:int=0, qk_norm:int=0,
+               num_experts:int=0, num_experts_per_tok:int=0, norm_topk_prob:bool=False,
+               bias:bool=False, attn_sink:bool=False, rope_config:dict[str, typing.Any]|None=None):
     self.n_heads      = n_heads
     self.n_kv_heads   = n_kv_heads
     self.head_dim     = head_dim
-    self.rope_theta   = rope_theta
-    self.rope_scaling_type, self.rope_scaling_factor, self.rope_original_context_length = (
-      rope_scaling_type, rope_scaling_factor, rope_original_context_length)
+    self.rope_config  = {"theta": 10000.0} | (rope_config or {})
     self.max_context  = max_context
     self.qk_norm      = qk_norm
 
@@ -134,8 +132,8 @@ class TransformerBlock:
 
     # --- feed-forward (MoE or dense) -------------------------------------
     if num_experts > 0:
-      self.moe_norm_topk_prob = moe_norm_topk_prob
-      if hasattr(self, "attn_sinks"):
+      self.norm_topk_prob = norm_topk_prob
+      if attn_sink:
         self.moe_swiglu_alpha = 1.702
         self.moe_swiglu_limit = 7.0
       self.num_experts_per_tok = num_experts_per_tok
@@ -160,8 +158,7 @@ class TransformerBlock:
     v = v.reshape(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)  # (B,KvH,T,Hd)
     if self.qk_norm == self.head_dim: q, k = self.attn_q_norm(q), self.attn_k_norm(k)
 
-    freqs_cis = precompute_freqs_cis(self.head_dim, self.max_context, self.rope_theta,
-                                     self.rope_scaling_type, self.rope_scaling_factor, self.rope_original_context_length)[start_pos:start_pos+T]
+    freqs_cis = precompute_freqs_cis(self.head_dim, self.max_context, **self.rope_config)[start_pos:start_pos+T]
     q = apply_rope(q, freqs_cis)
     k = apply_rope(k, freqs_cis)
 
@@ -189,14 +186,14 @@ class TransformerBlock:
     h_norm = self.ffn_norm(h)
     if hasattr(self, 'ffn_gate_exps'):
       x = h_norm.unsqueeze(2)  # (B, T, 1, D) - add expert dim for broadcasting
-      if hasattr(self, "moe_swiglu_limit"):
+      if hasattr(self, "attn_sinks"):
         probs, sel = self.ffn_gate_inp(h_norm).topk(self.num_experts_per_tok)  # (B, T, k) each
         probs = probs.softmax(-1)
       else:
         probs, sel = self.ffn_gate_inp(h_norm).softmax(-1).topk(self.num_experts_per_tok)  # (B, T, k) each
-        if self.moe_norm_topk_prob: probs = probs / probs.sum(axis=-1, keepdim=True)
+      if self.norm_topk_prob: probs = probs / probs.sum(axis=-1, keepdim=True)
       gate, up = self.ffn_gate_exps(sel, x), self.ffn_up_exps(sel, x)
-      if hasattr(self, "moe_swiglu_limit"):
+      if hasattr(self, "attn_sinks"):
         gate = gate.clip(max_=self.moe_swiglu_limit)
         up = up.clip(min_=-self.moe_swiglu_limit, max_=self.moe_swiglu_limit)
         act = gate * (gate * self.moe_swiglu_alpha).sigmoid() * (up + 1)
@@ -216,12 +213,11 @@ class TransformerBlock:
     return self._feed_forward(self._attention(x, start_pos)).contiguous()
 
 class Transformer:
-  def __init__(self, *, num_blocks, dim, hidden_dim, n_heads, n_kv_heads, norm_eps, vocab_size, head_dim:int, rope_theta:float,
-               max_context:int=0, qk_norm:int=0, num_experts:int=0, num_experts_per_tok:int=0, bias:bool=False, attn_sink:bool=False,
-               rope_scaling_type:str="default", rope_scaling_factor:float=1.0, rope_original_context_length:int=0, moe_norm_topk_prob:bool=False):
-    self.blk = [TransformerBlock(dim, hidden_dim, n_heads, n_kv_heads, norm_eps, head_dim, rope_theta, max_context, qk_norm,
-                                 num_experts, num_experts_per_tok, bias, attn_sink, rope_scaling_type, rope_scaling_factor,
-                                 rope_original_context_length, moe_norm_topk_prob) for _ in range(num_blocks)]
+  def __init__(self, *, num_blocks, dim, hidden_dim, n_heads, n_kv_heads, norm_eps, vocab_size, head_dim:int, max_context:int=0,
+               qk_norm:int=0, num_experts:int=0, num_experts_per_tok:int=0, norm_topk_prob:bool=False, bias:bool=False,
+               attn_sink:bool=False, rope_config:dict[str, typing.Any]|None=None):
+    self.blk = [TransformerBlock(dim, hidden_dim, n_heads, n_kv_heads, norm_eps, head_dim, max_context, qk_norm,
+                                 num_experts, num_experts_per_tok, norm_topk_prob, bias, attn_sink, rope_config) for _ in range(num_blocks)]
     self.token_embd  = nn.Embedding(vocab_size, dim)
     self.output_norm = nn.RMSNorm(dim, norm_eps)
     self.output = nn.Linear(dim, vocab_size, bias=False)
@@ -266,21 +262,21 @@ class Transformer:
         if 'attn_q.weight' in name: state_dict[name] = state_dict[name].rearrange("(n h two) d -> (n two h) d", n=n_heads, two=2)
         if 'attn_k.weight' in name: state_dict[name] = state_dict[name].rearrange("(n h two) d -> (n two h) d", n=n_kv_heads, two=2)
 
-    rope_scaling_type = kv[f'{arch}.rope.scaling.type'] if f'{arch}.rope.scaling.type' in kv else "default"
-    rope_scaling_factor = kv[f'{arch}.rope.scaling.factor'] if f'{arch}.rope.scaling.factor' in kv else 1.0
-    rope_original_context_length = int(kv[f'{arch}.rope.scaling.original_context_length']) if (
-      f'{arch}.rope.scaling.original_context_length' in kv) else 0
+    rope_config = {
+      "theta": kv.get(f'{arch}.rope.freq_base', 10000.0),
+      "type": kv.get(f'{arch}.rope.scaling.type', "default"),
+      "factor": kv.get(f'{arch}.rope.scaling.factor', 1.0),
+      "original_context_length": int(kv.get(f'{arch}.rope.scaling.original_context_length', 0)),
+    }
     model = Transformer(num_blocks=kv[f'{arch}.block_count'], dim=kv[f'{arch}.embedding_length'],
                         hidden_dim=kv.get(f'{arch}.expert_feed_forward_length', kv[f'{arch}.feed_forward_length']),
                         n_heads=n_heads, n_kv_heads=n_kv_heads, norm_eps=kv[f'{arch}.attention.layer_norm_rms_epsilon'],
                         vocab_size=len(kv['tokenizer.ggml.tokens']),
-                        head_dim=kv.get(f'{arch}.attention.key_length', kv[f'{arch}.embedding_length'] // n_heads),
-                        rope_theta=kv[f'{arch}.rope.freq_base'], max_context=max_context,
+                        head_dim=kv.get(f'{arch}.attention.key_length', kv[f'{arch}.embedding_length'] // n_heads), max_context=max_context,
                         qk_norm=int(state_dict['blk.0.attn_q_norm.weight'].shape[0]) if 'blk.0.attn_q_norm.weight' in state_dict else 0,
                         num_experts=kv.get(f'{arch}.expert_count', 0), num_experts_per_tok=kv.get(f'{arch}.expert_used_count', 0),
-                        bias='blk.0.attn_q.bias' in state_dict, attn_sink='blk.0.attn_sinks' in state_dict, rope_scaling_type=rope_scaling_type,
-                        rope_scaling_factor=rope_scaling_factor, rope_original_context_length=rope_original_context_length,
-                        moe_norm_topk_prob=arch == 'qwen3moe')
+                        norm_topk_prob=arch == 'qwen3moe', bias='blk.0.attn_q.bias' in state_dict, attn_sink='blk.0.attn_sinks' in state_dict,
+                        rope_config=rope_config)
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:
