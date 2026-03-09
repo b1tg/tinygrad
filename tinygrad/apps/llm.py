@@ -23,8 +23,10 @@ class SimpleTokenizer:
         + f"[^\\\\r\\\\n{r_p_L}{r_p_N}]?((?=[{r_p_L}])([^a-z]))+((?=[{r_p_L}])([^A-Z]))*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|"
         + f"[{r_p_N}]{{1,3}}| ?[^{r_ws}{r_p_L}{r_p_N}]+[\\\\r\\\\n/]*|[{r_ws}]*[\\\\r\\\\n]+|[{r_ws}]+(?![^{r_ws}])|[{r_ws}]+")
     else:
-      self._split_to_word = re.compile("(?i:'s|'t|'re|'ve|'m|'ll|'d)|" + \
-        f"[^\\\\r\\\\n{r_p_N}{r_p_L}]?[{r_p_L}]+|[{r_p_N}]{{1,3}}| ?[^{r_ws}{r_p_N}{r_p_L}]+[\\\\r\\\\n]*|[{r_ws}]*[\\\\r\\\\n]+|[{r_ws}]+(?![^{r_ws}])|[{r_ws}]+")
+      self._split_to_word = re.compile(
+        "(?i:'s|'t|'re|'ve|'m|'ll|'d)|"
+        + f"[^\\\\r\\\\n{r_p_N}{r_p_L}]?[{r_p_L}]+|[{r_p_N}]{{1,3}}| ?[^{r_ws}{r_p_N}{r_p_L}]+[\\\\r\\\\n]*|"
+        + f"[{r_ws}]*[\\\\r\\\\n]+|[{r_ws}]+(?![^{r_ws}])|[{r_ws}]+")
     self._split_to_sentence = re.compile("|".join(re.escape(tok) for tok in special_tokens.keys()) if special_tokens else r"(?!)")
 
     self._normal_tokens = {bytes(self._byte_decoder[c] for c in tok): tid for tok, tid in normal_tokens.items()}
@@ -105,19 +107,16 @@ def apply_rope(x:Tensor, freqs_cis:Tensor) -> Tensor:
 
 class TransformerBlock:
   def __init__(self, dim:int, hidden_dim:int, n_heads:int, n_kv_heads:int, norm_eps:float, head_dim:int, rope_theta:float,
-               max_context:int=0, qk_norm:int=0, num_experts:int=0, num_experts_per_tok:int=0, bias:bool=False):
+               max_context:int=0, qk_norm:int=0, num_experts:int=0, num_experts_per_tok:int=0, bias:bool=False, attn_sink:bool=False,
+               rope_scaling_type:str="default", rope_scaling_factor:float=1.0, rope_original_context_length:int=0, moe_norm_topk_prob:bool=False):
     self.n_heads      = n_heads
     self.n_kv_heads   = n_kv_heads
     self.head_dim     = head_dim
     self.rope_theta   = rope_theta
+    self.rope_scaling_type, self.rope_scaling_factor, self.rope_original_context_length = (
+      rope_scaling_type, rope_scaling_factor, rope_original_context_length)
     self.max_context  = max_context
     self.qk_norm      = qk_norm
-    self.moe_swiglu_alpha = 1.702
-    self.moe_swiglu_limit = 7.0
-    self.moe_norm_topk_prob = False
-    self.rope_scaling_type = "default"
-    self.rope_scaling_factor = 1.0
-    self.rope_original_context_length = 0
 
     # --- attention projections -------------------------------------------
     q_proj_out       = self.head_dim * n_heads
@@ -131,9 +130,14 @@ class TransformerBlock:
     self.attn_norm   = nn.RMSNorm(dim, norm_eps)
     self.ffn_norm    = nn.RMSNorm(dim, norm_eps)
     if qk_norm: self.attn_q_norm, self.attn_k_norm = nn.RMSNorm(qk_norm, norm_eps), nn.RMSNorm(qk_norm, norm_eps)
+    if attn_sink: self.attn_sinks = Tensor.zeros(n_heads)
 
     # --- feed-forward (MoE or dense) -------------------------------------
     if num_experts > 0:
+      self.moe_norm_topk_prob = moe_norm_topk_prob
+      if hasattr(self, "attn_sinks"):
+        self.moe_swiglu_alpha = 1.702
+        self.moe_swiglu_limit = 7.0
       self.num_experts_per_tok = num_experts_per_tok
       self.ffn_gate_inp = nn.Linear(dim, num_experts, bias=bias)  # router
       self.ffn_gate_exps = ExpertWeights(num_experts, dim, hidden_dim, bias=bias)
@@ -185,14 +189,14 @@ class TransformerBlock:
     h_norm = self.ffn_norm(h)
     if hasattr(self, 'ffn_gate_exps'):
       x = h_norm.unsqueeze(2)  # (B, T, 1, D) - add expert dim for broadcasting
-      if hasattr(self, "attn_sinks"):
+      if hasattr(self, "moe_swiglu_limit"):
         probs, sel = self.ffn_gate_inp(h_norm).topk(self.num_experts_per_tok)  # (B, T, k) each
         probs = probs.softmax(-1)
       else:
         probs, sel = self.ffn_gate_inp(h_norm).softmax(-1).topk(self.num_experts_per_tok)  # (B, T, k) each
         if self.moe_norm_topk_prob: probs = probs / probs.sum(axis=-1, keepdim=True)
       gate, up = self.ffn_gate_exps(sel, x), self.ffn_up_exps(sel, x)
-      if hasattr(self, "attn_sinks"):
+      if hasattr(self, "moe_swiglu_limit"):
         gate = gate.clip(max_=self.moe_swiglu_limit)
         up = up.clip(min_=-self.moe_swiglu_limit, max_=self.moe_swiglu_limit)
         act = gate * (gate * self.moe_swiglu_alpha).sigmoid() * (up + 1)
@@ -213,9 +217,11 @@ class TransformerBlock:
 
 class Transformer:
   def __init__(self, *, num_blocks, dim, hidden_dim, n_heads, n_kv_heads, norm_eps, vocab_size, head_dim:int, rope_theta:float,
-               max_context:int=0, qk_norm:int=0, num_experts:int=0, num_experts_per_tok:int=0, bias:bool=False):
+               max_context:int=0, qk_norm:int=0, num_experts:int=0, num_experts_per_tok:int=0, bias:bool=False, attn_sink:bool=False,
+               rope_scaling_type:str="default", rope_scaling_factor:float=1.0, rope_original_context_length:int=0, moe_norm_topk_prob:bool=False):
     self.blk = [TransformerBlock(dim, hidden_dim, n_heads, n_kv_heads, norm_eps, head_dim, rope_theta, max_context, qk_norm,
-                                 num_experts, num_experts_per_tok, bias) for _ in range(num_blocks)]
+                                 num_experts, num_experts_per_tok, bias, attn_sink, rope_scaling_type, rope_scaling_factor,
+                                 rope_original_context_length, moe_norm_topk_prob) for _ in range(num_blocks)]
     self.token_embd  = nn.Embedding(vocab_size, dim)
     self.output_norm = nn.RMSNorm(dim, norm_eps)
     self.output = nn.Linear(dim, vocab_size, bias=False)
@@ -260,6 +266,10 @@ class Transformer:
         if 'attn_q.weight' in name: state_dict[name] = state_dict[name].rearrange("(n h two) d -> (n two h) d", n=n_heads, two=2)
         if 'attn_k.weight' in name: state_dict[name] = state_dict[name].rearrange("(n h two) d -> (n two h) d", n=n_kv_heads, two=2)
 
+    rope_scaling_type = kv[f'{arch}.rope.scaling.type'] if f'{arch}.rope.scaling.type' in kv else "default"
+    rope_scaling_factor = kv[f'{arch}.rope.scaling.factor'] if f'{arch}.rope.scaling.factor' in kv else 1.0
+    rope_original_context_length = int(kv[f'{arch}.rope.scaling.original_context_length']) if (
+      f'{arch}.rope.scaling.original_context_length' in kv) else 0
     model = Transformer(num_blocks=kv[f'{arch}.block_count'], dim=kv[f'{arch}.embedding_length'],
                         hidden_dim=kv.get(f'{arch}.expert_feed_forward_length', kv[f'{arch}.feed_forward_length']),
                         n_heads=n_heads, n_kv_heads=n_kv_heads, norm_eps=kv[f'{arch}.attention.layer_norm_rms_epsilon'],
@@ -268,15 +278,9 @@ class Transformer:
                         rope_theta=kv[f'{arch}.rope.freq_base'], max_context=max_context,
                         qk_norm=int(state_dict['blk.0.attn_q_norm.weight'].shape[0]) if 'blk.0.attn_q_norm.weight' in state_dict else 0,
                         num_experts=kv.get(f'{arch}.expert_count', 0), num_experts_per_tok=kv.get(f'{arch}.expert_used_count', 0),
-                        bias='blk.0.attn_q.bias' in state_dict)
-    if arch == 'gpt-oss':
-      for i, b in enumerate(model.blk):
-        b.rope_scaling_type = kv[f'{arch}.rope.scaling.type']
-        b.rope_scaling_factor = kv[f'{arch}.rope.scaling.factor']
-        b.rope_original_context_length = int(kv[f'{arch}.rope.scaling.original_context_length'])
-        if (sink:=state_dict.get(f'blk.{i}.attn_sinks')) is not None: b.attn_sinks = Tensor.zeros(*sink.shape)
-    if arch == 'qwen3moe':
-      for b in model.blk: b.moe_norm_topk_prob = True
+                        bias='blk.0.attn_q.bias' in state_dict, attn_sink='blk.0.attn_sinks' in state_dict, rope_scaling_type=rope_scaling_type,
+                        rope_scaling_factor=rope_scaling_factor, rope_original_context_length=rope_original_context_length,
+                        moe_norm_topk_prob=arch == 'qwen3moe')
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:
