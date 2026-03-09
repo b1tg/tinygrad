@@ -74,16 +74,13 @@ class SimpleTokenizer:
     return [eos_id]
 
 @functools.cache
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, rope_scaling_type:str|None=None,
-                         rope_scaling_factor:float=1.0, rope_original_context_length:int=0) -> Tensor:
+def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, rope_scaling_type:str="default", rope_scaling_factor:float=1.0,
+                         rope_original_context_length:int=0, ntk_alpha:float=1.0, ntk_beta:float=32.0) -> Tensor:
   freqs = 1.0 / (theta ** (Tensor.arange(0, dim, 2)[:(dim // 2)] / dim))
   concentration = 1.0
   if rope_scaling_type == "yarn" and rope_scaling_factor > 1.0:
     concentration = 0.1 * math.log(rope_scaling_factor) + 1.0
-    d_half = dim / 2
-    ntk_alpha, ntk_beta = 1.0, 32.0
-    low = d_half * math.log(rope_original_context_length / (ntk_beta * 2 * math.pi)) / math.log(theta)
-    high = d_half * math.log(rope_original_context_length / (ntk_alpha * 2 * math.pi)) / math.log(theta)
+    low, high = (dim / 2 * math.log(rope_original_context_length / (x * 2 * math.pi)) / math.log(theta) for x in (ntk_beta, ntk_alpha))
     ramp = (Tensor.arange(dim // 2) - low) / (high - low)
     mask = 1.0 - ramp.clip(0, 1)
     freqs = (1.0 / (rope_scaling_factor / freqs)) * (1.0 - mask) + freqs * mask
@@ -118,7 +115,7 @@ class TransformerBlock:
     self.moe_swiglu_alpha = 1.702
     self.moe_swiglu_limit = 7.0
     self.moe_norm_topk_prob = False
-    self.rope_scaling_type: str|None = None
+    self.rope_scaling_type = "default"
     self.rope_scaling_factor = 1.0
     self.rope_original_context_length = 0
 
