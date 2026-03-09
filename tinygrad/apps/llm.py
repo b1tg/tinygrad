@@ -6,8 +6,7 @@ from tinygrad.helpers import partition, DEBUG, Timing, GlobalCounters, stderr_lo
 from tinygrad.viz.serve import TCPServerWithReuse, HTTPRequestHandler
 
 class SimpleTokenizer:
-  def __init__(self, normal_tokens:dict[str, int], special_tokens:dict[str, int], preset:str="llama3",
-               merges:list[str]|None=None):
+  def __init__(self, normal_tokens:dict[str, int], special_tokens:dict[str, int], preset:str="llama3"):
     if preset in ("gpt-oss", "gpt_oss", "o200k_harmony", "gpt-4o"): preset = "gpt-oss"
     if preset not in ("llama3","llama-v3","llama-bpe","qwen2","olmo","gpt-oss"): raise ValueError(f"Invalid tokenizer preset '{preset}'")
     # https://github.com/openai/gpt-2/blob/9b63575ef42771a015060c964af2c3da4cf7c8ab/src/encoder.py#L9
@@ -30,10 +29,6 @@ class SimpleTokenizer:
     self._split_to_sentence = re.compile("|".join(re.escape(tok) for tok in special_tokens.keys()) if special_tokens else r"(?!)")
 
     self._normal_tokens = {bytes(self._byte_decoder[c] for c in tok): tid for tok, tid in normal_tokens.items()}
-    self._bpe_ranks: dict[tuple[bytes, bytes], int]|None = None
-    if merges is not None:
-      def str2bytes(tok:str) -> bytes: return bytes(self._byte_decoder[c] for c in tok)
-      self._bpe_ranks = {(str2bytes(a), str2bytes(b)): i for i, merge in enumerate(merges) for a, b in [merge.split(" ", 1)]}
     self._special_tokens = special_tokens
     self._tok2bytes = {tid: tok for tok, tid in self._normal_tokens.items()} | {tid: tok.encode() for tok, tid in self._special_tokens.items()}
     self.preset = preset
@@ -43,16 +38,13 @@ class SimpleTokenizer:
     # https://github.com/ggml-org/llama.cpp/blob/94933c8c2eeaa9a7983e3f6c08af76bd86724094/src/llama-vocab.cpp#L1818-L1820
     vocab: typing.Iterable[tuple[str, int]] = ((tok, idx) for idx, tok in enumerate(kv["tokenizer.ggml.tokens"]))
     normal_tokens, special_tokens = partition(vocab, lambda e: kv["tokenizer.ggml.token_type"][e[1]] == 1)
-    return SimpleTokenizer(dict(normal_tokens), dict(special_tokens), kv["tokenizer.ggml.pre"],
-                           kv.get("tokenizer.ggml.merges") if kv.get("tokenizer.ggml.model") == "gpt2" else None)
+    return SimpleTokenizer(dict(normal_tokens), dict(special_tokens), kv["tokenizer.ggml.pre"])
 
   def _encode_word(self, word:bytes) -> list[int]:
     if (early_token:=self._normal_tokens.get(word)) is not None: return [early_token]
     parts = [bytes([b]) for b in word]
-    ranks = self._bpe_ranks if self._bpe_ranks is not None else self._normal_tokens
     while True:
-      i = min([(sys.maxsize, -1)] + [(ranks.get((parts[j], parts[j+1]) if self._bpe_ranks is not None
-               else parts[j]+parts[j+1], sys.maxsize), j) for j in range(len(parts)-1)])[1]
+      i = min([(sys.maxsize, -1)] + [(self._normal_tokens.get(parts[j]+parts[j+1], sys.maxsize), j) for j in range(len(parts)-1)])[1]
       if i == -1: break
       parts[i:i+2] = [parts[i] + parts[i+1]]
     try: return [self._normal_tokens[p] for p in parts]
