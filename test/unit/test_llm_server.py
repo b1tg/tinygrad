@@ -108,5 +108,33 @@ class TestTransformerGenerate(unittest.TestCase):
     # 4 tokens, chunk_size=4 -> 1 prefill chunk
     self.assertEqual(get_prefill_flags(list(range(4)), 4), [True, False, False])
 
+  def test_generate_truncates_when_context_full(self):
+    """When prompt length >= max_context, generate should truncate from the start and still produce tokens."""
+    from tinygrad.apps.llm import Transformer
+    model = Transformer(num_blocks=1, dim=64, hidden_dim=128, n_heads=2, n_kv_heads=2,
+                        norm_eps=1e-5, vocab_size=100, head_dim=32, rope_theta=10000.0, max_context=8)
+
+    captured_inputs = []
+    def mock_call(self, tokens, start_pos):
+      captured_inputs.append((tokens.shape, start_pos if isinstance(start_pos, int) else start_pos.val))
+      return Tensor([[42]])
+
+    with patch.object(Transformer, '__call__', mock_call):
+      # prompt exactly fills context window — should truncate to max_context-1=7 tokens and still generate
+      tokens = list(range(8))
+      gen = model.generate(tokens)
+      first_tok = next(gen)
+      self.assertEqual(first_tok, 42)
+
+      # prompt exceeds context window — same behavior
+      captured_inputs.clear()
+      model._cached_tokens = []
+      tokens = list(range(20))
+      gen = model.generate(tokens)
+      first_tok = next(gen)
+      self.assertEqual(first_tok, 42)
+      # should start from pos 0 (cache invalidated) and process max_context-1=7 tokens
+      self.assertEqual(captured_inputs[0][1], 0)
+
 if __name__ == '__main__':
   unittest.main()

@@ -233,6 +233,10 @@ class Transformer:
     return sum(1 for _ in itertools.takewhile(lambda ab: ab[0] == ab[1], zip(tokens[:-1], self._cached_tokens)))
 
   def generate(self, tokens:list[int], chunk_size:int=32):
+    # truncate from the start when prompt exceeds context window (like Ollama)
+    if len(tokens) >= self.max_context:
+      tokens = tokens[-(self.max_context - 1):]
+      self._cached_tokens = []
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
     v_toks = UOp.variable("toks", 1, chunk_size)
     # assign all input tokens once, then slice from start_pos for the model call
@@ -320,7 +324,8 @@ class Handler(HTTPRequestHandler):
     yield {"choices": [{"index":0, "delta":{},"finish_reason":"stop"}], **tmpl}
     if include_usage:
       yield {"choices": [], "usage": {"prompt_tokens": len(ids), "completion_tokens": len(out), "total_tokens": len(ids) + len(out)}, **tmpl}
-    stderr_log(f"gen:{len(out)/(time.perf_counter()-pt):4.0f} tok/s  {colored('--', 'BLACK')}  out:{len(out):5d}\n")
+    if len(out) > 0: stderr_log(f"gen:{len(out)/(time.perf_counter()-pt):4.0f} tok/s  {colored('--', 'BLACK')}  out:{len(out):5d}\n")
+    else: stderr_log(f"gen:   0 tok/s  {colored('--', 'BLACK')}  out:    0\n")
 
   def do_POST(self):
     raw_body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
