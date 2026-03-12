@@ -1,4 +1,4 @@
-import functools, itertools
+import functools, itertools, math
 from tinygrad.uop.ops import PatternMatcher, UPat, Ops, UOp
 from tinygrad.dtype import dtypes
 from tinygrad.helpers import cdiv, cmod, CORRECT_DIVMOD_FOLDING, unwrap
@@ -22,11 +22,11 @@ def fold_divmod_general(d: UOp, correct_divmod_folding: bool) -> UOp|None:
   # ** Constant Denominator Rules **
   # these rules strictly require y to be a scalar constant > 0
   if y.op is Ops.CONST and (c := y.arg) > 0:
-    # canonicalize_mod_div: (x%(d*k))//d -> (x//d)%k, puts nested div/mod in div-first canonical form for recombine
-    if d.op is Ops.IDIV and x.op is Ops.MOD and x.src[1].op is Ops.CONST and x.vmin >= 0 and x.src[1].arg % c == 0:
-      return x.src[0] // y % x.ufix(x.src[1].arg // c)
+    # nested_div_mod: (x%(k*c))//c -> (x//c)%k, and (x%(k*c))%c -> x%c
+    if x.op is Ops.MOD and (k := x.src[1].divides(c)) is not None:
+      return x.src[0] // y % k if d.op is Ops.IDIV else x.src[0] % y
 
-    # remove_nested_mod: remove nested mod in case the inner mod is a multiple of the outer mod, example: (a%4 + b)%2 -> (a+b)%2
+    # remove_nested_mod in sum: (a%4 + b)%2 -> (a+b)%2, requires non-negative sums
     if d.op is Ops.MOD and x.vmin >= 0:
       new_xs, changed = [], False
       for u in uops_no_const:
@@ -56,14 +56,11 @@ def fold_divmod_general(d: UOp, correct_divmod_folding: bool) -> UOp|None:
           return sum((f-r)//c * v for f,r,v in zip(factors,rems,terms)) + const//c + rem.vmin//c
 
     # gcd_with_remainder: factor out common gcd from numerator
-    # Note: this rule uses uops_no_const to exclude the additive constant from the GCD calculation
-    if x.vmin >= 0:
-      gcd = UOp.gcd(*uops_no_const, y).simplify()
-      if gcd.op is Ops.CONST and gcd.arg > 1:
-        new_x = unwrap(x_peeled.divide_exact(gcd)).simplify() + (const%c)//gcd.arg
-        if new_x.vmin >= 0:
-          ret = new_x.alu(d.op, x.ufix(c//gcd.arg))
-          return ret*gcd + const%gcd.arg if d.op is Ops.MOD else ret+const//c
+    if x.vmin >= 0 and (g:=math.gcd(*factors, c)) > 1:
+      new_x = unwrap(x_peeled.divides(g)).simplify() + (const//g)%(c//g)
+      if new_x.vmin >= 0:
+        if d.op is Ops.MOD: return new_x % (c//g) * g + const%g
+        return new_x // (c//g) + const//c
 
     # nest_by_factor: x//c -> (x//f)//(c//f), x%c -> (x//f%(c//f))*f + b where b=x%f
     if x.vmin >= 0:
