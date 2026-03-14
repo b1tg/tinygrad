@@ -66,10 +66,11 @@ class SimpleTokenizer:
     return [eos_id]
 
 @functools.cache
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> Tensor:
+def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, half: bool = False) -> Tensor:
   freqs = 1.0 / (theta ** (Tensor.arange(0, dim, 2)[:(dim // 2)] / dim))
   freqs = Tensor.arange(end).unsqueeze(dim=1) * freqs.unsqueeze(dim=0)
-  return freqs.cos().cat(freqs.sin(), dim=-1).contiguous()
+  ret = freqs.cos().cat(freqs.sin(), dim=-1).contiguous()
+  return ret.half() if half else ret
 
 class ExpertWeights:
   """Like nn.Linear but with num_experts dimension. Weight shape: (num_experts, out_features, in_features)."""
@@ -165,7 +166,7 @@ class TransformerBlock:
     q = self.attn_q_b(self.attn_q_a_norm(self.attn_q_a(x_norm))).reshape(B, T, self.n_heads, self.q_head_dim).transpose(1, 2)
     q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
     compressed_kv, k_pe = self.attn_kv_a_mqa(x_norm).split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-    freqs_cis = precompute_freqs_cis(self.qk_rope_head_dim, self.max_context, self.rope_theta)[start_pos:start_pos+T].half()
+    freqs_cis = precompute_freqs_cis(self.qk_rope_head_dim, self.max_context, self.rope_theta, half=True)[start_pos:start_pos+T]
     q_pe, k_pe = [apply_rope(w, freqs_cis, interleaved=True) for w in [q_pe, k_pe.unsqueeze(1)]]
     k_new = self.attn_kv_a_norm(compressed_kv).unsqueeze(1).cat(k_pe, dim=-1)
     assigned_k = self.cache_k.uop.after(self.cache_k[:, :, start_pos:start_pos+T, :].uop.assign(k_new.contiguous().uop))
@@ -251,9 +252,23 @@ class TransformerBlock:
       x = h_norm.unsqueeze(2)  # (B, T, 1, D) - add expert dim for broadcasting
       logits = self.ffn_gate_inp(h_norm)
       if hasattr(self, 'exp_probs_b'): logits = logits + self.exp_probs_b
-      probs, sel = logits.softmax(-1).topk(self.num_experts_per_tok)  # (B, T, k) each
-      if hasattr(self, 'expert_weights_scale'): probs = (probs / probs.sum(axis=-1, keepdim=True)) * self.expert_weights_scale
-      elif hasattr(self, 'ffn_gate_inp_shexp_weight'): probs = probs / probs.sum(axis=-1, keepdim=True)
+      if hasattr(self, 'expert_weights_scale') or hasattr(self, 'ffn_gate_inp_shexp_weight'):
+        # iterative argmax topk — O(k) kernels instead of O(n*log²n) from bitonic sort
+        k, n = self.num_experts_per_tok, logits.shape[-1]
+        masked = logits
+        top_vals, top_idxs = [], []
+        for _ in range(k):
+          idx = masked.argmax(-1, keepdim=True)
+          val = masked.max(-1, keepdim=True)
+          top_vals.append(val)
+          top_idxs.append(idx)
+          masked = masked + (Tensor.arange(n, device=logits.device) == idx).where(Tensor.full((), float('-inf'), device=logits.device, dtype=logits.dtype), Tensor.zeros((), device=logits.device, dtype=logits.dtype))
+        top_logits = Tensor.cat(*top_vals, dim=-1)
+        sel = Tensor.cat(*top_idxs, dim=-1)
+        probs = top_logits.softmax(-1)
+        if hasattr(self, 'expert_weights_scale'): probs = probs * self.expert_weights_scale
+      else:
+        probs, sel = logits.softmax(-1).topk(self.num_experts_per_tok)  # (B, T, k) each
       if hasattr(self, '_gate_up_w'):
         gate_up = (x.unsqueeze(-2) @ self._gate_up_w[sel].transpose(-1, -2)).squeeze(-2)
         gate, up = gate_up.chunk(2, dim=-1)
@@ -262,7 +277,12 @@ class TransformerBlock:
         x_down = self.ffn_down_exps(sel, self.ffn_gate_exps(sel, x).silu() * self.ffn_up_exps(sel, x))  # (B, T, k, D)
       out = (x_down * probs.unsqueeze(-1)).sum(axis=2)  # (B, T, D)
       if hasattr(self, 'ffn_gate_shexp'):
-        shared_out = self.ffn_down_shexp(self.ffn_gate_shexp(h_norm).silu() * self.ffn_up_shexp(h_norm))
+        if hasattr(self, '_shexp_gate_up_w'):
+          gate_up_sh = h_norm @ self._shexp_gate_up_w.T
+          sh_gate, sh_up = gate_up_sh.chunk(2, dim=-1)
+          shared_out = self.ffn_down_shexp(sh_gate.silu() * sh_up)
+        else:
+          shared_out = self.ffn_down_shexp(self.ffn_gate_shexp(h_norm).silu() * self.ffn_up_shexp(h_norm))
         if hasattr(self, 'ffn_gate_inp_shexp_weight'):
           shared_gate = (h_norm * self.ffn_gate_inp_shexp_weight).sum(axis=-1, keepdim=True).sigmoid()
           out = out + shared_out * shared_gate
@@ -377,6 +397,9 @@ class Transformer:
     for blk in model.blk:
       if hasattr(blk, 'ffn_gate_exps'):
         blk._gate_up_w = blk.ffn_gate_exps.weight.cat(blk.ffn_up_exps.weight, dim=1)
+      # Fuse shared expert gate+up weights
+      if hasattr(blk, 'ffn_gate_shexp'):
+        blk._shexp_gate_up_w = blk.ffn_gate_shexp.weight.cat(blk.ffn_up_shexp.weight, dim=0)
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:
       for s in (params:=nn.state.get_parameters(model)): s.replace(s.contiguous())
