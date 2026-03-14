@@ -40,8 +40,9 @@ llama-bench
 
 # [WIP] GLM-4.7 推理加速
 
-**Current:** 82 tok/s (JITBEAM=4), 74 tok/s (JITBEAM=2) | **Target:** 130 tok/s | **Progress:** 53→82 tok/s (1.55x)
+**Current:** 86 tok/s (JITBEAM=2), ~87 tok/s (JITBEAM=4) | **Target:** 135 tok/s | **Progress:** 53→86 tok/s (1.62x)
 **对比:** Qwen3.5:4b 相似模型大小(8.5 vs 8.8 GB)，171 tok/s @ 1513 GB/s
+**Kernels:** 1410 per step (30 per MoE layer)
 
 ## GLM-4.7 架构 (deepseek2)
 - 47 层: 1 dense + 46 MoE, 全部 MLA attention
@@ -49,7 +50,7 @@ llama-bench
 - MLA: q_lora_rank=768, kv_lora_rank=512, 20 heads
 - Vocab: 154,880
 
-## [DONE] 已完成的优化 (53→82 tok/s, +55%)
+## [DONE] 已完成的优化 (53→86 tok/s, +62%)
 
 ### 1. 移除 MLA binary swap hook (+10%: 48→53 tok/s)
 - `from tinygrad.apps.mla_binary_swap import *` 每次 kernel 编译都会触发 hook 检查
@@ -74,61 +75,94 @@ llama-bench
 - **Kernel count: 2424→1550 (-36%)**，这是最大的提速来源
 - 仅在 probs renormalize 的模型生效 (GLM-4.7, Qwen3.5-MoE)
 
-### 6. JITBEAM=4 (+11%: 74→82 tok/s)
-- JITBEAM=2→4 在 kernel 数量减少后效果更明显
+### 6. 简化 iterative argmax (移除max, 用gather) (+7%: 74→79 tok/s)
+- 移除每次迭代中的 `.max()` 调用，简化 masking 逻辑
+- 改用 `logits.gather(-1, sel).softmax(-1)` 替代逐步收集 probs
+- Kernel count 不变(1550)，但 kernel 更简单 → 更快
+
+### 7. Fuse q_a + kv_a input projections (+2%: 79→80.5 tok/s)
+- 合并 `attn_q_a.weight.cat(attn_kv_a_mqa.weight)` 为 `_qkv_a_w`
+- 一次 matmul + split 替代两次 matmul
+- **Kernel count: 1550→1503 (-47)**
+
+### 8. Fuse router + shared expert gate_up (+5.6%: 80.5→85 tok/s)
+- 合并 `ffn_gate_inp.weight.cat(_shexp_gate_up_w)` 为 `_router_shexp_w`
+- 一次 matmul + split 替代两次 matmul
+- **Kernel count: 1503→1457 (-46)**
+
+### 9. 移除 KV cache .contiguous() (+1.2%: 85→86 tok/s)
+- MLA cache write 中的 `k_new.contiguous()` 不必要
+- **Kernel count: 1457→1410 (-47)**
 
 ## Profiling 分析
 
 ### 瓶颈根因: kernel dispatch overhead
-- 2470 kernels 中 2237 个 (<15μs, ~10μs each) 被 dispatch overhead 占据
-- 实际 compute 只用 30-40% 的时间，60-70% 是 kernel launch overhead
-- 单个 tiny kernel: ~5μs dispatch + ~5μs compute = 10μs
-- 优化后 1550 kernels，dispatch overhead 显著降低
+- 1410 kernels, 每个 kernel ~5-10μs dispatch overhead
+- 理论 dispatch time: 1410 × 7μs ≈ 10ms → 当前 11.6ms, dispatch 占 ~85%
+- 实际 compute (matmuls) 只用 ~2-3ms, 其余是 dispatch + tiny kernel overhead
+- Bandwidth 利用率: ~630 GB/s (实际 active data ~1.57 GB → 7.3ms 中只用了 ~1.57/5300 = 0.3ms)
+- 模型是 dispatch-limited, 不是 bandwidth-limited
 
-### 现有 profiling (优化后, JITBEAM=2, 1550 kernels)
-| 类别 | 代表 kernel | 备注 |
-|------|------------|------|
-| Expert down matmul | `r_256_4_8_8_96_12_4_4_4_4` (131μs×46) | 最大单个 kernel |
-| Expert gate_up matmul | `r_2_1536_8_8_2_2_2_4_4` (28μs×46) | |
-| MLA attention matmuls | `r_640_32_8_6_4` etc. (15-18μs×47) | |
-| ~1200 tiny elementwise/reduce | `E_32_2n2`, `r_32_16_4` etc. (~10μs each) | dispatch 为主 |
+### Per-layer kernel breakdown (30 kernels per MoE layer)
+| 类别 | 数量 | 备注 |
+|------|------|------|
+| Matmuls (irreducible) | 10 | q_a+kv_a, q_b, k_b, 2×cache_matmul, attn_output, router+shexp, gate_up, down, down_shexp |
+| Iterative argmax | 8 | 4×argmax + 3×mask + 1×gather |
+| RMSNorms | 6 | 3 norms × 2 kernels each (reduce + ewise) |
+| KV cache ops | 3 | assign + read ops with start_pos |
+| Elementwise | 3 | RoPE, silu*up, residual add etc. |
 
-## 下一步方向 (82→130 tok/s, 还需 +59%)
+### 关键 kernel 频率 (from DEBUG=4 listing)
+- `E_16_32_4`: 94× (2/layer) — tiny norm constants
+- `E_768_16_8_2_4_4`: 91× — norm elementwise
+- `E_49152_16_8_2_4_4`: 91× — large matmul outputs
+- `r_*` reduces: 大量 46× kernels (各种 reduce ops in MLA/MoE)
+- 126 unique kernel types total
+
+## 下一步方向 (86→135 tok/s, 还需 +57%)
 
 ### 恢复时的即时TODO
-1. 确认 precompute_freqs_cis half=True 变更对 kernel count 的影响 (已改代码，未确认kernel数)
-2. 获取详细 per-layer kernel 分解 (每层MLA多少kernel, MoE多少, norm多少)
-3. 重点方向: 减少 ~1200 个 tiny kernel
+1. 达到 135 tok/s 需要 ~590 kernels (13/layer), 当前 1410 (30/layer), 需减少 58%
+2. 最大单项目标: iterative argmax 8 kernels/layer × 46 = 368 kernels (占总量 26%)
+3. 需要评估: 是否可以用 custom kernel 替代 iterative argmax (单 kernel top-4)
+4. 或者研究 tinygrad scheduler 如何 fuse 更多 elementwise → 可能需要 tinygrad core 改动
 
-### 关键思路
-- 每个 MoE layer ~33 kernels (16 MLA + 17 MoE FFN)
-- 每个 dense layer (layer 0) 的 kernel 数用于对比
-- 主要 tiny kernel 来源: RMSNorm(2 kernels each × 3-4/layer), softmax(3 kernels × 47), RoPE, iterative argmax(11/MoE layer)
-- 需要研究 tinygrad 的 kernel fusion 策略, 看能否手动合并某些操作
+### 可行的优化方向 (按预期收益排序)
 
-### P0: 继续减少 tiny kernel 数量
-- 当前 1550 kernels 中仍有 ~1200 个 tiny (<15μs)
-- 目标: 减到 ~800 → 预计 ~100 tok/s
-- 方向: 减少 MLA attention 中的小操作 (RoPE, norm, softmax 各有 3-5 个小 kernel)
+#### P0: 减少 iterative argmax kernels (368 kernels, 潜在减少 ~300)
+- 当前: 4 次 argmax + 3 次 mask + gather = 8 kernels/layer
+- 方案A: 用 Tensor.topk 但 patch tinygrad 使用更高效的 partial sort
+- 方案B: 写 custom reduce kernel 一次性返回 top-4 indices
+- 方案C: 研究是否有更少 kernel 的 tensor-level topk 实现
 
-### P1: MLA absorbed attention 预计算
-- 预存 `k_projected = k_cache @ k_b` 在 KV cache
-- 将 2-step matmul 变 1-step，但 KV cache 增大 16.6x
+#### P1: RMSNorm fusion (282 kernels, 潜在减少 ~140)
+- 3 norms × 2 kernels × 47 layers = 282 kernels
+- 如果 scheduler 能 fuse norm 的 reduce+elementwise 为 1 kernel → 省 141 kernels
+- 需要 tinygrad scheduler 改动
 
-### P2: tinygrad scheduler 改进
-- PCONTIG 在 AMD 上 crash (compiler error)
-- 需要更好的 elementwise fusion: reduce 后的 scale 应 inline 到下一个 matmul
+#### P2: MLA absorbed attention
+- 预存 k_absorbed 在 cache → 减少 2 matmul/layer
+- 分析显示 net savings 只有 0-1 kernel/layer, 不值得
 
-### P3: 多 GCD 并行
-- MI300X 有 8 GCDs，当前只用 1 个
+#### P3: 多 GCD 并行 (最有潜力但最复杂)
+- MI300X 有 8 GCDs, 每个有独立 dispatch 能力
+- 如果 dispatch 能并行到 2 个 GCD → 理论上 dispatch time 减半 → ~6ms → 167 tok/s
+- 需要 tinygrad multi-device 支持
+
+### 速度预测模型
+- 当前: 1410 kernels × ~8μs avg = 11.3ms → 86 tok/s
+- 目标: 135 tok/s → 7.4ms → ~925 kernels (at 8μs avg)
+- 或者保持 1410 kernels 但减少 avg dispatch to ~5.2μs → 需要 HCQ 优化
 
 ## 已排除的路径
 - @function 边界合并: 不影响 kernel 数量
 - JIT_BATCH_SIZE 调整: 单 mega-batch 反而更慢
 - PCONTIG=1/2/3: AMD compiler crash
 - MLA custom kernel: 只占 2.2%，非瓶颈
-- JITBEAM=2→4 without kernel reduction: 仅 +1.7%
-- precompute_freqs_cis half=True: 代码已加,对tok/s无影响(仍74 tok/s JITBEAM=2)
+- JITBEAM=2→4 without kernel reduction: 仅 +1.7% (在 1550 kernels 时)
+- precompute_freqs_cis half=True: 代码已加,对tok/s无影响
+- MLA absorbed attention (预存 k_b/v_b 结果到 cache): 分析后 net ~0 kernel savings, 不值得
+- JITBEAM=4 目前: ~87 tok/s (相比 JITBEAM=2 的 86, 仅 +1%)
 
 ## 相关文件
 - `tinygrad/apps/llm.py` - 主文件，包含所有优化

@@ -163,13 +163,18 @@ class TransformerBlock:
   def _mla_attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
     B, T, _ = x.shape
     x_norm = self.attn_norm(x)
-    q = self.attn_q_b(self.attn_q_a_norm(self.attn_q_a(x_norm))).reshape(B, T, self.n_heads, self.q_head_dim).transpose(1, 2)
+    if hasattr(self, '_qkv_a_w'):
+      qkv_a = x_norm @ self._qkv_a_w.T
+      q_a_out, kv_a_out = qkv_a.split([self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1)
+    else:
+      q_a_out, kv_a_out = self.attn_q_a(x_norm), self.attn_kv_a_mqa(x_norm)
+    q = self.attn_q_b(self.attn_q_a_norm(q_a_out)).reshape(B, T, self.n_heads, self.q_head_dim).transpose(1, 2)
     q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-    compressed_kv, k_pe = self.attn_kv_a_mqa(x_norm).split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+    compressed_kv, k_pe = kv_a_out.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
     freqs_cis = precompute_freqs_cis(self.qk_rope_head_dim, self.max_context, self.rope_theta, half=True)[start_pos:start_pos+T]
     q_pe, k_pe = [apply_rope(w, freqs_cis, interleaved=True) for w in [q_pe, k_pe.unsqueeze(1)]]
     k_new = self.attn_kv_a_norm(compressed_kv).unsqueeze(1).cat(k_pe, dim=-1)
-    assigned_k = self.cache_k.uop.after(self.cache_k[:, :, start_pos:start_pos+T, :].uop.assign(k_new.contiguous().uop))
+    assigned_k = self.cache_k.uop.after(self.cache_k[:, :, start_pos:start_pos+T, :].uop.assign(k_new.uop))
     tensor_assigned_k = Tensor(assigned_k, device=assigned_k.device)
     k_nope, k_rope = tensor_assigned_k[:, :, :start_pos+T, :].split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
     qk = (q_nope @ self.attn_k_b.weight.transpose(-1, -2) @ k_nope.transpose(-2, -1) + q_pe @ k_rope.transpose(-2, -1)) * self.attn_scale
@@ -250,22 +255,26 @@ class TransformerBlock:
     h_norm = self.ffn_norm(h)
     if hasattr(self, 'ffn_gate_exps'):
       x = h_norm.unsqueeze(2)  # (B, T, 1, D) - add expert dim for broadcasting
-      logits = self.ffn_gate_inp(h_norm)
+      # Fused router + shared expert gate_up matmul
+      if hasattr(self, '_router_shexp_w'):
+        n_experts = self.ffn_gate_inp.weight.shape[0]
+        router_shexp = h_norm @ self._router_shexp_w.T
+        logits, gate_up_sh = router_shexp.split([n_experts, self._shexp_gate_up_w.shape[0]], dim=-1)
+      else:
+        logits = self.ffn_gate_inp(h_norm)
+        gate_up_sh = None
       if hasattr(self, 'exp_probs_b'): logits = logits + self.exp_probs_b
       if hasattr(self, 'expert_weights_scale') or hasattr(self, 'ffn_gate_inp_shexp_weight'):
         # iterative argmax topk — O(k) kernels instead of O(n*log²n) from bitonic sort
         k, n = self.num_experts_per_tok, logits.shape[-1]
         masked = logits
-        top_vals, top_idxs = [], []
-        for _ in range(k):
+        top_idxs = []
+        for i in range(k):
           idx = masked.argmax(-1, keepdim=True)
-          val = masked.max(-1, keepdim=True)
-          top_vals.append(val)
           top_idxs.append(idx)
-          masked = masked + (Tensor.arange(n, device=logits.device) == idx).where(Tensor.full((), float('-inf'), device=logits.device, dtype=logits.dtype), Tensor.zeros((), device=logits.device, dtype=logits.dtype))
-        top_logits = Tensor.cat(*top_vals, dim=-1)
+          if i < k - 1: masked = (Tensor.arange(n, device=logits.device) != idx).where(masked, float('-inf'))
         sel = Tensor.cat(*top_idxs, dim=-1)
-        probs = top_logits.softmax(-1)
+        probs = logits.gather(-1, sel).softmax(-1)
         if hasattr(self, 'expert_weights_scale'): probs = probs * self.expert_weights_scale
       else:
         probs, sel = logits.softmax(-1).topk(self.num_experts_per_tok)  # (B, T, k) each
@@ -277,7 +286,10 @@ class TransformerBlock:
         x_down = self.ffn_down_exps(sel, self.ffn_gate_exps(sel, x).silu() * self.ffn_up_exps(sel, x))  # (B, T, k, D)
       out = (x_down * probs.unsqueeze(-1)).sum(axis=2)  # (B, T, D)
       if hasattr(self, 'ffn_gate_shexp'):
-        if hasattr(self, '_shexp_gate_up_w'):
+        if gate_up_sh is not None:
+          sh_gate, sh_up = gate_up_sh.chunk(2, dim=-1)
+          shared_out = self.ffn_down_shexp(sh_gate.silu() * sh_up)
+        elif hasattr(self, '_shexp_gate_up_w'):
           gate_up_sh = h_norm @ self._shexp_gate_up_w.T
           sh_gate, sh_up = gate_up_sh.chunk(2, dim=-1)
           shared_out = self.ffn_down_shexp(sh_gate.silu() * sh_up)
@@ -400,6 +412,12 @@ class Transformer:
       # Fuse shared expert gate+up weights
       if hasattr(blk, 'ffn_gate_shexp'):
         blk._shexp_gate_up_w = blk.ffn_gate_shexp.weight.cat(blk.ffn_up_shexp.weight, dim=0)
+      # Fuse router + shared expert gate_up: one matmul instead of two
+      if hasattr(blk, 'ffn_gate_shexp') and hasattr(blk, '_shexp_gate_up_w'):
+        blk._router_shexp_w = blk.ffn_gate_inp.weight.cat(blk._shexp_gate_up_w, dim=0)
+      # Fuse q_a + kv_a input projections: one matmul instead of two
+      if hasattr(blk, 'attn_q_a'):
+        blk._qkv_a_w = blk.attn_q_a.weight.cat(blk.attn_kv_a_mqa.weight, dim=0)
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:
       for s in (params:=nn.state.get_parameters(model)): s.replace(s.contiguous())
