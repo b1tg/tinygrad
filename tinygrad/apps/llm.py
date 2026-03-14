@@ -254,7 +254,12 @@ class TransformerBlock:
       probs, sel = logits.softmax(-1).topk(self.num_experts_per_tok)  # (B, T, k) each
       if hasattr(self, 'expert_weights_scale'): probs = (probs / probs.sum(axis=-1, keepdim=True)) * self.expert_weights_scale
       elif hasattr(self, 'ffn_gate_inp_shexp_weight'): probs = probs / probs.sum(axis=-1, keepdim=True)
-      x_down = self.ffn_down_exps(sel, self.ffn_gate_exps(sel, x).silu() * self.ffn_up_exps(sel, x))  # (B, T, k, D)
+      if hasattr(self, '_gate_up_w'):
+        gate_up = (x.unsqueeze(-2) @ self._gate_up_w[sel].transpose(-1, -2)).squeeze(-2)
+        gate, up = gate_up.chunk(2, dim=-1)
+        x_down = self.ffn_down_exps(sel, gate.silu() * up)
+      else:
+        x_down = self.ffn_down_exps(sel, self.ffn_gate_exps(sel, x).silu() * self.ffn_up_exps(sel, x))  # (B, T, k, D)
       out = (x_down * probs.unsqueeze(-1)).sum(axis=2)  # (B, T, D)
       if hasattr(self, 'ffn_gate_shexp'):
         shared_out = self.ffn_down_shexp(self.ffn_gate_shexp(h_norm).silu() * self.ffn_up_shexp(h_norm))
@@ -368,6 +373,10 @@ class Transformer:
     if arch == 'deepseek2' and kv.get(f'{arch}.expert_weights_scale'):
       for blk in model.blk:
         if hasattr(blk, 'ffn_gate_exps'): blk.expert_weights_scale = kv[f'{arch}.expert_weights_scale']
+    # Fuse gate+up expert weights: one gather+matmul instead of two
+    for blk in model.blk:
+      if hasattr(blk, 'ffn_gate_exps'):
+        blk._gate_up_w = blk.ffn_gate_exps.weight.cat(blk.ffn_up_exps.weight, dim=1)
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:
       for s in (params:=nn.state.get_parameters(model)): s.replace(s.contiguous())
@@ -408,6 +417,8 @@ models = {
   "qwen3:8b": "https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf",
   "qwen3:30b-a3b": "https://huggingface.co/Qwen/Qwen3-30B-A3B-GGUF/resolve/main/Qwen3-30B-A3B-Q4_K_M.gguf",
   "qwen3.5:0.8b": "https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/Qwen3.5-0.8B-Q8_0.gguf",
+  "qwen3.5:2b": "https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/main/Qwen3.5-2B-Q4_K_M.gguf",
+  "qwen3.5:4b": "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q4_K_M.gguf",
   "qwen3.5:9b": "https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q4_K_M.gguf",
   "qwen3.5:27b": "https://huggingface.co/unsloth/Qwen3.5-27B-GGUF/resolve/main/Qwen3.5-27B-Q4_K_M.gguf",
   "qwen3.5:35b-a3b": "https://huggingface.co/unsloth/Qwen3.5-35B-A3B-GGUF/resolve/main/Qwen3.5-35B-A3B-Q4_K_M.gguf",
@@ -516,6 +527,7 @@ if __name__ == "__main__":
 
   # load the model
   raw_model = Tensor.from_url(models[args.model])
+  print(args.model, raw_model)
   model, kv = Transformer.from_gguf(raw_model, args.max_context)
   if DEBUG >= 1 or args.benchmark:
     print(f"using model {args.model} with {raw_model.nbytes():,} bytes and {sum(x.numel() for x in nn.state.get_parameters(model)):,} params")
