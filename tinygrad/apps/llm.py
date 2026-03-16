@@ -302,8 +302,11 @@ class Transformer:
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:
-      for s in (params:=nn.state.get_parameters(model)): s.replace(s.contiguous())
-      Tensor.realize(*params)
+      lazy = ({id(getattr(blk,n).weight) for blk in model.blk for n in blk.__dict__
+               if isinstance(getattr(blk,n), (nn.Linear, ExpertWeights))} | {id(model.output.weight)}) if getenv("LAZY_DEQUANT", 0) else set()
+      for s in (params:=nn.state.get_parameters(model)):
+        if id(s) not in lazy: s.replace(s.contiguous())
+      Tensor.realize(*[s for s in params if id(s) not in lazy])
     return model, kv
 
   def get_start_pos(self, tokens:list[int]):
