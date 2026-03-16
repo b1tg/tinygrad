@@ -3,7 +3,7 @@ from collections import OrderedDict
 from typing import Any, Callable, BinaryIO, Iterable, cast
 from tinygrad.tensor import Tensor
 from tinygrad.dtype import dtypes
-from tinygrad.helpers import prod, argsort, DEBUG, Timing, CI, GlobalCounters, tqdm, round_up, T, strides_for_shape
+from tinygrad.helpers import prod, argsort, getenv, DEBUG, Timing, CI, GlobalCounters, tqdm, round_up, T, strides_for_shape
 
 class TensorIO(io.RawIOBase, BinaryIO):
   def __init__(self, t: Tensor):
@@ -293,7 +293,7 @@ def torch_load(t:Tensor) -> dict[str, Tensor]:
     fobj.seek(rwd)
     return TorchPickle(fobj).load()
 
-def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
+def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int, lazy: bool = False) -> Tensor:
   """
   Converts ggml tensor data to a tinygrad tensor.
 
@@ -304,7 +304,8 @@ def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
 
   # native types
   if (dtype := { 0: dtypes.float32, 1: dtypes.float16, 16: dtypes.int8, 17: dtypes.int16, 18: dtypes.int32 }.get(ggml_type)) is not None:
-    return t[:dtype.itemsize * n].contiguous().bitcast(dtype)
+    data = t[:dtype.itemsize * n].contiguous()
+    return data.realize().bitcast(dtype) if lazy else data.bitcast(dtype)
 
   def q_to_uint8(t: Tensor, b: int) -> Tensor:
     # TODO: rewrite with arange?
@@ -314,6 +315,7 @@ def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
   # map to (number of elements, number of bytes)
   if (nelements_nbytes := { 2:(32,18), 3:(32,20), 8:(32,34), 12:(256,144), 13:(256,176), 14:(256,210), 39:(32,17) }.get(ggml_type)) is not None:
     blocks = t[:(n//nelements_nbytes[0])*nelements_nbytes[1]].reshape((-1, nelements_nbytes[1])).contiguous()
+    if lazy: blocks = blocks.realize()
     if ggml_type == 2: return (q_to_uint8(blocks[:,2:], 4).bitcast(dtypes.int8) - 8) * blocks[:,:2].bitcast(dtypes.float16).cast(dtypes.float32)
     if ggml_type == 3:
       d, m = (blocks[:,s:s+2].bitcast(dtypes.float16).cast(dtypes.float32) for s in [ 0, 2 ])
@@ -380,6 +382,7 @@ def gguf_load(tensor: Tensor) -> tuple[dict, dict[str, Tensor]]:
   alignment, pos = kv_data.get("general.alignment", 32), reader.tell()
   data_start = round_up(pos, alignment)
 
-  for name, dims, typ, off in t_infos: state_dict[name] = ggml_data_to_tensor(tensor[data_start + off:], prod(dims), typ).reshape(*reversed(dims))
+  for name, dims, typ, off in t_infos:
+    state_dict[name] = ggml_data_to_tensor(tensor[data_start + off:], prod(dims), typ, lazy=bool(getenv("DEQUANT", 0))).reshape(*reversed(dims))
 
   return kv_data, state_dict
