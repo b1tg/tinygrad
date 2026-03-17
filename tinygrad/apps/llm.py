@@ -244,7 +244,7 @@ class TransformerBlock:
         x_down = self.ffn_down_exps(sel, g.silu() * up)
       else: x_down = self.ffn_down_exps(sel, self.ffn_gate_exps(sel, x).silu() * self.ffn_up_exps(sel, x))
       out = (x_down * probs.unsqueeze(-1)).sum(axis=2)
-      if hasattr(self, 'ffn_gate_shexp'):
+      if hasattr(self, 'ffn_down_shexp'):
         if gate_up_sh is None and hasattr(self, '_shexp_gate_up_w'): gate_up_sh = h_norm @ self._shexp_gate_up_w.T
         if gate_up_sh is not None:
           sh_g, sh_up = gate_up_sh.chunk(2, dim=-1)
