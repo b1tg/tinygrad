@@ -141,13 +141,9 @@ class TransformerBlock:
 
   @function(precompile=bool(getenv("PRECOMPILE", 0)))
   def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
-    x_norm = _rms_norm(x, self.attn_norm.eps) if hasattr(self, '_norm_absorbed') else self.attn_norm(x)
-    if hasattr(self, '_qkv_w'):
-      qkv = x_norm @ self._qkv_w.T
-      q_dim, k_dim = self.n_heads * self.head_dim * (2 if self.has_gate else 1), self.n_kv_heads * self.head_dim
-      q, k, v = qkv.split([q_dim, k_dim, k_dim], dim=-1)
-    else:
-      q, k, v = self.attn_q(x_norm), self.attn_k(x_norm), self.attn_v(x_norm)
+    x_norm = _rms_norm(x, self.attn_norm.eps)
+    qd, kd = self.n_heads * self.head_dim * (2 if self.has_gate else 1), self.n_kv_heads * self.head_dim
+    q, k, v = (x_norm @ self._qkv_w.T).split([qd, kd, kd], dim=-1)
     if self.qk_norm and self.qk_norm != self.head_dim: q, k = self.attn_q_norm(q), self.attn_k_norm(k)
 
     B, T, _ = x.shape
@@ -184,27 +180,20 @@ class TransformerBlock:
   @function(precompile=bool(getenv("PRECOMPILE", 0)))
   def _delta_net(self, x:Tensor) -> Tensor:
     B, _, _ = x.shape
-    x_norm = _rms_norm(x, self.attn_norm.eps) if hasattr(self, '_norm_absorbed') else self.attn_norm(x)
-    if hasattr(self, '_ssm_gates_w'):
-      gates = x_norm @ self._ssm_gates_w.T
-      out_gate, beta_flat, alpha_flat, qkv = gates.split([self.num_v_heads * self.head_v_dim, self.num_v_heads, self.num_v_heads, self.conv_channels], dim=-1)
-      out_gate = out_gate.reshape(B, 1, self.num_v_heads, self.head_v_dim)
-      beta = beta_flat.sigmoid().reshape(B, self.num_v_heads, 1, 1)
-      alpha = ((alpha_flat.float() + self.ssm_dt_bias).softplus() * self.ssm_a).reshape(B, self.num_v_heads, 1, 1).exp()
-    else:
-      out_gate = self.attn_gate(x_norm).reshape(B, 1, self.num_v_heads, self.head_v_dim)
-      beta = self.ssm_beta(x_norm).sigmoid().reshape(B, self.num_v_heads, 1, 1)
-      alpha = ((self.ssm_alpha(x_norm).float() + self.ssm_dt_bias).softplus() * self.ssm_a).reshape(B, self.num_v_heads, 1, 1).exp()
-      qkv = self.attn_qkv(x_norm)
+    x_norm = _rms_norm(x, self.attn_norm.eps)
+    out_gate, beta, alpha, qkv = (x_norm @ self._ssm_gates_w.T).split(
+      [self.num_v_heads * self.head_v_dim, self.num_v_heads, self.num_v_heads, self.conv_channels], dim=-1)
+    out_gate = out_gate.reshape(B, 1, self.num_v_heads, self.head_v_dim)
+    beta = beta.sigmoid().reshape(B, self.num_v_heads, 1, 1)
+    alpha = ((alpha.float() + self.ssm_dt_bias).softplus() * self.ssm_a).reshape(B, self.num_v_heads, 1, 1).exp()
     conv_flat = (self.ssm_conv_kernel - 1) * self.conv_channels
     ssm_flat = self.num_v_heads * self.head_v_dim * self.head_v_dim
     conv_state = self.delta_cache[:, :conv_flat].reshape(B, self.ssm_conv_kernel - 1, self.conv_channels)
     recurrent_state = self.delta_cache[:, conv_flat:conv_flat + ssm_flat].reshape(B, self.num_v_heads, self.head_v_dim, self.head_v_dim)
     conv_window = conv_state.cat(qkv, dim=1)
     conv_out = (conv_window * self.ssm_conv1d.T.unsqueeze(0)).sum(axis=1).silu()
-    qk_flat, v = conv_out.split([2*self.q_dim, self.conv_channels - 2*self.q_dim], dim=-1)
-    qk = qk_flat.reshape(B, 2*self.num_k_heads, self.head_k_dim).normalize(dim=-1)
-    q, k = qk.chunk(2, dim=1)
+    qk, v = conv_out.split([2*self.q_dim, self.conv_channels - 2*self.q_dim], dim=-1)
+    q, k = qk.reshape(B, 2*self.num_k_heads, self.head_k_dim).normalize(dim=-1).chunk(2, dim=1)
     v = v.reshape(B, self.num_v_heads, self.head_v_dim)
     if self.num_v_heads != self.num_k_heads:
       k_repeat = self.num_v_heads // self.num_k_heads
@@ -217,13 +206,12 @@ class TransformerBlock:
     assigned = self.delta_cache.uop.after(self.delta_cache.uop.assign(new_cache.cast(self.delta_cache.dtype).uop))
     cache_tensor = Tensor(assigned, device=self.delta_cache.device)
     final_state = cache_tensor[:, conv_flat:conv_flat + ssm_flat].reshape(B, self.num_v_heads, self.head_v_dim, self.head_v_dim)
-    ssm_raw = (final_state@q).squeeze(-1).reshape(B, 1, self.num_v_heads, self.head_v_dim)
-    core_attn_out = _rms_norm(ssm_raw, self.ssm_norm.eps) if hasattr(self, '_norm_absorbed') else self.ssm_norm(ssm_raw)
+    core_attn_out = _rms_norm((final_state@q).squeeze(-1).reshape(B, 1, self.num_v_heads, self.head_v_dim), self.ssm_norm.eps)
     return x + self.ssm_out((core_attn_out * out_gate.silu()).reshape(B, 1, -1).contiguous())
 
   @function(precompile=bool(getenv("PRECOMPILE", 0)))
   def _feed_forward(self, h: Tensor) -> Tensor:
-    h_norm = _rms_norm(h, self.ffn_norm.eps) if hasattr(self, '_norm_absorbed') else self.ffn_norm(h)
+    h_norm = _rms_norm(h, self.ffn_norm.eps)
     if hasattr(self, 'ffn_gate_exps'):
       x = h_norm.unsqueeze(2)  # (B, T, 1, D) - add expert dim for broadcasting
       if hasattr(self, '_router_shexp_w'):
@@ -233,30 +221,23 @@ class TransformerBlock:
       n, k = logits.shape[-1], self.num_experts_per_tok
       idx_i, idx_j = Tensor.arange(n).reshape(1, 1, n, 1), Tensor.arange(n).reshape(1, 1, 1, n)
       cmp = (logits.unsqueeze(-1) > logits.unsqueeze(-2)) | ((logits.unsqueeze(-1) == logits.unsqueeze(-2)) & (idx_i < idx_j))
-      ranks = cmp.sum(axis=-1).cast('int32')
       zeros = logits * 0
-      sel = zeros.scatter(-1, ranks, zeros + Tensor.arange(n).reshape(1, 1, n).cast(logits.dtype))[:, :, n-k:].cast('int32').contiguous()
+      sel = zeros.scatter(-1, cmp.sum(axis=-1).cast('int32'), zeros+Tensor.arange(n).reshape(1,1,n).cast(logits.dtype))
+      sel = sel[:,:,n-k:].cast('int32').contiguous()
       probs = logits.gather(-1, sel).softmax(-1) if hasattr(self, 'ffn_gate_inp_shexp_weight') else logits.softmax(-1).gather(-1, sel)
-      if hasattr(self, '_gate_up_w'):
-        gate_up = (x.unsqueeze(-2) @ self._gate_up_w[sel].transpose(-1, -2)).squeeze(-2)
-        g, up = gate_up.chunk(2, dim=-1)
-        x_down = self.ffn_down_exps(sel, g.silu() * up)
-      else: x_down = self.ffn_down_exps(sel, self.ffn_gate_exps(sel, x).silu() * self.ffn_up_exps(sel, x))
-      out = (x_down * probs.unsqueeze(-1)).sum(axis=2)
-      if hasattr(self, 'ffn_down_shexp'):
-        if gate_up_sh is None and hasattr(self, '_shexp_gate_up_w'): gate_up_sh = h_norm @ self._shexp_gate_up_w.T
-        if gate_up_sh is not None:
-          sh_g, sh_up = gate_up_sh.chunk(2, dim=-1)
-          shared_out = self.ffn_down_shexp(sh_g.silu() * sh_up)
-        else: shared_out = self.ffn_down_shexp(self.ffn_gate_shexp(h_norm).silu() * self.ffn_up_shexp(h_norm))
-        shared_gate = (h_norm * self.ffn_gate_inp_shexp_weight).sum(axis=-1, keepdim=True).sigmoid() if hasattr(self, 'ffn_gate_inp_shexp_weight') else 1
-        out = out + shared_out * shared_gate
-      return h + out
-    if hasattr(self, '_gate_up_w'):
-      gate_up = (h_norm @ self._gate_up_w.T).contiguous()
+      gate_up = (x.unsqueeze(-2) @ self._gate_up_w[sel].transpose(-1, -2)).squeeze(-2)
       g, up = gate_up.chunk(2, dim=-1)
-      return h + self.ffn_down(g.silu().contiguous() * up)
-    return h + self.ffn_down(self.ffn_gate(h_norm).silu().contiguous() * self.ffn_up(h_norm))
+      out = (self.ffn_down_exps(sel, g.silu() * up) * probs.unsqueeze(-1)).sum(axis=2)
+      if hasattr(self, 'ffn_down_shexp'):
+        if gate_up_sh is None: gate_up_sh = h_norm @ self._shexp_gate_up_w.T
+        sh_g, sh_up = gate_up_sh.chunk(2, dim=-1)
+        gw = getattr(self, 'ffn_gate_inp_shexp_weight', None)
+        shared_gate = (h_norm * gw).sum(axis=-1, keepdim=True).sigmoid() if gw is not None else 1
+        out = out + self.ffn_down_shexp(sh_g.silu() * sh_up) * shared_gate
+      return h + out
+    gate_up = (h_norm @ self._gate_up_w.T).contiguous()
+    g, up = gate_up.chunk(2, dim=-1)
+    return h + self.ffn_down(g.silu().contiguous() * up)
 
   def __call__(self, x: Tensor, start_pos: int|UOp):
     if hasattr(self, 'ssm_out'):
@@ -293,8 +274,7 @@ class Transformer:
     x = self.token_embd(tokens)                           # (B, T, D)
     for block in self.blk: x = block(x, start_pos)
     # TODO: add temperature
-    x_norm = _rms_norm(x, self.output_norm.eps) if hasattr(self, '_output_norm_absorbed') else self.output_norm(x)
-    return self.output(x_norm)[:, -1, :].argmax(-1, keepdim=True)
+    return self.output(_rms_norm(x, self.output_norm.eps))[:, -1, :].argmax(-1, keepdim=True)
 
   def __call__(self, tokens:Tensor, start_pos:int|UOp=0) -> Tensor:
     return (self.prefill_jit if resolve(tokens.shape[1] != 1) else self.rollout_jit)(tokens, start_pos)
@@ -338,36 +318,32 @@ class Transformer:
                         full_attention_interval=kv.get(f'{arch}.full_attention_interval', 0))
 
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
-    # weight fusions + norm absorption: fewer matmuls per token
+    # weight fusions + norm absorption: cat weights for fewer matmuls, absorb RMSNorm weight into downstream matmul
+    def _w(o, a):
+      v = getattr(o, a)
+      return v.weight if hasattr(v, 'weight') else v
     for blk in model.blk:
-      if hasattr(blk, 'ffn_gate_exps'): blk._gate_up_w = blk.ffn_gate_exps.weight.cat(blk.ffn_up_exps.weight, dim=1)
-      if hasattr(blk, 'ffn_gate_shexp'):
-        blk._shexp_gate_up_w = blk.ffn_gate_shexp.weight.cat(blk.ffn_up_shexp.weight, dim=0)
-        blk._router_shexp_w = blk.ffn_gate_inp.weight.cat(blk._shexp_gate_up_w, dim=0)
-      if hasattr(blk, 'ffn_gate') and not hasattr(blk, 'ffn_gate_exps'): blk._gate_up_w = blk.ffn_gate.weight.cat(blk.ffn_up.weight, dim=0)
-      if hasattr(blk, 'attn_gate'): blk._ssm_gates_w = blk.attn_gate.weight.cat(blk.ssm_beta.weight, blk.ssm_alpha.weight, blk.attn_qkv.weight, dim=0)
-      if hasattr(blk, 'attn_q') and hasattr(blk, 'attn_k'): blk._qkv_w = blk.attn_q.weight.cat(blk.attn_k.weight, blk.attn_v.weight, dim=0)
-      # absorb RMSNorm weights into fused matmul weights
-      if hasattr(blk, '_ssm_gates_w'): blk._ssm_gates_w, blk._norm_absorbed = blk._ssm_gates_w * blk.attn_norm.weight, True
-      elif hasattr(blk, '_qkv_w'): blk._qkv_w, blk._norm_absorbed = blk._qkv_w * blk.attn_norm.weight, True
-      if hasattr(blk, '_norm_absorbed'):
-        if not hasattr(blk, 'ffn_gate_exps') and hasattr(blk, '_gate_up_w'): blk._gate_up_w = blk._gate_up_w * blk.ffn_norm.weight
-        elif hasattr(blk, 'ffn_gate_exps'):
-          w = blk.ffn_norm.weight
-          if hasattr(blk, '_router_shexp_w'): blk._router_shexp_w = blk._router_shexp_w * w
-          else: blk.ffn_gate_inp.weight = blk.ffn_gate_inp.weight * w
-          if hasattr(blk, '_gate_up_w'): blk._gate_up_w = blk._gate_up_w * w
-          if hasattr(blk, 'ffn_gate_inp_shexp_weight'): blk.ffn_gate_inp_shexp_weight = blk.ffn_gate_inp_shexp_weight * w
-        if hasattr(blk, 'ssm_norm'): blk.ssm_out.weight = blk.ssm_out.weight * blk.ssm_norm.weight.unsqueeze(0).expand(blk.num_v_heads, -1).reshape(-1)
-      # delete fused originals
-      if hasattr(blk, '_gate_up_w') and hasattr(blk, 'ffn_gate_exps'): blk.ffn_gate_exps.weight = blk.ffn_up_exps.weight = None
-      for fused, deps in [('_gate_up_w', ('ffn_gate','ffn_up')), ('_ssm_gates_w', ('attn_gate','ssm_beta','ssm_alpha','attn_qkv')),
-                           ('_qkv_w', ('attn_q','attn_k','attn_v')), ('_router_shexp_w', ('ffn_gate_shexp','ffn_up_shexp'))]:
-        if hasattr(blk, fused):
-          for a in deps:
-            if hasattr(blk, a): delattr(blk, a)
-    if any(hasattr(blk, '_norm_absorbed') for blk in model.blk):
-      model.output.weight, model._output_norm_absorbed = model.output.weight * model.output_norm.weight, True
+      for tgt, dim, *srcs in [('_qkv_w',0,'attn_q','attn_k','attn_v'), ('_ssm_gates_w',0,'attn_gate','ssm_beta','ssm_alpha','attn_qkv'),
+                               ('_gate_up_w',0,'ffn_gate','ffn_up'), ('_gate_up_w',1,'ffn_gate_exps','ffn_up_exps'),
+                               ('_shexp_gate_up_w',0,'ffn_gate_shexp','ffn_up_shexp')]:
+        if all(hasattr(blk, s) for s in srcs): setattr(blk, tgt, _w(blk, srcs[0]).cat(*[_w(blk, s) for s in srcs[1:]], dim=dim))
+      if hasattr(blk, '_shexp_gate_up_w'): blk._router_shexp_w = blk.ffn_gate_inp.weight.cat(blk._shexp_gate_up_w, dim=0)
+      for norm, excl, shared in [('attn_norm', ['_ssm_gates_w','_qkv_w'], []),
+                                  ('ffn_norm', ['_router_shexp_w','ffn_gate_inp'], ['_gate_up_w','ffn_gate_inp_shexp_weight'])]:
+        if not hasattr(blk, norm): continue
+        nw = getattr(blk, norm).weight
+        absorbed = [t for t in excl if hasattr(blk, t)][:1]
+        for t in absorbed: setattr(blk, t, _w(blk, t) * nw)
+        for t in shared:
+          if hasattr(blk, t): setattr(blk, t, _w(blk, t) * nw)
+      if hasattr(blk, 'ssm_norm'): blk.ssm_out.weight = blk.ssm_out.weight * blk.ssm_norm.weight.unsqueeze(0).expand(blk.num_v_heads, -1).reshape(-1)
+      if hasattr(blk, 'ffn_gate_exps'): blk.ffn_gate_exps.weight = blk.ffn_up_exps.weight = None
+      for tgt, _, *srcs in [('_qkv_w','attn_q','attn_k','attn_v'), ('_ssm_gates_w','attn_gate','ssm_beta','ssm_alpha','attn_qkv'),
+                             ('_gate_up_w','ffn_gate','ffn_up'), ('_router_shexp_w','ffn_gate_shexp','ffn_up_shexp')]:
+        if hasattr(blk, tgt):
+          for s in srcs:
+            if hasattr(blk, s): delattr(blk, s)
+    model.output.weight = model.output.weight * model.output_norm.weight
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:
       for s in (params:=nn.state.get_parameters(model)): s.replace(s.contiguous())
