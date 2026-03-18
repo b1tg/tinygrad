@@ -230,14 +230,13 @@ class TransformerBlock:
         router_shexp = h_norm @ self._router_shexp_w.T
         logits, gate_up_sh = router_shexp.split([self.ffn_gate_inp.weight.shape[0], self._shexp_gate_up_w.shape[0]], dim=-1)
       else: logits, gate_up_sh = self.ffn_gate_inp(h_norm), None
-      if hasattr(self, 'ffn_gate_inp_shexp_weight'):
-        vals, indices = logits, []
-        for i in range(self.num_experts_per_tok):
-          idx = vals.argmax(-1, keepdim=True); indices.append(idx)
-          if i < self.num_experts_per_tok - 1: vals = vals.scatter(-1, idx, -1e9)
-        sel = Tensor.cat(*indices, dim=-1)
-        probs = logits.gather(-1, sel).softmax(-1)
-      else: probs, sel = logits.softmax(-1).topk(self.num_experts_per_tok)
+      n, k = logits.shape[-1], self.num_experts_per_tok
+      idx_i, idx_j = Tensor.arange(n).reshape(1, 1, n, 1), Tensor.arange(n).reshape(1, 1, 1, n)
+      cmp = (logits.unsqueeze(-1) > logits.unsqueeze(-2)) | ((logits.unsqueeze(-1) == logits.unsqueeze(-2)) & (idx_i < idx_j))
+      ranks = cmp.sum(axis=-1).cast('int32')
+      zeros = logits * 0
+      sel = zeros.scatter(-1, ranks, zeros + Tensor.arange(n).reshape(1, 1, n).cast(logits.dtype))[:, :, n-k:].cast('int32').contiguous()
+      probs = logits.gather(-1, sel).softmax(-1) if hasattr(self, 'ffn_gate_inp_shexp_weight') else logits.softmax(-1).gather(-1, sel)
       if hasattr(self, '_gate_up_w'):
         gate_up = (x.unsqueeze(-2) @ self._gate_up_w[sel].transpose(-1, -2)).squeeze(-2)
         g, up = gate_up.chunk(2, dim=-1)
