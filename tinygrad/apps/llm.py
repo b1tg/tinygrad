@@ -338,8 +338,8 @@ class Transformer:
           if hasattr(blk, t): setattr(blk, t, _w(blk, t) * nw)
       if hasattr(blk, 'ssm_norm'): blk.ssm_out.weight = blk.ssm_out.weight * blk.ssm_norm.weight.unsqueeze(0).expand(blk.num_v_heads, -1).reshape(-1)
       if hasattr(blk, 'ffn_gate_exps'): blk.ffn_gate_exps.weight = blk.ffn_up_exps.weight = None
-      for tgt, _, *srcs in [('_qkv_w','attn_q','attn_k','attn_v'), ('_ssm_gates_w','attn_gate','ssm_beta','ssm_alpha','attn_qkv'),
-                             ('_gate_up_w','ffn_gate','ffn_up'), ('_router_shexp_w','ffn_gate_shexp','ffn_up_shexp')]:
+      for tgt, *srcs in [('_qkv_w','attn_q','attn_k','attn_v'), ('_ssm_gates_w','attn_gate','ssm_beta','ssm_alpha','attn_qkv'),
+                          ('_gate_up_w','ffn_gate','ffn_up'), ('_router_shexp_w','ffn_gate_shexp','ffn_up_shexp')]:
         if hasattr(blk, tgt):
           for s in srcs:
             if hasattr(blk, s): delattr(blk, s)
