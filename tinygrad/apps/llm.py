@@ -264,20 +264,16 @@ class TransformerBlock:
         logits = self.ffn_gate_inp(h_norm)
         gate_up_sh = None
       if hasattr(self, 'exp_probs_b'): logits = logits + self.exp_probs_b
-      if hasattr(self, 'expert_weights_scale') or hasattr(self, 'ffn_gate_inp_shexp_weight'):
-        # iterative argmax topk — O(k) kernels instead of O(n*log²n) from bitonic sort
-        k, n = self.num_experts_per_tok, logits.shape[-1]
-        masked = logits
-        top_idxs = []
-        for i in range(k):
-          idx = masked.argmax(-1, keepdim=True)
-          top_idxs.append(idx)
-          if i < k - 1: masked = (Tensor.arange(n, device=logits.device) != idx).where(masked, float('-inf'))
-        sel = Tensor.cat(*top_idxs, dim=-1)
-        probs = logits.gather(-1, sel).softmax(-1)
-        if hasattr(self, 'expert_weights_scale'): probs = probs * self.expert_weights_scale
-      else:
-        probs, sel = logits.softmax(-1).topk(self.num_experts_per_tok)  # (B, T, k) each
+      # pairwise ranking topk: count how many each expert beats → rank, scatter by rank, take top-k
+      # NOTE: no .contiguous() on sel — lets scheduler fuse topk with expert weight gather
+      n, k = logits.shape[-1], self.num_experts_per_tok
+      cmp = (logits.unsqueeze(-1) > logits.unsqueeze(-2)) | ((logits.unsqueeze(-1) == logits.unsqueeze(-2)) & \
+        (Tensor.arange(n).reshape(1,1,n,1) < Tensor.arange(n).reshape(1,1,1,n)))
+      ranks = cmp.sum(axis=-1).cast('int32')
+      arange = Tensor.arange(n).reshape(1,1,n).cast(logits.dtype)
+      sel = (logits*0).scatter(-1, ranks, logits*0 + arange)[:,:,n-k:].cast('int32')
+      probs = logits.gather(-1, sel).softmax(-1)
+      if hasattr(self, 'expert_weights_scale'): probs = probs * self.expert_weights_scale
       if hasattr(self, '_gate_up_w'):
         gate_up = (x.unsqueeze(-2) @ self._gate_up_w[sel].transpose(-1, -2)).squeeze(-2)
         gate, up = gate_up.chunk(2, dim=-1)
@@ -405,17 +401,16 @@ class Transformer:
     if arch == 'deepseek2' and kv.get(f'{arch}.expert_weights_scale'):
       for blk in model.blk:
         if hasattr(blk, 'ffn_gate_exps'): blk.expert_weights_scale = kv[f'{arch}.expert_weights_scale']
-    # Fuse gate+up expert weights: one gather+matmul instead of two
+    # Weight fusions: fewer matmuls but lazy cat hurts bandwidth on dispatch-bound devices (385)
+    # defaults to on for REALIZE=1 (realized weights), off for REALIZE=0 (lazy weights)
     for blk in model.blk:
-      if hasattr(blk, 'ffn_gate_exps'):
-        blk._gate_up_w = blk.ffn_gate_exps.weight.cat(blk.ffn_up_exps.weight, dim=1)
-      # Fuse shared expert gate+up weights
-      if hasattr(blk, 'ffn_gate_shexp'):
-        blk._shexp_gate_up_w = blk.ffn_gate_shexp.weight.cat(blk.ffn_up_shexp.weight, dim=0)
-      # Fuse router + shared expert gate_up: one matmul instead of two
-      if hasattr(blk, 'ffn_gate_shexp') and hasattr(blk, '_shexp_gate_up_w'):
-        blk._router_shexp_w = blk.ffn_gate_inp.weight.cat(blk._shexp_gate_up_w, dim=0)
-      # Fuse q_a + kv_a input projections: one matmul instead of two
+      if getenv("FUSE_WEIGHTS", int(realize)):
+        if hasattr(blk, 'ffn_gate_exps'):
+          blk._gate_up_w = blk.ffn_gate_exps.weight.cat(blk.ffn_up_exps.weight, dim=1)
+        if hasattr(blk, 'ffn_gate_shexp'):
+          blk._shexp_gate_up_w = blk.ffn_gate_shexp.weight.cat(blk.ffn_up_shexp.weight, dim=0)
+        if hasattr(blk, 'ffn_gate_shexp') and hasattr(blk, '_shexp_gate_up_w'):
+          blk._router_shexp_w = blk.ffn_gate_inp.weight.cat(blk._shexp_gate_up_w, dim=0)
       if hasattr(blk, 'attn_q_a'):
         blk._qkv_a_w = blk.attn_q_a.weight.cat(blk.attn_kv_a_mqa.weight, dim=0)
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
