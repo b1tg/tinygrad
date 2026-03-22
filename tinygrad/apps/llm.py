@@ -159,7 +159,7 @@ class TransformerBlock:
       self.ffn_up      = nn.Linear(dim, hidden_dim, bias=False)
       self.ffn_down    = nn.Linear(hidden_dim, dim, bias=False)
 
-  @function(precompile=bool(getenv("PRECOMPILE", 0)))
+  @(function(precompile=bool(getenv("PRECOMPILE", 0))) if not getenv("MERGE_FN", 0) else lambda f: f)
   def _mla_attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
     B, T, _ = x.shape
     x_norm = self.attn_norm(x)
@@ -183,7 +183,7 @@ class TransformerBlock:
     attn = (qk.softmax(-1) @ k_nope @ self.attn_v_b.weight.transpose(-1, -2)).transpose(1, 2).reshape(B, T, -1)
     return x + self.attn_output(attn)
 
-  @function(precompile=bool(getenv("PRECOMPILE", 0)))
+  @(function(precompile=bool(getenv("PRECOMPILE", 0))) if not getenv("MERGE_FN", 0) else lambda f: f)
   def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
     x_norm = self.attn_norm(x)                       # (B,T,D)
     q, k, v = self.attn_q(x_norm), self.attn_k(x_norm), self.attn_v(x_norm)
@@ -250,7 +250,7 @@ class TransformerBlock:
     core_attn_out = self.ssm_norm((final_state@q).squeeze(-1).reshape(B, 1, self.num_v_heads, self.head_v_dim))
     return x + self.ssm_out((core_attn_out * out_gate.silu()).reshape(B, 1, -1).cast(x.dtype))
 
-  @function(precompile=bool(getenv("PRECOMPILE", 0)))
+  @(function(precompile=bool(getenv("PRECOMPILE", 0))) if not getenv("MERGE_FN", 0) else lambda f: f)
   def _feed_forward(self, h: Tensor) -> Tensor:
     h_norm = self.ffn_norm(h)
     if hasattr(self, 'ffn_gate_exps'):
@@ -264,16 +264,21 @@ class TransformerBlock:
         logits = self.ffn_gate_inp(h_norm)
         gate_up_sh = None
       if hasattr(self, 'exp_probs_b'): logits = logits + self.exp_probs_b
-      # pairwise ranking topk: count how many each expert beats → rank, scatter by rank, take top-k
-      # NOTE: no .contiguous() on sel — lets scheduler fuse topk with expert weight gather
+      # TOPK=0: bitonic sort (original), TOPK=1: pairwise with tiebreaker, TOPK=2: pairwise no tiebreaker (default)
       n, k = logits.shape[-1], self.num_experts_per_tok
-      cmp = (logits.unsqueeze(-1) > logits.unsqueeze(-2)) | ((logits.unsqueeze(-1) == logits.unsqueeze(-2)) & \
-        (Tensor.arange(n).reshape(1,1,n,1) < Tensor.arange(n).reshape(1,1,1,n)))
-      ranks = cmp.sum(axis=-1).cast('int32')
-      arange = Tensor.arange(n).reshape(1,1,n).cast(logits.dtype)
-      sel = (logits*0).scatter(-1, ranks, logits*0 + arange)[:,:,n-k:].cast('int32')
-      probs = logits.gather(-1, sel).softmax(-1)
-      if hasattr(self, 'expert_weights_scale'): probs = probs * self.expert_weights_scale
+      topk_mode = getenv("TOPK", 2)
+      if topk_mode == 0:
+        probs, sel = logits.softmax(-1).topk(k)
+        if hasattr(self, 'expert_weights_scale'): probs = probs * self.expert_weights_scale
+      else:
+        cmp = (logits.unsqueeze(-1) > logits.unsqueeze(-2))
+        if topk_mode == 1: cmp = cmp | ((logits.unsqueeze(-1) == logits.unsqueeze(-2)) & \
+          (Tensor.arange(n).reshape(1,1,n,1) < Tensor.arange(n).reshape(1,1,1,n)))
+        ranks = cmp.sum(axis=-1).cast('int32')
+        arange = Tensor.arange(n).reshape(1,1,n).cast(logits.dtype)
+        sel = (logits*0).scatter(-1, ranks, logits*0 + arange)[:,:,n-k:].cast('int32')
+        probs = logits.gather(-1, sel).softmax(-1)
+        if hasattr(self, 'expert_weights_scale'): probs = probs * self.expert_weights_scale
       if hasattr(self, '_gate_up_w'):
         gate_up = (x.unsqueeze(-2) @ self._gate_up_w[sel].transpose(-1, -2)).squeeze(-2)
         gate, up = gate_up.chunk(2, dim=-1)
@@ -300,6 +305,15 @@ class TransformerBlock:
     gated  = self.ffn_gate(h_norm).silu().contiguous() * self.ffn_up(h_norm)
     return h + self.ffn_down(gated)
 
+  # MERGE_FN=1: merge attn+ffn into single @function (fewer scheduling barriers)
+  if getenv("MERGE_FN", 0):
+    @function(precompile=bool(getenv("PRECOMPILE", 0)))
+    def _mla_and_ffn(self, x: Tensor, start_pos: int|UOp) -> Tensor:
+      return self._feed_forward(self._mla_attention(x, start_pos))
+    @function(precompile=bool(getenv("PRECOMPILE", 0)))
+    def _attn_and_ffn(self, x: Tensor, start_pos: int|UOp) -> Tensor:
+      return self._feed_forward(self._attention(x, start_pos))
+
   def __call__(self, x: Tensor, start_pos: int|UOp):
     if hasattr(self, 'ssm_out'):
       if not hasattr(self, "delta_cache"):
@@ -313,6 +327,9 @@ class TransformerBlock:
                                     dtype=x.dtype, device=x.device).contiguous().realize()
     elif not hasattr(self, "cache_kv"):
       self.cache_kv = Tensor.zeros(2, x.shape[0], self.n_kv_heads, self.max_context, self.head_dim, device=x.device).clone()
+    if getenv("MERGE_FN", 0):
+      if hasattr(self, 'attn_kv_a_mqa'): return self._mla_and_ffn(x, start_pos).contiguous()
+      return self._attn_and_ffn(x, start_pos).contiguous()
     attn_fn = self._mla_attention if hasattr(self, 'attn_kv_a_mqa') else self._attention
     return self._feed_forward(attn_fn(x, start_pos)).contiguous()
 
