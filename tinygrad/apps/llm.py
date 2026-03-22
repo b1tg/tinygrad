@@ -277,6 +277,7 @@ class TransformerBlock:
         ranks = cmp.sum(axis=-1).cast('int32')
         arange = Tensor.arange(n).reshape(1,1,n).cast(logits.dtype)
         sel = (logits*0).scatter(-1, ranks, logits*0 + arange)[:,:,n-k:].cast('int32')
+        if getenv("CONTIGUOUS_SEL", 0): sel = sel.contiguous()
         probs = logits.gather(-1, sel).softmax(-1)
         if hasattr(self, 'expert_weights_scale'): probs = probs * self.expert_weights_scale
       if hasattr(self, '_gate_up_w'):
