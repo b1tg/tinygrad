@@ -62,6 +62,31 @@ class SimpleTokenizer:
     if self.preset == 'qwen2': return [eos_id] + self.encode("\n")
     return [eos_id]
 
+from tinygrad.uop.ops import KernelInfo, AxisType
+from tinygrad.dtype import AddrSpace, dtypes
+
+def _topk_rank_kernel(sorted_idx:UOp, sorted_val:UOp, logits:UOp) -> UOp:
+  N = logits.size
+  i, j = UOp.range(N, 0), UOp.range(N, 1, axis_type=AxisType.REDUCE)
+  rank = UOp.placeholder((1,), dtypes.int32, slot=3, addrspace=AddrSpace.REG)
+  rank = rank.after(i)[0].set(0)
+  vi, vj = logits[i], logits[j]
+  is_better = (vi > vj) | (vi.eq(vj) & (i.cast(dtypes.int32) < j.cast(dtypes.int32)))
+  rank = rank[0].set(rank.after(j)[0] + is_better.cast(dtypes.int32), end=j)
+  store = UOp.group(sorted_idx[rank[0]].store(i.cast(sorted_idx.dtype.base)), sorted_val[rank[0]].store(vi))
+  return store.end(i).sink(arg=KernelInfo(name=f"topk_rank_{N}", opts_to_apply=()))
+
+def pairwise_topk(logits: Tensor, n: int, k: int, device: str|None=None) -> Tensor:
+  """Pairwise ranking topk: returns indices of top-k elements. O(n²) comparisons, fixed kernel count."""
+  if getenv("CUSTOM_TOPK", 0) == 2:
+    sorted_idx, sorted_val = Tensor.empty(n, dtype='int32', device=device), Tensor.empty(n, dtype=logits.dtype, device=device)
+    sorted_idx, sorted_val, _ = Tensor.custom_kernel(sorted_idx, sorted_val, logits.reshape(n), fxn=_topk_rank_kernel)
+    return sorted_idx[n-k:].reshape(1, 1, k)
+  cmp = (logits.unsqueeze(-1) > logits.unsqueeze(-2)) | ((logits.unsqueeze(-1) == logits.unsqueeze(-2)) & \
+    (Tensor.arange(n).reshape(1,1,n,1) < Tensor.arange(n).reshape(1,1,1,n)))
+  ranks = (logits*0).scatter(-1, cmp.sum(axis=-1).cast('int32'), logits*0+Tensor.arange(n).reshape(1,1,n).cast(logits.dtype))
+  return ranks[:,:,n-k:].cast('int32')
+
 @functools.cache
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> Tensor:
   freqs = 1.0 / (theta ** (Tensor.arange(0, dim, 2)[:(dim // 2)] / dim))
@@ -87,7 +112,7 @@ def apply_rope(x:Tensor, freqs_cis:Tensor, rope_dim:int=0) -> Tensor:
 class TransformerBlock:
   def __init__(self, dim:int, hidden_dim:int, n_heads:int, n_kv_heads:int, norm_eps:float, head_dim:int, rope_theta:float, rope_dim:int=0,
                max_context:int=0, qk_norm:int=0, num_experts:int=0, num_experts_per_tok:int=0, shared_expert_dim:int=0,
-               has_gate:bool=False, ssm:dict|None=None):
+               has_gate:bool=False, norm_topk_prob:bool=False, ssm:dict|None=None):
     self.n_heads      = n_heads
     self.n_kv_heads   = n_kv_heads
     self.head_dim     = head_dim
@@ -123,6 +148,7 @@ class TransformerBlock:
     # --- feed-forward (MoE or dense) -------------------------------------
     if num_experts > 0:
       self.num_experts_per_tok = num_experts_per_tok
+      self.norm_topk_prob = norm_topk_prob
       self.ffn_gate_inp = nn.Linear(dim, num_experts, bias=False)  # router
       self.ffn_gate_exps = ExpertWeights(num_experts, dim, hidden_dim)
       self.ffn_up_exps = ExpertWeights(num_experts, dim, hidden_dim)
@@ -208,8 +234,9 @@ class TransformerBlock:
     h_norm = self.ffn_norm(h)
     if hasattr(self, 'ffn_gate_exps'):
       x = h_norm.unsqueeze(2)  # (B, T, 1, D) - add expert dim for broadcasting
-      probs, sel = self.ffn_gate_inp(h_norm).softmax(-1).topk(self.num_experts_per_tok)  # (B, T, k) each
-      if hasattr(self, 'ffn_gate_shexp'): probs = probs / probs.sum(axis=-1, keepdim=True)
+      logits, n, k = self.ffn_gate_inp(h_norm), self.ffn_gate_inp.weight.shape[0], self.num_experts_per_tok
+      sel = pairwise_topk(logits, n, k, h.device)
+      probs = logits.gather(-1, sel).softmax(-1) if self.norm_topk_prob else logits.softmax(-1).gather(-1, sel)
       x_down = self.ffn_down_exps(sel, self.ffn_gate_exps(sel, x).silu() * self.ffn_up_exps(sel, x))  # (B, T, k, D)
       out = (x_down * probs.unsqueeze(-1)).sum(axis=2)  # (B, T, D)
       if hasattr(self, 'ffn_gate_shexp'):
@@ -237,10 +264,10 @@ class TransformerBlock:
 class Transformer:
   def __init__(self, *, num_blocks, dim, hidden_dim, n_heads, n_kv_heads, norm_eps, vocab_size, head_dim:int, rope_theta:float, rope_dim:int=0,
                max_context:int=0, qk_norm:int=0, num_experts:int=0, num_experts_per_tok:int=0,
-               shared_expert_dim:int=0, full_attention_interval:int=0, ssm:dict|None=None):
+               shared_expert_dim:int=0, full_attention_interval:int=0, norm_topk_prob:bool=False, ssm:dict|None=None):
     self.blk = [TransformerBlock(dim, hidden_dim, n_heads, n_kv_heads, norm_eps, head_dim, rope_theta, rope_dim, max_context,
                                  head_dim if ssm else qk_norm, num_experts=num_experts, num_experts_per_tok=num_experts_per_tok,
-                                 shared_expert_dim=shared_expert_dim, has_gate=ssm is not None,
+                                 shared_expert_dim=shared_expert_dim, has_gate=ssm is not None, norm_topk_prob=norm_topk_prob,
                                  ssm=ssm if ssm and (i+1) % full_attention_interval != 0 else None) for i in range(num_blocks)]
     self.token_embd  = nn.Embedding(vocab_size, dim)
     self.output_norm = nn.RMSNorm(dim, norm_eps)
@@ -297,7 +324,8 @@ class Transformer:
                         qk_norm=int(state_dict['blk.0.attn_q_norm.weight'].shape[0]) if 'blk.0.attn_q_norm.weight' in state_dict else 0,
                         num_experts=kv.get(f'{arch}.expert_count', 0), num_experts_per_tok=kv.get(f'{arch}.expert_used_count', 0),
                         shared_expert_dim=kv.get(f'{arch}.expert_shared_feed_forward_length', 0), ssm=ssm,
-                        full_attention_interval=kv.get(f'{arch}.full_attention_interval', 0))
+                        full_attention_interval=kv.get(f'{arch}.full_attention_interval', 0),
+                        norm_topk_prob=arch in ('qwen3moe', 'qwen35moe'))
 
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
