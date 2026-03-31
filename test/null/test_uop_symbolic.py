@@ -1024,6 +1024,28 @@ class TestSymbolicVariables(unittest.TestCase):
     assert (a * a).variables() == [a]
     assert (a//4 + a//6).variables() == [a]
 
+class TestVariableConstant(unittest.TestCase):
+  """Test UOp.variable with min==max (returns const)."""
+  def test_variable_const_bind_returns_const(self):
+    v = Variable("x", 3, 3)
+    b = v.bind(3)
+    self.assertEqual(b.op, Ops.CONST)
+    self.assertEqual(b.arg, 3)
+  def test_variable_const_val(self):
+    self.assertEqual(Variable("x", 7, 7).bind(7).val, 7)
+  def test_variable_const_unbind(self):
+    _, val = Variable("x", 4, 4).bind(4).unbind()
+    self.assertEqual(val, 4)
+  def test_variable_const_in_tensor_slice(self):
+    from tinygrad import Tensor
+    t = Tensor.zeros(1, 100, dtype='int32')
+    sp = Variable("sp", 0, 99).bind(3)
+    nt = Variable("nt", 1, 1).bind(1)
+    self.assertEqual(t[:, sp:sp+nt].shape, (1, 1))
+  def test_normal_variable_unchanged(self):
+    v = Variable("x", 1, 10)
+    self.assertEqual(v.op, Ops.DEFINE_VAR)
+
 class TestSymInfer(unittest.TestCase):
   def test_sym_infer(self):
     a = Variable("a", 0, 10)
