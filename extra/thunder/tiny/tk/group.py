@@ -75,9 +75,9 @@ class Group:
 
     a_base_shape = cast(RT, a).base_shape
     if a_base_shape.cols == 16:
-      wmma_arg = ('WMMA_16_16_16___bf16_float', (16, 16, 16), dtypes.bfloat16, dtypes.float, 'AMD', 64, (((4, 2), (3, 2)), ((4, 2), (3, 2)), ((4, 2), (3, 2))), ()) # type: ignore
+      wmma_arg = ('WMMA_16_16_16___bf16_float', (16, 16, 16), (dtypes.bfloat16, dtypes.bfloat16), dtypes.float, 'AMD', 64, (((4, 2), (3, 2)), ((4, 2), (3, 2)), ((4, 2), (3, 2))), ()) # type: ignore
     elif a_base_shape.cols == 32:
-      wmma_arg = ('WMMA_16_16_32___bf16_float', (16, 16, 32), dtypes.bfloat16, dtypes.float, 'AMD', 64, (((4, 2), (3, 2), (9, 2)), ((4, 2), (3, 2), (9, 2)), ((4, 2), (3, 2))), ()) # type: ignore
+      wmma_arg = ('WMMA_16_16_32___bf16_float', (16, 16, 32), (dtypes.bfloat16, dtypes.bfloat16), dtypes.float, 'AMD', 64, (((4, 2), (3, 2), (9, 2)), ((4, 2), (3, 2), (9, 2)), ((4, 2), (3, 2))), ()) # type: ignore
     else: raise NotImplementedError(f"mma_AB not implemented for {a_base_shape.cols=}")
 
     for height in self.ker.range(c.shape[-3], track=False):
@@ -105,9 +105,9 @@ class Group:
 
     a_base_shape = cast(RT, a).base_shape
     if a_base_shape.cols == 16:
-      wmma_arg = ('WMMA_16_16_16___bf16_float', (16, 16, 16), dtypes.bfloat16, dtypes.float, 'AMD', 64, (((4, 2), (3, 2)), ((4, 2), (3, 2)), ((4, 2), (3, 2))), ()) # type: ignore
+      wmma_arg = ('WMMA_16_16_16___bf16_float', (16, 16, 16), (dtypes.bfloat16, dtypes.bfloat16), dtypes.float, 'AMD', 64, (((4, 2), (3, 2)), ((4, 2), (3, 2)), ((4, 2), (3, 2))), ()) # type: ignore
     elif a_base_shape.cols == 32:
-      wmma_arg = ('WMMA_16_16_32___bf16_float', (16, 16, 32), dtypes.bfloat16, dtypes.float, 'AMD', 64, (((4, 2), (3, 2), (9, 2)), ((4, 2), (3, 2), (9, 2)), ((4, 2), (3, 2))), ()) # type: ignore
+      wmma_arg = ('WMMA_16_16_32___bf16_float', (16, 16, 32), (dtypes.bfloat16, dtypes.bfloat16), dtypes.float, 'AMD', 64, (((4, 2), (3, 2), (9, 2)), ((4, 2), (3, 2), (9, 2)), ((4, 2), (3, 2))), ()) # type: ignore
     else: raise NotImplementedError(f"mma_ABt not implemented for {a_base_shape.cols=}")
 
     for height in self.ker.range(c.shape[-3], track=False):
@@ -135,9 +135,9 @@ class Group:
 
     a_base_shape = cast(RT, a).base_shape
     if a_base_shape.cols == 16:
-      wmma_arg = ('WMMA_16_16_16___bf16_float', (16, 16, 16), dtypes.bfloat16, dtypes.float, 'AMD', 64, (((4, 2), (3, 2)), ((4, 2), (3, 2)), ((4, 2), (3, 2))), ()) # type: ignore
+      wmma_arg = ('WMMA_16_16_16___bf16_float', (16, 16, 16), (dtypes.bfloat16, dtypes.bfloat16), dtypes.float, 'AMD', 64, (((4, 2), (3, 2)), ((4, 2), (3, 2)), ((4, 2), (3, 2))), ()) # type: ignore
     elif a_base_shape.cols == 32:
-      wmma_arg = ('WMMA_16_16_32___bf16_float', (16, 16, 32), dtypes.bfloat16, dtypes.float, 'AMD', 64, (((4, 2), (3, 2), (9, 2)), ((4, 2), (3, 2), (9, 2)), ((4, 2), (3, 2))), ()) # type: ignore
+      wmma_arg = ('WMMA_16_16_32___bf16_float', (16, 16, 32), (dtypes.bfloat16, dtypes.bfloat16), dtypes.float, 'AMD', 64, (((4, 2), (3, 2), (9, 2)), ((4, 2), (3, 2), (9, 2)), ((4, 2), (3, 2))), ()) # type: ignore
     else: raise NotImplementedError(f"mma_AtB not implemented for {a_base_shape.cols=}")
 
     for height in self.ker.range(c.shape[-3], track=False):
@@ -165,9 +165,9 @@ class Group:
 
     a_base_shape = cast(RT, a).base_shape
     if a_base_shape.cols == 16:
-      wmma_arg = ('WMMA_16_16_16___bf16_float', (16, 16, 16), dtypes.bfloat16, dtypes.float, 'AMD', 64, (((4, 2), (3, 2)), ((4, 2), (3, 2)), ((4, 2), (3, 2))), ()) # type: ignore
+      wmma_arg = ('WMMA_16_16_16___bf16_float', (16, 16, 16), (dtypes.bfloat16, dtypes.bfloat16), dtypes.float, 'AMD', 64, (((4, 2), (3, 2)), ((4, 2), (3, 2)), ((4, 2), (3, 2))), ()) # type: ignore
     elif a_base_shape.cols == 32:
-      wmma_arg = ('WMMA_16_16_32___bf16_float', (16, 16, 32), dtypes.bfloat16, dtypes.float, 'AMD', 64, (((4, 2), (3, 2), (9, 2)), ((4, 2), (3, 2), (9, 2)), ((4, 2), (3, 2))), ()) # type: ignore
+      wmma_arg = ('WMMA_16_16_32___bf16_float', (16, 16, 32), (dtypes.bfloat16, dtypes.bfloat16), dtypes.float, 'AMD', 64, (((4, 2), (3, 2), (9, 2)), ((4, 2), (3, 2), (9, 2)), ((4, 2), (3, 2))), ()) # type: ignore
     else: raise NotImplementedError(f"mma_AtBt not implemented for {a_base_shape.cols=}")
 
     for height in self.ker.range(c.shape[-3], track=False):

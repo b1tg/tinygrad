@@ -60,7 +60,7 @@ def compute_on_locals(acc:UOp, Asl:UOp, Bsl:UOp, rng:int, afters:tuple[UOp, ...]
   acc_load = acc_after[N_inner_loop, M_inner_loop]
 
   # do WMMA
-  wmma_arg = ('WMMA_16_16_32_half_float', (16, 16, 32), dtypes.half, dtypes.float, 'AMD', 64, ((), (), ((3, 2), (2, 2))), ())
+  wmma_arg = ('WMMA_16_16_32_half_float', (16, 16, 32), (dtypes.half, dtypes.half), dtypes.float, 'AMD', 64, ((), (), ((3, 2), (2, 2))), ())
   out = UOp(Ops.WMMA, dtypes.float.vec(4), (Ar[M_inner_loop], Br[N_inner_loop], acc_load), arg=wmma_arg)
 
   # store back the acc

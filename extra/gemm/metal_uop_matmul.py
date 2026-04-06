@@ -28,7 +28,7 @@ def hand_spec_tc_cores():
   acc = acc[1].set(0.0)
 
   # TODO: make this simple
-  wmma_arg = ('WMMA_8_8_8_float_float', (8, 8, 8), dtypes.float, dtypes.float, 'METAL', 32, (((3, 2),), ((3, 2),), ((3, 2),)), ())
+  wmma_arg = ('WMMA_8_8_8_float_float', (8, 8, 8), (dtypes.float, dtypes.float), dtypes.float, 'METAL', 32, (((3, 2),), ((3, 2),), ((3, 2),)), ())
 
   acc_load = UOp.vectorize(acc.after(gk)[0], acc.after(gk)[1])
   out = UOp(Ops.WMMA, dtypes.float.vec(2), (a_tc, b_tc, acc_load), arg=wmma_arg)

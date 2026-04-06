@@ -55,7 +55,7 @@ def render_wmma_amd(ctx, wmma: UOp, cdna=False) -> str:
   if cdna:
     if K == 32: dt_map.update({dtypes.half: ".f16", dtypes.bfloat16: ".bf16"})
     return f"  {ctx[wmma]} = call {ldt(wmma.dtype)} @llvm.amdgcn.mfma.{dt_map[wmma.src[-1].dtype.scalar()]}" + \
-           f".{N}x{M}x{K}{dt_map[wmma.arg[2]]}(" + ", ".join([f"{ldt(w.dtype)} {ctx[w]}" for w in wmma.src]) + ", i32 0, i32 0, i32 0)"
+           f".{N}x{M}x{K}{dt_map[wmma.arg[2][0]]}(" + ", ".join([f"{ldt(w.dtype)} {ctx[w]}" for w in wmma.src]) + ", i32 0, i32 0, i32 0)"
   # https://github.com/llvm/llvm-project/blob/main/llvm/test/CodeGen/AMDGPU/GlobalISel/llvm.amdgcn.wmma_32.ll
   # example: %wmma0 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x16.f16(<16 x half> %v99,<16 x half> %v100,<8 x float> %v101)
   return f"  {ctx[wmma]} = call {ldt(wmma.dtype)} @llvm.amdgcn.wmma.{dt_map[wmma.src[-1].dtype.scalar()]}.16x16x16." + \
@@ -152,7 +152,8 @@ class LLVMRenderer(Renderer):
       if AMX and u.op is Ops.WMMA: # prealloc aux buffers as AMX can only load from memory
         vc += 1
         r[u] = f"%wmma{vc}"
-        for i, dtype in enumerate(u.arg[2].vec(sz) for sz in [prod(size for _, size in upcast) for upcast in u.arg[6]]):
+        for i, dtype in enumerate(dt.vec(sz) for dt, sz in zip([u.arg[2][0], u.arg[2][1], u.arg[3]],
+                                   [prod(size for _, size in upcast) for upcast in u.arg[6]])):
           kernel += [f"  {r[u]}_amx{i} = alloca {ldt(dtype)}, align {dtype.itemsize}",
                      f"  {r[u]}_ptr_amx{i} = ptrtoint {ldt(dtype.ptr())} {r[u]}_amx{i} to i64"]
 
