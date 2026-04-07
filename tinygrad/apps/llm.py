@@ -284,7 +284,6 @@ class Transformer:
     self.max_context = config.max_context
     self.has_ssm = config.ssm is not None
     self._cached_tokens: list[int] = []
-    self._cached_msg_count: int = 0
     # we specialize the JIT for prefill and rollout
     self.prefill_jit = TinyJit(self.forward)
     self.rollout_jit = TinyJit(self.forward)
@@ -417,10 +416,14 @@ CHAT_HTML = b'''<!DOCTYPE html><html><head><title>tinygrad chat</title><style>
     const d = document.createElement('div'); d.className = 'msg'; chat.appendChild(d);
     const r = await fetch('/v1/chat/completions', {method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({model: 'llama', messages: msgs, stream: true, temperature: 0.7})});
+    let buf = '';
     for (const rd = r.body.getReader(), dec = new TextDecoder();;) {
       const {done, value} = await rd.read();
       if (done) break;
-      for (const ln of dec.decode(value).split('\\n'))
+      buf += dec.decode(value, {stream: true});
+      const lines = buf.split('\\n');
+      buf = lines.pop();
+      for (const ln of lines)
         if (ln.startsWith('data: ') && !ln.includes('[DONE]'))
           try { d.textContent += JSON.parse(ln.slice(6)).choices[0]?.delta?.content || '' } catch {}
       chat.scrollTop = chat.scrollHeight;
@@ -428,6 +431,8 @@ CHAT_HTML = b'''<!DOCTYPE html><html><head><title>tinygrad chat</title><style>
     msgs.push({role: 'assistant', content: d.textContent});
   }
 </script></body></html>'''
+
+_text_to_tokens: dict[str, list[int]] = {}  # generated text → original token ids (avoids BPE roundtrip loss)
 
 class Handler(HTTPRequestHandler):
   def log_request(self, code='-', size='-'): pass
@@ -441,16 +446,20 @@ class Handler(HTTPRequestHandler):
     tmpl = {"id":f"chatcmpl-{uuid.uuid4().hex[:24]}", "object":"chat.completion.chunk", "created":int(time.time()), "model":model_name}
     yield {"choices": [{"index":0, "delta":{"role":"assistant","content":""}, "finish_reason":None}], **tmpl}
     out: list[int] = []
+    out_text: list[str] = []
     finish_reason = "stop"
     st = time.perf_counter()
     for next_id in model.generate(ids, temperature=temperature):
       if len(out) == 0: stderr_log(f"prefill:{(len(ids)-cache_start_pos)/((pt:=time.perf_counter())-st):4.0f} tok/s  {colored('--', 'BLACK')}  ")
       if next_id == eos_id: break
       out.append(next_id)
-      yield {"choices": [{"index":0, "delta":{"content":tok.decode([next_id])}, "finish_reason":None}], **tmpl}
+      chunk = tok.decode([next_id])
+      out_text.append(chunk)
+      yield {"choices": [{"index":0, "delta":{"content":chunk}, "finish_reason":None}], **tmpl}
       if max_tokens is not None and len(out) >= max_tokens:
         finish_reason = "length"
         break
+    if out: _text_to_tokens["".join(out_text)] = out
     yield {"choices": [{"index":0, "delta":{},"finish_reason":finish_reason}], **tmpl}
     if include_usage:
       yield {"choices": [], "usage": {"prompt_tokens": len(ids), "completion_tokens": len(out), "total_tokens": len(ids) + len(out)}, **tmpl}
@@ -464,12 +473,13 @@ class Handler(HTTPRequestHandler):
     if DEBUG >= 1: print(json.dumps(body, indent=2))
     if self.path == "/v1/chat/completions":
       # extract tokens, last assistant message is treated as prefill
-      n = model._cached_msg_count + 1 if model._cached_msg_count and len(body["messages"]) > model._cached_msg_count else 0
-      ids: list[int] = model._cached_tokens[:] if n else [bos_id] if bos_id is not None else []
-      for i, msg in enumerate(body["messages"][n:], n):
+      if len(body["messages"]) == 1: _text_to_tokens.clear()
+      ids: list[int] = [bos_id] if bos_id is not None else []
+      for i, msg in enumerate(body["messages"]):
         ids += tok.role(msg["role"])
         content = msg["content"]
-        if isinstance(content, str): ids += tok.encode(content)
+        # use cached tokens for assistant content to avoid BPE roundtrip loss (encode(decode(tokens)) != tokens)
+        if isinstance(content, str): ids += _text_to_tokens.get(content, tok.encode(content)) if msg["role"] == "assistant" else tok.encode(content)
         elif isinstance(content, list):
           for c in content:
             if c["type"] == "text": ids += tok.encode(c["text"])
@@ -491,7 +501,6 @@ class Handler(HTTPRequestHandler):
           if c["choices"] and c["choices"][0].get("finish_reason"): finish_reason = c["choices"][0]["finish_reason"]
         self.send_data(json.dumps({**c, "object":"chat.completion",
           "choices":[{"index":0, "message":{"role":"assistant","content":"".join(out)}, "finish_reason":finish_reason}]}).encode())
-      model._cached_msg_count = len(body["messages"])
     else:
       raise RuntimeError(f"unhandled path {self.path}")
 
