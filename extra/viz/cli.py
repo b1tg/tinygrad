@@ -59,7 +59,6 @@ def main(args) -> None:
     events:list = viz.load_pickle(args.profile_path, default=[])
     if (profile_bytes:=viz.get_profile(events)) is None: raise RuntimeError(f"empty profile in {args.profile_path}")
     profile = decode_profile(profile_bytes)
-    viz.load_amd_counters(viz.ctxs, events)
     profile["layout"].update([(f'{c["name"]} {s["name"]}', s["data"]) for c in viz.ctxs if c["name"].startswith("SQTT") for s in c["steps"]
                               if "PKTS" in s["name"]])
     if args.src is None:
@@ -88,7 +87,7 @@ def main(args) -> None:
         op_str = hex_colored(op_name, color) if color and not args.no_color else op_name
         phase, delay = None, 0
         idx = next(pkt_idxs.setdefault(e.device, itertools.count()))
-        if e.device.startswith("WAVE") or e.device == "OTHER_SIMD":
+        if e.device.startswith("WAVE"):
           inst = f"0x{(pc:=int(info.replace('PC:', ''))):05x} {pc_map[pc]}" if info else f"{'':7} {op_name}"
           dispatch_to_inst[f"{e.device}-{idx}"] = (inst, int(e.st))
           phase = "DISPATCH"
@@ -117,7 +116,12 @@ def main(args) -> None:
     if agg and total > 0:
       from tabulate import tabulate
       items = sorted(agg.items(), key=lambda kv:kv[1][0], reverse=True)
-      table = [[format_colored(name), time_to_str(t, w=9), c, f"{(t/total*100.0):.2f}%"] for name,(t,c) in items]
+      rows = 20
+      table = [[format_colored(name), time_to_str(t, w=9), c, f"{(t/total*100.0):.2f}%"] for name,(t,c) in items[:rows]]
+      if items[rows:]:
+        other_t = sum(t for _,(t,_) in items[rows:])
+        other_c = sum(c for _,(_,c) in items[rows:])
+        table.append(["Other", time_to_str(other_t, w=9), other_c, f"{(other_t/total*100.0):.2f}%"])
       print(tabulate(table, headers=["name", "total", "count", "pct"], tablefmt="github"))
     return None
 
