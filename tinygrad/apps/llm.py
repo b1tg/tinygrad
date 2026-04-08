@@ -1,5 +1,5 @@
 from __future__ import annotations
-import sys, argparse, typing, re, unicodedata, json, uuid, time, functools, itertools
+import sys, argparse, codecs, typing, re, unicodedata, json, uuid, time, functools, itertools
 from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function
 from tinygrad.uop.ops import resolve
@@ -55,6 +55,10 @@ class SimpleTokenizer:
     return tokens + self._encode_sentence(text[pos:])
 
   def decode(self, ids:list[int]) -> str: return b''.join(self._tok2bytes[tid] for tid in ids).decode(errors='replace')
+  def stream_decoder(self) -> typing.Callable[[int|None], str]:
+    dec = codecs.getincrementaldecoder('utf-8')('replace')
+    def _decode(tid:int|None=None) -> str: return dec.decode(self._tok2bytes[tid]) if tid is not None else dec.decode(b'', final=True)
+    return _decode
   def role(self, role:str):
     if self.preset == 'olmo': return self.encode("<|" + role + "|>\n")  # OLMoE Instruct format
     if self.preset == 'qwen2': return self.encode("<|im_start|>" + role + "\n")
@@ -359,6 +363,7 @@ class Transformer:
     start_pos = self.get_start_pos(tokens)
     # SSM state is sequential: if tokens diverge from cache, state is invalid and must be rebuilt
     if self.has_ssm and start_pos < len(self._cached_tokens):
+      print("🔥")
       Tensor.realize(*[b.delta_cache.assign(Tensor.zeros_like(b.delta_cache)) for b in self.blk if hasattr(b, 'delta_cache')])
       start_pos = 0
     out, prompt_len = None, len(tokens)
@@ -445,21 +450,22 @@ class Handler(HTTPRequestHandler):
                f"in:{colored(f'{cache_start_pos:5d}', 'green')} +{len(ids)-cache_start_pos:5d}  {colored('--', 'BLACK')}  ")
     tmpl = {"id":f"chatcmpl-{uuid.uuid4().hex[:24]}", "object":"chat.completion.chunk", "created":int(time.time()), "model":model_name}
     yield {"choices": [{"index":0, "delta":{"role":"assistant","content":""}, "finish_reason":None}], **tmpl}
-    out: list[int] = []
-    out_text: list[str] = []
+    out, out_text = [], ""
     finish_reason = "stop"
     st = time.perf_counter()
+    dec = tok.stream_decoder()
     for next_id in model.generate(ids, temperature=temperature):
       if len(out) == 0: stderr_log(f"prefill:{(len(ids)-cache_start_pos)/((pt:=time.perf_counter())-st):4.0f} tok/s  {colored('--', 'BLACK')}  ")
       if next_id == eos_id: break
       out.append(next_id)
-      chunk = tok.decode([next_id])
-      out_text.append(chunk)
+      out_text += (chunk := dec(next_id))
       yield {"choices": [{"index":0, "delta":{"content":chunk}, "finish_reason":None}], **tmpl}
       if max_tokens is not None and len(out) >= max_tokens:
         finish_reason = "length"
         break
-    if out: _text_to_tokens["".join(out_text)] = out
+    out_text += (tail := dec())
+    if tail: yield {"choices": [{"index":0, "delta":{"content":tail}, "finish_reason":None}], **tmpl}
+    if out: _text_to_tokens[out_text] = out
     yield {"choices": [{"index":0, "delta":{},"finish_reason":finish_reason}], **tmpl}
     if include_usage:
       yield {"choices": [], "usage": {"prompt_tokens": len(ids), "completion_tokens": len(out), "total_tokens": len(ids) + len(out)}, **tmpl}
@@ -473,12 +479,10 @@ class Handler(HTTPRequestHandler):
     if DEBUG >= 1: print(json.dumps(body, indent=2))
     if self.path == "/v1/chat/completions":
       # extract tokens, last assistant message is treated as prefill
-      if len(body["messages"]) == 1: _text_to_tokens.clear()
       ids: list[int] = [bos_id] if bos_id is not None else []
       for i, msg in enumerate(body["messages"]):
         ids += tok.role(msg["role"])
         content = msg["content"]
-        # use cached tokens for assistant content to avoid BPE roundtrip loss (encode(decode(tokens)) != tokens)
         if isinstance(content, str): ids += _text_to_tokens.get(content, tok.encode(content)) if msg["role"] == "assistant" else tok.encode(content)
         elif isinstance(content, list):
           for c in content:
@@ -551,7 +555,8 @@ if __name__ == "__main__":
       ids += tok.role("user") + tok.encode(input('>>> ')) + tok.end_turn(eos_id) + tok.role("assistant")
     except EOFError:
       break
+    dec = tok.stream_decoder()
     for next_id in model.generate(ids):
-      sys.stdout.write(tok.decode([next_id]) if next_id != eos_id else "\n\n")
+      sys.stdout.write(dec(next_id) if next_id != eos_id else dec() + "\n\n")
       sys.stdout.flush()
       if next_id == eos_id: break
