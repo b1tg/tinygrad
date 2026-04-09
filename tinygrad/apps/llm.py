@@ -288,6 +288,8 @@ class Transformer:
     self.max_context = config.max_context
     self.has_ssm = config.ssm is not None
     self._cached_tokens: list[int] = []
+    self._ssm_checkpoints: list[tuple[int, list[Tensor]]] = []  # (position, [delta_cache copies per block])
+    self.n_checkpoints, self.checkpoint_every = 32, 64
     # we specialize the JIT for prefill and rollout
     self.prefill_jit = TinyJit(self.forward)
     self.rollout_jit = TinyJit(self.forward)
@@ -361,17 +363,25 @@ class Transformer:
     t = Tensor(tokens + [0] * (self.max_context - len(tokens)), dtype="int32").reshape(1, self.max_context)
     # recompute start_pos from what's currently valid in the kv cache
     start_pos = self.get_start_pos(tokens)
-    # SSM state is sequential: if tokens diverge from cache, state is invalid and must be rebuilt
+    # SSM state is sequential: if tokens diverge from cache, restore from nearest checkpoint or reset to 0
+    ssm_blk = [b for b in self.blk if isinstance(b, GatedDeltaNetBlock)]
     if self.has_ssm and start_pos < len(self._cached_tokens):
-      print("🔥")
-      Tensor.realize(*[b.delta_cache.assign(Tensor.zeros_like(b.delta_cache)) for b in self.blk if hasattr(b, 'delta_cache')])
-      start_pos = 0
-    out, prompt_len = None, len(tokens)
+      start_pos, saved = next(((p, d) for p, d in reversed(self._ssm_checkpoints) if p <= start_pos),
+                              (0, [Tensor.zeros_like(b.delta_cache) for b in ssm_blk]))
+      Tensor.realize(*[b.delta_cache.assign(s.to(b.delta_cache.device)) for b, s in zip(ssm_blk, saved)])
+      self._ssm_checkpoints = [(p, d) for p, d in self._ssm_checkpoints if p <= start_pos]  # discard stale checkpoints
+      cp_mem = sum(sum(s.nbytes() for s in d) for _, d in self._ssm_checkpoints)
+      stderr_log(f"🔥SSM {'restored checkpoint at pos ' + str(start_pos) if start_pos else 'full restore'}"
+                 f" ({len(self._ssm_checkpoints)} checkpoints, {cp_mem/1024/1024:.1f}MB)\n")
+    out, prompt_len, last_cp = None, len(tokens), start_pos
     while len(tokens) < self.max_context:
       sp, nt = v_start_pos.bind(start_pos), v_toks.bind(min(chunk_size, len(tokens) - start_pos))
       out = self(t[:, sp:sp+nt] if start_pos < prompt_len or out is None else out, sp, temp).realize()
       start_pos += nt.val
-      # chunked prefill: keep processing until all prompt tokens are consumed
+      if ssm_blk and start_pos - last_cp >= self.checkpoint_every:  # save SSM checkpoint periodically
+        self._ssm_checkpoints.append((start_pos, [b.delta_cache.clone() for b in ssm_blk]))
+        if len(self._ssm_checkpoints) > self.n_checkpoints: self._ssm_checkpoints.pop(0)
+        last_cp = start_pos
       if start_pos < len(tokens): continue
       tokens.append(int(out.item()))
       self._cached_tokens = tokens[:-1]
@@ -436,8 +446,6 @@ CHAT_HTML = b'''<!DOCTYPE html><html><head><title>tinygrad chat</title><style>
   }
 </script></body></html>'''
 
-_text_to_tokens: dict[str, list[int]] = {}  # generated text → original token ids (avoids BPE roundtrip loss)
-
 class Handler(HTTPRequestHandler):
   def log_request(self, code='-', size='-'): pass
   def do_GET(self):
@@ -449,7 +457,7 @@ class Handler(HTTPRequestHandler):
                f"in:{colored(f'{cache_start_pos:5d}', 'green')} +{len(ids)-cache_start_pos:5d}  {colored('--', 'BLACK')}  ")
     tmpl = {"id":f"chatcmpl-{uuid.uuid4().hex[:24]}", "object":"chat.completion.chunk", "created":int(time.time()), "model":model_name}
     yield {"choices": [{"index":0, "delta":{"role":"assistant","content":""}, "finish_reason":None}], **tmpl}
-    out, out_text = [], ""
+    out: list[int] = []
     finish_reason = "stop"
     st = time.perf_counter()
     dec = tok.stream_decoder()
@@ -457,15 +465,12 @@ class Handler(HTTPRequestHandler):
       if len(out) == 0: stderr_log(f"prefill:{(len(ids)-cache_start_pos)/((pt:=time.perf_counter())-st):4.0f} tok/s  {colored('--', 'BLACK')}  ")
       if next_id == eos_id: break
       out.append(next_id)
-      out_text += (chunk := dec(next_id))
-      yield {"choices": [{"index":0, "delta":{"content":chunk}, "finish_reason":None}], **tmpl}
+      yield {"choices": [{"index":0, "delta":{"content":dec(next_id)}, "finish_reason":None}], **tmpl}
       if max_tokens is not None and len(out) >= max_tokens:
         finish_reason = "length"
         break
-    out_text += (tail := dec())
-    if tail: yield {"choices": [{"index":0, "delta":{"content":tail}, "finish_reason":None}], **tmpl}
-    if out: _text_to_tokens[out_text] = out
-    yield {"choices": [{"index":0, "delta":{},"finish_reason":finish_reason}], **tmpl}
+    if (tail := dec()): yield {"choices": [{"index":0, "delta":{"content":tail}, "finish_reason":None}], **tmpl}
+    yield {"choices": [{"index":0, "delta":{}, "finish_reason":finish_reason}], **tmpl}
     if include_usage:
       yield {"choices": [], "usage": {"prompt_tokens": len(ids), "completion_tokens": len(out), "total_tokens": len(ids) + len(out)}, **tmpl}
     et = time.perf_counter()
@@ -482,7 +487,7 @@ class Handler(HTTPRequestHandler):
       for i, msg in enumerate(body["messages"]):
         ids += tok.role(msg["role"])
         content = msg["content"]
-        if isinstance(content, str): ids += _text_to_tokens.get(content, tok.encode(content)) if msg["role"] == "assistant" else tok.encode(content)
+        if isinstance(content, str): ids += tok.encode(content)
         elif isinstance(content, list):
           for c in content:
             if c["type"] == "text": ids += tok.encode(c["text"])
@@ -513,12 +518,15 @@ if __name__ == "__main__":
   parser.add_argument("--max_context", type=int, default=4096, help="Max Context Length")
   parser.add_argument("--serve", nargs='?', type=int, const=8000, metavar="PORT", help="Run OpenAI compatible API (optional port, default 8000)")
   parser.add_argument("--warmup", action="store_true", help="warmup the JIT")
+  parser.add_argument("--ctx_checkpoints", type=int, default=32, help="Max SSM state checkpoints (default 32)")
+  parser.add_argument("--checkpoint_every", type=int, default=8192, help="Save SSM checkpoint every N tokens during prefill (default 8192)")
   parser.add_argument("--benchmark", nargs='?', type=int, const=20, metavar="COUNT", help="Benchmark tok/s (optional count, default 20)")
   args = parser.parse_args()
 
   # load the model
   raw_model = Tensor.from_url(models.get(args.model, args.model))
   model, kv = Transformer.from_gguf(raw_model, args.max_context)
+  model.n_checkpoints, model.checkpoint_every = args.ctx_checkpoints, args.checkpoint_every
   model_name = kv.get('general.name') or kv.get('general.basename') or args.model
   print(f"using model \"{model_name}\" with {raw_model.nbytes():,} bytes and {sum(x.numel() for x in nn.state.get_parameters(model)):,} params")
   del raw_model

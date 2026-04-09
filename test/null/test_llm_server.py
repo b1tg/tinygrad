@@ -45,8 +45,13 @@ class TestLLMServer(unittest.TestCase):
     cls.server.server_close()
 
   def setUp(self):
-    import tinygrad.apps.llm as llm
-    llm._text_to_tokens.clear()
+    self.mock_tok.role = Mock(return_value=[100, 101])
+    self.mock_tok.encode = Mock(side_effect=lambda s: [1000 + ord(c) for c in s])
+    self.mock_tok.decode = Mock(return_value="Hello")
+    self.mock_tok.stream_decoder = Mock(return_value=lambda tid=None: "Hello" if tid is not None else "")
+    self.mock_tok.end_turn = Mock(return_value=[998])
+    self.mock_model.generate = Mock(side_effect=lambda ids, **kwargs: iter([300, 301, 999]))
+    self.mock_model.get_start_pos = Mock(return_value=0)
 
   def test_chat_completion_stream(self):
     stream = self.client.chat.completions.create(
