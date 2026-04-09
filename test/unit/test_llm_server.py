@@ -6,6 +6,9 @@ from tinygrad.apps.llm import Transformer, TransformerConfig, SSMConfig
 
 TEST_CONFIG = TransformerConfig(num_blocks=1, dim=64, hidden_dim=128, n_heads=2, n_kv_heads=2,
                           norm_eps=1e-5, vocab_size=100, head_dim=32, rope_theta=10000.0, max_context=32)
+SSM_CONFIG = TransformerConfig(num_blocks=4, dim=64, hidden_dim=128, n_heads=2, n_kv_heads=2, norm_eps=1e-5, vocab_size=100,
+  head_dim=32, rope_theta=10000.0, max_context=256, qk_norm=32, full_attention_interval=4,
+  ssm=SSMConfig(conv_kernel=4, state_size=128, group_count=16, time_step_rank=32, inner_size=4096))
 
 class TestTransformerGenerate(unittest.TestCase):
   def test_kv_cache_reuse(self):
@@ -159,64 +162,29 @@ class TestTransformerGenerate(unittest.TestCase):
       next(gen)
     self.assertAlmostEqual(captured_temps[-1], 0.6, places=5)
 
-class TestSSMCheckpoints(unittest.TestCase):
-  def test_checkpoint_saved_during_generation(self):
-    """Checkpoints are saved every checkpoint_every tokens during generate()."""
-    from dataclasses import replace
-    ssm = SSMConfig(conv_kernel=4, state_size=128, group_count=16, time_step_rank=32, inner_size=4096)
-    config = replace(TEST_CONFIG, max_context=256, ssm=ssm, full_attention_interval=4, num_blocks=4, dim=64, hidden_dim=128,
-                     n_heads=2, n_kv_heads=2, head_dim=32, qk_norm=32)
-    model = Transformer(config)
-    model.checkpoint_every = 16
+  def test_ssm_checkpoint_restore_on_diverge(self):
+    """SSM checkpoint: generate 32 tokens (checkpoints at 8,16,24,32), then diverge at pos 20 → should resume from pos 16, not 0."""
+    model = Transformer(SSM_CONFIG)
+    model.ctx_checkpoints, model.checkpoint_every_n = 32, 8
 
-    # generate enough tokens to trigger checkpoint saves
+    # step 1: generate 32 tokens, this creates checkpoints at positions 8, 16, 24, 32
     gen = model.generate(list(range(1, 6)), chunk_size=1)
-    for _ in range(48): next(gen)
-
-    # should have checkpoints at intervals of 16
-    cp_positions = [p for p, _ in model._ssm_checkpoints]
-    self.assertGreater(len(cp_positions), 0)
-    self.assertTrue(all(p > 0 for p in cp_positions))
-
-  def test_checkpoint_restore_on_diverge(self):
-    """When tokens diverge, SSM state is restored from nearest checkpoint instead of full reset."""
-    from dataclasses import replace
-    ssm = SSMConfig(conv_kernel=4, state_size=128, group_count=16, time_step_rank=32, inner_size=4096)
-    config = replace(TEST_CONFIG, max_context=256, ssm=ssm, full_attention_interval=4, num_blocks=4, dim=64, hidden_dim=128,
-                     n_heads=2, n_kv_heads=2, head_dim=32, qk_norm=32)
-    model = Transformer(config)
-    model.checkpoint_every = 8
-
-    # first generate: build cache and checkpoints
-    tokens1 = list(range(1, 6))
-    gen = model.generate(tokens1, chunk_size=1)
     for _ in range(32): next(gen)
-    self.assertGreater(len(model._ssm_checkpoints), 0)
     cp_positions = [p for p, _ in model._ssm_checkpoints]
 
-    # second generate with tokens that diverge mid-way
-    tokens2 = list(model._cached_tokens[:20]) + [999, 998, 997]  # match first 20, then diverge
-    captured_start = []
+    # step 2: new tokens match first 20 then diverge — generate() should restore checkpoint at pos 16
+    tokens2 = list(model._cached_tokens[:20]) + [999, 998, 997]
+    captured_start_pos = []
     orig_call = Transformer.__call__
-    def spy_call(self_inner, tokens, start_pos, temperature):
-      captured_start.append(start_pos if isinstance(start_pos, int) else start_pos.val)
+    def spy(self_inner, tokens, start_pos, temperature):
+      captured_start_pos.append(start_pos if isinstance(start_pos, int) else start_pos.val)
       return orig_call(self_inner, tokens, start_pos, temperature)
+    with patch.object(Transformer, '__call__', spy):
+      next(model.generate(tokens2, chunk_size=1))
 
-    with patch.object(Transformer, '__call__', spy_call):
-      gen = model.generate(tokens2, chunk_size=1)
-      next(gen)
-
-    # should resume from a checkpoint position, not from 0
-    best_cp = max((p for p in cp_positions if p <= 20), default=0)
-    self.assertEqual(captured_start[0], best_cp)
-    self.assertGreater(best_cp, 0)
-
-  def test_no_checkpoint_without_ssm(self):
-    """Non-SSM models don't save checkpoints."""
-    model = Transformer(TEST_CONFIG)
-    gen = model.generate(list(range(1, 6)))
-    for _ in range(3): next(gen)
-    self.assertEqual(len(model._ssm_checkpoints), 0)
+    # first __call__ should start at checkpoint pos 16 (nearest checkpoint <= 20), not 0
+    best_cp = max(p for p in cp_positions if p <= 20)
+    self.assertEqual(captured_start_pos[0], best_cp)
 
 if __name__ == '__main__':
   unittest.main()

@@ -289,7 +289,7 @@ class Transformer:
     self.has_ssm = config.ssm is not None
     self._cached_tokens: list[int] = []
     self._ssm_checkpoints: list[tuple[int, list[Tensor]]] = []  # (position, [delta_cache copies per block])
-    self.n_checkpoints, self.checkpoint_every = 32, 64
+    self.ctx_checkpoints, self.checkpoint_every_n = 0, 0
     # we specialize the JIT for prefill and rollout
     self.prefill_jit = TinyJit(self.forward)
     self.rollout_jit = TinyJit(self.forward)
@@ -353,6 +353,21 @@ class Transformer:
   def get_start_pos(self, tokens:list[int]):
     return sum(1 for _ in itertools.takewhile(lambda ab: ab[0] == ab[1], zip(tokens[:-1], self._cached_tokens)))
 
+  def _ssm_save(self, pos:int):
+    saved = [b.delta_cache.clone() for b in self.blk if hasattr(b, 'delta_cache')]
+    Tensor.realize(*saved)
+    self._ssm_checkpoints.append((pos, saved))
+    if len(self._ssm_checkpoints) > self.ctx_checkpoints: self._ssm_checkpoints.pop(0)
+
+  def _ssm_restore(self, pos:int) -> int:
+    blk, old_pos = [b for b in self.blk if hasattr(b, 'delta_cache')], pos
+    pos, saved = next(((p,d) for p,d in reversed(self._ssm_checkpoints) if p<=pos), (0,[Tensor.zeros_like(b.delta_cache) for b in blk]))
+    Tensor.realize(*[b.delta_cache.assign(s.to(b.delta_cache.device)) for b,s in zip(blk, saved)])
+    while self._ssm_checkpoints and self._ssm_checkpoints[-1][0] > pos: self._ssm_checkpoints.pop()
+    cp_mb = sum(s.nbytes() for _,d in self._ssm_checkpoints for s in d)/1024/1024
+    if DEBUG >= 1: stderr_log(f"SSM restored {old_pos} -> {pos} ({len(self._ssm_checkpoints)} checkpoints, {cp_mb:.1f} MB)\n")
+    return pos
+
   def generate(self, tokens:list[int], chunk_size:int=32, temperature:float=0.0):
     if self.has_ssm: chunk_size = 1
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
@@ -363,24 +378,14 @@ class Transformer:
     t = Tensor(tokens + [0] * (self.max_context - len(tokens)), dtype="int32").reshape(1, self.max_context)
     # recompute start_pos from what's currently valid in the kv cache
     start_pos = self.get_start_pos(tokens)
-    # SSM state is sequential: if tokens diverge from cache, restore from nearest checkpoint or reset to 0
-    ssm_blk = [b for b in self.blk if isinstance(b, GatedDeltaNetBlock)]
-    if self.has_ssm and start_pos < len(self._cached_tokens):
-      start_pos, saved = next(((p, d) for p, d in reversed(self._ssm_checkpoints) if p <= start_pos),
-                              (0, [Tensor.zeros_like(b.delta_cache) for b in ssm_blk]))
-      Tensor.realize(*[b.delta_cache.assign(s.to(b.delta_cache.device)) for b, s in zip(ssm_blk, saved)])
-      self._ssm_checkpoints = [(p, d) for p, d in self._ssm_checkpoints if p <= start_pos]  # discard stale checkpoints
-      cp_mem = sum(sum(s.nbytes() for s in d) for _, d in self._ssm_checkpoints)
-      stderr_log(f"🔥SSM {'restored checkpoint at pos ' + str(start_pos) if start_pos else 'full restore'}"
-                 f" ({len(self._ssm_checkpoints)} checkpoints, {cp_mem/1024/1024:.1f}MB)\n")
+    if self.has_ssm and start_pos < len(self._cached_tokens): start_pos = self._ssm_restore(start_pos)
     out, prompt_len, last_cp = None, len(tokens), start_pos
     while len(tokens) < self.max_context:
       sp, nt = v_start_pos.bind(start_pos), v_toks.bind(min(chunk_size, len(tokens) - start_pos))
       out = self(t[:, sp:sp+nt] if start_pos < prompt_len or out is None else out, sp, temp).realize()
       start_pos += nt.val
-      if ssm_blk and start_pos - last_cp >= self.checkpoint_every:  # save SSM checkpoint periodically
-        self._ssm_checkpoints.append((start_pos, [b.delta_cache.clone() for b in ssm_blk]))
-        if len(self._ssm_checkpoints) > self.n_checkpoints: self._ssm_checkpoints.pop(0)
+      if self.has_ssm and self.ctx_checkpoints and start_pos - last_cp >= self.checkpoint_every_n:
+        self._ssm_save(start_pos)
         last_cp = start_pos
       if start_pos < len(tokens): continue
       tokens.append(int(out.item()))
@@ -518,15 +523,15 @@ if __name__ == "__main__":
   parser.add_argument("--max_context", type=int, default=4096, help="Max Context Length")
   parser.add_argument("--serve", nargs='?', type=int, const=8000, metavar="PORT", help="Run OpenAI compatible API (optional port, default 8000)")
   parser.add_argument("--warmup", action="store_true", help="warmup the JIT")
-  parser.add_argument("--ctx_checkpoints", type=int, default=32, help="Max SSM state checkpoints (default 32)")
-  parser.add_argument("--checkpoint_every", type=int, default=8192, help="Save SSM checkpoint every N tokens during prefill (default 8192)")
+  parser.add_argument("--ctx_checkpoints", type=int, default=32, help="Max SSM state checkpoints (default 32, 0 to disable)")
+  parser.add_argument("--checkpoint_every_n", type=int, default=64, help="Save SSM checkpoint every N tokens (default 64)")
   parser.add_argument("--benchmark", nargs='?', type=int, const=20, metavar="COUNT", help="Benchmark tok/s (optional count, default 20)")
   args = parser.parse_args()
 
   # load the model
   raw_model = Tensor.from_url(models.get(args.model, args.model))
   model, kv = Transformer.from_gguf(raw_model, args.max_context)
-  model.n_checkpoints, model.checkpoint_every = args.ctx_checkpoints, args.checkpoint_every
+  model.ctx_checkpoints, model.checkpoint_every_n = args.ctx_checkpoints, args.checkpoint_every_n
   model_name = kv.get('general.name') or kv.get('general.basename') or args.model
   print(f"using model \"{model_name}\" with {raw_model.nbytes():,} bytes and {sum(x.numel() for x in nn.state.get_parameters(model)):,} params")
   del raw_model
