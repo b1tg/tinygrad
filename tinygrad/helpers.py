@@ -61,6 +61,8 @@ def lo32(x:Any) -> Any: return x & 0xFFFFFFFF # Any is sint
 def hi32(x:Any) -> Any: return x >> 32 # Any is sint
 def data64(data:Any) -> tuple[Any, Any]: return (data >> 32, data & 0xFFFFFFFF) # Any is sint
 def data64_le(data:Any) -> tuple[Any, Any]: return (data & 0xFFFFFFFF, data >> 32) # Any is sint
+def to_be32(val:Any) -> Any: return ((val & 0xFF) << 24) | (((val >> 8) & 0xFF) << 16) | (((val >> 16) & 0xFF) << 8) | ((val >> 24) & 0xFF)
+def to_be64(val:Any) -> Any: return to_be32(val >> 32) | (to_be32(val & 0xFFFFFFFF) << 32)
 def getbits(value: int, start: int, end: int): return (value >> start) & ((1 << (end - start + 1)) - 1)
 def i2u(bits: int, value: int): return value if value >= 0 else (1<<bits)+value
 def is_numpy_ndarray(x) -> bool: return str(type(x)) == "<class 'numpy.ndarray'>"
@@ -119,18 +121,16 @@ def suppress_finalizing(func):
       if not getattr(sys, 'is_finalizing', lambda: True)(): raise # re-raise if not finalizing
   return wrapper
 
-def select_first_inited(candidates:Sequence[Callable[...,T]|Sequence[Callable[...,T]|None]], err_msg:str, cache:dict|None=None):
+def select_first_inited(candidates:Sequence[Callable[...,T]], err_msg:str, cache:dict|None=None, **kwargs):
   excs = []
   for typ in candidates:
     if cache is not None and typ in cache: return cache[typ]
     try:
-      x = tuple([cast(Callable, t)() if t is not None else None for t in typ]) if isinstance(typ, Sequence) else cast(Callable, typ)()
+      x = typ(**kwargs)
       if cache is not None: cache[typ] = x
       return x
     except Exception as e: excs.append(e)
-  raise ExceptionGroup(err_msg, excs)
-
-def unwrap_class_type(cls_t): return cls_t.func if isinstance(cls_t, functools.partial) else cls_t
+  raise excs[0] if len(excs) == 1 else ExceptionGroup(err_msg, excs)
 
 def pluralize(st:str, cnt:int): return f"{cnt} {st}"+('' if cnt == 1 else 's')
 
@@ -180,10 +180,22 @@ class ContextVar(Generic[T]):
 class Target:
   device: str = ""
   renderer: str = ""
+  arch: str = ""
+  interface: str = ""
 
   @staticmethod
-  def parse(s:str) -> Target: return Target(*(x.upper() for x in s.split(':')))
-  def __repr__(self) -> str: return self.device + (":" + self.renderer if self.renderer else "")
+  def parse(s:str) -> Target:
+    if len(iface_split:=s.split('+')) == 2: iface, s = iface_split
+    elif len(iface_split) > 2: raise RuntimeError(f"too many '+' in target string: {s!r}")
+    else: iface = ""
+    match [x.upper() if i < 2 else x for i,x in enumerate(s.split(':'))]:
+      case [dev, ren, arch]: return Target(dev, ren, arch, iface)
+      case [dev, ren]: return Target(dev, ren, interface=iface)
+      case [dev]: return Target(dev, interface=iface)
+      case _: raise RuntimeError(f"too many ':' in target string: {s!r}")
+  def __repr__(self): return re.sub(":*$", "", (self.interface + "+" if self.interface else "") + ":".join([self.device, self.renderer, self.arch]))
+  # replaces if not already set
+  def replacedefault(self, **kwargs) -> Target: return replace(self, **{k:v for k,v in kwargs.items() if not getattr(self, k)})
 
 class _DEV(ContextVar):
   _value = Target()
@@ -192,9 +204,9 @@ class _DEV(ContextVar):
   @value.setter
   def value(self, v:str|Target): self._value = v if isinstance(v, Target) else Target.parse(v)
   def __getattr__(self, k): return getattr(self.value, k)
-  # get target for device string
-  def target(self, dev:str) -> Target:
-    t = self.value if self.device == dev or not self.device else Target(device=dev)
+  # get target for device string, kwargs are passed if not already specified
+  def target(self, dev:str, **kwargs) -> Target:
+    t = self.value.replacedefault(**kwargs) if self.device == dev or not self.device else Target(device=dev, **kwargs)
     # TODO: remove this once DEV supports secondary targets
     if (cv:=ContextVar._cache.get(f"{dev}_CC", None)) is not None and cv.value:
       assert not t.renderer, f"renderer set in DEV and {dev}_CC"
@@ -214,7 +226,7 @@ VALIDATE_WITH_CPU, DISABLE_FAST_IDIV = ContextVar("VALIDATE_WITH_CPU", 0), Conte
 CORRECT_DIVMOD_FOLDING, FUSE_OPTIM = ContextVar("CORRECT_DIVMOD_FOLDING", 0), ContextVar("FUSE_OPTIM", 0)
 ALLOW_DEVICE_USAGE, MAX_BUFFER_SIZE = ContextVar("ALLOW_DEVICE_USAGE", 1), ContextVar("MAX_BUFFER_SIZE", 0)
 MAX_KERNEL_BUFFERS = ContextVar("MAX_KERNEL_BUFFERS", 0)
-EMULATE, EMULATED_DTYPES = ContextVar("EMULATE", ""), ContextVar("EMULATED_DTYPES", "")
+EMULATED_DTYPES = ContextVar("EMULATED_DTYPES", "")
 CAPTURE_PROCESS_REPLAY = ContextVar("CAPTURE_PROCESS_REPLAY", 0)
 CPU_COUNT = ContextVar("CPU_COUNT", max(1, len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)))
 # Compilers
@@ -239,8 +251,6 @@ ALLOW_TF32 = ContextVar("ALLOW_TF32", 0)
 SCACHE = ContextVar("SCACHE", 1)
 # allow use of atomics for embedding backward
 USE_ATOMICS = ContextVar("USE_ATOMICS", 0)
-# allow use of assembly for gemm
-ASM_GEMM = ContextVar("ASM_GEMM", 0)
 
 @dataclass(frozen=True)
 class Metadata:

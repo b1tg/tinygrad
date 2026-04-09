@@ -4,14 +4,12 @@ from tinygrad.uop import Ops
 from tinygrad.dtype import dtypes, ConstType, least_upper_dtype, least_upper_float
 from tinygrad.helpers import polyN
 from tinygrad.mixin.dtype import DTypeMixin
+from tinygrad.mixin.creation import CreationMixin
 
 
-class ElementwiseMixin(DTypeMixin):
+class ElementwiseMixin(DTypeMixin, CreationMixin):
   # required to implement
   def alu(self, op: Ops, *src: Self) -> Self:
-    raise NotImplementedError
-
-  def const_like(self, b: ConstType) -> Self:
     raise NotImplementedError
 
   def _broadcasted(self, y: Self | ConstType, reverse: bool = False) -> tuple[Self, Self]:
@@ -257,9 +255,25 @@ class ElementwiseMixin(DTypeMixin):
   # NOTE: __eq__ isn't overridden, and means the same thing as is by default
 
   def lshift(self, x: Self | int, reverse: bool = False) -> Self:
+    """
+    Computes left arithmetic shift of `self` by `x` bits. `self` must have integer dtype.
+    Equivalent to `self << x`.
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(Tensor([1, 3, 31], dtype=dtypes.uint8).lshift(2).numpy())
+    ```
+    """
     return self._binop(Ops.SHL, x, reverse)
 
   def rshift(self, x: Self | int, reverse: bool = False) -> Self:
+    """
+    Computes right arithmetic shift of `self` by `x` bits. `self` must have integer dtype.
+    Equivalent to `self >> x`.
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(Tensor([4, 13, 125], dtype=dtypes.uint8).rshift(2).numpy())
+    ```
+    """
     return self._binop(Ops.SHR, x, reverse)
 
   def __lshift__(self, x: Self | int) -> Self:
@@ -853,6 +867,52 @@ class ElementwiseMixin(DTypeMixin):
     """
     return self.maximum(0) + (alpha * ((self / alpha).exp() - 1)).minimum(0)
 
+  def selu(self, alpha=1.67326, gamma=1.0507) -> Self:
+    """
+    Applies the Scaled Exponential Linear Unit (SELU) function element-wise.
+
+    - Paper: https://arxiv.org/abs/1706.02515v5
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(Tensor([-3., -2., -1., 0., 1., 2., 3.]).selu().numpy())
+    ```
+    """
+    return gamma * (self >= 0).where(self, alpha * (self.exp() - 1))
+
+  def softplus(self, beta=1.0) -> Self:
+    """
+    Applies the Softplus function element-wise.
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(Tensor([-3., -2., -1., 0., 1., 2., 3.]).softplus().numpy())
+    ```
+    """
+    return (1/beta) * (self*beta).logaddexp(0.0)
+
+  def mish(self) -> Self:
+    """
+    Applies the Mish function element-wise.
+
+    - Paper: https://arxiv.org/abs/1908.08681v3
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(Tensor([-3., -2., -1., 0., 1., 2., 3.]).mish().numpy())
+    ```
+    """
+    return self * self.softplus().tanh()
+
+  def logsigmoid(self) -> Self:
+    """
+    Applies the LogSigmoid function element-wise.
+
+    - See: https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.logsigmoid.html
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(Tensor([-3., -2., -1., 0., 1., 2., 3.]).logsigmoid().numpy())
+    ```
+    """
+    return -(-self).softplus()
+
   def sinh(self) -> Self:
     """
     Applies the Hyperbolic Sine (sinh) function element-wise.
@@ -914,3 +974,16 @@ class ElementwiseMixin(DTypeMixin):
     """
     if self.dtype != dtypes.bool and not dtypes.is_int(self.dtype): raise RuntimeError(f"{self.dtype} is not supported")
     return self.logical_not() if self.dtype == dtypes.bool else self ^ -1
+
+  def lerp(self, end: Self, weight: Self | ConstType) -> Self:
+    """
+    Linearly interpolates between `self` and `end` by `weight`.
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(Tensor([1., 2., 3.]).lerp(Tensor([4., 5., 6.]), 0.5).numpy())
+    ```
+    """
+    if self.dtype == dtypes.uint8 and isinstance(weight, ElementwiseMixin):
+      w_i = (weight * (1<<(W_PREC:=7)) + 0.5).cast(dtypes.int16)
+      return (self+(((end - self).cast(dtypes.int8) * w_i + (1<<W_PREC-1)).cast(dtypes.uint16) >> W_PREC)).cast(dtypes.uint8)
+    return self + (end - self) * weight
