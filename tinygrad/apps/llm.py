@@ -147,6 +147,7 @@ class TransformerConfig:
   routed_scaling_factor: float = 1.0
   qkv_bias: bool = False
   expert_bias: bool = False
+  q_lora_rank: int = 0
 
 class FFNBlock:
   def __init__(self, config:TransformerConfig):
@@ -268,7 +269,12 @@ class MLATransformerBlock(FFNBlock):
   def __init__(self, config:TransformerConfig):
     super().__init__(config)
     qk_nope_head_dim = config.head_dim - config.rope_dim
-    self.attn_q = nn.Linear(config.dim, config.n_heads * config.head_dim, bias=False)
+    if config.q_lora_rank > 0:
+      self.attn_q_a = nn.Linear(config.dim, config.q_lora_rank, bias=False)
+      self.attn_q_a_norm = nn.RMSNorm(config.q_lora_rank, config.norm_eps)
+      self.attn_q_b = nn.Linear(config.q_lora_rank, config.n_heads * config.head_dim, bias=False)
+    else:
+      self.attn_q = nn.Linear(config.dim, config.n_heads * config.head_dim, bias=False)
     self.attn_kv_a_mqa = nn.Linear(config.dim, config.kv_lora_rank + config.rope_dim, bias=False)
     self.attn_kv_a_norm = nn.RMSNorm(config.kv_lora_rank, config.norm_eps)
     self.attn_k_b = {"weight": Tensor.zeros(config.n_heads, config.kv_lora_rank, qk_nope_head_dim)}
@@ -278,7 +284,8 @@ class MLATransformerBlock(FFNBlock):
   def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
     B, T, _ = x.shape
     q_nope_head_dim = self.config.head_dim - self.config.rope_dim
-    q = self.attn_q(x).reshape(B, T, self.config.n_heads, self.config.head_dim).transpose(1, 2)
+    q_in = self.attn_q_b(self.attn_q_a_norm(self.attn_q_a(x))) if self.config.q_lora_rank > 0 else self.attn_q(x)
+    q = q_in.reshape(B, T, self.config.n_heads, self.config.head_dim).transpose(1, 2)
     q_nope, q_rope = q[..., :q_nope_head_dim], q[..., q_nope_head_dim:]
     q = (q_nope @ self.attn_k_b["weight"].transpose(-1, -2)).cat(apply_rope(q_rope, self.freqs_cis[start_pos:start_pos+T]), dim=-1)
 
@@ -453,14 +460,17 @@ class Transformer:
       state_dict = {k.replace('post_attention_norm', 'ffn_norm'):v for k,v in state_dict.items()}
     if num_blocks != kv[f'{arch}.block_count']:
       state_dict = {k:v for k,v in state_dict.items() if not (k.startswith('blk.') and int(k.split('.')[1]) >= num_blocks)}
+    if arch == 'glm-dsa':  # DSA indexer tensors are loaded but unused (llama.cpp does the same)
+      state_dict = {k:v for k,v in state_dict.items() if '.indexer.' not in k}
 
     kv_lora_rank = kv.get(f'{arch}.attention.kv_lora_rank', 0)
+    q_lora_rank = kv.get(f'{arch}.attention.q_lora_rank', 0)
     head_dim = kv.get(f'{arch}.attention.key_length_mla', kv.get(f'{arch}.attention.key_length', kv[f'{arch}.embedding_length'] // n_heads))
     rope_dim = kv.get(f'{arch}.rope.dimension_count', head_dim)
 
     # Permute RoPE weights from interleaved to half-split layout.
     for name in state_dict:
-      if 'attn_q.weight' in name and (arch == 'llama' or kv_lora_rank):
+      if ('attn_q.weight' in name and (arch == 'llama' or kv_lora_rank)) or ('attn_q_b.weight' in name and q_lora_rank):
         w = state_dict[name].reshape(n_heads, state_dict[name].shape[0]//n_heads, -1)
         prefix = head_dim-rope_dim
         state_dict[name] = w[:, :prefix].cat(w[:, prefix:].rearrange("n (h two) d -> n (two h) d", two=2), dim=1).reshape(-1, w.shape[-1])
@@ -492,7 +502,8 @@ class Transformer:
       routed_scaling_factor=kv.get(f'{arch}.expert_weights_scale', 1.0), attn_output_gate=arch in ('qwen35', 'qwen35moe'), ssm=ssm,
       full_attention_interval=kv.get(f'{arch}.full_attention_interval', 0),
       qkv_bias='blk.0.attn_q.bias' in state_dict,
-      expert_bias=f"blk.{kv.get(f'{arch}.leading_dense_block_count', 0)}.exp_probs_b.bias" in state_dict)
+      expert_bias=f"blk.{kv.get(f'{arch}.leading_dense_block_count', 0)}.exp_probs_b.bias" in state_dict,
+      q_lora_rank=q_lora_rank)
     model = Transformer(config, devices=devices)
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
