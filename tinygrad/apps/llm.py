@@ -144,6 +144,9 @@ class TransformerConfig:
   leading_dense_blocks: int = 0
   dense_hidden_dim: int = 0
   routed_scaling_factor: float = 1.0
+  qkv_bias: bool = False
+  expert_bias: bool = False
+  q_lora_rank: int = 0
 
 class FFNBlock:
   def __init__(self, config:TransformerConfig):
@@ -156,7 +159,7 @@ class FFNBlock:
     # --- feed-forward (MoE or dense) -------------------------------------
     if config.num_experts > 0:
       self.ffn_gate_inp = nn.Linear(config.dim, config.num_experts, bias=False)  # router
-      if config.kv_lora_rank > 0: self.exp_probs_b = {"bias": Tensor.zeros(config.num_experts)}
+      if config.expert_bias: self.exp_probs_b = {"bias": Tensor.zeros(config.num_experts)}
       self.ffn_gate_exps = ExpertWeights(config.num_experts, config.dim, config.hidden_dim)
       self.ffn_up_exps = ExpertWeights(config.num_experts, config.dim, config.hidden_dim)
       self.ffn_down_exps = ExpertWeights(config.num_experts, config.hidden_dim, config.dim)
@@ -217,9 +220,9 @@ class TransformerBlock(FFNBlock):
     # --- attention projections (all linear, bias-free) ------------------
     q_proj_out       = config.head_dim * config.n_heads * (2 if config.attn_output_gate else 1)
     kv_proj_out      = config.head_dim * config.n_kv_heads
-    self.attn_q      = nn.Linear(config.dim, q_proj_out,  bias=False)
-    self.attn_k      = nn.Linear(config.dim, kv_proj_out, bias=False)
-    self.attn_v      = nn.Linear(config.dim, kv_proj_out, bias=False)
+    self.attn_q      = nn.Linear(config.dim, q_proj_out,  bias=config.qkv_bias)
+    self.attn_k      = nn.Linear(config.dim, kv_proj_out, bias=config.qkv_bias)
+    self.attn_v      = nn.Linear(config.dim, kv_proj_out, bias=config.qkv_bias)
     self.attn_output = nn.Linear(config.head_dim * config.n_heads, config.dim, bias=False)
     if config.qk_norm: self.attn_q_norm, self.attn_k_norm = nn.RMSNorm(config.qk_norm, config.norm_eps), nn.RMSNorm(config.qk_norm, config.norm_eps)
 
@@ -259,7 +262,7 @@ class TransformerBlock(FFNBlock):
     if not hasattr(self, "cache_kv"):
       # TODO: how is the dtype of this determined?
       self.cache_kv = Tensor.empty(2, x.shape[0], self.config.n_kv_heads, self.config.max_context, self.config.head_dim, device=x.device)
-      self.freqs_cis = precompute_freqs_cis(self.config.rope_dim, self.config.max_context, self.config.rope_theta)
+      self.freqs_cis = precompute_freqs_cis(self.config.rope_dim, self.config.max_context, self.config.rope_theta).to(x.device)
 
 class MLATransformerBlock(FFNBlock):
   def __init__(self, config:TransformerConfig):
@@ -307,7 +310,7 @@ class MLATransformerBlock(FFNBlock):
     if not hasattr(self, "cache_k"):
       self.cache_k = Tensor.empty(x.shape[0], 1, self.config.max_context, self.config.kv_lora_rank + self.config.rope_dim, device=x.device)
       self.cache_v = Tensor.empty(x.shape[0], 1, self.config.max_context, self.config.kv_lora_rank, device=x.device)
-      self.freqs_cis = precompute_freqs_cis(self.config.rope_dim, self.config.max_context, self.config.rope_theta)
+      self.freqs_cis = precompute_freqs_cis(self.config.rope_dim, self.config.max_context, self.config.rope_theta).to(x.device)
 
 class GatedDeltaNetBlock(FFNBlock):
   def __init__(self, config:TransformerConfig, ssm:SSMConfig):
@@ -367,25 +370,33 @@ class GatedDeltaNetBlock(FFNBlock):
       self.recurrent_state = Tensor.zeros(x.shape[0], self.num_v_heads, self.head_v_dim, self.head_v_dim, device=x.device).clone()
 
 class Transformer:
-  def __init__(self, config:TransformerConfig):
+  def __init__(self, config:TransformerConfig, devices:tuple[str,...]|None=None):
     dense_config = replace(config, num_experts=0, num_experts_per_tok=0, shared_expert_dim=0, hidden_dim=config.dense_hidden_dim or config.hidden_dim)
     if config.ssm: config = replace(config, qk_norm=config.head_dim)
     block_cls = MLATransformerBlock if config.kv_lora_rank > 0 else TransformerBlock
-    self.blk:list[FFNBlock] = [GatedDeltaNetBlock(config, config.ssm) if config.ssm and (i+1) % config.full_attention_interval != 0 else
-                               block_cls(dense_config if i < config.leading_dense_blocks else config) for i in range(config.num_blocks)]
+    def _mk(i):
+      c = dense_config if i < config.leading_dense_blocks else config
+      blk = GatedDeltaNetBlock(c, c.ssm) if c.ssm and (i+1) % c.full_attention_interval != 0 else block_cls(c)
+      if devices:
+        for v in nn.state.get_parameters(blk): v.to_(devices[i % len(devices)])
+      return blk
+    self.blk:list[FFNBlock] = [_mk(i) for i in range(config.num_blocks)]
     self.token_embd  = nn.Embedding(config.vocab_size, config.dim)
     self.output_norm = nn.RMSNorm(config.dim, config.norm_eps)
     self.output = nn.Linear(config.dim, config.vocab_size, bias=False)
     self.max_context = config.max_context
     self.has_recurrent_block = any(isinstance(b, GatedDeltaNetBlock) for b in self.blk)
     self._cached_tokens: list[int] = []
+    self._blk_devs = [b.attn_norm.weight.device for b in self.blk]
+    self._head_dev = self.output_norm.weight.device
     # we specialize the JIT for prefill and rollout
     self.prefill_jit = TinyJit(self.forward)
     self.rollout_jit = TinyJit(self.forward)
 
   def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
     x = self.token_embd(tokens).float()                   # (B, T, D)
-    for block in self.blk: x = block(x, start_pos)
+    for i, block in enumerate(self.blk): x = block(x.to(self._blk_devs[i]), start_pos)
+    x = x.to(self._head_dev)
     logits = self.output(self.output_norm(x))[:, -1, :]
     # Gumbel-max trick: argmax(logits/temp - log(-log(uniform))) is equivalent to sampling from softmax(logits/temp)
     return (logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1, keepdim=True)
@@ -394,9 +405,23 @@ class Transformer:
     return (self.prefill_jit if resolve(tokens.shape[1] != 1) else self.rollout_jit)(tokens.contiguous(), start_pos, temperature)
 
   @staticmethod
-  def from_gguf(gguf:Tensor, max_context:int|None=None, realize=bool(getenv("REALIZE", 0))) -> tuple[Transformer, dict]:
-    # TODO: remove the need for copy to default device
-    kv, state_dict = nn.state.gguf_load(gguf.to(None).realize())
+  def from_gguf(gguf:Tensor, max_context:int|None=None, realize=bool(getenv("REALIZE", 0)),
+                shard:int=1) -> tuple[Transformer, dict]:
+    # header pass on disk tensor to determine arch and per-tensor routing
+    kv, _ = nn.state.gguf_load(gguf)
+    arch = kv['general.architecture']
+    num_blocks = kv[f'{arch}.block_count'] - kv.get(f'{arch}.nextn_predict_layers', 0)
+
+    from tinygrad.device import Device
+    devices = tuple(f"{Device.DEFAULT.split(':')[0]}:{i}" for i in range(shard)) if shard > 1 else None
+    def dev_fn(name:str) -> str:
+      if devices and name.startswith('blk.'):
+        i = int(name.split('.')[1])
+        if i < num_blocks: return devices[i % len(devices)]
+      return devices[0] if devices else Device.DEFAULT
+
+    # load state_dict (gguf_load auto-discovers multi-part siblings from disk path)
+    _, state_dict = nn.state.gguf_load(gguf, device_fn=dev_fn)
 
     # all state items should be float16, not float32
     state_dict = {k:v.cast('float16') if getenv("HALF", 1) else v for k,v in state_dict.items()}
@@ -404,14 +429,18 @@ class Transformer:
     # some models like Llama 3.2 don't have an output.weight, they just tie to the token_embd.weight
     if 'output.weight' not in state_dict: state_dict['output.weight'] = state_dict['token_embd.weight']
 
-    arch = kv['general.architecture']
     max_context = min(max_context, kv[f'{arch}.context_length']) if max_context is not None else kv[f'{arch}.context_length']
     n_heads, n_kv_heads = kv[f'{arch}.attention.head_count'], kv[f'{arch}.attention.head_count_kv']
 
     ssm = None
     if arch in ('qwen35', 'qwen35moe'):
       ssm = SSMConfig(**{k: kv[f'{arch}.ssm.{k}'] for k in ('conv_kernel','state_size','group_count','time_step_rank','inner_size')})
+    if arch in ('qwen35', 'qwen35moe', 'glm4moe'):
       state_dict = {k.replace('post_attention_norm', 'ffn_norm'):v for k,v in state_dict.items()}
+    if num_blocks != kv[f'{arch}.block_count']:
+      state_dict = {k:v for k,v in state_dict.items() if not (k.startswith('blk.') and int(k.split('.')[1]) >= num_blocks)}
+    if arch == 'glm-dsa':  # DSA indexer tensors are loaded but unused (llama.cpp does the same)
+      state_dict = {k:v for k,v in state_dict.items() if '.indexer.' not in k}
 
     kv_lora_rank = kv.get(f'{arch}.attention.kv_lora_rank', 0)
     head_dim = kv.get(f'{arch}.attention.key_length_mla', kv.get(f'{arch}.attention.key_length', kv[f'{arch}.embedding_length'] // n_heads))
@@ -429,7 +458,7 @@ class Transformer:
       elif kv_lora_rank and 'attn_kv_a_mqa.weight' in name:
         state_dict[name] = state_dict[name][:kv_lora_rank].cat(state_dict[name][kv_lora_rank:].rearrange("(h two) d -> (two h) d", two=2), dim=0)
     config = TransformerConfig(
-      num_blocks=kv[f'{arch}.block_count'], dim=kv[f'{arch}.embedding_length'],
+      num_blocks=num_blocks, dim=kv[f'{arch}.embedding_length'],
       hidden_dim=kv.get(f'{arch}.expert_feed_forward_length', kv.get(f'{arch}.feed_forward_length', 0)),
       n_heads=n_heads, n_kv_heads=n_kv_heads, norm_eps=kv[f'{arch}.attention.layer_norm_rms_epsilon'],
       vocab_size=len(kv['tokenizer.ggml.tokens']),
@@ -449,8 +478,10 @@ class Transformer:
       shared_expert_gate=f"blk.{kv.get(f'{arch}.leading_dense_block_count', 0)}.ffn_gate_inp_shexp.weight" in state_dict,
       dense_hidden_dim=kv.get(f'{arch}.feed_forward_length', 0) if kv.get(f'{arch}.leading_dense_block_count', 0) else 0,
       routed_scaling_factor=kv.get(f'{arch}.expert_weights_scale', 1.0), attn_output_gate=arch in ('qwen35', 'qwen35moe'), ssm=ssm,
-      full_attention_interval=kv.get(f'{arch}.full_attention_interval', 0))
-    model = Transformer(config)
+      full_attention_interval=kv.get(f'{arch}.full_attention_interval', 0),
+      qkv_bias='blk.0.attn_q.bias' in state_dict,
+      expert_bias=f"blk.{kv.get(f'{arch}.leading_dense_block_count', 0)}.exp_probs_b.bias" in state_dict)
+    model = Transformer(config, devices=devices)
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:
@@ -618,11 +649,12 @@ if __name__ == "__main__":
   parser.add_argument("--serve", nargs='?', type=int, const=8000, metavar="PORT", help="Run OpenAI compatible API (optional port, default 8000)")
   parser.add_argument("--warmup", action="store_true", help="warmup the JIT")
   parser.add_argument("--benchmark", nargs='?', type=int, const=20, metavar="COUNT", help="Benchmark tok/s (optional count, default 20)")
+  parser.add_argument("--shard", type=int, default=1, help="Shard model across N devices (layer-wise)")
   args = parser.parse_args()
 
   # load the model
   raw_model = Tensor.from_url(models.get(args.model, args.model))
-  model, kv = Transformer.from_gguf(raw_model, args.max_context)
+  model, kv = Transformer.from_gguf(raw_model, args.max_context, shard=args.shard)
   model_name = kv.get('general.name') or kv.get('general.basename') or args.model
   print(f"using model \"{model_name}\" with {raw_model.nbytes():,} bytes and {sum(x.numel() for x in nn.state.get_parameters(model)):,} params")
   del raw_model
