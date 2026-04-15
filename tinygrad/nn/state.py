@@ -3,7 +3,7 @@ from collections import OrderedDict
 from typing import Any, Callable, BinaryIO, Iterable, cast
 from tinygrad.tensor import Tensor
 from tinygrad.dtype import dtypes
-from tinygrad.helpers import prod, argsort, DEBUG, Timing, CI, GlobalCounters, tqdm, round_up, T, strides_for_shape
+from tinygrad.helpers import prod, argsort, DEBUG, Timing, CI, GlobalCounters, tqdm, round_up, strides_for_shape
 
 class TensorIO(io.RawIOBase, BinaryIO):
   def __init__(self, t: Tensor):
@@ -34,9 +34,9 @@ safe_dtypes = {"BOOL":dtypes.bool, "I8":dtypes.int8, "U8":dtypes.uint8, "I16":dt
                "I64":dtypes.int64, "U64":dtypes.uint64, "F16":dtypes.float16, "BF16":dtypes.bfloat16, "F32":dtypes.float32, "F64":dtypes.float64}
 inverse_safe_dtypes = {v:k for k,v in safe_dtypes.items()}
 
-def accept_filename(func: Callable[[Tensor], T]) -> Callable[[Tensor|str|pathlib.Path], T]:
+def accept_filename(func):
   @functools.wraps(func)
-  def wrapper(fn: Tensor|str|pathlib.Path) -> T: return func(Tensor(pathlib.Path(fn)) if not isinstance(fn, Tensor) else fn)
+  def wrapper(fn, *args, **kwargs): return func(Tensor(pathlib.Path(fn)) if not isinstance(fn, Tensor) else fn, *args, **kwargs)
   return wrapper
 
 @accept_filename
@@ -293,6 +293,13 @@ def torch_load(t:Tensor) -> dict[str, Tensor]:
     fobj.seek(rwd)
     return TorchPickle(fobj).load()
 
+_GGML_NATIVE_ITEMSIZE = {0:4, 1:2, 16:1, 17:2, 18:4, 30:2}
+_GGML_QUANT_BLOCK = {2:(32,18), 3:(32,20), 6:(32,22), 7:(32,24), 8:(32,34), 12:(256,144), 13:(256,176), 14:(256,210), 39:(32,17), 41:(128,18)}
+def ggml_nbytes(ggml_type:int, n:int) -> int:
+  if (itemsize := _GGML_NATIVE_ITEMSIZE.get(ggml_type)) is not None: return n * itemsize
+  ne, nb = _GGML_QUANT_BLOCK[ggml_type]
+  return (n // ne) * nb
+
 def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
   """
   Converts ggml tensor data to a tinygrad tensor.
@@ -368,7 +375,7 @@ def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
   raise ValueError(f"GGML type '{ggml_type}' is not supported!")
 
 @accept_filename
-def gguf_load(tensor: Tensor) -> tuple[dict, dict[str, Tensor]]:
+def gguf_load(tensor: Tensor, device_fn:Callable[[str], str]|None=None) -> tuple[dict, dict[str, Tensor]]:
   """
   Loads a .gguf file, returning the `kv_data` and `state_dict`.
 
@@ -377,7 +384,8 @@ def gguf_load(tensor: Tensor) -> tuple[dict, dict[str, Tensor]]:
   kv_data, state_dict = nn.state.gguf_load(gguf_tensor)
   ```
 
-  NOTE: The provided tensor must be on a device that supports execution.
+  NOTE: The provided tensor must be on a device that supports execution, unless `device_fn` is given — then each tensor's raw bytes
+  are copied and realized on `device_fn(name)` before dequantization, so the source tensor may stay on DISK.
   """
   reader, kv_data, state_dict = io.BufferedReader(TensorIO(tensor), 1_000_000), {}, {}
   def read_unpack(fmt: str, n: int): return struct.unpack(fmt, reader.read(n))[0]
@@ -400,6 +408,10 @@ def gguf_load(tensor: Tensor) -> tuple[dict, dict[str, Tensor]]:
   alignment, pos = kv_data.get("general.alignment", 32), reader.tell()
   data_start = round_up(pos, alignment)
 
-  for name, dims, typ, off in t_infos: state_dict[name] = ggml_data_to_tensor(tensor[data_start + off:], prod(dims), typ).reshape(*reversed(dims))
+  for name, dims, typ, off in t_infos:
+    n = prod(dims)
+    raw = tensor[data_start + off : data_start + off + ggml_nbytes(typ, n)]
+    if device_fn is not None: raw = raw.to(device_fn(name)).realize()
+    state_dict[name] = ggml_data_to_tensor(raw, n, typ).reshape(*reversed(dims))
 
   return kv_data, state_dict
