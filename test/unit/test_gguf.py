@@ -1,6 +1,6 @@
-import os, struct, unittest
+import os, struct, tempfile, unittest
 from tinygrad import dtypes, Tensor, fetch, Device
-from tinygrad.nn.state import ggml_data_to_tensor, gguf_load
+from tinygrad.nn.state import ggml_data_to_tensor, gguf_load, ggml_nbytes
 from tinygrad.device import is_dtype_supported
 import numpy as np
 from gguf import GGUFReader, GGUFValueType, GGMLQuantizationType, GGML_QUANT_SIZES, dequantize, quantize
@@ -176,6 +176,66 @@ class TestGGUFGEMV(unittest.TestCase):
   def test_gguf_gemv_mxfp4(self): self._test_gguf_gemv(GGMLQuantizationType.MXFP4)
   @unittest.skipUnless(is_dtype_supported(dtypes.bfloat16), "Backend must support bfloat16")
   def test_gguf_gemv_bf16(self): self._test_gguf_gemv(GGMLQuantizationType.BF16)
+
+def _make_gguf(tensors:dict[str, np.ndarray], kv:dict|None=None) -> bytes:
+  """Build a minimal GGUF v3 file in memory with f32 tensors."""
+  buf, kv, data_parts, offset = bytearray(), kv or {}, [], 0
+  buf += struct.pack("<4siqq", b"GGUF", 3, len(tensors), len(kv))
+  for k, v in kv.items():
+    buf += struct.pack("<Q", len(k)) + k.encode()
+    buf += (struct.pack("<iI", 4, v) if isinstance(v, int) else struct.pack("<iQ", 8, len(v)) + v.encode())
+  for name, arr in tensors.items():
+    buf += struct.pack("<Q", len(name)) + name.encode() + struct.pack("<I", arr.ndim)
+    for d in reversed(arr.shape): buf += struct.pack("<Q", d)
+    buf += struct.pack("<iQ", 0, offset)
+    data_parts.append(arr.astype(np.float32).tobytes())
+    offset += len(data_parts[-1])
+  buf += b"\x00" * ((32 - len(buf) % 32) % 32)
+  for d in data_parts: buf += d
+  return bytes(buf)
+
+class TestGGMLNbytes(unittest.TestCase):
+  def test_native_types(self):
+    self.assertEqual(ggml_nbytes(0, 1024), 1024 * 4)   # float32
+    self.assertEqual(ggml_nbytes(1, 1024), 1024 * 2)   # float16
+    self.assertEqual(ggml_nbytes(16, 256), 256)         # int8
+  def test_quant_types(self):
+    for qtype in [GGMLQuantizationType.Q4_0, GGMLQuantizationType.Q4_1, GGMLQuantizationType.Q8_0,
+                  GGMLQuantizationType.Q4_K, GGMLQuantizationType.Q5_K, GGMLQuantizationType.Q6_K]:
+      block_size, type_size = GGML_QUANT_SIZES[qtype]
+      n = block_size * 8
+      self.assertEqual(ggml_nbytes(qtype.value, n), type_size * 8, msg=f"failed for {qtype.name}")
+
+class TestGGUFMultiPart(unittest.TestCase):
+  def test_multipart_auto_discovery(self):
+    a, b = np.array([[1, 2, 3], [4, 5, 6]], dtype=np.float32), np.array([[7, 8], [9, 10], [11, 12]], dtype=np.float32)
+    part1 = _make_gguf({"tensor_a": a}, kv={"split.count": 2, "split.no": 0, "split.tensors.count": 2, "general.architecture": "test"})
+    part2 = _make_gguf({"tensor_b": b}, kv={"split.count": 2, "split.no": 1, "split.tensors.count": 2})
+    with tempfile.TemporaryDirectory() as td:
+      for i, data in enumerate([part1, part2], 1):
+        with open(os.path.join(td, f"model-{i:05d}-of-00002.gguf"), "wb") as f: f.write(data)
+      kv, sd = gguf_load(os.path.join(td, "model-00001-of-00002.gguf"), device_fn=lambda _: Device.DEFAULT)
+      self.assertEqual(set(sd.keys()), {"tensor_a", "tensor_b"})
+      np.testing.assert_equal(sd["tensor_a"].numpy(), a)
+      np.testing.assert_equal(sd["tensor_b"].numpy(), b)
+      self.assertEqual(kv["general.architecture"], "test")
+
+  def test_single_file_no_split(self):
+    data = _make_gguf({"w": np.array([1, 2, 3], dtype=np.float32)})
+    with tempfile.TemporaryDirectory() as td:
+      p = os.path.join(td, "model.gguf")
+      with open(p, "wb") as f: f.write(data)
+      _, sd = gguf_load(p, device_fn=lambda _: Device.DEFAULT)
+      np.testing.assert_equal(sd["w"].numpy(), [1, 2, 3])
+
+  def test_device_fn(self):
+    data = _make_gguf({"a": np.array([1, 2], dtype=np.float32), "b": np.array([3, 4], dtype=np.float32)})
+    with tempfile.TemporaryDirectory() as td:
+      p = os.path.join(td, "model.gguf")
+      with open(p, "wb") as f: f.write(data)
+      _, sd = gguf_load(p, device_fn=lambda _: Device.DEFAULT)
+      np.testing.assert_equal(sd["a"].numpy(), [1, 2])
+      np.testing.assert_equal(sd["b"].numpy(), [3, 4])
 
 if __name__ == '__main__':
   unittest.main()

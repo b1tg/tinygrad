@@ -1,4 +1,4 @@
-import json, pathlib, zipfile, pickle, tarfile, struct, functools, io, zlib
+import json, pathlib, zipfile, pickle, tarfile, struct, functools, io, zlib, re
 from collections import OrderedDict
 from typing import Any, Callable, BinaryIO, Iterable, cast
 from tinygrad.tensor import Tensor
@@ -293,12 +293,8 @@ def torch_load(t:Tensor) -> dict[str, Tensor]:
     fobj.seek(rwd)
     return TorchPickle(fobj).load()
 
-_GGML_NATIVE_ITEMSIZE = {0:4, 1:2, 16:1, 17:2, 18:4, 30:2}
+_GGML_NATIVE_DTYPES = {0: dtypes.float32, 1: dtypes.float16, 16: dtypes.int8, 17: dtypes.int16, 18: dtypes.int32, 30: dtypes.bfloat16}
 _GGML_QUANT_BLOCK = {2:(32,18), 3:(32,20), 6:(32,22), 7:(32,24), 8:(32,34), 12:(256,144), 13:(256,176), 14:(256,210), 39:(32,17), 41:(128,18)}
-def ggml_nbytes(ggml_type:int, n:int) -> int:
-  if (itemsize := _GGML_NATIVE_ITEMSIZE.get(ggml_type)) is not None: return n * itemsize
-  ne, nb = _GGML_QUANT_BLOCK[ggml_type]
-  return (n // ne) * nb
 
 def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
   """
@@ -313,10 +309,7 @@ def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
   # https://github.com/ggerganov/ggml/blob/323951f1bdcdfbd5b5ff3a9a7c3770e63b1a560e/include/ggml.h#L356
 
   # native types
-  if (dtype := {
-    0: dtypes.float32, 1: dtypes.float16, 16: dtypes.int8,
-    17: dtypes.int16, 18: dtypes.int32, 30: dtypes.bfloat16,
-  }.get(ggml_type)) is not None:
+  if (dtype := _GGML_NATIVE_DTYPES.get(ggml_type)) is not None:
     return t[:dtype.itemsize * n].contiguous().bitcast(dtype)
 
   def q_to_uint8(t: Tensor, b: int) -> Tensor:
@@ -324,12 +317,8 @@ def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
     shift_tensor, bitmask = Tensor.stack(*[ Tensor(2**(i*b), device=t.device, dtype=t.dtype) for i in range(8//b) ]), 0xff >> (8 - b)
     return t.unsqueeze(-1).expand((*t.shape,8//b)).idiv(shift_tensor).bitwise_and(bitmask).transpose(-1, -2).flatten(-2)
 
-  # map to (number of elements, number of bytes)
-  if (nelements_nbytes := {
-    2:(32,18), 3:(32,20), 6:(32,22), 7:(32,24), 8:(32,34),
-    12:(256,144), 13:(256,176), 14:(256,210), 39:(32,17),
-    41:(128,18)
-  }.get(ggml_type)) is not None:
+  # quantized types
+  if (nelements_nbytes := _GGML_QUANT_BLOCK.get(ggml_type)) is not None:
     blocks = t[:(n//nelements_nbytes[0])*nelements_nbytes[1]].reshape((-1, nelements_nbytes[1])).contiguous()
     if ggml_type == 2: return (q_to_uint8(blocks[:,2:], 4).bitcast(dtypes.int8) - 8) * blocks[:,:2].bitcast(dtypes.float16).cast(dtypes.float32)
     if ggml_type == 3:
@@ -378,40 +367,55 @@ def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
 def gguf_load(tensor: Tensor, device_fn:Callable[[str], str]|None=None) -> tuple[dict, dict[str, Tensor]]:
   """
   Loads a .gguf file, returning the `kv_data` and `state_dict`.
+  Multi-part GGUFs (split.count > 1) are auto-discovered when the source is a disk-backed tensor.
 
   ```python
   gguf_tensor = Tensor(pathlib.Path("Meta-Llama-3-8B-Instruct.Q4_0.gguf")).to(Device.DEFAULT)
   kv_data, state_dict = nn.state.gguf_load(gguf_tensor)
   ```
 
-  NOTE: The provided tensor must be on a device that supports execution, unless `device_fn` is given — then each tensor's raw bytes
-  are copied and realized on `device_fn(name)` before dequantization, so the source tensor may stay on DISK.
+  NOTE: The provided tensor must be on a device that supports execution, or `device_fn` must be given to route
+  each tensor's raw bytes to a target device before dequantization.
   """
-  reader, kv_data, state_dict = io.BufferedReader(TensorIO(tensor), 1_000_000), {}, {}
-  def read_unpack(fmt: str, n: int): return struct.unpack(fmt, reader.read(n))[0]
-  def read_str(): return str(reader.read(read_uint64()), "utf-8")
-  def read_arr():
-    reader, n = readers[read_int32()], read_uint64()
-    return [ reader() for _ in range(n) ]
+  def _load_file(tensor: Tensor) -> tuple[dict, dict[str, Tensor]]:
+    reader, kv_data, state_dict = io.BufferedReader(TensorIO(tensor), 1_000_000), {}, {}
+    def read_unpack(fmt: str, n: int): return struct.unpack(fmt, reader.read(n))[0]
+    def read_str(): return str(reader.read(read_uint64()), "utf-8")
+    def read_arr():
+      reader, n = readers[read_int32()], read_uint64()
+      return [ reader() for _ in range(n) ]
 
-  readers: dict[int, Callable[[], Any]] = { 8: read_str, 9: read_arr, **{ t: functools.partial(read_unpack, "<"+f, nb) for t,f,nb in \
-    [ (0,"c",1), (1,"b",1), (2,"H",2), (3,"h",2), (4,"I",4), (5,"i",4), (6,"f",4), (7,"?",1), (10,"Q",8), (11,"q",8), (12,"d",8) ] } }
-  read_uint32, read_int32, read_uint64, read_int64 = readers[4], readers[5], readers[10], readers[11]
+    readers: dict[int, Callable[[], Any]] = { 8: read_str, 9: read_arr, **{ t: functools.partial(read_unpack, "<"+f, nb) for t,f,nb in \
+      [ (0,"c",1), (1,"b",1), (2,"H",2), (3,"h",2), (4,"I",4), (5,"i",4), (6,"f",4), (7,"?",1), (10,"Q",8), (11,"q",8), (12,"d",8) ] } }
+    read_uint32, read_int32, read_uint64, read_int64 = readers[4], readers[5], readers[10], readers[11]
 
-  magic, version, n_tensors, n_kv = reader.read(4), read_int32(), read_int64(), read_int64()
-  if magic != b"GGUF" or version not in [2, 3]: raise ValueError("Invalid GGUF format!")
-  for _ in range(n_kv):
-    k, typ = read_str(), read_int32()
-    kv_data[k] = readers[typ]()
+    magic, version, n_tensors, n_kv = reader.read(4), read_int32(), read_int64(), read_int64()
+    if magic != b"GGUF" or version not in [2, 3]: raise ValueError("Invalid GGUF format!")
+    for _ in range(n_kv):
+      k, typ = read_str(), read_int32()
+      kv_data[k] = readers[typ]()
 
-  t_infos = [ (read_str(), tuple(read_uint64() for _ in range(read_uint32())), read_int32(), read_uint64()) for _ in range(n_tensors) ]
-  alignment, pos = kv_data.get("general.alignment", 32), reader.tell()
-  data_start = round_up(pos, alignment)
+    t_infos = [ (read_str(), tuple(read_uint64() for _ in range(read_uint32())), read_int32(), read_uint64()) for _ in range(n_tensors) ]
+    alignment, pos = kv_data.get("general.alignment", 32), reader.tell()
+    data_start = round_up(pos, alignment)
 
-  for name, dims, typ, off in t_infos:
-    n = prod(dims)
-    raw = tensor[data_start + off : data_start + off + ggml_nbytes(typ, n)]
-    if device_fn is not None: raw = raw.to(device_fn(name)).realize()
-    state_dict[name] = ggml_data_to_tensor(raw, n, typ).reshape(*reversed(dims))
+    for name, dims, typ, off in t_infos:
+      n = prod(dims)
+      nbytes = n * _GGML_NATIVE_DTYPES[typ].itemsize if typ in _GGML_NATIVE_DTYPES else (n // _GGML_QUANT_BLOCK[typ][0]) * _GGML_QUANT_BLOCK[typ][1]
+      raw = tensor[data_start + off : data_start + off + nbytes]
+      if device_fn is not None: raw = raw.to(device_fn(name)).realize()
+      state_dict[name] = ggml_data_to_tensor(raw, n, typ).reshape(*reversed(dims))
 
+    return kv_data, state_dict
+
+  kv_data, state_dict = _load_file(tensor)
+  if kv_data.get('split.count', 1) > 1:
+    assert isinstance(tensor.device, str) and tensor.device.startswith("DISK:"), "multi-part GGUF requires a disk-backed tensor"
+    src = tensor.device[5:]
+    m = re.match(r"^(.*)-(\d{5})-of-(\d{5})\.gguf$", src)
+    assert m, f"cannot parse multi-part GGUF path: {src}"
+    base, total = m.group(1), int(m.group(3))
+    for i in range(2, total+1):
+      _, sd = _load_file(Tensor(pathlib.Path(f"{base}-{i:05d}-of-{total:05d}.gguf")))
+      state_dict.update(sd)
   return kv_data, state_dict

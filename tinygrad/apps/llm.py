@@ -410,42 +410,23 @@ class Transformer:
     return (self.prefill_jit if resolve(tokens.shape[1] != 1) else self.rollout_jit)(tokens.contiguous(), start_pos, temperature)
 
   @staticmethod
-  def from_gguf(path:str, max_context:int|None=None, realize=bool(getenv("REALIZE", 0)),
+  def from_gguf(gguf:Tensor, max_context:int|None=None, realize=bool(getenv("REALIZE", 0)),
                 shard:int=1) -> tuple[Transformer, dict]:
-    """Load a Transformer from a GGUF file (local path or URL). Multi-part GGUFs auto-discovered from first part."""
-    import pathlib
-    from tinygrad.helpers import fetch
-    src = fetch(path)
-
-    # read header from disk (cheap) to determine arch, block count, and multi-part layout
-    kv, _ = nn.state.gguf_load(Tensor(src))
+    # header pass on disk tensor to determine arch and per-tensor routing
+    kv, _ = nn.state.gguf_load(gguf)
     arch = kv['general.architecture']
     num_blocks = kv[f'{arch}.block_count'] - kv.get(f'{arch}.nextn_predict_layers', 0)
 
-    # discover all parts
-    parts = [src]
-    if kv.get('split.count', 1) > 1:
-      m = re.match(r"^(.*)-(\d{5})-of-(\d{5})\.gguf$", str(src))
-      assert m, f"cannot parse multi-part GGUF path: {src}"
-      base, total = m.group(1), int(m.group(3))
-      parts = [pathlib.Path(f"{base}-{i:05d}-of-{total:05d}.gguf") for i in range(1, total+1)]
+    from tinygrad.device import Device
+    devices = tuple(f"{Device.DEFAULT.split(':')[0]}:{i}" for i in range(shard)) if shard > 1 else None
+    def dev_fn(name:str) -> str:
+      if devices and name.startswith('blk.'):
+        i = int(name.split('.')[1])
+        if i < num_blocks: return devices[i % len(devices)]
+      return devices[0] if devices else Device.DEFAULT
 
-    # determine per-tensor device routing
-    devices, dev_fn = None, None
-    if shard > 1:
-      from tinygrad.device import Device
-      devices = tuple(f"{Device.DEFAULT.split(':')[0]}:{i}" for i in range(shard))
-      def dev_fn(name:str) -> str:
-        if name.startswith('blk.'):
-          i = int(name.split('.')[1])
-          if i < num_blocks: return devices[i % len(devices)]
-        return devices[0]
-
-    # load state_dict from all parts
-    state_dict: dict[str, Tensor] = {}
-    for p in parts:
-      _, sd = nn.state.gguf_load(Tensor(p) if shard > 1 else Tensor(p).to(None).realize(), device_fn=dev_fn)
-      state_dict.update(sd)
+    # load state_dict (gguf_load auto-discovers multi-part siblings from disk path)
+    _, state_dict = nn.state.gguf_load(gguf, device_fn=dev_fn)
 
     # all state items should be float16, not float32
     state_dict = {k:v.cast('float16') if getenv("HALF", 1) else v for k,v in state_dict.items()}
@@ -678,9 +659,15 @@ if __name__ == "__main__":
   args = parser.parse_args()
 
   # load the model
-  model, kv = Transformer.from_gguf(models.get(args.model, args.model), args.max_context, shard=args.shard)
+  raw_model = Tensor.from_url(models.get(args.model, args.model))
+  model, kv = Transformer.from_gguf(raw_model, args.max_context, shard=args.shard)
   model_name = kv.get('general.name') or kv.get('general.basename') or args.model
-  print(f"using model \"{model_name}\" with {sum(x.numel() for x in nn.state.get_parameters(model)):,} params")
+  print(f"using model \"{model_name}\" with {raw_model.nbytes():,} bytes and {sum(x.numel() for x in nn.state.get_parameters(model)):,} params")
+  del raw_model
+
+  # TODO: why this is required to free the RAM of the GGUF copy?
+  import gc
+  gc.collect()
 
   tok = SimpleTokenizer.from_gguf_kv(kv)
   bos_id: int|None = kv.get('tokenizer.ggml.bos_token_id') if kv.get('tokenizer.ggml.add_bos_token', True) else None
