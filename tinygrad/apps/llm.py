@@ -77,7 +77,7 @@ class SimpleTokenizer:
     if self.preset == 'glm4': return []
     if self.preset == 'tekken': return self.encode("[/INST]")
     return [eos_id]
-  def bos_prefix(self, bos_id:int|None) -> list[int]:
+  def prefix(self, bos_id:int|None) -> list[int]:
     ids = [bos_id] if bos_id is not None else []
     if self.preset == 'glm4': ids.append(self._special_tokens['<sop>'])
     return ids
@@ -619,7 +619,7 @@ class Handler(HTTPRequestHandler):
     if DEBUG >= 1: print(json.dumps(body, indent=2))
     if self.path == "/v1/chat/completions":
       # extract tokens, last assistant message is treated as prefill
-      ids: list[int] = tok.bos_prefix(bos_id)
+      ids: list[int] = tok.prefix(bos_id)
       for i, msg in enumerate(body["messages"]):
         ids += tok.role(msg["role"])
         content = msg["content"]
@@ -684,7 +684,7 @@ if __name__ == "__main__":
 
   # do benchmark
   if args.benchmark is not None:
-    gen = model.generate(toks:=(tok.bos_prefix(bos_id) or [0]))
+    gen = model.generate(toks:=(tok.prefix(bos_id) or [0]))
     for _ in range(args.benchmark):
       GlobalCounters.reset()
       with Timing(on_exit=lambda x: f", {1e9/x:6.2f} tok/s, {GlobalCounters.global_mem/x:7.2f} GB/s,"
@@ -693,7 +693,7 @@ if __name__ == "__main__":
     exit(0)
 
   # interactive chat
-  ids: list[int] = tok.bos_prefix(bos_id)
+  ids: list[int] = tok.prefix(bos_id)
   while 1:
     try:
       ids += tok.role("user") + tok.encode(input('>>> ')) + tok.end_turn(eos_id) + tok.role("assistant")
