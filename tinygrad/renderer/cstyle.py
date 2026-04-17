@@ -462,6 +462,104 @@ class CUDARenderer(CStyleLanguage):
 class NVCCRenderer(CUDARenderer):
   def __init__(self, target:Target): super().__init__(target, use_nvcc=True)
 
+_ascend_rewrite = PatternMatcher([
+  # Conditional LOAD with gate (e.g. from masked cat)
+  (UPat(Ops.LOAD, src=(UPat(Ops.INDEX, src=(UPat(Ops.PARAM, name="buf"), UPat.var("idx"), UPat.var("gate"))), UPat.var("var"))),
+   lambda ctx,buf,idx,gate,var: f"({ctx[gate]}?{ctx[buf]}_l.GetValue({ctx[idx]}):{ctx[var]})"),
+  (UPat(Ops.LOAD, src=(UPat(Ops.INDEX, src=(UPat(Ops.PARAM, name="buf"), UPat.var("idx"))),)),
+   lambda ctx,buf,idx: f"{ctx[buf]}_l.GetValue({ctx[idx]})"),
+  (UPat(Ops.STORE, src=(UPat(Ops.INDEX, src=(UPat(Ops.PARAM, name="buf"), UPat.var("idx"))), UPat.var("var"))),
+   lambda ctx,buf,idx,var: f"{ctx[buf]}_l.SetValue({ctx[idx]}, {ctx[var]});"),
+  # AIV disallows bool→float direct cast; use ternary to emit 1.0f/0.0f explicitly.
+  (UPat(Ops.CAST, dtype=dtypes.floats, src=(UPat.var("x", dtype=dtypes.bool),), name="c"),
+   lambda ctx,x,c: f"({ctx[x]}?({ctx.render_cast(c.dtype,'1.0f')}):({ctx.render_cast(c.dtype,'0.0f')}))"),
+  (UPat(Ops.CAST, dtype=dtypes.ints, src=(UPat.var("x", dtype=dtypes.bool),), name="c"),
+   lambda ctx,x,c: f"({ctx[x]}?({ctx.render_cast(c.dtype,'1')}):({ctx.render_cast(c.dtype,'0')}))"),
+]) + base_rewrite
+
+class AscendRenderer(CStyleLanguage):
+  # Ascend 910B2: AIV (vector core) per-block SPMD model. No tensor cores in v1.
+  # AIV can't directly read/write GM via scalar access — must DMA via DataCopy into UB, compute, DataCopy back.
+  # UB scalar access goes through LocalTensor::GetValue/SetValue (blessed API).
+  # Kernel name MUST end with _2147483647 (INT32_MAX = generic tiling key).
+  global_max = (65535, 65535, 65535)
+  local_max = (1,)*3
+  has_local = False
+  has_shared = False
+  shared_max = 0
+  supports_float4 = False
+
+  kernel_typedef = "extern \"C\" __global__ [aicore] void"
+  buffer_prefix = "__ubuf__ "
+  barrier = ""
+  code_for_workitem = {"g": lambda x: "GetBlockIdx()" if int(x) == 0 else "0",
+                       "i": lambda x: "GetBlockIdx()" if int(x) == 0 else "0"}
+  type_map = {dtypes.bfloat16: "bfloat16_t", dtypes.half: "half"}
+  # AIV scalar unit has sqrt/abs intrinsics but NO scalar exp/log/sin — tinygrad will decompose these via TRANSCENDENTAL.
+  code_for_op = {**{k:v for k,v in CStyleLanguage.code_for_op.items() if k not in {Ops.EXP2, Ops.LOG2, Ops.SIN}},
+    Ops.SQRT: lambda x,dtype: f"sqrt({x})",
+    Ops.RECIPROCAL: lambda x,dtype: f"(1.0f/{x})" if dtype == dtypes.float else f"(1/{x})"}
+  string_rewrite = _ascend_rewrite
+
+  def __init__(self, target:Target):
+    super().__init__(target)
+    from tinygrad.runtime.ops_ascend import AscendCompiler
+    self.compiler = AscendCompiler(target.arch or "Ascend910B2")
+
+  def render_kernel(self, function_name, kernel, bufs, uops, prefix=None):
+    used = {u.dtype for u in uops}
+    includes = ["#include \"kernel_operator.h\"", "using namespace AscendC;",
+                "#define INFINITY __builtin_bit_cast(float, (int)0x7f800000)",
+                "#define NAN __builtin_bit_cast(float, (int)0x7fc00000)"]
+    if any(dt == dtypes.half for dt in used): includes.append("#include \"asc_fp16.h\"")
+    if any(dt == dtypes.bfloat16 for dt in used): includes.append("#include \"asc_bf16.h\"")
+
+    # Build TPipe wrapper: map each __ubuf__ pointer param to a LocalTensor's phys addr.
+    # Inputs (read-only) → VECIN queue + DataCopy GM→UB.
+    # Outputs (mutable) → VECOUT queue, DataCopy UB→GM at end.
+    # Scalar (int) params passed through as-is.
+    fn_name = f"{function_name}_2147483647"
+    gm_params, scalar_params = [], []
+    for name, (dtype, mutable) in bufs:
+      if isinstance(dtype, PtrDType):
+        gm_params.append((name, dtype.base, mutable, dtype.size))
+      else:
+        scalar_params.append((name, dtype))
+    sig_parts = [f"__gm__ {self.render_dtype(dt)}* {nm}_gm" for nm, dt, _, _ in gm_params]
+    sig_parts += [f"{self.arg_int_prefix} {nm}" for nm, dt in scalar_params]
+    sig = ", ".join(sig_parts)
+
+    # TILE = tensor size padded up to multiple of 8 (32 bytes for fp32) for DataCopy alignment.
+    body = [f"{self.kernel_typedef} {fn_name}({sig}) {{"]
+    body.append("  TPipe _pipe;")
+    for nm, dt, mut, sz in gm_params:
+      tsz = max(8, ((sz + 7) // 8) * 8) if sz > 0 else 8
+      pos = "QuePosition::VECOUT" if mut else "QuePosition::VECIN"
+      body.append(f"  GlobalTensor<{self.render_dtype(dt)}> {nm}_g; {nm}_g.SetGlobalBuffer({nm}_gm, {tsz});")
+      body.append(f"  TQue<{pos}, 1> {nm}_q;")
+      body.append(f"  _pipe.InitBuffer({nm}_q, 1, {tsz}*sizeof({self.render_dtype(dt)}));")
+      body.append(f"  LocalTensor<{self.render_dtype(dt)}> {nm}_l = {nm}_q.AllocTensor<{self.render_dtype(dt)}>();")
+    for nm, dt, mut, sz in gm_params:
+      if not mut:
+        tsz = max(8, ((sz + 7) // 8) * 8) if sz > 0 else 8
+        body.append(f"  DataCopy({nm}_l, {nm}_g, {tsz});")
+        body.append(f"  {nm}_q.EnQue({nm}_l); {nm}_l = {nm}_q.DeQue<{self.render_dtype(dt)}>();")
+    # User body: LOAD/STORE are rewritten to `_l.GetValue(i)` / `_l.SetValue(i,v)` already.
+    body.extend(kernel)
+    # Flush scalar-pipe writes to UB so MTE sees them when writing back
+    body.append("  PipeBarrier<PIPE_ALL>();")
+    # DataCopy outputs back
+    for nm, dt, mut, sz in gm_params:
+      if mut:
+        tsz = max(8, ((sz + 7) // 8) * 8) if sz > 0 else 8
+        body.append(f"  {nm}_q.EnQue({nm}_l); {nm}_l = {nm}_q.DeQue<{self.render_dtype(dt)}>();")
+        body.append(f"  DataCopy({nm}_g, {nm}_l, {tsz});")
+    for nm, _, _, _ in gm_params:
+      body.append(f"  {nm}_q.FreeTensor({nm}_l);")
+    body.append("}")
+    prg = "\n".join(includes + body)
+    return prg if prefix is None else "\n".join(prefix) + "\n" + prg
+
 def fp8_index(dtype: DType): return (dtypes.fp8e4m3, dtypes.fp8e5m2).index(dtype.scalar())
 def _ocml(op): return lambda x,dtype: f"__ocml_{op}_f{ {dtypes.half:16, dtypes.double:64}.get(dtype, 32)}({x})"
 
