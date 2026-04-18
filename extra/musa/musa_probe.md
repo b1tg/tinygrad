@@ -211,3 +211,50 @@ python extra/musa/probe.py    # expects [0, 11, 22, ..., 165]
 - llama.cpp MUSA PR #8383（API 宏替换范例）：https://github.com/ggml-org/llama.cpp/pull/8383
 - torch_musa（PyTorch 扩展）：https://github.com/MooreThreads/torch_musa
 - tilelang_musa（DSL → MUSA C）：https://github.com/MooreThreads/tilelang_musa
+- MATE (MUSA AI Tensor Engine)：https://github.com/MooreThreads/mate — 开源 "CUTLASS 等价物"，只支持 mp_31
+
+## 生态路线观察（2026-04-18，4 框架实测）
+
+| 项目 | GEMM 路径 | 能提供给 tinygrad 的参考 |
+|---|---|---|
+| **torch_musa** | 100% → `mublasSgemm` / `mudnn::MatMul` | 无，薄 wrapper；example kernel 是 naive |
+| **vllm-musa** | 源码级 Musify 翻译 + torch_musa/muDNN 兜底 | 无高性能 kernel；全靠 muDNN |
+| **tilelang-musa** | DSL → MUSA C tile templates | `dequantize_gemm/` 示例只覆盖 FP4/MXFP4/W4A8/FP16xInt4，**无 Q4_K/K-quant** |
+| **MATE** | **256 个预编译 ELF blob** (`mubin/mp31/gemm/*.cpp`) | 证实 Moore Threads 自己也不做 codegen，fast path = 手写 SASS blob |
+
+**Moore Threads 自己都 100% 放弃 codegen 路线**。muDNN 内部 = MATE 在 mp_31 上暴露的那种 hand-assembled blob，只是 mp_22 版本闭源。tinygrad 在 mp_22 codegen 天花板 ~30% muDNN 是结构性的——IR 没有 muDNN 用的原语（warp shuffle、`ldmatrix` TC fragment、`cp.async`、swizzled smem）。
+
+## muDNN C++ API（`<mudnn.h>` / `<mudnn_math.h>`）
+
+核心接口：
+
+```cpp
+namespace musa::dnn;
+
+class Handle {
+  Handle(int device_id);
+  // Handle 持有 musaStream_t，可通过 SetStream() 设置
+};
+
+enum class Tensor::Type { QINT4, QINT8, INT8, INT16, INT32, INT64,
+                          UINT8, UINT16, UINT32, UINT64,
+                          HALF, BFLOAT16, FLOAT, DOUBLE, BOOL };
+
+class Tensor {
+  Status SetAddr(const void* addr);
+  Status SetType(Type t);
+  Status SetNdInfo(int ndims, const int64_t* dim);
+  // Format: NCW/NWC/NCHW/NHWC/… 对 matmul 可忽略
+};
+
+class MatMul {
+  Status SetTranspose(bool left, bool right);
+  Status SetAlpha(double); Status SetBeta(double);
+  Status Run(Handle& h, Tensor& c, const Tensor& a, const Tensor& b,
+             const MemoryMaintainer& = nullptr);
+  Status RunWithBiasAdd(Handle&, Tensor& d, const Tensor& a, const Tensor& b,
+                         const Tensor& c, const Tensor& bias, ...);
+};
+```
+
+我们写的 `extra/musa/mudnn_wrapper.cc` 把 MatMul 封成 `extern "C" int mudnn_tg_matmul(handle, a, b, c, M, N, K, dtype_code, ta, tb)`，供 `runtime/support/mudnn.py` ctypes 调用。
