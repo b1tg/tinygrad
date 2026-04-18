@@ -462,6 +462,28 @@ class CUDARenderer(CStyleLanguage):
 class NVCCRenderer(CUDARenderer):
   def __init__(self, target:Target): super().__init__(target, use_nvcc=True)
 
+def _musa_h2f(op): return lambda x,dtype: (f"((half){op}((float){x}))" if dtype==dtypes.half else
+    f"((__mt_bfloat16){op}((float){x}))" if dtype==dtypes.bfloat16 else f"{op}({x})")
+
+class MUSARenderer(CUDARenderer):
+  type_map = {dtypes.bfloat16: "__mt_bfloat16"}
+  code_for_op = {**CStyleLanguage.code_for_op,
+    Ops.TRUNC: _musa_h2f("trunc"), Ops.SIN: _musa_h2f("sin"), Ops.LOG2: _musa_h2f("log2"),
+    Ops.EXP2: _musa_h2f("exp2"), Ops.SQRT: _musa_h2f("sqrt"),
+    Ops.RECIPROCAL: lambda x,dtype: (f"((half)(1.0f/(float){x}))" if dtype==dtypes.half else
+      f"((__mt_bfloat16)(1.0f/(float){x}))" if dtype==dtypes.bfloat16 else f"(1/{x})")}
+  def __init__(self, target:Target):
+    CStyleLanguage.__init__(self, target)
+    from tinygrad.runtime.support.compiler_musa import MCCCompiler
+    self.compiler, self.tensor_cores = MCCCompiler(target.arch, cache_key="musa"), []
+  def render_kernel(self, function_name, kernel, bufs, uops, prefix=None):
+    prefix = ["template <class T, class F> __device__ __forceinline__ T tg_bitcast(F v) { union U { F f; T t; }; U u; u.f = v; return u.t; }"]
+    used_dtypes = uops_to_dtypes(uops)
+    if any(dt.scalar() == dtypes.half for dt in used_dtypes): prefix.append("#include <musa_fp16.h>")
+    if any(dt.scalar() == dtypes.bfloat16 for dt in used_dtypes): prefix.append("#include <musa_bf16.h>")
+    prefix += [self.render_vector_prefix(dt) for dt in used_dtypes if dt.count in (4,8) and dt.scalar() in {dtypes.half, dtypes.bfloat16}]
+    return CStyleLanguage.render_kernel(self, function_name, kernel, bufs, uops, prefix=prefix)
+
 def fp8_index(dtype: DType): return (dtypes.fp8e4m3, dtypes.fp8e5m2).index(dtype.scalar())
 def _ocml(op): return lambda x,dtype: f"__ocml_{op}_f{ {dtypes.half:16, dtypes.double:64}.get(dtype, 32)}({x})"
 

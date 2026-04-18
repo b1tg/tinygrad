@@ -48,6 +48,7 @@ def __getattr__(nm):
     case "avcodec": return load("avcodec", None, ["{}/libavcodec/hevc/hevc.h", "{}/libavcodec/cbs_h265.h"], srcs=ffmpeg_src)
     case "opencl": return load("opencl", "'OpenCL'", ["/usr/include/CL/cl.h"])
     case "cuda": return load("cuda", "'cuda'", ["/usr/include/cuda.h"], args=["-D__CUDA_API_VERSION_INTERNAL"], parse_macros=False)
+    case "musa": return load("musa", "'/usr/local/musa/lib/libmusa.so'", ["/tmp/1/musa_headers/musa.h"], parse_macros=False)
     case "nvrtc": return load("nvrtc", "'nvrtc'", ["/usr/include/nvrtc.h"], paths=nv_lib_path, prolog=["import sysconfig"])
     case "nvjitlink": load("nvjitlink", "'nvJitLink'", [root/"extra/nvJitLink.h"], paths=nv_lib_path, prolog=["import sysconfig"])
     case "kfd": return load("kfd", None, [root/"extra/hip_gpu_driver/kfd_ioctl.h"])
