@@ -1,7 +1,7 @@
 import os, struct, unittest, tempfile, pathlib, sys
 from tinygrad import dtypes, Tensor, fetch, Device
 from tinygrad.helpers import disable_gc
-from tinygrad.llm.gguf import _ggml_iq_grid, ggml_data_to_tensor, gguf_load, gguf_load_file
+from tinygrad.llm.gguf import _ggml_iq_grid, ggml_data_to_tensor, gguf_load
 from tinygrad.runtime.autogen import ggml_common as _ggml
 from tinygrad.device import is_dtype_supported
 import numpy as np
@@ -142,7 +142,7 @@ class TestGGUF(unittest.TestCase):
       a, b = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32), np.array([5.0, 6.0], dtype=np.float32)
       (d / "test-00001-of-00002.gguf").write_bytes(build(2, 0, [("a", (4,), 0, a.tobytes())]))
       (d / "test-00002-of-00002.gguf").write_bytes(build(2, 1, [("b", (2,), 0, b.tobytes())]))
-      kv, ts, _ = gguf_load_file(d / "test-00001-of-00002.gguf")
+      kv, ts = gguf_load(d / "test-00001-of-00002.gguf")
       self.assertEqual(kv["split.count"], 2)
       np.testing.assert_equal(ts["a"].numpy(), a)
       np.testing.assert_equal(ts["b"].numpy(), b)
@@ -150,7 +150,7 @@ class TestGGUF(unittest.TestCase):
       # missing part 2
       (d / "test-00002-of-00002.gguf").unlink()
       with self.assertRaises(FileNotFoundError):
-        gguf_load_file(d / "test-00001-of-00002.gguf")
+        gguf_load(d / "test-00001-of-00002.gguf")
 
   def _test_dequantization(self, qtype: GGMLQuantizationType):
     block_size, type_size = GGML_QUANT_SIZES[qtype]
