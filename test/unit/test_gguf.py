@@ -1,4 +1,4 @@
-import os, struct, unittest, sys
+import os, struct, unittest, sys, tempfile
 from tinygrad import dtypes, Tensor, fetch, Device
 from tinygrad.helpers import disable_gc
 from tinygrad.llm.gguf import _ggml_iq_grid, ggml_data_to_tensor, gguf_load
@@ -206,6 +206,26 @@ class TestGGUFGEMV(unittest.TestCase):
   def test_gguf_gemv_mxfp4(self): self._test_gguf_gemv(GGMLQuantizationType.MXFP4)
   @unittest.skipUnless(is_dtype_supported(dtypes.bfloat16), "Backend must support bfloat16")
   def test_gguf_gemv_bf16(self): self._test_gguf_gemv(GGMLQuantizationType.BF16)
+
+class TestGGUFDeviceFn(unittest.TestCase):
+  def test_device_fn(self):
+    a, b = np.arange(8, dtype=np.float32).reshape(2,4), (np.arange(12, dtype=np.float32)*0.5).reshape(3,4)
+    # minimal GGUF: header, 2 f32 tensors, aligned data
+    buf = bytearray(struct.pack("<4siqq", b"GGUF", 3, 2, 0))
+    for name, arr, off in [(b"a.weight", a, 0), (b"b.weight", b, a.nbytes)]:
+      buf += struct.pack("<Q", len(name)) + name + struct.pack("<I", 2)
+      for d in reversed(arr.shape): buf += struct.pack("<Q", d)
+      buf += struct.pack("<iQ", 0, off)
+    buf += b"\x00" * ((32 - len(buf) % 32) % 32) + a.tobytes() + b.tobytes()
+    seen: list[str] = []
+    def dev_fn(name: str) -> str: seen.append(name); return Device.DEFAULT
+    with tempfile.NamedTemporaryFile(suffix=".gguf") as f:
+      f.write(bytes(buf)); f.flush()
+      _, tensors = gguf_load(f.name, device_fn=dev_fn)
+    self.assertEqual(sorted(seen), ["a.weight", "b.weight"])
+    self.assertEqual(tensors["a.weight"].device, Device.DEFAULT)
+    np.testing.assert_equal(tensors["a.weight"].numpy(), a)
+    np.testing.assert_equal(tensors["b.weight"].numpy(), b)
 
 class TestGGUFGC(unittest.TestCase):
   def test_gguf_load_no_tensor_leak(self):

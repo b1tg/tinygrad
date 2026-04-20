@@ -1,10 +1,10 @@
-import functools, io, struct
+import functools, io, pathlib, struct
 from typing import Any, Callable
 
 from tinygrad.tensor import Tensor
 from tinygrad.dtype import dtypes
 from tinygrad.helpers import prod, round_up
-from tinygrad.nn.state import TensorIO, accept_filename
+from tinygrad.nn.state import TensorIO
 
 # ggml packs each iq grid entry as N bytes (N=4 for uint32 grids, N=8 for uint64 grids) in a single word. See ggml-common.h.
 @functools.lru_cache(None)
@@ -131,10 +131,10 @@ readers: dict[int, Callable[[io.BufferedIOBase], Any]] = { 8: read_str, 9: read_
     [ (0,"c",1), (1,"b",1), (2,"H",2), (3,"h",2), (4,"I",4), (5,"i",4), (6,"f",4), (7,"?",1), (10,"Q",8), (11,"q",8), (12,"d",8) ] } }
 read_uint32, read_int32, read_uint64, read_int64 = readers[4], readers[5], readers[10], readers[11]
 
-@accept_filename
-def gguf_load(tensor: Tensor) -> tuple[dict, dict[str, Tensor]]:
+def gguf_load(src: Tensor|str|pathlib.Path, device_fn: Callable[[str], str]|None = None) -> tuple[dict, dict[str, Tensor]]:
   """
   Loads a .gguf file, returning the `kv_data` and `state_dict`.
+  If `device_fn` is given, each tensor's raw bytes are routed to `device_fn(name)` before dequantization.
 
   ```python
   import pathlib
@@ -147,6 +147,7 @@ def gguf_load(tensor: Tensor) -> tuple[dict, dict[str, Tensor]]:
 
   NOTE: The provided tensor must be on a device that supports execution.
   """
+  tensor = src if isinstance(src, Tensor) else Tensor(pathlib.Path(src))
   r = io.BufferedReader(TensorIO(tensor), 1_000_000)
   magic, version, n_tensors, n_kv = r.read(4), read_int32(r), read_int64(r), read_int64(r)
   if magic != b"GGUF" or version not in [2, 3]: raise ValueError("Invalid GGUF format!")
@@ -160,5 +161,11 @@ def gguf_load(tensor: Tensor) -> tuple[dict, dict[str, Tensor]]:
   alignment, pos = kv_data.get("general.alignment", 32), r.tell()
   data_start = round_up(pos, alignment)
 
-  state_dict = {name: ggml_data_to_tensor(tensor[data_start + off:], prod(dims), typ).reshape(*reversed(dims)) for name, dims, typ, off in t_infos}
-  return kv_data, state_dict
+  if device_fn is None:
+    return kv_data, {name: ggml_data_to_tensor(tensor[data_start+off:], prod(dims), typ).reshape(*reversed(dims)) for name, dims, typ, off in t_infos}
+  # device_fn needs each tensor's exact byte range, so use the next offset as end (tensors are packed)
+  offs = sorted(off for _,_,_,off in t_infos)
+  ends = dict(zip(offs, offs[1:] + [tensor.shape[0] - data_start]))
+  return kv_data, {name: ggml_data_to_tensor(
+    tensor[data_start+off : data_start+ends[off]].to(device_fn(name)).realize(), prod(dims), typ).reshape(*reversed(dims))
+    for name, dims, typ, off in t_infos}
