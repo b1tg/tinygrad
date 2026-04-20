@@ -2,7 +2,7 @@ from __future__ import annotations
 import functools, itertools, pathlib
 from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function
-from tinygrad.llm.gguf import gguf_load, gguf_size
+from tinygrad.llm.gguf import gguf_load, gguf_load_file
 from tinygrad.uop.ops import resolve
 
 @functools.cache
@@ -321,9 +321,14 @@ class Transformer:
     return (self.prefill_jit if resolve(tokens.shape[1] != 1) else self.rollout_jit)(tokens.contiguous(), start_pos, temperature)
 
   @staticmethod
-  def from_gguf(gguf:str|pathlib.Path, max_context:int|None=None, realize=bool(getenv("REALIZE", 0))) -> tuple[Transformer, dict, int]:
-    path = pathlib.Path(gguf)
-    kv, state_dict = gguf_load(path)
+  def from_gguf(gguf:Tensor|str|pathlib.Path, max_context:int|None=None,
+                realize=bool(getenv("REALIZE", 0))) -> tuple[Transformer, dict, int]:
+    if isinstance(gguf, Tensor):
+      # TODO: remove the need for copy to default device
+      kv, state_dict = gguf_load(gguf.to(None).realize())
+      nbytes = gguf.nbytes()
+    else:
+      kv, state_dict, nbytes = gguf_load_file(gguf)
 
     # all state items should be float16, not float32
     state_dict = {k:v.cast('float16') if getenv("HALF", 1) else v for k,v in state_dict.items()}
@@ -386,7 +391,7 @@ class Transformer:
     if realize:
       for s in (params:=nn.state.get_parameters(model)): s.replace(s.contiguous())
       Tensor.realize(*params)
-    return model, kv, gguf_size(path, kv)
+    return model, kv, nbytes
 
   def get_start_pos(self, tokens:list[int]) -> int:
     prefix_len = sum(1 for _ in itertools.takewhile(lambda ab: ab[0] == ab[1], zip(tokens[:-1], self._cached_tokens)))
