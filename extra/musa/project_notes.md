@@ -4,7 +4,7 @@ description: Plan and verification gates for adding MTT S4000 (MUSA) backend to 
 type: project
 originSessionId: 6b0ec650-60aa-467e-b86a-51c5fd81ef3d
 ---
-MTT S4000 / MUSA tinygrad backend — **working as of 2026-04-18**.
+MTT S4000 / MUSA tinygrad backend — **working as of 2026-04-22**.
 
 **Why:** Remote SSH machine (connect.sha1.seetacloud.com:28017) has S4000 + MUSA SDK 3.1.0. Local only edits/rsyncs.
 
@@ -20,25 +20,27 @@ MTT S4000 / MUSA tinygrad backend — **working as of 2026-04-18**.
 - Compile cmd: `mcc -x musa -mtgpu --offload-arch=mp_22 -O2 --cuda-device-only -o out.fatbin src.mu`. fatbin loads via `muModuleLoadData` directly.
 - Out of scope (do NOT attempt): HCQ direct driver, `/dev/mtgpu` ioctl, MTLink multi-GPU, muBLAS/muDNN external calls, Musify CUDA translation.
 
-## Measured perf (2026-04-18)
-- Qwen3-0.6B-Q8_0: no BEAM 32 tok/s (22 GB/s); JITBEAM=2 48 tok/s (34 GB/s, +55%). BEAM warmup adds ~120s cold compile.
-- Qwen3.5-9B-Q4_K_M: no BEAM 0.27 tok/s (1.49 GB/s). BEAM=2 now safe (preflight converts SIGSEGV → RuntimeError) but gives 0.18 tok/s — the rejected candidates were the good ones, leaving BEAM's search space strictly worse than baseline. Hot kernel root cause: default opt picks 32 threads/block with lidx-indexed byte-stride loads, killing coalescing on Q4_K_M dequant. Per-kernel BW <3 GB/s on a ~500 GB/s card.
+## Measured perf (2026-04-22, final)
+- Qwen3-0.6B-Q8_0: no BEAM 32 tok/s (22 GB/s); JITBEAM=2 ~48 tok/s (34 GB/s, +55%). BEAM warmup ~2 min.
+- Qwen3.5-0.8B-Q8_0: 29 tok/s (28 GB/s). **Use Q8 on MUSA**.
+- Qwen3.5-0.8B-Q4_K_M: 1.58 tok/s (1.05 GB/s) — **18× slower than Q8 on same model**. Dequant codegen pathology.
+- Qwen3.5-9B-Q4_K_M: no BEAM 0.27 tok/s. BEAM=2 safe (preflight) but picks worse kernels than baseline — high-coalescing candidates are resource-rejected.
+- GEMV fp16 8192: baseline 73 GB/s (14%), BEAM=2 **169 GB/s (33%)**. muDNN reference 505 GB/s (hardware ceiling).
 
-## BEAM action space for mp_22 (codegen/opt/search.py)
-- `actions` LOCAL/GROUPTOP/GROUP amts were NVIDIA-tuned (LOCAL caps at 29 with only one `32` special case). mp_22 warp=128 wants larger blocks.
-- **Fix**: add `32/64/128/256` to `LOCAL/GROUPTOP/GROUP` amts. BEAM now picks `GROUP(0, 128)` on GEMV when available.
-- **Effect**: marginal wall-clock gain (BEAM search already hits its IR-ceiling before these help much). Kept because it's the correct direction structurally — NVIDIA-only defaults were wrong.
-- **MATVEC heuristic CAST-unwrap hack was REVERTED**: user correctly pointed out tinygrad's design philosophy is that BEAM should find optimal kernels. Heuristic is only a fallback/baseline. Putting fixes in heuristic is not the right layer.
+## BEAM action space + MUSARenderer.shared_max
+- Upstream BEAM `actions` LOCAL/GROUPTOP/GROUP amts are NVIDIA-tuned (LOCAL caps at 29 + special case 32). mp_22 warp=128.
+- **First attempt (REVERTED)**: added `32/64/128/256/512/1024` to LOCAL, `128/256/512` to GROUPTOP, `32/64/128/256` to GROUP across 3–6 axes each (~57 new candidates). BEAM search time exploded >20× with NO wall-clock benefit — tinygrad BEAM is width-2 greedy and each candidate costs 500 ms of mcc compile.
+- **Final kept**: ONE targeted `Opt(LOCAL, axis=0, arg=128)` for the canonical mp_22 block. Plus `MUSARenderer.shared_max = 73728` (72 KB, S4000 spec from Moore Threads programming guide ch09; default 48 KB from CUDARenderer is wrong for S4000).
+- **Effect**: BEAM=2 on 8192 fp16 GEMV: 73 → 169 GB/s (2.3×). Search stays ~1 min/shape.
+- **Lesson**: tinygrad BEAM is already near-optimal within its IR's expressible space. Adding more action candidates just slows search without unlocking qualitatively new kernels. The 30% muDNN ceiling is an IR limitation (missing warp shuffle / TC fragment / cp.async UOps), not action-space coverage.
+- **MATVEC heuristic CAST-unwrap hack was REVERTED**: tinygrad's philosophy is BEAM should find the optimal kernel. Heuristic is only a fallback. Putting fixes at heuristic level is wrong layer.
 
-## MUDNN=1 debug fast-path (engine/realize.py + runtime/ops_musa.py + extra/musa/mudnn_wrapper.cc)
-- User request: "add a MUDNN=1 debug branch to get LLM speed up; we'll replace it with native codegen later."
-- Wrote `extra/musa/mudnn_wrapper.cc` — extern "C" shim over `musa::dnn::MatMul`. Built on first use via `runtime/support/mudnn.py::_build_wrapper`.
-- `ops_musa.py::detect_matmul(ast)` scans AST for the matmul pattern (3 PARAMs, 1 REDUCE ADD, MUL of 2 INDEX with CAST unwrap, no random-gen ops). Returns (dtype, M, N, K, a_arg, b_arg, out_arg) or None.
-- `ops_musa.py::MUDNNMatmulRunner` — implements Runner interface, direct muDNN call.
-- `engine/realize.py::get_runner` — when `MUDNN=1` env var and device starts with "MUSA", checks detect_matmul; if matches, returns MUDNNMatmulRunner instead of CompiledRunner.
-- **Verified effect** (wall-clock bench): fp16 8192 GEMV 127→215 GB/s (+69%), fp16 8192 GEMM 5→15.3 TFLOPS (3x), warmup 30s→7.8s (4x).
-- **Does not help GGUF Q8/Q4 LLM decode**: dequant fused into matmul AST has 4 PARAMs (int8_weight + scale + input + out) and CAST/MUL chains that detect_matmul rejects. Steady-state LLM decode unchanged (still 29 tok/s on Qwen3.5-0.8B-Q8).
-- **TODO for Q-format**: extend detect_matmul to recognize the dequant-matmul pattern.
+## MUDNN=1 fast-path — BUILT AND REMOVED
+- User asked for a `MUDNN=1` debug branch to get muDNN-speed matmul via external call.
+- Implemented end-to-end: `extra/musa/mudnn_wrapper.cc` (extern "C" over `musa::dnn::MatMul`), `runtime/support/mudnn.py` (ctypes), `ops_musa.py::{detect_matmul, MUDNNMatmulRunner}`, hook in `engine/realize.py::get_runner`.
+- Verified: fp16 8192 GEMV wall-clock 127→215 GB/s (+69%), GEMM 8192 5→15.3 TF (3×), first-token warmup 30 s→7.8 s (4×).
+- Did NOT help Q8/Q4 LLM decode (dequant-fused matmul is 4-PARAM AST, detector rejects).
+- **User then removed it**: violates tinygrad's no-external-lib philosophy. All files deleted. Finding preserved: hardware isn't the bottleneck (muDNN hits 65% HBM peak), tinygrad's 15-33% codegen ceiling is IR-expressiveness limited. Can rebuild this pathway in ~1 day if ever needed for reference.
 
 ## Native bfloat16 fix (2-5x on bf16 workloads)
 - `tinygrad/device.py:327` `is_dtype_supported(bfloat16, MUSA)` was falling through to default `return False`. That triggered `uop/decompositions.py`'s `pm_float_decomp` to rewrite every bf16 op into `load ushort → bitcast to uint → shift → fp32 math → cast_float_to_bf16` (the software IEEE754 round-trip `cast_float_to_bf16` function in cstyle.py:87-92).

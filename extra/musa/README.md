@@ -34,7 +34,7 @@ DEV=MUSA python extra/musa/bench_vs_torch.py
 | `tinygrad/runtime/autogen/__init__.py` | one `case "musa":` dispatch entry |
 | `tinygrad/device.py` | `is_dtype_supported(bfloat16, "MUSA")` — **correctness fix**, see Gotcha 2 |
 | `tinygrad/renderer/cstyle.py` | `MUSARenderer(CUDARenderer)` with half/bf16→fp32 math fallback |
-| `tinygrad/codegen/opt/search.py` | BEAM actions add `LOCAL/GROUP/GROUPTOP` amts `32/64/128/256` (for mp_22 warp=128) |
+| `tinygrad/codegen/opt/search.py` | BEAM actions add one targeted `LOCAL axis=0 arg=128` (canonical block size for mp_22 warp=128) |
 
 ## Measured performance
 
@@ -49,15 +49,17 @@ DEV=MUSA python extra/musa/bench_vs_torch.py
 
 ### GEMV micro-benchmark (`extra/musa/bench_vs_torch.py`, wall-clock including Python/ctypes)
 
-| Shape | dtype | muDNN (ref) | tinygrad `DEV=MUSA` |
-|---|---|---|---|
-| 4096 | fp16 | 277 GB/s | 31 GB/s (11%) |
-| 4096 | bf16 | 271 GB/s | 15 GB/s (6%) |
-| 8192 | fp16 | 505 GB/s | **77 GB/s (15%)** |
-| 8192 | bf16 | 526 GB/s | **46 GB/s (9%)** |
-| 8192 GEMM | fp16 | 78 TF | 4.8 TF (6%) |
+| Shape | dtype | muDNN (ref) | tinygrad baseline | tinygrad BEAM=2 |
+|---|---|---|---|---|
+| 4096 | fp16 | 277 GB/s | 31 GB/s (11%) | — |
+| 4096 | bf16 | 271 GB/s | 15 GB/s (6%) | — |
+| 8192 | fp16 | 505 GB/s | 73 GB/s (14%) | **169 GB/s (33%)** |
+| 8192 | bf16 | 526 GB/s | 46 GB/s (9%) | — |
+| 8192 GEMM | fp16 | 78 TF | 4.8 TF (6%) | — |
 
 muDNN reference = what torch_musa gets via direct C++ call (our `bench_vs_torch.py` `TORCH=1` path). This is the hardware ceiling.
+
+BEAM=2 warmup cost: ~1 min per unique shape (many mcc subprocess compiles, diskcache makes subsequent runs fast).
 
 ## Fixes shipped (each one independently verified)
 
@@ -71,10 +73,12 @@ muDNN reference = what torch_musa gets via direct C++ call (our `bench_vs_torch.
 - `__call__` raises `RuntimeError` if `prod(local_size)` exceeds it
 - Converts SIGSEGV-level faults into catchable exceptions that BEAM's `try/except` handles
 
-**3. Expanded BEAM action space** (`search.py`)
-- Added `LOCAL/GROUPTOP/GROUP` amts `32/64/128/256`
-- mp_22's warp is 128 (not 32 like NVIDIA), so NVIDIA-tuned caps at 29 were structurally wrong
-- BEAM now picks `GROUP(axis=0, arg=128)` when it's optimal. Marginal wall-clock gain (within noise at 8192 GEMV), but correct direction.
+**3. BEAM action: one targeted `LOCAL=128`** (`search.py`) + **MUSARenderer `shared_max=73728`** (`cstyle.py`)
+- mp_22 warp=128, S4000 has 72 KB smem/block (vs NVIDIA default 48 KB)
+- Per Moore Threads programming guide chapter 9: recommended block sizes 128/256/512/1024
+- **Tried first**: add 57 extra `LOCAL/GROUP/GROUPTOP` amts across all axes → BEAM search time exploded 20x (naive width-2 search cost grows with candidate count; each candidate = 500ms mcc compile) with no wall-clock improvement. **Reverted.**
+- **Kept**: single `Opt(OptOps.LOCAL, axis=0, arg=128)` entry + `shared_max=73728` override. fp16 8192 GEMV with BEAM=2 goes 162 → **169 GB/s** (33% of muDNN 505 GB/s). Search time stays ~1 min per shape.
+- **Lesson**: tinygrad BEAM is already near-optimal within its IR's expressible space; throwing more actions at it just slows search without unlocking qualitatively new kernels.
 
 **4. Half/bf16 math fp32 fallback** (`MUSARenderer.code_for_op`)
 - mp_22 lacks declarations for `hexp2/hsin` (gated behind `__MUSA_ARCH__ >= 800`) and lacks bodies for `htrunc` — see Gotcha 1
@@ -99,7 +103,10 @@ Getting closer to muDNN requires one of:
 
 ## Open TODOs
 
-- [ ] **BEAM quality on quantized matmul**: preflight rejects high-local candidates that exceed mp_22 per-block resources. Those were often the good ones. Needs resource-aware per-kernel estimator, not blanket block-size cap.
+- [ ] **MUSA Tensor Core integration**: S4000 has QY2 TC with `16x8x16 IMMA` shape (per MUSA programming guide ch09). Add `tc.get_musa(arch)` entry + MMA intrinsic rendering in `MUSARenderer.render_kernel`. Est +5-10× for GEMM-heavy (prefill, training); negligible for single-user decode.
+- [ ] **Warp shuffle reduce primitive**: `__shfl_down_sync` / `__shfl_xor_sync` / `__shfl_up_sync` verified to compile and link on mp_22 (libdevice.bc exports `__mt_shfl_*_sync_i32`). Replacing tinygrad's smem-based GROUP_REDUCE with shuffle reduce could save 5 `__syncthreads()` per reduction. Needs new tinygrad IR uop; affects all backends.
+- [ ] **`__ldg` read-only load hint**: detect PARAM buffers that are only read (no STORE into them) and emit `__ldg(&ptr[i])` to hit read-only L1. ~10 lines in `MUSARenderer.string_rewrite`. Est +5-10% for decode-shape GEMV.
+- [ ] **BEAM quality on quantized matmul**: preflight rejects high-local candidates that exceed mp_22 per-function max_threads. Those were often the good ones. Needs resource-aware per-kernel estimator, not blanket block-size cap.
 - [ ] **Native half intrinsics on mp_31+**: when `__MUSA_ARCH__ >= 800` (future arch), `hexp2/hsin` are declared. Gate the fp32 fallback in `MUSARenderer.code_for_op` on arch.
 - [ ] **Tensor cores**: `MUSARenderer.tensor_cores = []`. mp_22 has 128 TCs but `mma.h` template API isn't wired. Minimal GEMV win (memory-bound) but big for prefill / training.
 - [ ] **MUSAGraph re-enable**: currently disabled in `MUSADevice.__init__`. SDK 3.1.0 returns error 801 on both `muGraphExecKernelNodeSetParams` and `muGraphExecUpdate`; the full implementation is kept at `runtime/graph/musa.py` for when driver gains exec-level updates.

@@ -466,6 +466,8 @@ def _musa_h2f(op): return lambda x,dtype: (f"((half){op}((float){x}))" if dtype=
     f"((__mt_bfloat16){op}((float){x}))" if dtype==dtypes.bfloat16 else f"{op}({x})")
 
 class MUSARenderer(CUDARenderer):
+  # S4000/mp_22 hardware: 72 KB shared memory per block (vs CUDA default 48 KB). Per Moore Threads programming guide ch09.
+  shared_max = 73728
   type_map = {dtypes.bfloat16: "__mt_bfloat16"}
   code_for_op = {**CStyleLanguage.code_for_op,
     Ops.TRUNC: _musa_h2f("trunc"), Ops.SIN: _musa_h2f("sin"), Ops.LOG2: _musa_h2f("log2"),
