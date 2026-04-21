@@ -55,7 +55,8 @@ class TransformerConfig:
   rope_dim: int
   v_head_dim: int
   max_context: int = 0
-  qk_norm: int = 0
+  q_norm: int = 0
+  k_norm: int = 0
   num_experts: int = 0
   num_experts_per_tok: int = 0
   norm_topk_prob: bool = False
@@ -148,11 +149,11 @@ class TransformerBlock(FFNBlock):
     self.attn_k      = nn.Linear(config.dim, kv_proj_out, bias=config.qkv_bias)
     self.attn_v      = nn.Linear(config.dim, kv_proj_out, bias=config.qkv_bias)
     self.attn_output = nn.Linear(config.head_dim * config.n_heads, config.dim, bias=False)
-    if config.qk_norm: self.attn_q_norm, self.attn_k_norm = nn.RMSNorm(config.qk_norm, config.norm_eps), nn.RMSNorm(config.qk_norm, config.norm_eps)
+    if config.q_norm: self.attn_q_norm, self.attn_k_norm = nn.RMSNorm(config.q_norm, config.norm_eps), nn.RMSNorm(config.k_norm, config.norm_eps)
 
   def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
     q, k, v = self.attn_q(x), self.attn_k(x), self.attn_v(x)
-    if self.config.qk_norm and self.config.qk_norm != self.config.head_dim: q, k = self.attn_q_norm(q), self.attn_k_norm(k)
+    if self.config.q_norm and self.config.q_norm != self.config.head_dim: q, k = self.attn_q_norm(q), self.attn_k_norm(k)
 
     B, T, _ = x.shape
     if self.config.attn_output_gate:
@@ -161,7 +162,7 @@ class TransformerBlock(FFNBlock):
     q = q.reshape(B, T, self.config.n_heads,    self.config.head_dim).transpose(1, 2)  # (B,H,T,Hd)
     k = k.reshape(B, T, self.config.n_kv_heads, self.config.head_dim).transpose(1, 2)  # (B,KvH,T,Hd)
     v = v.reshape(B, T, self.config.n_kv_heads, self.config.head_dim).transpose(1, 2)  # (B,KvH,T,Hd)
-    if self.config.qk_norm == self.config.head_dim: q, k = self.attn_q_norm(q), self.attn_k_norm(k)
+    if self.config.q_norm == self.config.head_dim: q, k = self.attn_q_norm(q), self.attn_k_norm(k)
 
     q = apply_rope(q[..., :self.config.rope_dim], self.freqs_cis[start_pos:start_pos+T]).cat(q[..., self.config.rope_dim:], dim=-1)
     k = apply_rope(k[..., :self.config.rope_dim], self.freqs_cis[start_pos:start_pos+T]).cat(k[..., self.config.rope_dim:], dim=-1)
@@ -296,7 +297,7 @@ class GatedDeltaNetBlock(FFNBlock):
 class Transformer:
   def __init__(self, config:TransformerConfig):
     dense_config = replace(config, num_experts=0, num_experts_per_tok=0, shared_expert_dim=0, hidden_dim=config.dense_hidden_dim or config.hidden_dim)
-    if config.ssm: config = replace(config, qk_norm=config.head_dim)
+    if config.ssm: config = replace(config, q_norm=config.head_dim, k_norm=config.head_dim)
     block_cls = MLATransformerBlock if config.kv_lora_rank > 0 else TransformerBlock
     self.blk:list[FFNBlock] = [GatedDeltaNetBlock(config, config.ssm) if config.ssm and (i+1) % config.full_attention_interval != 0 else
                                block_cls(dense_config if i < config.leading_dense_blocks else config) for i in range(config.num_blocks)]
@@ -367,9 +368,10 @@ class Transformer:
       rope_dim=rope_dim,
       v_head_dim=kv.get(f'{arch}.attention.value_length_mla', kv.get(f'{arch}.attention.value_length', head_dim)),
       max_context=max_context,
-      qk_norm=int(state_dict['blk.0.attn_q_norm.weight'].shape[0]) if 'blk.0.attn_q_norm.weight' in state_dict else 0,
+      q_norm=int(state_dict['blk.0.attn_q_norm.weight'].shape[0]) if 'blk.0.attn_q_norm.weight' in state_dict else 0,
+      k_norm=int(state_dict['blk.0.attn_k_norm.weight'].shape[0]) if 'blk.0.attn_k_norm.weight' in state_dict else 0,
       num_experts=kv.get(f'{arch}.expert_count', 0), num_experts_per_tok=kv.get(f'{arch}.expert_used_count', 0),
-      norm_topk_prob=kv.get(f'{arch}.expert_weights_norm', arch in ('qwen3moe', 'qwen35moe')),
+      norm_topk_prob=kv.get(f'{arch}.expert_weights_norm', arch in ('qwen3moe', 'qwen35moe', 'minimax-m2')),
       kv_lora_rank=kv_lora_rank, q_lora_rank=kv.get(f'{arch}.attention.q_lora_rank', 0),
       leading_dense_blocks=kv.get(f'{arch}.leading_dense_block_count', 0),
       shared_expert_dim=kv.get(
