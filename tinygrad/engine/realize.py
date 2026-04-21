@@ -129,15 +129,6 @@ class EncDec(Runner):
 
 method_cache: dict[tuple[str, type, bytes, tuple, bool], CompiledRunner] = {}
 def get_runner(device:str, ast:UOp) -> CompiledRunner:
-  # MUDNN=1 debug fast-path: intercept matmul kernels and route to muDNN
-  from tinygrad.helpers import getenv as _getenv
-  if _getenv("MUDNN", 0) and device.split(":")[0] == "MUSA":
-    try:
-      from tinygrad.runtime.ops_musa import detect_matmul, MUDNNMatmulRunner
-      info = detect_matmul(ast)
-      if info is not None: return MUDNNMatmulRunner(Device[device], ast, info)
-    except Exception as e:
-      if DEBUG >= 2: print(f"MUDNN fast-path skip: {e}")
   # TODO: this should be all context relevant to rendering
   context = (NOOPT.value, DEVECTORIZE.value, EMULATED_DTYPES.value)
   ckey = (device, type(Device[device].compiler), ast.key, context, False)

@@ -346,6 +346,7 @@ def is_dtype_supported(dtype:DType, target:Target|None=None) -> bool:
       case "CUDA" | "NV": return not CI or BENCHMARKS or target.renderer == "PYTHON"
       case "CPU" if target.renderer == "LLVM": return OSX
       case "PYTHON": return sys.version_info >= (3, 12)
+      case "MUSA": return True  # mp_22+ has native __half; cl_khr_fp16-style CI gating not applicable
   if dtype == dtypes.float64:
     match target.device:
       case _ if dtypes.long in EMULATED_DTYPES.tolist(dtypes): return False # double can't be bitcast to anything without long support

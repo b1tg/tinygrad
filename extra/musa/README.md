@@ -1,6 +1,6 @@
 # MUSA backend for tinygrad (MTT S4000 / Moore Threads)
 
-Status: **working for inference**, fp16/bf16 GEMV at ~25% muDNN from pure codegen; optional `MUDNN=1` debug fast-path doubles it for simple matmul shapes.
+Status: **working for inference**, fp16/bf16 GEMV at ~15-25% muDNN from pure codegen.
 
 Implemented 2026-04-18 against MUSA SDK 3.1.0 on MTT S4000 (mp_22, driver 2.7.0).
 
@@ -9,11 +9,8 @@ Implemented 2026-04-18 against MUSA SDK 3.1.0 on MTT S4000 (mp_22, driver 2.7.0)
 # needs MUSA SDK installed + libmusa.so on LD_LIBRARY_PATH + py3.11+
 DEV=MUSA python -m tinygrad.llm -m /path/to/model.gguf
 
-# optional: bench vs torch_musa/muDNN
+# optional: bench vs torch_musa/muDNN (requires torch_musa in system python)
 DEV=MUSA python extra/musa/bench_vs_torch.py
-
-# optional debug fast-path: routes pure matmul kernels to muDNN directly
-MUDNN=1 DEV=MUSA python -m tinygrad.llm -m /path/to/fp16_model.gguf
 ```
 
 ## Files added / modified
@@ -23,13 +20,11 @@ MUDNN=1 DEV=MUSA python -m tinygrad.llm -m /path/to/fp16_model.gguf
 |---|---|
 | `tinygrad/runtime/autogen/musa.py` | clang2py ctypes binding for libmusa.so (265 driver APIs) |
 | `tinygrad/runtime/support/compiler_musa.py` | `MCCCompiler` — `mcc` subprocess + diskcache |
-| `tinygrad/runtime/ops_musa.py` | `MUSADevice / MUSAProgram / MUSAAllocator`, launch preflight, `MUDNNMatmulRunner` fast-path |
+| `tinygrad/runtime/ops_musa.py` | `MUSADevice / MUSAProgram / MUSAAllocator`, launch preflight |
 | `tinygrad/runtime/graph/musa.py` | `MUSAGraph` (currently disabled — driver doesn't support graph exec update) |
-| `tinygrad/runtime/support/mudnn.py` | ctypes binding to the muDNN C wrapper (`extra/musa/mudnn_wrapper.cc`) |
 | `extra/musa/probe.py` | self-contained ctypes probe: compile + load + launch vadd |
 | `extra/musa/vadd.mu` | probe kernel source |
 | `extra/musa/bench_vs_torch.py` | side-by-side GEMV/GEMM benchmark vs torch_musa |
-| `extra/musa/mudnn_wrapper.cc` | `extern "C"` shim exposing muDNN `MatMul` to ctypes |
 | `extra/musa/musa_probe.md` | MUSA SDK facts / API mapping / mcc flags / half-intrinsic matrix |
 | `extra/musa/project_notes.md` | chronological engineering log (fixes shipped, reasoning, reverts) |
 
@@ -40,7 +35,6 @@ MUDNN=1 DEV=MUSA python -m tinygrad.llm -m /path/to/fp16_model.gguf
 | `tinygrad/device.py` | `is_dtype_supported(bfloat16, "MUSA")` — **correctness fix**, see Gotcha 2 |
 | `tinygrad/renderer/cstyle.py` | `MUSARenderer(CUDARenderer)` with half/bf16→fp32 math fallback |
 | `tinygrad/codegen/opt/search.py` | BEAM actions add `LOCAL/GROUP/GROUPTOP` amts `32/64/128/256` (for mp_22 warp=128) |
-| `tinygrad/engine/realize.py` | `get_runner` checks `MUDNN=1` env to route matmul ASTs to `MUDNNMatmulRunner` |
 
 ## Measured performance
 
@@ -55,23 +49,22 @@ MUDNN=1 DEV=MUSA python -m tinygrad.llm -m /path/to/fp16_model.gguf
 
 ### GEMV micro-benchmark (`extra/musa/bench_vs_torch.py`, wall-clock including Python/ctypes)
 
-| Shape | dtype | muDNN GB/s | tinygrad `DEV=MUSA` | tinygrad `MUDNN=1` |
-|---|---|---|---|---|
-| 4096 | fp16 | 277 | 47 (17%) | — |
-| 4096 | bf16 | 271 | 19 (7%) | — |
-| 8192 | fp16 | 498 | **127 (25%)** | **215 (43%)** |
-| 8192 | bf16 | 514 | **62 (12%)** | — |
-| 8192 | GEMM fp16 | 78.6 TF | 5.0 TF | **15.3 TF** |
+| Shape | dtype | muDNN (ref) | tinygrad `DEV=MUSA` |
+|---|---|---|---|
+| 4096 | fp16 | 277 GB/s | 31 GB/s (11%) |
+| 4096 | bf16 | 271 GB/s | 15 GB/s (6%) |
+| 8192 | fp16 | 505 GB/s | **77 GB/s (15%)** |
+| 8192 | bf16 | 526 GB/s | **46 GB/s (9%)** |
+| 8192 GEMM | fp16 | 78 TF | 4.8 TF (6%) |
 
-muDNN standalone = what torch_musa/mudnn.so gets via direct C++ call, wall-clock same protocol. This is the hardware ceiling.
+muDNN reference = what torch_musa gets via direct C++ call (our `bench_vs_torch.py` `TORCH=1` path). This is the hardware ceiling.
 
 ## Fixes shipped (each one independently verified)
 
-**1. `is_dtype_supported(bfloat16, "MUSA")` = True** ← one-line upstream fix, **+2-5x bf16 speedup**
-- Was falling through to default `return False` in `device.py:327`
-- Triggered `uop/decompositions.py::pm_float_decomp` to rewrite every bf16 op as `uint16 + bit manipulation + IEEE754 round-trip`
-- Kernel now declares `__mt_bfloat16*` buffers with native bf16 arithmetic
-- bf16 8192 GEMV: 23 → 62 GB/s; bf16 8192 GEMM: 0.96 → 4.65 TF
+**1. `is_dtype_supported(*, "MUSA")` explicit for half + bfloat16** ← one-line upstream fix, **+2-5x bf16 speedup**
+- bf16: was falling through to default `return False` in `device.py:327`; triggered `uop/decompositions.py::pm_float_decomp` to rewrite every bf16 op as `uint16 + bit manipulation + IEEE754 round-trip`
+- Fix: add `"MUSA"` to the bf16 True case → kernel now declares `__mt_bfloat16*` buffers with native bf16 arithmetic. bf16 8192 GEMV 23 → 62 GB/s; bf16 8192 GEMM 0.96 → 4.65 TF
+- half: was implicitly True via end-of-function fall-through (no explicit case); added explicit `case "MUSA": return True` for symmetry and clarity. MUSA hardware has native `__half` on mp_22+.
 
 **2. BEAM launch preflight** ← crash-safety, BEAM=2 on 9B no longer core-dumps
 - `MUSAProgram.__init__` queries `MU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK`
@@ -83,18 +76,12 @@ muDNN standalone = what torch_musa/mudnn.so gets via direct C++ call, wall-clock
 - mp_22's warp is 128 (not 32 like NVIDIA), so NVIDIA-tuned caps at 29 were structurally wrong
 - BEAM now picks `GROUP(axis=0, arg=128)` when it's optimal. Marginal wall-clock gain (within noise at 8192 GEMV), but correct direction.
 
-**4. `MUDNN=1` debug fast-path** ← optional external call
-- Pure matmul ASTs get detected in `get_runner` and routed to muDNN via `MUDNNMatmulRunner`
-- fp16 8192 GEMV wall-clock 127 → 215 GB/s (+69%), GEMM 8192 4.97 → 15.3 TF (3×), first-token warmup 30s → 7.8s (4× faster)
-- **Does not help GGUF Q8/Q4 LLM decode** — dequant is fused into the matmul AST (4 PARAMs, CAST/MUL chains); detector requires exactly 3 PARAMs. Deliberate: this is the debug-only path the user asked for, not a production solution
-- Wrapper: `extra/musa/mudnn_wrapper.cc` (C++ → `extern "C"`), built on first use by `runtime/support/mudnn.py::_build_wrapper`
-
-**5. Half/bf16 math fp32 fallback** (`MUSARenderer.code_for_op`)
+**4. Half/bf16 math fp32 fallback** (`MUSARenderer.code_for_op`)
 - mp_22 lacks declarations for `hexp2/hsin` (gated behind `__MUSA_ARCH__ >= 800`) and lacks bodies for `htrunc` — see Gotcha 1
 - `TRUNC/SIN/LOG2/EXP2/SQRT/RECIPROCAL` all cast to float, compute, cast back
 - Without this, kernels fail at compile ("undeclared hexp2") or link ("undefined hsqrt")
 
-**6. `check()` signature fix** ← error reporting
+**5. `check()` signature fix** ← error reporting
 - `muGetErrorString` wants `POINTER(POINTER(c_char))`, not `c_char_p`. See Gotcha 3.
 
 ## Ceiling analysis
@@ -106,15 +93,13 @@ muDNN standalone = what torch_musa/mudnn.so gets via direct C++ call, wall-clock
 
 Moore Threads themselves don't codegen fast matmul — they hand-assemble them per arch and ship as blobs. tinygrad's IR lacks the primitives muDNN uses internally (warp shuffle, `ldmatrix`-style TC fragment loads, `cp.async`, swizzled smem layouts). BEAM explores within the IR's expressible space, so its ceiling on mp_22 is ~30% muDNN regardless of tuning.
 
-Getting to 90% requires one of:
+Getting closer to muDNN requires one of:
 1. Extending tinygrad IR with warp-level primitives (multi-week work, affects all backends)
 2. Adding MUSA tensor-core UOp with `mma.h` template calls in `MUSARenderer.render_kernel` + `tc.get_musa` (weeks, helps GEMM not GEMV)
-3. Accepting 30% codegen ceiling + offering `MUDNN=1` for users who need muDNN speed (current state)
 
 ## Open TODOs
 
 - [ ] **BEAM quality on quantized matmul**: preflight rejects high-local candidates that exceed mp_22 per-block resources. Those were often the good ones. Needs resource-aware per-kernel estimator, not blanket block-size cap.
-- [ ] **`MUDNNMatmulRunner` Q-format detection**: extend `detect_matmul` to recognize `int8_weight * scale @ fp16_input` pattern (4 PARAMs instead of 3). Alternatively: intercept dequant as separate kernel, feed fp16 result to muDNN matmul.
 - [ ] **Native half intrinsics on mp_31+**: when `__MUSA_ARCH__ >= 800` (future arch), `hexp2/hsin` are declared. Gate the fp32 fallback in `MUSARenderer.code_for_op` on arch.
 - [ ] **Tensor cores**: `MUSARenderer.tensor_cores = []`. mp_22 has 128 TCs but `mma.h` template API isn't wired. Minimal GEMV win (memory-bound) but big for prefill / training.
 - [ ] **MUSAGraph re-enable**: currently disabled in `MUSADevice.__init__`. SDK 3.1.0 returns error 801 on both `muGraphExecKernelNodeSetParams` and `muGraphExecUpdate`; the full implementation is kept at `runtime/graph/musa.py` for when driver gains exec-level updates.
