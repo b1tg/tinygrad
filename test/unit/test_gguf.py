@@ -161,6 +161,11 @@ class TestGGUF(unittest.TestCase):
     self.assertEqual(tensors["a.weight"].device, Device.DEFAULT)
     np.testing.assert_equal(tensors["a.weight"].numpy(), a)
     np.testing.assert_equal(tensors["b.weight"].numpy(), b)
+    # device_fn returning None skips the tensor
+    with tempfile.NamedTemporaryFile(suffix=".gguf") as f:
+      f.write(bytes(buf)); f.flush()
+      _, tensors = gguf_load(f.name, device_fn=lambda n: Device.DEFAULT if n == "a.weight" else None)
+    self.assertEqual(list(tensors.keys()), ["a.weight"])
 
   def _test_dequantization(self, qtype: GGMLQuantizationType):
     block_size, type_size = GGML_QUANT_SIZES[qtype]

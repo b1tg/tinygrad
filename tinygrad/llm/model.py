@@ -321,18 +321,23 @@ class Transformer:
   @staticmethod
   def from_gguf(gguf:Tensor|str|pathlib.Path, max_context:int|None=None,
                 realize=bool(getenv("REALIZE", 0)), shard:int=1) -> tuple[Transformer, dict]:
+    layers = int(getenv("LAYERS", 0))
     if shard > 1:
       from tinygrad.device import Device
       devs = tuple(f"{Device.DEFAULT.split(':')[0]}:{i}" for i in range(shard))
       kv_peek, _ = gguf_load(gguf)
-      nblk = kv_peek[f'{kv_peek["general.architecture"]}.block_count']
-      def dev_fn(name:str) -> str:
-        if name.startswith('blk.') and (i:=int(name.split('.')[1])) < nblk: return devs[i % len(devs)]
+      nblk = layers if layers > 0 else kv_peek[f'{kv_peek["general.architecture"]}.block_count']
+      def dev_fn(name:str) -> str|None:
+        if name.startswith('blk.'):
+          i = int(name.split('.')[1])
+          return devs[i % len(devs)] if i < nblk else None
         return devs[0]
       kv, state_dict = gguf_load(gguf, device_fn=dev_fn)
     else:
       # TODO: remove the need for copy to default device
       kv, state_dict = gguf_load(gguf.to(None).realize() if isinstance(gguf, Tensor) else gguf)
+      if layers > 0: state_dict = {k:v for k,v in state_dict.items() if not (k.startswith('blk.') and int(k.split('.')[1]) >= layers)}
+    if layers > 0: kv[f'{kv["general.architecture"]}.block_count'] = layers
 
     # all state items should be float16, not float32
     state_dict = {k:v.cast('float16') if getenv("HALF", 1) else v for k,v in state_dict.items()}
