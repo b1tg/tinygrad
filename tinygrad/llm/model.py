@@ -1,5 +1,5 @@
 from __future__ import annotations
-import functools, itertools
+import functools, itertools, pathlib
 from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function
 from tinygrad.llm.gguf import gguf_load
@@ -319,9 +319,10 @@ class Transformer:
     return (self.prefill_jit if resolve(tokens.shape[1] != 1) else self.rollout_jit)(tokens.contiguous(), start_pos, temperature)
 
   @staticmethod
-  def from_gguf(gguf:Tensor, max_context:int|None=None, realize=bool(getenv("REALIZE", 0))) -> tuple[Transformer, dict]:
+  def from_gguf(gguf:Tensor|str|pathlib.Path, max_context:int|None=None,
+                realize=bool(getenv("REALIZE", 0))) -> tuple[Transformer, dict]:
     # TODO: remove the need for copy to default device
-    kv, state_dict = gguf_load(gguf.to(None).realize())
+    kv, state_dict = gguf_load(gguf.to(None).realize() if isinstance(gguf, Tensor) else gguf)
 
     # all state items should be float16, not float32
     state_dict = {k:v.cast('float16') if getenv("HALF", 1) else v for k,v in state_dict.items()}

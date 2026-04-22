@@ -1,10 +1,10 @@
-import functools, io, struct
+import functools, io, pathlib, re, struct
 from typing import Any, Callable
 
 from tinygrad.tensor import Tensor
 from tinygrad.dtype import dtypes
 from tinygrad.helpers import prod, round_up
-from tinygrad.nn.state import TensorIO, accept_filename
+from tinygrad.nn.state import TensorIO
 
 # ggml packs each iq grid entry as N bytes (N=4 for uint32 grids, N=8 for uint64 grids) in a single word. See ggml-common.h.
 @functools.lru_cache(None)
@@ -131,10 +131,26 @@ readers: dict[int, Callable[[io.BufferedIOBase], Any]] = { 8: read_str, 9: read_
     [ (0,"c",1), (1,"b",1), (2,"H",2), (3,"h",2), (4,"I",4), (5,"i",4), (6,"f",4), (7,"?",1), (10,"Q",8), (11,"q",8), (12,"d",8) ] } }
 read_uint32, read_int32, read_uint64, read_int64 = readers[4], readers[5], readers[10], readers[11]
 
-@accept_filename
-def gguf_load(tensor: Tensor) -> tuple[dict, dict[str, Tensor]]:
+def _gguf_parse(tensor: Tensor) -> tuple[dict, dict[str, Tensor]]:
+  r = io.BufferedReader(TensorIO(tensor), 1_000_000)
+  magic, version, n_tensors, n_kv = r.read(4), read_int32(r), read_int64(r), read_int64(r)
+  if magic != b"GGUF" or version not in [2, 3]: raise ValueError("Invalid GGUF format!")
+  kv_data = {}
+  for _ in range(n_kv):
+    k, typ = read_str(r), read_int32(r)
+    kv_data[k] = readers[typ](r)
+  t_infos = [ (read_str(r), tuple(read_uint64(r) for _ in range(read_uint32(r))), read_int32(r), read_uint64(r)) for _ in range(n_tensors) ]
+  alignment, pos = kv_data.get("general.alignment", 32), r.tell()
+  data_start = round_up(pos, alignment)
+  return kv_data, {name: ggml_data_to_tensor(tensor[data_start+off:], prod(dims), typ).reshape(*reversed(dims)) for name, dims, typ, off in t_infos}
+
+def _gguf_split_paths(path: pathlib.Path, total: int) -> list[pathlib.Path]:
+  if not (m := re.match(r"^(.*)-00001-of-\d{5}\.gguf$", str(path))): raise ValueError(f"first split path must end with -00001-of-NNNNN.gguf: {path}")
+  return [pathlib.Path(f"{m.group(1)}-{i:05d}-of-{total:05d}.gguf") for i in range(1, total+1)]
+
+def gguf_load(src: Tensor|str|pathlib.Path) -> tuple[dict, dict[str, Tensor]]:
   """
-  Loads a .gguf file, returning the `kv_data` and `state_dict`.
+  Loads a .gguf file, returning the `kv_data` and `state_dict`. Multi-part splits are auto-merged when loaded by path.
 
   ```python
   import pathlib
@@ -147,18 +163,10 @@ def gguf_load(tensor: Tensor) -> tuple[dict, dict[str, Tensor]]:
 
   NOTE: The provided tensor must be on a device that supports execution.
   """
-  r = io.BufferedReader(TensorIO(tensor), 1_000_000)
-  magic, version, n_tensors, n_kv = r.read(4), read_int32(r), read_int64(r), read_int64(r)
-  if magic != b"GGUF" or version not in [2, 3]: raise ValueError("Invalid GGUF format!")
-
-  kv_data = {}
-  for _ in range(n_kv):
-    k, typ = read_str(r), read_int32(r)
-    kv_data[k] = readers[typ](r)
-
-  t_infos = [ (read_str(r), tuple(read_uint64(r) for _ in range(read_uint32(r))), read_int32(r), read_uint64(r)) for _ in range(n_tensors) ]
-  alignment, pos = kv_data.get("general.alignment", 32), r.tell()
-  data_start = round_up(pos, alignment)
-
-  state_dict = {name: ggml_data_to_tensor(tensor[data_start + off:], prod(dims), typ).reshape(*reversed(dims)) for name, dims, typ, off in t_infos}
-  return kv_data, state_dict
+  def load(p): return _gguf_parse(p if isinstance(p, Tensor) else Tensor(pathlib.Path(p)).to(None).realize())
+  kv, sd = load(src)
+  if kv.get('split.count', 1) <= 1: return kv, sd
+  if isinstance(src, Tensor): raise ValueError("multi-part GGUF requires a path argument (got Tensor)")
+  if kv.get('split.no', 0) != 0: raise ValueError(f"multi-part GGUF must be loaded from the first split, got split.no={kv['split.no']}")
+  for pp in _gguf_split_paths(pathlib.Path(src), kv['split.count'])[1:]: sd.update(load(pp)[1])
+  return kv, sd
