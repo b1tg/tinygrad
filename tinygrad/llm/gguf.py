@@ -185,7 +185,8 @@ def gguf_load(src: Tensor|str|pathlib.Path, device_fn: Callable[[str], str|None]
 
   NOTE: The provided tensor must be on a device that supports execution.
   """
-  def load(p): return _gguf_parse(p if isinstance(p, Tensor) else Tensor(pathlib.Path(p)).to(None).realize(), device_fn)
+  # With device_fn, each tensor's bytes already hop to their target device — don't also stage the full file on Device.DEFAULT.
+  def load(p): return _gguf_parse(p if isinstance(p, Tensor) else (Tensor(pathlib.Path(p)) if device_fn else Tensor(pathlib.Path(p)).to(None).realize()), device_fn)
   kv, sd = load(src)
   if kv.get('split.count', 1) <= 1: return kv, sd
   if isinstance(src, Tensor): raise ValueError("multi-part GGUF requires a path argument (got Tensor)")
