@@ -27,13 +27,41 @@ MTT S4000 / MUSA tinygrad backend — **working as of 2026-04-22**.
 - Qwen3.5-9B-Q4_K_M: no BEAM 0.27 tok/s. BEAM=2 safe (preflight) but picks worse kernels than baseline — high-coalescing candidates are resource-rejected.
 - GEMV fp16 8192: baseline 73 GB/s (14%), BEAM=2 **169 GB/s (33%)**. muDNN reference 505 GB/s (hardware ceiling).
 
-## BEAM action space + MUSARenderer.shared_max
+## BEAM action space + MUSARenderer hardware constants
 - Upstream BEAM `actions` LOCAL/GROUPTOP/GROUP amts are NVIDIA-tuned (LOCAL caps at 29 + special case 32). mp_22 warp=128.
 - **First attempt (REVERTED)**: added `32/64/128/256/512/1024` to LOCAL, `128/256/512` to GROUPTOP, `32/64/128/256` to GROUP across 3–6 axes each (~57 new candidates). BEAM search time exploded >20× with NO wall-clock benefit — tinygrad BEAM is width-2 greedy and each candidate costs 500 ms of mcc compile.
-- **Final kept**: ONE targeted `Opt(LOCAL, axis=0, arg=128)` for the canonical mp_22 block. Plus `MUSARenderer.shared_max = 73728` (72 KB, S4000 spec from Moore Threads programming guide ch09; default 48 KB from CUDARenderer is wrong for S4000).
+- **Final kept**:
+  - single BEAM action `Opt(LOCAL, axis=0, arg=128)` — canonical mp_22 block start
+  - `MUSARenderer.shared_max = 73728` (72 KB, vs CUDARenderer's 48 KB)
+  - `MUSARenderer.global_max = (2**31-1, 2**31-1, 2**31-1)` (vs CUDARenderer y/z=65535)
+  - `MUSARenderer.local_max = (1024, 1024, 1024)` (vs CUDARenderer z=64)
+- These three Renderer constants match musaInfo: `sharedMemPerBlock`, `maxGridSize`, `maxThreadsDim`. Prevents BEAM from pruning candidates that the hardware actually supports.
 - **Effect**: BEAM=2 on 8192 fp16 GEMV: 73 → 169 GB/s (2.3×). Search stays ~1 min/shape.
-- **Lesson**: tinygrad BEAM is already near-optimal within its IR's expressible space. Adding more action candidates just slows search without unlocking qualitatively new kernels. The 30% muDNN ceiling is an IR limitation (missing warp shuffle / TC fragment / cp.async UOps), not action-space coverage.
+- **Lesson**: tinygrad BEAM is already near-optimal within its IR's expressible space. Adding more action candidates just slows search without unlocking qualitatively new kernels. Hardware-constant overrides are correctness — they don't add perf, they just stop artificial NVIDIA-caps from shrinking the legitimate search space.
 - **MATVEC heuristic CAST-unwrap hack was REVERTED**: tinygrad's philosophy is BEAM should find the optimal kernel. Heuristic is only a fallback. Putting fixes at heuristic level is wrong layer.
+
+## Hardware-constant audit (2026-04-22)
+musaInfo fields vs tinygrad Renderer usage:
+
+| spec field | value | used? | via |
+|---|---|---|---|
+| compute cap 2.2 | mp_22 | ✓ | `arch=f"mp_{M}{m}"` in MUSADevice |
+| maxThreadsPerBlock | 1024 | ✓ | per-kernel `muFuncGetAttribute` preflight |
+| sharedMemPerBlock | 72 KB | ✓ | `MUSARenderer.shared_max=73728` |
+| maxGridSize x/y/z | INT_MAX/INT_MAX/INT_MAX | ✓ | `global_max = (2**31-1,)*3` |
+| maxThreadsDim x/y/z | 1024/1024/1024 | ✓ | `local_max = (1024,)*3` |
+| warpSize | 128 | partial | single BEAM action `LOCAL arg=128` (no `warp_size` attr on Renderer class to set) |
+| multiProcessorCount | 56 | ✗ | BEAM doesn't know; ideal global_size is SM_count multiple |
+| maxThreadsPerMultiprocessor | 6144 | ✗ | occupancy heuristic absent |
+| regsPerBlock | 262144 | ✗ | BEAM_UPCAST_MAX not arch-aware |
+| sharedMemPerMultiprocessor | 72 KB | ✗ | same as per-block → 1 full-smem block occupies whole MP; BEAM doesn't weigh occupancy vs tile size |
+| l2CacheSize | 24 MB | ✗ | big-tensor tiling heuristic absent |
+| concurrentKernels | 1 | ✗ | may mean "no overlap" → MUSAGraph's disabled status is correct anyway |
+| totalConstMem | 8192 bytes | ✗ | extremely small, no const-cache usage yet |
+| totalGlobalMem | 47.91 GB | ✗ | MAX_BUFFER_SIZE not set |
+| isMultiGpuBoard | 1 | ✗ | MTLink untested |
+
+TODO: occupancy-aware BEAM estimator is the real lever for last-mile perf; currently BEAM only times kernels, doesn't model hardware.
 
 ## MUDNN=1 fast-path — BUILT AND REMOVED
 - User asked for a `MUDNN=1` debug branch to get muDNN-speed matmul via external call.

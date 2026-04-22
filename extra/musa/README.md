@@ -73,12 +73,15 @@ BEAM=2 warmup cost: ~1 min per unique shape (many mcc subprocess compiles, diskc
 - `__call__` raises `RuntimeError` if `prod(local_size)` exceeds it
 - Converts SIGSEGV-level faults into catchable exceptions that BEAM's `try/except` handles
 
-**3. BEAM action: one targeted `LOCAL=128`** (`search.py`) + **MUSARenderer `shared_max=73728`** (`cstyle.py`)
-- mp_22 warp=128, S4000 has 72 KB smem/block (vs NVIDIA default 48 KB)
-- Per Moore Threads programming guide chapter 9: recommended block sizes 128/256/512/1024
-- **Tried first**: add 57 extra `LOCAL/GROUP/GROUPTOP` amts across all axes → BEAM search time exploded 20x (naive width-2 search cost grows with candidate count; each candidate = 500ms mcc compile) with no wall-clock improvement. **Reverted.**
-- **Kept**: single `Opt(OptOps.LOCAL, axis=0, arg=128)` entry + `shared_max=73728` override. fp16 8192 GEMV with BEAM=2 goes 162 → **169 GB/s** (33% of muDNN 505 GB/s). Search time stays ~1 min per shape.
-- **Lesson**: tinygrad BEAM is already near-optimal within its IR's expressible space; throwing more actions at it just slows search without unlocking qualitatively new kernels.
+**3. BEAM targeted action + Renderer hardware constants** (`search.py` + `cstyle.py`)
+- Added single BEAM action `Opt(OptOps.LOCAL, axis=0, arg=128)` for mp_22's canonical block size (warp=128).
+- `MUSARenderer` overrides three CUDA-inherited hardware constants to match S4000 (musaInfo-verified):
+  - `shared_max = 73728` — 72 KB/block (vs CUDA's 48 KB default)
+  - `global_max = (2147483647, 2147483647, 2147483647)` — all 3 axes INT_MAX (vs CUDA y/z capped at 65535)
+  - `local_max = (1024, 1024, 1024)` — isotropic (vs CUDA z capped at 64)
+- **Tried first**: add 57 extra `LOCAL/GROUP/GROUPTOP` amts across all axes → BEAM search time exploded 20× (naive width-2 search cost grows with candidate count; each candidate = 500ms mcc compile) with no wall-clock improvement. **Reverted.**
+- **Kept**: the single targeted action + 3 hardware-constant overrides. fp16 8192 GEMV with BEAM=2 goes 162 → **169 GB/s** (33% of muDNN 505 GB/s). Search time stays ~1 min per shape.
+- **Lesson**: tinygrad BEAM is already near-optimal within its IR's expressible space; throwing more actions at it slows search without unlocking qualitatively new kernels. Hardware-constant overrides are correctness (they stop BEAM from pruning correctly-specced candidates) — not perf on their own.
 
 **4. Half/bf16 math fp32 fallback** (`MUSARenderer.code_for_op`)
 - mp_22 lacks declarations for `hexp2/hsin` (gated behind `__MUSA_ARCH__ >= 800`) and lacks bodies for `htrunc` — see Gotcha 1
@@ -111,6 +114,8 @@ Getting closer to muDNN requires one of:
 - [ ] **Tensor cores**: `MUSARenderer.tensor_cores = []`. mp_22 has 128 TCs but `mma.h` template API isn't wired. Minimal GEMV win (memory-bound) but big for prefill / training.
 - [ ] **MUSAGraph re-enable**: currently disabled in `MUSADevice.__init__`. SDK 3.1.0 returns error 801 on both `muGraphExecKernelNodeSetParams` and `muGraphExecUpdate`; the full implementation is kept at `runtime/graph/musa.py` for when driver gains exec-level updates.
 - [ ] **Multi-GPU via MTLink**: `peer_access` hooks in `MUSADevice` are wired but untested (single-card test box).
+- [ ] **In-process compile via libclang-cpp**: `/usr/local/musa/lib/libclang-cpp.so.14` present. Writing a C++ shim that invokes `clang::CompilerInstance` with mcc's target flags (`-mtgpu --offload-arch=mp_22 --cuda-device-only`) could drop per-kernel compile 500 ms → ~50 ms, making BEAM cold-start tolerable. Risks: must reverse-engineer mcc's driver flag set, libclang-cpp ABI unstable across SDK versions, Moore Threads private patches may not be fully exported. Purely ergonomic — doesn't lift the 30% muDNN ceiling.
+- [ ] **Hardware-constants beyond `shared_max/local_max/global_max`**: `multiProcessorCount=56`, `regsPerBlock=262144`, `l2CacheSize=24MB`, `concurrentKernels=1`, `totalGlobalMem=47.91GB` etc. are **not** threaded through into BEAM's estimator. Occupancy-aware kernel cost model would let BEAM weigh tile-size vs latency-hiding properly; currently BEAM is shape-level only.
 
 ## Out of scope (deliberately not pursued)
 
@@ -122,7 +127,7 @@ Getting closer to muDNN requires one of:
 
 **Mirror libcuda driver API, not runtime API.** Driver API (`libmusa.so`, `mu*` prefix) is a 1:1 mirror of libcuda (`cu*`), down to `_v2` suffixes. `ops_musa.py` is essentially `ops_cuda.py` with `s/cu/mu/`. The `libmusart.so` runtime API (`musa*` prefix) is a thin wrapper not needed here.
 
-**Subprocess mcc, not in-process JIT.** MUSA has no public NVRTC-equivalent. `mcc` is an offline clang fork; tinygrad shells out per unique kernel and caches fatbin on disk.
+**Subprocess mcc, not in-process JIT.** MUSA SDK 3.1.0 ships **no NVRTC-equivalent library** (no `libmurtc.so`, no rtc headers). `mcc` is the offline clang fork; tinygrad shells out per unique kernel and caches fatbin on disk. Each cold compile ~500 ms; diskcache hits are instant. Alternative in-process path via `libclang-cpp.so.14` (present in `/usr/local/musa/lib/`, 224 MB) is theoretically possible but requires a C++ wrapper that replicates mcc's driver flags — significant work for ~10× compile speedup, not a perf-path unblock.
 
 **Reuse CUDARenderer.** MUSA C++ is a strict subset of CUDA C++ for device code. Only overrides needed:
 - include names: `cuda_fp16.h` → `musa_fp16.h`, `cuda_bf16.h` → `musa_bf16.h`
