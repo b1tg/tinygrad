@@ -156,6 +156,18 @@ def _gguf_split_paths(path: pathlib.Path, total: int) -> list[pathlib.Path]:
   if not (m := re.match(r"^(.*)-00001-of-\d{5}\.gguf$", str(path))): raise ValueError(f"first split path must end with -00001-of-NNNNN.gguf: {path}")
   return [pathlib.Path(f"{m.group(1)}-{i:05d}-of-{total:05d}.gguf") for i in range(1, total+1)]
 
+def gguf_load_kv(path: str|pathlib.Path) -> dict:
+  """Read only the KV metadata from a GGUF file (no tensor bytes loaded onto any device)."""
+  with open(path, 'rb') as fp:
+    r = io.BufferedReader(fp, 1_000_000)
+    magic, version, _, n_kv = r.read(4), read_int32(r), read_int64(r), read_int64(r)
+    if magic != b"GGUF" or version not in [2, 3]: raise ValueError("Invalid GGUF format!")
+    kv_data = {}
+    for _ in range(n_kv):
+      k, typ = read_str(r), read_int32(r)
+      kv_data[k] = readers[typ](r)
+    return kv_data
+
 def gguf_load(src: Tensor|str|pathlib.Path, device_fn: Callable[[str], str|None]|None = None) -> tuple[dict, dict[str, Tensor]]:
   """
   Loads a .gguf file, returning the `kv_data` and `state_dict`. Multi-part splits are auto-merged when loaded by path.

@@ -2,7 +2,7 @@ from __future__ import annotations
 import functools, itertools, pathlib
 from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function
-from tinygrad.llm.gguf import gguf_load
+from tinygrad.llm.gguf import gguf_load, gguf_load_kv
 from tinygrad.uop.ops import resolve
 
 @functools.cache
@@ -325,7 +325,7 @@ class Transformer:
     if shard > 1:
       from tinygrad.device import Device
       devs = tuple(f"{Device.DEFAULT.split(':')[0]}:{i}" for i in range(shard))
-      kv_peek, _ = gguf_load(gguf)
+      kv_peek = gguf_load_kv(gguf) if not isinstance(gguf, Tensor) else gguf_load(gguf)[0]
       nblk = layers if layers > 0 else kv_peek[f'{kv_peek["general.architecture"]}.block_count']
       def dev_fn(name:str) -> str|None:
         if name.startswith('blk.'):
