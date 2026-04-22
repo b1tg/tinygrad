@@ -144,6 +144,24 @@ class TestGGUF(unittest.TestCase):
       with self.assertRaises(FileNotFoundError):
         gguf_load(d / "test-00001-of-00002.gguf")
 
+  def test_device_fn(self):
+    a, b = np.arange(8, dtype=np.float32).reshape(2,4), (np.arange(12, dtype=np.float32)*0.5).reshape(3,4)
+    buf = bytearray(struct.pack("<4siqq", b"GGUF", 3, 2, 0))
+    for name, arr, off in [(b"a.weight", a, 0), (b"b.weight", b, a.nbytes)]:
+      buf += struct.pack("<Q", len(name)) + name + struct.pack("<I", 2)
+      for d in reversed(arr.shape): buf += struct.pack("<Q", d)
+      buf += struct.pack("<iQ", 0, off)
+    buf += b"\x00" * ((32 - len(buf) % 32) % 32) + a.tobytes() + b.tobytes()
+    seen: list[str] = []
+    def dev_fn(name: str) -> str: seen.append(name); return Device.DEFAULT
+    with tempfile.NamedTemporaryFile(suffix=".gguf") as f:
+      f.write(bytes(buf)); f.flush()
+      _, tensors = gguf_load(f.name, device_fn=dev_fn)
+    self.assertEqual(sorted(seen), ["a.weight", "b.weight"])
+    self.assertEqual(tensors["a.weight"].device, Device.DEFAULT)
+    np.testing.assert_equal(tensors["a.weight"].numpy(), a)
+    np.testing.assert_equal(tensors["b.weight"].numpy(), b)
+
   def _test_dequantization(self, qtype: GGMLQuantizationType):
     block_size, type_size = GGML_QUANT_SIZES[qtype]
     n_el, n_bytes = ggml_test_block_count * block_size, ggml_test_block_count * type_size

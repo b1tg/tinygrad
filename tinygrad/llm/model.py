@@ -320,9 +320,19 @@ class Transformer:
 
   @staticmethod
   def from_gguf(gguf:Tensor|str|pathlib.Path, max_context:int|None=None,
-                realize=bool(getenv("REALIZE", 0))) -> tuple[Transformer, dict]:
-    # TODO: remove the need for copy to default device
-    kv, state_dict = gguf_load(gguf.to(None).realize() if isinstance(gguf, Tensor) else gguf)
+                realize=bool(getenv("REALIZE", 0)), shard:int=1) -> tuple[Transformer, dict]:
+    if shard > 1:
+      from tinygrad.device import Device
+      devs = tuple(f"{Device.DEFAULT.split(':')[0]}:{i}" for i in range(shard))
+      kv_peek, _ = gguf_load(gguf)
+      nblk = kv_peek[f'{kv_peek["general.architecture"]}.block_count']
+      def dev_fn(name:str) -> str:
+        if name.startswith('blk.') and (i:=int(name.split('.')[1])) < nblk: return devs[i % len(devs)]
+        return devs[0]
+      kv, state_dict = gguf_load(gguf, device_fn=dev_fn)
+    else:
+      # TODO: remove the need for copy to default device
+      kv, state_dict = gguf_load(gguf.to(None).realize() if isinstance(gguf, Tensor) else gguf)
 
     # all state items should be float16, not float32
     state_dict = {k:v.cast('float16') if getenv("HALF", 1) else v for k,v in state_dict.items()}
