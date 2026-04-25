@@ -29,8 +29,10 @@ EVENT_INDEX_PARTIAL_FLUSH = 4 # based on a comment in nvd.h
 WAIT_REG_MEM_FUNCTION_EQ  = 3 # ==
 WAIT_REG_MEM_FUNCTION_NEQ = 4 # !=
 WAIT_REG_MEM_FUNCTION_GEQ = 5 # >=
-AQL_HDR = (1 << hsa.HSA_PACKET_HEADER_BARRIER) | (hsa.HSA_FENCE_SCOPE_SYSTEM << hsa.HSA_PACKET_HEADER_SCACQUIRE_FENCE_SCOPE) \
-        | (hsa.HSA_FENCE_SCOPE_SYSTEM << hsa.HSA_PACKET_HEADER_SCRELEASE_FENCE_SCOPE)
+_fence = hsa.HSA_FENCE_SCOPE_AGENT if getenv("AGENT_FENCE") else hsa.HSA_FENCE_SCOPE_SYSTEM
+_barrier = 0 if getenv("NO_BARRIER") else (1 << hsa.HSA_PACKET_HEADER_BARRIER)
+AQL_HDR = _barrier | (_fence << hsa.HSA_PACKET_HEADER_SCACQUIRE_FENCE_SCOPE) \
+        | (_fence << hsa.HSA_PACKET_HEADER_SCRELEASE_FENCE_SCOPE)
 
 @dataclass(frozen=True)
 class ProfileSQTTEvent(ProfileEvent): device:str; kern:int; se:int; blob:bytes; itrace:bool; exec_tag:int # noqa: E702

@@ -17,7 +17,8 @@ class ExpertWeights:
     self.weight = Tensor.zeros(num_experts, out_features, in_features)
   def __call__(self, sel:Tensor, x:Tensor) -> Tensor:
     # sel: (B, T, k), x: (B, T, 1, in) or (B, T, k, in) -> output: (B, T, k, out)
-    return (x.unsqueeze(-2) @ self.weight[sel].transpose(-1, -2)).squeeze(-2)
+    if getenv("NOTRANSPOSE"): return (self.weight[sel] @ x.unsqueeze(-1)).contiguous().squeeze(-1)
+    return (x.unsqueeze(-2) @ self.weight[sel].transpose(-1, -2)).contiguous().squeeze(-2)
 
 def apply_rope(x:Tensor, freqs_cis:Tensor) -> Tensor:
   assert x.shape[-1] % 2 == 0
@@ -26,10 +27,10 @@ def apply_rope(x:Tensor, freqs_cis:Tensor) -> Tensor:
   return (x1 * cos - x2 * sin).cat(x2 * cos + x1 * sin, dim=-1)
 
 def pairwise_topk(x: Tensor, k: int) -> tuple[Tensor, Tensor]:
-  n = x.shape[-1]
-  vals = Tensor.arange(n).reshape(1,1,n).cast(x.dtype).expand(x.shape)
+  n, d = x.shape[-1], x.device
+  vals = Tensor.arange(n, device=d).reshape(1,1,n).cast(x.dtype).expand(x.shape)
   cmp = (x.unsqueeze(-1) > x.unsqueeze(-2)) | ((x.unsqueeze(-1) == x.unsqueeze(-2)) & \
-    (Tensor.arange(n).reshape(1,1,n,1) < Tensor.arange(n).reshape(1,1,1,n)))
+    (Tensor.arange(n, device=d).reshape(1,1,n,1) < Tensor.arange(n, device=d).reshape(1,1,1,n)))
   sel = Tensor.zeros_like(x).scatter(-1, cmp.sum(axis=-1).cast('int32'), vals)[:,:,n-k:].cast('int32')
   return x.gather(-1, sel), sel
 
@@ -56,6 +57,7 @@ class TransformerConfig:
   v_head_dim: int
   max_context: int = 0
   qk_norm: int = 0
+  k_norm: int = 0
   num_experts: int = 0
   num_experts_per_tok: int = 0
   norm_topk_prob: bool = False
@@ -110,7 +112,7 @@ class FFNBlock:
         vals, sel = pairwise_topk(logits, self.config.num_experts_per_tok)
         probs = vals.softmax(-1) if self.config.norm_topk_prob else logits.softmax(-1).gather(-1, sel)
       probs = probs * self.config.routed_scaling_factor
-      x_down = self.ffn_down_exps(sel, self.ffn_gate_exps(sel, h).silu() * self.ffn_up_exps(sel, h))  # (B, T, k, D)
+      x_down = self.ffn_down_exps(sel, (self.ffn_gate_exps(sel, h).silu() * self.ffn_up_exps(sel, h)).contiguous())  # (B, T, k, D)
       out = (x_down * probs.unsqueeze(-1)).sum(axis=2)  # (B, T, D)
       if hasattr(self, 'ffn_gate_shexp'):
         shexp = self.ffn_down_shexp(self.ffn_gate_shexp(x).silu().contiguous() * self.ffn_up_shexp(x))
@@ -148,7 +150,9 @@ class TransformerBlock(FFNBlock):
     self.attn_k      = nn.Linear(config.dim, kv_proj_out, bias=config.qkv_bias)
     self.attn_v      = nn.Linear(config.dim, kv_proj_out, bias=config.qkv_bias)
     self.attn_output = nn.Linear(config.head_dim * config.n_heads, config.dim, bias=False)
-    if config.qk_norm: self.attn_q_norm, self.attn_k_norm = nn.RMSNorm(config.qk_norm, config.norm_eps), nn.RMSNorm(config.qk_norm, config.norm_eps)
+    if config.qk_norm:
+      self.attn_q_norm = nn.RMSNorm(config.qk_norm, config.norm_eps)
+      self.attn_k_norm = nn.RMSNorm(config.k_norm or config.qk_norm, config.norm_eps)
 
   def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
     q, k, v = self.attn_q(x), self.attn_k(x), self.attn_v(x)
@@ -186,7 +190,7 @@ class TransformerBlock(FFNBlock):
     if not hasattr(self, "cache_kv"):
       # TODO: how is the dtype of this determined?
       self.cache_kv = Tensor.empty(2, x.shape[0], self.config.n_kv_heads, self.config.max_context, self.config.head_dim, device=x.device)
-      self.freqs_cis = precompute_freqs_cis(self.config.rope_dim, self.config.max_context, self.config.rope_theta)
+      self.freqs_cis = precompute_freqs_cis(self.config.rope_dim, self.config.max_context, self.config.rope_theta).to(x.device)
 
 class MLATransformerBlock(FFNBlock):
   def __init__(self, config:TransformerConfig):
@@ -232,7 +236,7 @@ class MLATransformerBlock(FFNBlock):
   def _init_state(self, x:Tensor):
     if not hasattr(self, "cache_k"):
       self.cache_k = Tensor.empty(x.shape[0], 1, self.config.max_context, self.config.kv_lora_rank + self.config.rope_dim, device=x.device)
-      self.freqs_cis = precompute_freqs_cis(self.config.rope_dim, self.config.max_context, self.config.rope_theta)
+      self.freqs_cis = precompute_freqs_cis(self.config.rope_dim, self.config.max_context, self.config.rope_theta).to(x.device)
 
 class GatedDeltaNetBlock(FFNBlock):
   def __init__(self, config:TransformerConfig, ssm:SSMConfig):
@@ -292,12 +296,17 @@ class GatedDeltaNetBlock(FFNBlock):
       self.recurrent_state = Tensor.zeros(x.shape[0], self.num_v_heads, self.head_v_dim, self.head_v_dim, device=x.device).clone()
 
 class Transformer:
-  def __init__(self, config:TransformerConfig):
+  def __init__(self, config:TransformerConfig, devices:tuple[str,...]|None=None):
     dense_config = replace(config, num_experts=0, num_experts_per_tok=0, shared_expert_dim=0, hidden_dim=config.dense_hidden_dim or config.hidden_dim)
-    if config.ssm: config = replace(config, qk_norm=config.head_dim)
+    if config.ssm: config = replace(config, qk_norm=config.head_dim, k_norm=config.head_dim)
     block_cls = MLATransformerBlock if config.kv_lora_rank > 0 else TransformerBlock
-    self.blk:list[FFNBlock] = [GatedDeltaNetBlock(config, config.ssm) if config.ssm and (i+1) % config.full_attention_interval != 0 else
-                               block_cls(dense_config if i < config.leading_dense_blocks else config) for i in range(config.num_blocks)]
+    def _mk(i):
+      c = dense_config if i < config.leading_dense_blocks else config
+      blk = GatedDeltaNetBlock(c, c.ssm) if c.ssm and (i+1) % c.full_attention_interval != 0 else block_cls(c)
+      if devices:
+        for v in nn.state.get_parameters(blk): v.to_(devices[i % len(devices)])
+      return blk
+    self.blk:list[FFNBlock] = [_mk(i) for i in range(config.num_blocks)]
     self.token_embd  = nn.Embedding(config.vocab_size, config.dim)
     self.output_norm = nn.RMSNorm(config.dim, config.norm_eps)
     self.output = nn.Linear(config.dim, config.vocab_size, bias=False)
@@ -310,7 +319,8 @@ class Transformer:
 
   def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
     x = self.token_embd(tokens).float()                   # (B, T, D)
-    for block in self.blk: x = block(x, start_pos)
+    for block in self.blk: x = block(x.to(block.attn_norm.weight.device), start_pos)
+    x = x.to(self.output_norm.weight.device)
     logits = self.output(self.output_norm(x))[:, -1, :]
     # Gumbel-max trick: argmax(logits/temp - log(-log(uniform))) is equivalent to sampling from softmax(logits/temp)
     return (logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1, keepdim=True)
@@ -320,9 +330,22 @@ class Transformer:
 
   @staticmethod
   def from_gguf(gguf:Tensor|str|pathlib.Path, max_context:int|None=None,
-                realize=bool(getenv("REALIZE", 0))) -> tuple[Transformer, dict]:
-    # TODO: remove the need for copy to default device
-    kv, state_dict = gguf_load(gguf.to(None).realize() if isinstance(gguf, Tensor) else gguf)
+                realize=bool(getenv("REALIZE", 0)), shard:int=1) -> tuple[Transformer, dict]:
+    from tinygrad.device import Device
+    devices = tuple(Device.DEFAULT if i == 0 else f"{Device.DEFAULT.split(':')[0]}:{i}" for i in range(shard)) if shard > 1 else None
+    if devices:
+      from tinygrad.llm.gguf import _gguf_header
+      kv_tmp, _, _ = _gguf_header(gguf if isinstance(gguf, Tensor) else Tensor(gguf))
+      arch_tmp = kv_tmp['general.architecture']
+      num_blocks = kv_tmp[f'{arch_tmp}.block_count'] - kv_tmp.get(f'{arch_tmp}.nextn_predict_layers', 0)
+      def dev_fn(name:str) -> str:
+        if name.startswith('blk.'):
+          i = int(name.split('.')[1])
+          if i < num_blocks: return devices[i % len(devices)]
+        return devices[0]
+      kv, state_dict = gguf_load(gguf, device_fn=dev_fn)
+    else:
+      kv, state_dict = gguf_load(gguf.to(None).realize() if isinstance(gguf, Tensor) else gguf)
 
     # all state items should be float16, not float32
     state_dict = {k:v.cast('float16') if getenv("HALF", 1) else v for k,v in state_dict.items()}
@@ -366,6 +389,7 @@ class Transformer:
       v_head_dim=kv.get(f'{arch}.attention.value_length_mla', kv.get(f'{arch}.attention.value_length', head_dim)),
       max_context=max_context,
       qk_norm=int(state_dict['blk.0.attn_q_norm.weight'].shape[0]) if 'blk.0.attn_q_norm.weight' in state_dict else 0,
+      k_norm=int(state_dict['blk.0.attn_k_norm.weight'].shape[0]) if 'blk.0.attn_k_norm.weight' in state_dict else 0,
       num_experts=kv.get(f'{arch}.expert_count', 0), num_experts_per_tok=kv.get(f'{arch}.expert_used_count', 0),
       norm_topk_prob=kv.get(f'{arch}.expert_weights_norm', arch in ('qwen3moe', 'qwen35moe')),
       kv_lora_rank=kv_lora_rank, q_lora_rank=kv.get(f'{arch}.attention.q_lora_rank', 0),
@@ -379,7 +403,7 @@ class Transformer:
       full_attention_interval=kv.get(f'{arch}.full_attention_interval', 0),
       qkv_bias='blk.0.attn_q.bias' in state_dict,
       expert_bias=f"blk.{kv.get(f'{arch}.leading_dense_block_count', 0)}.exp_probs_b.bias" in state_dict)
-    model = Transformer(config)
+    model = Transformer(config, devices=devices)
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:
