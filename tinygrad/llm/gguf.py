@@ -12,6 +12,11 @@ def _ggml_iq_grid(device: str, grid: tuple[int, ...], grid_shape: tuple[int, int
   values = [float((w >> (8*i)) & 0xFF) for w in grid for i in range(grid_shape[1])]
   return Tensor(values, dtype=dtypes.float32, device=device).reshape(grid_shape)
 
+_GGML_NATIVE = {0: dtypes.float32, 1: dtypes.float16, 24: dtypes.int8, 25: dtypes.int16,
+                26: dtypes.int32, 27: dtypes.int64, 28: dtypes.float64, 30: dtypes.bfloat16}
+_GGML_QUANT = {2:(32,18), 3:(32,20), 6:(32,22), 7:(32,24), 8:(32,34),
+               12:(256,144), 13:(256,176), 14:(256,210), 18:(256,98), 21:(256,110), 22:(256,82), 23:(256,136), 39:(32,17), 41:(128,18)}
+
 def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
   """
   Converts ggml tensor data to a tinygrad tensor.
@@ -25,10 +30,7 @@ def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
   # https://github.com/ggerganov/ggml/blob/323951f1bdcdfbd5b5ff3a9a7c3770e63b1a560e/include/ggml.h#L356
 
   # native types
-  if (dtype := {
-    0: dtypes.float32, 1: dtypes.float16, 24: dtypes.int8,
-    25: dtypes.int16, 26: dtypes.int32, 27: dtypes.int64, 28: dtypes.float64, 30: dtypes.bfloat16,
-  }.get(ggml_type)) is not None:
+  if (dtype := _GGML_NATIVE.get(ggml_type)) is not None:
     return t[:dtype.itemsize * n].contiguous().bitcast(dtype)
 
   def q_to_uint8(t: Tensor, b: int) -> Tensor:
@@ -37,11 +39,7 @@ def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
     return t.unsqueeze(-1).expand((*t.shape,8//b)).idiv(shift_tensor).bitwise_and(bitmask).transpose(-1, -2).flatten(-2)
 
   # map to (number of elements, number of bytes)
-  if (nelements_nbytes := {
-    2:(32,18), 3:(32,20), 6:(32,22), 7:(32,24), 8:(32,34),
-    12:(256,144), 13:(256,176), 14:(256,210), 18:(256,98), 21:(256,110), 22:(256,82), 23:(256,136), 39:(32,17),
-    41:(128,18)
-  }.get(ggml_type)) is not None:
+  if (nelements_nbytes := _GGML_QUANT.get(ggml_type)) is not None:
     from tinygrad.runtime.autogen import ggml_common as _ggml
     blocks = t[:(n//nelements_nbytes[0])*nelements_nbytes[1]].reshape((-1, nelements_nbytes[1])).contiguous()
     if ggml_type == 2: return (q_to_uint8(blocks[:,2:], 4).bitcast(dtypes.int8) - 8) * blocks[:,:2].bitcast(dtypes.float16).cast(dtypes.float32)
@@ -131,7 +129,7 @@ readers: dict[int, Callable[[io.BufferedIOBase], Any]] = { 8: read_str, 9: read_
     [ (0,"c",1), (1,"b",1), (2,"H",2), (3,"h",2), (4,"I",4), (5,"i",4), (6,"f",4), (7,"?",1), (10,"Q",8), (11,"q",8), (12,"d",8) ] } }
 read_uint32, read_int32, read_uint64, read_int64 = readers[4], readers[5], readers[10], readers[11]
 
-def _gguf_parse(tensor: Tensor) -> tuple[dict, dict[str, Tensor]]:
+def _gguf_header(tensor: Tensor):
   r = io.BufferedReader(TensorIO(tensor), 1_000_000)
   magic, version, n_tensors, n_kv = r.read(4), read_int32(r), read_int64(r), read_int64(r)
   if magic != b"GGUF" or version not in [2, 3]: raise ValueError("Invalid GGUF format!")
@@ -143,9 +141,19 @@ def _gguf_parse(tensor: Tensor) -> tuple[dict, dict[str, Tensor]]:
 
   t_infos = [ (read_str(r), tuple(read_uint64(r) for _ in range(read_uint32(r))), read_int32(r), read_uint64(r)) for _ in range(n_tensors) ]
   alignment, pos = kv_data.get("general.alignment", 32), r.tell()
-  data_start = round_up(pos, alignment)
+  return kv_data, t_infos, round_up(pos, alignment)
 
-  state_dict = {name: ggml_data_to_tensor(tensor[data_start + off:], prod(dims), typ).reshape(*reversed(dims)) for name, dims, typ, off in t_infos}
+def _gguf_parse(tensor: Tensor, device_fn: Callable[[str], str]|None=None) -> tuple[dict, dict[str, Tensor]]:
+  kv_data, t_infos, data_start = _gguf_header(tensor)
+  state_dict = {}
+  for name, dims, typ, off in t_infos:
+    n = prod(dims)
+    if device_fn:
+      nbytes = n * _GGML_NATIVE[typ].itemsize if typ in _GGML_NATIVE else (n // _GGML_QUANT[typ][0]) * _GGML_QUANT[typ][1]
+      raw = tensor[data_start + off : data_start + off + nbytes].to(device_fn(name)).realize()
+    else:
+      raw = tensor[data_start + off:]
+    state_dict[name] = ggml_data_to_tensor(raw, n, typ).reshape(*reversed(dims))
   return kv_data, state_dict
 
 def _gguf_split_paths(path: pathlib.Path, kv: dict) -> list[pathlib.Path]:
@@ -154,7 +162,7 @@ def _gguf_split_paths(path: pathlib.Path, kv: dict) -> list[pathlib.Path]:
   if not (m := re.match(r"^(.*)-00001-of-\d{5}\.gguf$", str(path))): raise ValueError(f"first split path must end with -00001-of-NNNNN.gguf: {path}")
   return [pathlib.Path(f"{m.group(1)}-{i:05d}-of-{total:05d}.gguf") for i in range(1, total+1)]
 
-def gguf_load(fn: Tensor|str|pathlib.Path) -> tuple[dict, dict[str, Tensor]]:
+def gguf_load(fn: Tensor|str|pathlib.Path, devices:tuple[str,...]|None=None) -> tuple[dict, dict[str, Tensor]]:
   """
   Loads a .gguf file, returning the `kv_data` and `state_dict`. Multi-part splits are auto-merged when loaded by path.
 
@@ -169,8 +177,22 @@ def gguf_load(fn: Tensor|str|pathlib.Path) -> tuple[dict, dict[str, Tensor]]:
 
   NOTE: The provided tensor must be on a device that supports execution.
   """
+  device_fn = None
+  if devices:
+    kv_tmp, _, _ = _gguf_header(fn if isinstance(fn, Tensor) else Tensor(fn))
+    arch = kv_tmp['general.architecture']
+    num_blocks = kv_tmp[f'{arch}.block_count'] - kv_tmp.get(f'{arch}.nextn_predict_layers', 0)
+
+    def device_fn(name:str) -> str:
+      if name.startswith('blk.'):
+        i = int(name.split('.')[1])
+        if i < num_blocks: return devices[i * len(devices) // num_blocks]
+      return devices[0]
+
   # TODO: remove the need for copy to default device
-  def load(p): return _gguf_parse(p if isinstance(p, Tensor) else Tensor(p).to(None).realize())
+  def load(p):
+    t = p if isinstance(p, Tensor) else Tensor(p)
+    return _gguf_parse(t, device_fn) if device_fn else _gguf_parse(t.to(None).realize())
   kv, sd = load(fn)
   if kv.get('split.count', 1) <= 1: return kv, sd
   if isinstance(fn, Tensor): raise ValueError("multi-part GGUF requires a path argument (got Tensor)")
