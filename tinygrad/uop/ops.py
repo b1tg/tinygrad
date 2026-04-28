@@ -77,14 +77,16 @@ def consumer_map_from_toposort(lst:Iterable[UOp]):
       if s in ret: ret[s][u] = None
   return ret
 
-def pretty_print(x:UOp, cache=None, d=0)->str:
-  def dfs(x:UOp, cache:dict):
+def pretty_print(x:UOp, cache=None, d=0, max_depth=200)->str:
+  def dfs(x:UOp, cache:dict, depth=0):
+    if depth > max_depth: return
     for s in x.src:
       cache.setdefault(s, [len(cache), 0, False])[1] += 1
-      if cache[s][1] == 1: dfs(s, cache)
+      if cache[s][1] == 1: dfs(s, cache, depth+1)
   if cache is None: dfs(x, cache:={})
+  if d > max_depth: return f"{' '*d}..."
   if (cx:=cache.setdefault(x, [0,0,False]))[2]: return f"{' '*d}x{cx[0]}"
-  cx[2], srcs = True, (''.join(f'\n{pretty_print(s, cache, d+2)},' for s in x.src))
+  cx[2], srcs = True, (''.join(f'\n{pretty_print(s, cache, d+2, max_depth)},' for s in x.src))
   return f"{' '*d}{f'x{cx[0]}:=' * (cx[1]>1)}{type(x).__name__}({x.op}, {x.dtype}, arg={x.argstr()}{x.tagstr()}, src=({srcs}))"
 
 class UOpMetaClass(type):
