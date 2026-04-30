@@ -51,6 +51,7 @@ def simplify_valid_load(buf:UOp, start_idx:UOp, valid:UOp) -> UOp|None:
 
 
 load_store_indexing = PatternMatcher([
+  (UPat(Ops.INDEX, src=(UPat.var("buf"),)), lambda buf: buf),
   # image load valid idx simplification
   (UPat(Ops.INDEX, src=(UPat.var("buf"), invalid_gate)), lambda buf,x,i,cond: simplify_valid_load(buf, x, cond)),
   # simplify away long after index has been lowered
@@ -280,6 +281,18 @@ pm_render = PatternMatcher([
   (UPat(Ops.GEP, name='gep'), lambda gep: UOp(Ops.STACK, gep.dtype, tuple(gep.src[0].gep(x) for x in gep.arg)) if len(gep.arg) > 1 else None),
   (UPat(Ops.GEP, name='gep'), lambda gep: gep.src[0] if gep.src[0].dtype.vcount == 1 and gep.arg == (0,) else None),
   (UPat(Ops.STACK, src=(UPat(name='x'),)), lambda x: x),
+  # LOAD(INDEX(STACK(p,p,...,p), idx_scalar, ...)) where all STACK srcs identical ptrs is broadcast load
+  # Rewrite to scalar load + STACK broadcast (renders as `make_T(x, x, ..., x)`)
+  (UPat(Ops.LOAD, name='ld', src=(
+      UPat(Ops.INDEX, name='idx_node', src=(UPat(Ops.STACK, name='stk'), UPat.var('off')), allow_any_len=True),
+    ), allow_any_len=True),
+    lambda ld, stk, idx_node, off: (lambda scalar_ld: UOp(Ops.STACK, ld.dtype, (scalar_ld,) * ld.dtype.vcount))(
+      UOp(Ops.LOAD, ld.dtype.scalar(),
+          (UOp(Ops.INDEX, idx_node.dtype.scalar(), (stk.src[0], off) + idx_node.src[2:]),) + ld.src[1:]))
+      if isinstance(stk.dtype, PtrDType) and len(stk.src) > 1
+         and all(s is stk.src[0] for s in stk.src)
+         and off.dtype.vcount == 1
+      else None),
   # give any loads that are masked an alt value
   (UPat(Ops.LOAD, src=(UPat(Ops.INDEX, src=(UPat(), UPat(), UPat())).or_casted(),), allow_any_len=True, name="x"),
     lambda x: x.replace(src=(x.src[0], x.const_like(0))+x.src[1:])
