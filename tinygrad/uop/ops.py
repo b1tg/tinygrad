@@ -918,7 +918,7 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
     if len(shape) > 1: ret = ret.reshape(shape)
     return ret
   def placeholder_like(self, slot:int):
-    assert all_int(self.shape), "no placeholder-like on symbolic shape"
+    if not all_int(self.shape): return self.param_like(slot)
     return UOp.placeholder(self.max_shard_shape, self.dtype, slot)
 
   # set is store+end+after

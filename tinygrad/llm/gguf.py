@@ -143,6 +143,8 @@ def _gguf_header(tensor: Tensor):
   alignment, pos = kv_data.get("general.alignment", 32), r.tell()
   return kv_data, t_infos, round_up(pos, alignment)
 
+expert_raw_weights: dict[str, tuple[Tensor, int, int]] = {}
+
 def _gguf_parse(tensor: Tensor, device_fn: Callable[[str], str]|None=None) -> tuple[dict, dict[str, Tensor]]:
   kv_data, t_infos, data_start = _gguf_header(tensor)
   state_dict = {}
@@ -153,6 +155,10 @@ def _gguf_parse(tensor: Tensor, device_fn: Callable[[str], str]|None=None) -> tu
       raw = tensor[data_start + off : data_start + off + nbytes].to(device_fn(name)).realize()
     else:
       raw = tensor[data_start + off:]
+    if '_exps.weight' in name and typ in _GGML_QUANT:
+      nbytes = (n // _GGML_QUANT[typ][0]) * _GGML_QUANT[typ][1]
+      raw_t = raw[:nbytes] if device_fn else tensor[data_start + off : data_start + off + nbytes]
+      expert_raw_weights[name] = (raw_t, typ, dims[-1])
     state_dict[name] = ggml_data_to_tensor(raw, n, typ).reshape(*reversed(dims))
   return kv_data, state_dict
 

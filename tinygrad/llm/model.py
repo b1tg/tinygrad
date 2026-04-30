@@ -110,8 +110,20 @@ class FFNBlock:
         vals, sel = pairwise_topk(logits, self.config.num_experts_per_tok)
         probs = vals.softmax(-1) if self.config.norm_topk_prob else logits.softmax(-1).gather(-1, sel)
       probs = probs * self.config.routed_scaling_factor
-      x_down = self.ffn_down_exps(sel, (self.ffn_gate_exps(sel, h).silu() * self.ffn_up_exps(sel, h)).contiguous())  # (B, T, k, D)
-      out = (x_down * probs.unsqueeze(-1)).sum(axis=2)  # (B, T, D)
+      if getenv("CUSTOM_EXPERT") and hasattr(self, '_fused_gu_cache') and hasattr(self, '_down_fused_cache'):
+        from tinygrad.llm.hip_expert import expert_fused_gate_up, expert_down_fused, _find_raw_blocks
+        c = self.config
+        H = c.hidden_dim if isinstance(c.hidden_dim, int) else c.hidden_dim[self._blk_idx]
+        raw_g, raw_u = _find_raw_blocks(self.ffn_gate_exps.weight), _find_raw_blocks(self.ffn_up_exps.weight)
+        raw_d = _find_raw_blocks(self.ffn_down_exps.weight)
+        gu = expert_fused_gate_up(x, sel, raw_g, raw_u, NE=c.num_experts, H=H, D=c.dim,
+                                  K=c.num_experts_per_tok, qt=self._gu_qt, _src_lib=self._fused_gu_cache)
+        out = expert_down_fused(gu, sel, probs, raw_d, NE=c.num_experts, out_dim=c.dim, H=H,
+                                K=c.num_experts_per_tok, qt=self._down_qt, _src_lib=self._down_fused_cache).unsqueeze(0)
+      else:
+        fused = (self.ffn_gate_exps(sel, h).silu() * self.ffn_up_exps(sel, h)).contiguous()
+        x_down = self.ffn_down_exps(sel, fused)
+        out = (x_down * probs.unsqueeze(-1)).sum(axis=2)
       if hasattr(self, 'ffn_gate_shexp'):
         shexp = self.ffn_down_shexp(self.ffn_gate_shexp(x).silu().contiguous() * self.ffn_up_shexp(x))
         if hasattr(self, 'ffn_gate_inp_shexp'): shexp = shexp * (x * self.ffn_gate_inp_shexp["weight"]).sum(axis=-1, keepdim=True).sigmoid()
@@ -132,7 +144,7 @@ class FFNBlock:
     # we pass in the weights implicitly so we unpack the GGUF on the fly
     @function(precompile=True, allow_implicit=True)
     def _run(x:Tensor, start_pos:int|UOp):
-      h =     x + self._attention(self.attn_norm(x), start_pos)
+      h = x + self._attention(self.attn_norm(x), start_pos)
       return (h + self._feed_forward(self.ffn_norm(h))).contiguous()
     return _run(x, start_pos)
 
@@ -298,6 +310,25 @@ class Transformer:
     block_cls = MLATransformerBlock if config.kv_lora_rank > 0 else TransformerBlock
     self.blk:list[FFNBlock] = [GatedDeltaNetBlock(config, config.ssm) if config.ssm and (i+1) % config.full_attention_interval != 0 else
                                block_cls(dense_config if i < config.leading_dense_blocks else config) for i in range(config.num_blocks)]
+    for i, b in enumerate(self.blk): b._blk_idx = i
+    if getenv("CUSTOM_EXPERT") and config.num_experts > 0:
+      from tinygrad.llm.hip_expert import _get_fused_gu_kernel, _get_down_fused_kernel
+      from tinygrad.llm.gguf import expert_raw_weights
+      for b in self.blk:
+        if hasattr(b, 'ffn_gate_exps'):
+          H = config.hidden_dim if isinstance(config.hidden_dim, int) else config.hidden_dim[b._blk_idx]
+          gname = f"blk.{b._blk_idx}.ffn_gate_exps.weight"
+          dname = f"blk.{b._blk_idx}.ffn_down_exps.weight"
+          if gname in expert_raw_weights:
+            qt_g = expert_raw_weights[gname][1]
+            if qt_g in {2, 12}:
+              b._gu_qt = qt_g
+              b._fused_gu_cache = _get_fused_gu_kernel(H, config.dim, config.num_experts_per_tok, config.num_experts, qt_g)
+          if dname in expert_raw_weights:
+            qt_d = expert_raw_weights[dname][1]
+            b._down_qt = qt_d
+            if qt_d in {2, 8}:  # Q5_0 (qt=6) stays with BEAM — custom kernel not yet validated
+              b._down_fused_cache = _get_down_fused_kernel(config.dim, H, config.num_experts_per_tok, config.num_experts, qt_d)
     self.token_embd  = nn.Embedding(config.vocab_size, config.dim)
     self.output_norm = nn.RMSNorm(config.dim, config.norm_eps)
     self.output = nn.Linear(config.dim, config.vocab_size, bias=False)
