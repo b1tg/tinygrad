@@ -571,7 +571,8 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
       if src_axis is None: return None
       arg_acc:list[sint] = list(itertools.accumulate(self.marg, operator.mul, initial=1))
       # new_axis is the last one that preserves prod(prior to new_axis) and must not move items between shards
-      new_axis = len(arg_acc) - arg_acc[::-1].index(prod(self.src[0].shape[:src_axis])) - 1
+      target = ssimplify(prod(self.src[0].shape[:src_axis]))
+      new_axis = len(arg_acc) - next(i for i,x in enumerate(reversed(arg_acc)) if ssimplify(ssimplify(x)-target) == 0) - 1
       if self.shape[new_axis] % len(self.device) != 0: raise RuntimeError(f"reshape {self.src[0].shape} -> {self.shape} moved items between shards")
       return new_axis
     if self.op is Ops.PERMUTE: return self.marg.index(src_axis) if src_axis is not None else None
@@ -1458,27 +1459,42 @@ pm_lower_index_dtype = PatternMatcher([
   # There are no Unary ops at this point in symbolic, those are introduced later
   (UPat(GroupOp.Binary, name="u", src=(UPat.var("x").cast(dtypes.weakint), UPat.var("y").cast(dtypes.weakint))), lambda u,x,y:
     x.cast(dt:=least_upper_dtype(select_dtype(u), x.dtype, y.dtype)).alu(u.op, y.cast(dt)).cast(u.dtype)),
+  (UPat(GroupOp.ALU, dtype=dtypes.weakint, name="u"), lambda u:
+    u.replace(dtype=select_dtype(u)) if all(s.dtype in dtypes.ints for s in u.src) else None),
+  (UPat(GroupOp.Binary, name="u"), lambda u:
+    u.replace(src=tuple(s.cast(u.dtype) for s in u.src)) if u.dtype in dtypes.ints and all(s.dtype in dtypes.ints for s in u.src) and
+      any(s.dtype != u.dtype for s in u.src) else None),
   (UPat((Ops.CONST, Ops.VCONST), dtype=dtypes.weakint, name="u"),
     lambda u: u.replace(dtype=select_dtype(u)).cast(u.dtype) if u.arg!=Invalid else None),
   (UPat(Ops.WHERE, dtypes.weakint, src=(UPat.var("cond"), UPat.var("x").cast(dtypes.weakint), UPat.var("y").cast(dtypes.weakint))), lambda cond,x,y:
     cond.where(x.cast(dt:=least_upper_dtype(x.dtype, y.dtype)), y.cast(dt)).cast(dtypes.weakint)),
+  (UPat(Ops.WHERE, dtypes.weakint, src=(UPat.var("cond"), UPat.var("x", dtypes.ints), UPat.var("y", dtypes.ints))), lambda cond,x,y:
+    cond.where(x.cast(dt:=least_upper_dtype(x.dtype, y.dtype)), y.cast(dt))),
   (UPat(Ops.RANGE, src=(UPat.var("end").cast(dtypes.weakint)), name="r"), lambda r,end: r.replace(dtype=end.dtype, src=(end,)).cast(dtypes.weakint)),
+  (UPat(Ops.RANGE, dtype=dtypes.weakint, src=(UPat.var("end", dtypes.ints),), name="r"), lambda r,end: r.replace(dtype=end.dtype, src=(end,))),
   (UPat(Ops.STACK, src=UPat().cast(dtypes.weakint), name="v"),
     lambda v: v.replace(dtype=(dt:=select_dtype(v)), src=tuple(s.src[0].cast(dt.scalar()) for s in v.src)).cast(dtypes.weakint)),
+  (UPat(Ops.STACK, name="v"), lambda v:
+    v.replace(dtype=(dt:=select_dtype(v)), src=tuple(s.cast(dt.scalar()) for s in v.src)) if v.dtype.scalar() == dtypes.weakint and
+      all(s.dtype in dtypes.ints for s in v.src) else None),
   # special can only be int32
   (UPat(Ops.SPECIAL, src=(UPat.var("var").cast(dtypes.weakint),), name="u"),
     lambda u,var: u.replace(dtype=dtypes.int, src=(var,)).cast(dtypes.weakint)),
+  (UPat(Ops.SPECIAL, dtype=dtypes.weakint, src=(UPat.var("var", dtypes.ints),), name="u"), lambda u,var: u.replace(dtype=dtypes.int, src=(var,))),
   (UPat(Ops.DEFINE_VAR, dtype=dtypes.weakint, name="u"), lambda u: u.replace(dtype=dtypes.int).cast(dtypes.weakint)),
   (UPat(Ops.BIND, src=(UPat.var("var").cast(dtypes.weakint), UPat.cvar("val").cast(dtypes.weakint))),
     lambda var,val: var.bind(val).cast(dtypes.weakint)),
+  (UPat(Ops.BIND, dtype=dtypes.weakint, src=(UPat.var("var", dtypes.ints), UPat.cvar("val", dtypes.ints))), lambda var,val: var.bind(val)),
   # lower Invalid
   (UPat.var("buf").index(UPat.var("cond").where(UPat.var("idx"), UPat(Ops.CONST, arg=Invalid))), lambda buf,idx,cond: buf.index(idx, cond, ptr=True)),
+  (UPat(Ops.INDEX, src=(UPat.var("buf"),)), lambda buf: buf),
   # remove hanging casts
   (UPat(Ops.INDEX, src=(UPat.var("buf"), UPat.var("idx", dtypes.ints).cast()),), lambda buf,idx: buf.index(idx, ptr=True)),
   (UPat(Ops.INDEX, src=(UPat.var("buf"), UPat.var("idx", dtypes.ints).cast(), UPat.var("valid"))),
    lambda buf,idx,valid: buf.index(idx, valid, ptr=True)),
   (UPat((Ops.SINK, Ops.NOOP, Ops.END), name="n"),
    lambda n: n.replace(src=tuple(s.src[0] if s.op is Ops.CAST and s.dtype == dtypes.weakint else s for s in n.src))),
+  (UPat(Ops.CAST, dtype=dtypes.weakint, src=(UPat.var("x", dtypes.ints),)), lambda x: x),
   # vectorized indexes (ie. images) must be int
   (UPat(Ops.INDEX, src=(UPat(), UPat(Ops.STACK, dtypes.long, name="vec")), allow_any_len=True, name="idx"),
    lambda idx,vec: idx.replace(src=(idx.src[0], UOp.vectorize(*(u.cast(dtypes.int) for u in vec.src)), *idx.src[2:])))

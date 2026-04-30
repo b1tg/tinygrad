@@ -2,7 +2,7 @@ from __future__ import annotations
 import functools, itertools, pathlib
 from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function
-from tinygrad.llm.gguf import gguf_load
+from tinygrad.llm.gguf import gguf_load, _layer_shard_device, _layer_shard_splits
 from tinygrad.uop.ops import resolve
 
 @functools.cache
@@ -15,8 +15,35 @@ class ExpertWeights:
   """Like nn.Linear but with num_experts dimension. Weight shape: (num_experts, out_features, in_features)."""
   def __init__(self, num_experts:int, in_features:int, out_features:int):
     self.weight = Tensor.zeros(num_experts, out_features, in_features)
+  def _raw_half(self, raw:Tensor, off:Tensor) -> Tensor:
+    return raw.bitcast('float16')[off // 2].cast('float32')
+  def _raw_gemv(self, sel:Tensor, x:Tensor) -> Tensor|None:
+    if not getenv("CODEGEN_EXPERT") or not hasattr(self, '_raw_weight'): return None
+    raw, qt = self._raw_weight
+    if qt not in {2, 8}: return None
+    ne, H, D = self.weight.shape
+    K, prefix = sel.shape[-1], sel.shape[:-1]
+    bpr, bpb = D//32, (18 if qt == 2 else 34)
+    pre1 = (1,)*len(prefix)
+    e = sel.reshape(prefix+(K, 1, 1, 1))
+    h = Tensor.arange(H, device=x.device).reshape(pre1+(1, H, 1, 1))
+    db = Tensor.arange(bpr, device=x.device).reshape(pre1+(1, 1, bpr, 1))
+    di = Tensor.arange(32, device=x.device).reshape(pre1+(1, 1, 1, 32))
+    off = ((e*H + h)*bpr + db) * bpb
+    scale = self._raw_half(raw, off)
+    if qt == 2:
+      q = raw[off + 2 + (di%16)].rshift(((di%32)//16)*4).bitwise_and(0xF).cast('float32') - 8
+    else:
+      q = raw[off + 2 + di].cast('uint8').bitcast('int8').cast('float32')
+    x_ = x.expand(prefix+(K, D)) if x.shape[-2] == 1 else x
+    x_ = x_.reshape(prefix+(K, bpr, 32)).unsqueeze(-3)
+    return (x_ * scale * q).sum(axis=(-1, -2))
   def __call__(self, sel:Tensor, x:Tensor) -> Tensor:
     # sel: (B, T, k), x: (B, T, 1, in) or (B, T, k, in) -> output: (B, T, k, out)
+    if (ret:=self._raw_gemv(sel, x)) is not None: return ret
+    if isinstance(self.weight.device, tuple):
+      sel, x = sel.to(self.weight.device), x.to(self.weight.device) if isinstance(x.device, str) else x
+      return (x.unsqueeze(-2) * self.weight[sel]).sum(axis=-1).contiguous()
     return (x.unsqueeze(-2) @ self.weight[sel].transpose(-1, -2)).contiguous().squeeze(-2)
 
 def apply_rope(x:Tensor, freqs_cis:Tensor) -> Tensor:
@@ -123,7 +150,7 @@ class FFNBlock:
       else:
         fused = (self.ffn_gate_exps(sel, h).silu() * self.ffn_up_exps(sel, h)).contiguous()
         x_down = self.ffn_down_exps(sel, fused)
-        out = (x_down * probs.unsqueeze(-1)).sum(axis=2)
+        out = (x_down * probs.to(x_down.device).unsqueeze(-1)).sum(axis=2).to(x.device)
       if hasattr(self, 'ffn_gate_shexp'):
         shexp = self.ffn_down_shexp(self.ffn_gate_shexp(x).silu().contiguous() * self.ffn_up_shexp(x))
         if hasattr(self, 'ffn_gate_inp_shexp'): shexp = shexp * (x * self.ffn_gate_inp_shexp["weight"]).sum(axis=-1, keepdim=True).sigmoid()
@@ -145,7 +172,7 @@ class FFNBlock:
     @function(precompile=True, allow_implicit=True)
     def _run(x:Tensor, start_pos:int|UOp):
       h = x + self._attention(self.attn_norm(x), start_pos)
-      return (h + self._feed_forward(self.ffn_norm(h))).contiguous()
+      return h + self._feed_forward(self.ffn_norm(h))
     return _run(x, start_pos)
 
 class TransformerBlock(FFNBlock):
@@ -413,9 +440,24 @@ class Transformer:
       expert_bias=f"blk.{kv.get(f'{arch}.leading_dense_block_count', 0)}.exp_probs_b.bias" in state_dict)
     model = Transformer(config)
     if devices:
+      splits = _layer_shard_splits(config.num_blocks, len(devices))
       for i, blk in enumerate(model.blk):
-        for v in nn.state.get_parameters(blk): v.to_(devices[i * len(devices) // config.num_blocks])
+        for v in nn.state.get_parameters(blk): v.to_(_layer_shard_device(i, devices, splits))
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
+    if getenv("CODEGEN_EXPERT") and config.num_experts > 0:
+      from tinygrad.llm.gguf import expert_raw_weights
+      for b in model.blk:
+        if hasattr(b, 'ffn_gate_exps'):
+          for attr in ("ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"):
+            name = f"blk.{b._blk_idx}.{attr}.weight"
+            if name in expert_raw_weights and expert_raw_weights[name][1] in {2, 8}:
+              getattr(b, attr)._raw_weight = expert_raw_weights[name][:2]
+    if getenv("MOE_TP") and devices and config.num_experts > 0:
+      for b in model.blk:
+        if hasattr(b, 'ffn_gate_exps'):
+          b.ffn_gate_exps.weight.shard_(devices, axis=1)
+          b.ffn_up_exps.weight.shard_(devices, axis=1)
+          b.ffn_down_exps.weight.shard_(devices, axis=2)
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:
       for s in (params:=nn.state.get_parameters(model)): s.replace(s.contiguous())

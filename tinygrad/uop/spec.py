@@ -176,6 +176,7 @@ shared_codegen_spec = PatternMatcher([
   (UPat(Ops.GEP, src=(UPat.var("src"),), name="gep"), lambda gep,src: gep.dtype == src.dtype.scalar()),
 
   # LOAD(idx) / STORE(idx, val)
+  (UPat(Ops.LOAD, name="x"), lambda x: True if x.src[0].op is Ops.INDEX else None),
   (UPat().index(UPat()).or_casted().load(), lambda: True),
   (UPat().index(UPat(), UPat(dtype=dtypes.bool)).or_casted().load(), lambda: True),  # gated load (alt added in program_spec)
   (UPat(Ops.INDEX).or_casted().store(UPat()), lambda: True),
@@ -189,6 +190,8 @@ shared_codegen_spec = PatternMatcher([
   # INDEX (2-arg and 3-arg with bool gate)
   (UPat(GroupOp.Defines|{Ops.AFTER}, name="buf").index(UPat.var("idx")), validate_index),
   (UPat(Ops.INDEX, src=(UPat(GroupOp.Defines|{Ops.AFTER}, name="buf"), UPat.var("idx"), UPat.var("gate", dtype=dtypes.bool))), validate_index),
+  (UPat(Ops.INDEX, src=(UPat(), UPat()), allow_any_len=True, name="idx"),
+   lambda idx: all(dtypes.is_int(x.dtype.scalar()) or x.dtype.scalar() == dtypes.bool for x in idx.src[1:])),
 
   # SPECIAL
   (UPat(Ops.SPECIAL, src=(UPat.var("x", (dtypes.weakint, dtypes.int32)),), name="s"), lambda s,x: s.dtype == x.dtype and isinstance(s.arg, str)),

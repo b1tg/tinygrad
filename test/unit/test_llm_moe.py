@@ -1,8 +1,11 @@
 import unittest
 import numpy as np
+import os
 from dataclasses import replace
-from tinygrad import Tensor
-from tinygrad.llm.model import TransformerBlock, TransformerConfig
+from tinygrad import Tensor, dtypes
+from tinygrad.helpers import getenv
+from tinygrad.llm.gguf import ggml_data_to_tensor, _layer_shard_device, _layer_shard_splits
+from tinygrad.llm.model import ExpertWeights, TransformerBlock, TransformerConfig
 
 def _moe_config(dim=8, hidden=16, n_heads=2, num_experts=4, num_experts_per_tok=2):
   return TransformerConfig(
@@ -12,6 +15,53 @@ def _moe_config(dim=8, hidden=16, n_heads=2, num_experts=4, num_experts_per_tok=
     num_experts=num_experts, num_experts_per_tok=num_experts_per_tok)
 
 class TestMoEFeedForward(unittest.TestCase):
+  def test_layer_shard_splits(self):
+    old = os.environ.get("LLM_SHARD_SPLITS")
+    try:
+      os.environ.pop("LLM_SHARD_SPLITS", None)
+      getenv.cache_clear()
+      self.assertEqual(_layer_shard_splits(61, 4), (0, 15, 30, 45, 61))
+      os.environ["LLM_SHARD_SPLITS"] = "0,14,30,46,61"
+      getenv.cache_clear()
+      splits = _layer_shard_splits(61, 4)
+      self.assertEqual(splits, (0, 14, 30, 46, 61))
+      self.assertEqual([_layer_shard_device(i, ("A", "B", "C", "D"), splits) for i in (0, 13, 14, 45, 60)], ["A", "A", "B", "C", "D"])
+      os.environ["LLM_SHARD_SPLITS"] = "0,14,61"
+      getenv.cache_clear()
+      with self.assertRaises(ValueError): _layer_shard_splits(61, 4)
+    finally:
+      if old is None: os.environ.pop("LLM_SHARD_SPLITS", None)
+      else: os.environ["LLM_SHARD_SPLITS"] = old
+      getenv.cache_clear()
+
+  def test_raw_expert_gemv_q4_0_q8_0(self):
+    def f16(x): return np.array([x], dtype=np.float16).view(np.uint8).tolist()
+    for qt in (2, 8):
+      ne, hidden, dim = 3, 2, 32
+      raw = []
+      for e in range(ne):
+        for h in range(hidden):
+          if qt == 2:
+            raw += f16(0.5)
+            qs = [((i+e+h)&15) for i in range(dim)]
+            raw += [qs[i] | (qs[i+16]<<4) for i in range(16)]
+          else:
+            raw += f16(0.25)
+            raw += np.array([((i+e+h)%17)-8 for i in range(dim)], dtype=np.int8).view(np.uint8).tolist()
+      rawt = Tensor(raw, dtype=dtypes.uint8)
+      ew = ExpertWeights(ne, dim, hidden)
+      ew.weight, ew._raw_weight = ggml_data_to_tensor(rawt, ne*hidden*dim, qt).reshape(ne, hidden, dim), (rawt, qt)
+      sel, x = Tensor([[[0, 2]]], dtype=dtypes.int32), Tensor(np.arange(dim, dtype=np.float32).reshape(1, 1, 1, dim))
+      ref = (x.unsqueeze(-2) @ ew.weight[sel].transpose(-1, -2)).contiguous().squeeze(-2)
+      old = os.environ.get("CODEGEN_EXPERT")
+      os.environ["CODEGEN_EXPERT"] = "1"
+      getenv.cache_clear()
+      try: np.testing.assert_allclose(ew(sel, x).numpy(), ref.numpy(), rtol=1e-5, atol=1e-5)
+      finally:
+        if old is None: os.environ.pop("CODEGEN_EXPERT", None)
+        else: os.environ["CODEGEN_EXPERT"] = old
+        getenv.cache_clear()
+
   def test_moe_feed_forward(self):
     dim, hidden, n_heads = 8, 16, 2
     num_experts, k = 4, 2

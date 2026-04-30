@@ -38,7 +38,7 @@ def create_schedule(sched_sink:UOp) -> UOp:
                 in_degree[k] += 1
             case Ops.MSELECT | Ops.MSTACK:
               for ss in s.src:
-                if ss.op is Ops.MSELECT: ss = ss.src[0]
+                ss = _unwrap_src(ss.src[0] if ss.op is Ops.MSELECT else ss)
                 if ss.op not in {Ops.BUFFER, Ops.PARAM}:
                   assert ss.op is Ops.AFTER, f"ss.op is not AFTER, it's {ss.op}"
                   for t in _split_after(ss)[0]:
@@ -77,7 +77,7 @@ def create_new_buffer(ctx:tuple[dict[UOp, UOp], tuple[UOp, ...]], b:UOp):
   return ret
 
 pm_post_sched_cache = PatternMatcher([
-  (UPat(Ops.PARAM, name="x"), lambda ctx,x: ctx[1][x.arg]),
+  (UPat(Ops.PARAM, name="x"), lambda ctx,x: ctx[1][x.arg] if x.arg < len(ctx[1]) else None),
   # create new BUFFERs for LUNIQUE BUFFERs from rangeify
   (UPat(Ops.BUFFER, src=(UPat(Ops.LUNIQUE), UPat(Ops.DEVICE)), name="b"), create_new_buffer),
 ])

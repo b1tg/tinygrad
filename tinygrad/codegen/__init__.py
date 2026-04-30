@@ -107,6 +107,9 @@ def full_rewrite_to_sink(sink:UOp, ren:Renderer|None=None, optimize:bool=True, b
 pm_linearize_cleanups = PatternMatcher([
   # if statements are not allowed in the graph
   (UPat((Ops.IF, Ops.ENDIF)), lambda: panic(RuntimeError, "if not allowed in graph")),
+  (UPat(Ops.INDEX, src=(UPat.var("buf"),)), lambda buf: (buf, [])),
+  (UPat(Ops.LOAD, name="ld"), lambda ld: (nld:=ld.replace(src=(ld.src[0].src[0],)+ld.src[1:]), [nld])
+   if ld.src[0].op is Ops.INDEX and len(ld.src[0].src) == 1 else None),
   # gated INDEX becomes IF-STORE-ENDIF. this is the only use of IF-ENDIF
   (UPat(Ops.STORE, name="u", src=(UPat(Ops.INDEX, src=(UPat(), UPat(), UPat(name="gate", dtype=dtypes.bool))).or_casted(), UPat())),
    lambda u, gate: (u, [mif:=UOp(Ops.IF, src=(gate, u.src[0])), u, UOp(Ops.ENDIF, src=(mif,))]))

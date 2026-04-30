@@ -3,7 +3,7 @@ from typing import Any, Callable
 
 from tinygrad.tensor import Tensor
 from tinygrad.dtype import dtypes
-from tinygrad.helpers import prod, round_up
+from tinygrad.helpers import prod, round_up, getenv
 from tinygrad.nn.state import TensorIO
 
 # ggml packs each iq grid entry as N bytes (N=4 for uint32 grids, N=8 for uint64 grids) in a single word. See ggml-common.h.
@@ -16,6 +16,16 @@ _GGML_NATIVE = {0: dtypes.float32, 1: dtypes.float16, 24: dtypes.int8, 25: dtype
                 26: dtypes.int32, 27: dtypes.int64, 28: dtypes.float64, 30: dtypes.bfloat16}
 _GGML_QUANT = {2:(32,18), 3:(32,20), 6:(32,22), 7:(32,24), 8:(32,34),
                12:(256,144), 13:(256,176), 14:(256,210), 18:(256,98), 21:(256,110), 22:(256,82), 23:(256,136), 39:(32,17), 41:(128,18)}
+
+def _layer_shard_splits(num_blocks:int, ndev:int) -> tuple[int, ...]:
+  if not (raw:=getenv("LLM_SHARD_SPLITS", "")): return tuple(i*num_blocks//ndev for i in range(ndev+1))
+  splits = tuple(int(x) for x in raw.split(',') if x)
+  if len(splits) != ndev+1 or splits[0] != 0 or splits[-1] != num_blocks or any(a >= b for a,b in zip(splits, splits[1:])):
+    raise ValueError(f"LLM_SHARD_SPLITS must be {ndev+1} increasing integers from 0 to {num_blocks}, got {raw!r}")
+  return splits
+
+def _layer_shard_device(i:int, devices:tuple[str, ...], splits:tuple[int, ...]) -> str:
+  return devices[next(j for j in range(len(devices)) if splits[j] <= i < splits[j+1])]
 
 def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
   """
@@ -188,11 +198,12 @@ def gguf_load(fn: Tensor|str|pathlib.Path, devices:tuple[str,...]|None=None) -> 
     kv_tmp, _, _ = _gguf_header(fn if isinstance(fn, Tensor) else Tensor(fn))
     arch = kv_tmp['general.architecture']
     num_blocks = kv_tmp[f'{arch}.block_count'] - kv_tmp.get(f'{arch}.nextn_predict_layers', 0)
+    splits = _layer_shard_splits(num_blocks, len(devices))
 
     def device_fn(name:str) -> str:
       if name.startswith('blk.'):
         i = int(name.split('.')[1])
-        if i < num_blocks: return devices[i * len(devices) // num_blocks]
+        if i < num_blocks: return _layer_shard_device(i, devices, splits)
       return devices[0]
 
   # TODO: remove the need for copy to default device

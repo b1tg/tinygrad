@@ -5,8 +5,11 @@ from tinygrad.uop.ops import UOp, Invalid
 # *** allreduce implementation ***
 def handle_allreduce(buf:UOp, red:UOp) -> UOp|None:
   if not isinstance(buf.device, tuple): return None
-  assert all_int(buf.shape), f"does not support symbolic shape {buf.shape}"
-  ndev, shape, numel = len(buf.device), buf.shape, prod(buf.shape)
+  ndev, shape = len(buf.device), buf.shape
+  if not all_int(shape):
+    buf = buf.contiguous()
+    return functools.reduce(lambda x,y: x.alu(red.arg, y), [buf.mselect(i).contiguous().copy_to_device(red.src[1]) for i in range(ndev)])
+  numel = prod(shape)
 
   # ring allreduce doesn't provide a benefit with only 2 nodes or where number of elements is less than 256k (empirically)
   # fallback to naive allreduce to save on kernel dispatch, chunking and reassembling chunks.
