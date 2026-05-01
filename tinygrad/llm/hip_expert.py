@@ -50,7 +50,7 @@ def _make_fused_gate_up_q4k_src(H: int, D: int, K: int, NE: int, eps: float = 1e
     x_load_lds = f"""
     long hoff=(long)(k/{K})*{D}L;
     float sum_sq=0.0f;
-    for(int i=tid;i<{D};i+=256) {{ float v=(float)h[hoff+i]; sum_sq+=v*v; sx[i]=v; }}
+    for(int i=tid;i<{D};i+=256) {{ float v=h[hoff+i]; sum_sq+=v*v; sx[i]=v; }}
     __builtin_amdgcn_s_barrier();
     RED32(sum_sq);
     __attribute__((shared, aligned(4))) float warp_sq[{RPW}];
@@ -785,3 +785,49 @@ def expert_gemv_q8(x: Tensor, sel: Tensor, wname: str, NE: int, H: int, D: int,
     name="expert_gemv_q8", device=x.device, src=src, lib=lib, ops=ops, mem=mem)
 
   return Tensor(out.uop.after(call)).reshape(T, K, H)
+
+# ---- Q8_0 nn.Linear custom GEMV (no expert indexing) ----
+
+def _make_linear_q8_0_src(H: int, D: int) -> str:
+  bpr = D // 32
+  return _HDR + f"""
+extern "C" __attribute__((global)) void __attribute__((amdgpu_flat_work_group_size(64, 64)))
+linear_q8_gemv(float* out, const float* x, const unsigned char* w, const int toks) {{{{
+    int tid=__ockl_get_local_id(0), warp=tid>>5, lane=tid&31;
+    int row=__ockl_get_group_id(0)*2+warp, tok=__ockl_get_group_id(1);
+    if(row>={H}) return;
+    long base=(long)row*{bpr*34}L;
+    long xoff=(long)tok*{D}L;
+    float acc=0.0f;
+    for(int b=lane;b<{bpr};b+=32) {{{{
+        long o=base+(long)b*34L; float s=lh(w+o);
+        const signed char* q=(const signed char*)(w+o+2);
+        float p=0.0f; for(int j=0;j<32;j++) p+=x[xoff+b*32+j]*(float)q[j];
+        acc+=s*p;
+    }}}}
+    RED32(acc);
+    if(lane==0) out[tok*{H}+row]=acc;
+}}}}
+"""
+
+def _get_linear_q8_kernel(H: int, D: int) -> tuple[str, bytes]:
+  key = ("linear_q8", H, D)
+  if key not in _kernel_cache:
+    src = _make_linear_q8_0_src(H, D)
+    _kernel_cache[key] = (src, _compile(src))
+  return _kernel_cache[key]
+
+def linear_q8_gemv(x: Tensor, raw_w: Tensor, H: int, D: int, _src_lib: tuple|None = None) -> Tensor:
+  src, lib = _src_lib or _get_linear_q8_kernel(H, D)
+  ngh = (H + 1) // 2
+  bpr = D // 32
+  T = prod(x.shape) // D
+  ops, mem = 2 * T * H * D, H * bpr * 34 + T * D * 4
+  out = Tensor.zeros(T * H, dtype=dtypes.float32, device=x.device)
+  def fxn(o, xf, wf):
+    sink = UOp.sink(UOp.special(ngh, "gidx0"), UOp.special(T, "gidx1"), UOp.special(64, "lidx0"),
+                    o, xf, wf, arg=KernelInfo(name="linear_q8", estimates=Estimates(ops=ops, mem=mem)))
+    return UOp(Ops.PROGRAM, src=(sink, UOp(Ops.DEVICE, arg=x.device),
+               UOp(Ops.LINEAR, src=(*sink.src, sink)), UOp(Ops.SOURCE, arg=src), UOp(Ops.BINARY, arg=lib)))
+  out, *_ = Tensor.custom_kernel(out, x, raw_w, fxn=fxn)
+  return out
