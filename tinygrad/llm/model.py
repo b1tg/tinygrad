@@ -343,6 +343,11 @@ class Transformer:
     kv_lora_rank = kv.get(f'{arch}.attention.kv_lora_rank', 0)
     head_dim = kv.get(f'{arch}.attention.key_length_mla', kv.get(f'{arch}.attention.key_length', kv[f'{arch}.embedding_length'] // n_heads))
     rope_dim = kv.get(f'{arch}.rope.dimension_count', head_dim)
+    # Split fused ffn_gate_up_exps into separate gate and up expert tensors
+    for name in [n for n in state_dict if 'ffn_gate_up_exps.weight' in n]:
+      w = state_dict.pop(name)
+      state_dict[name.replace('ffn_gate_up_exps', 'ffn_gate_exps')] = w[:, :w.shape[1]//2, :]
+      state_dict[name.replace('ffn_gate_up_exps', 'ffn_up_exps')] = w[:, w.shape[1]//2:, :]
 
     # Permute RoPE weights from interleaved to half-split layout.
     for name in state_dict:
