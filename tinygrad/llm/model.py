@@ -346,11 +346,11 @@ class Transformer:
 
     # Permute RoPE weights from interleaved to half-split layout.
     for name in state_dict:
-      if ('attn_q.weight' in name or 'attn_q_b.weight' in name) and (arch == 'llama' or kv_lora_rank):
+      if ('attn_q.weight' in name or 'attn_q_b.weight' in name) and (arch in ('llama', 'mistral3') or kv_lora_rank):
         w = state_dict[name].reshape(n_heads, state_dict[name].shape[0]//n_heads, -1)
         prefix = head_dim-rope_dim
         state_dict[name] = w[:, :prefix].cat(w[:, prefix:].rearrange("n (h two) d -> n (two h) d", two=2), dim=1).reshape(-1, w.shape[-1])
-      elif arch == 'llama' and 'attn_k.weight' in name:
+      elif arch in ('llama', 'mistral3') and 'attn_k.weight' in name:
         w = state_dict[name].reshape(n_kv_heads, state_dict[name].shape[0]//n_kv_heads, -1)
         state_dict[name] = w.rearrange("n (h two) d -> n (two h) d", two=2).reshape(-1, w.shape[-1])
       elif kv_lora_rank and 'attn_kv_a_mqa.weight' in name:
