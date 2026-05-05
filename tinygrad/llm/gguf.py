@@ -58,12 +58,30 @@ def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
      # Q4_K: 256 elements per 144-byte block (d:2, dmin:2, scales:12, qs:128)
      # Q5_K: 256 elements per 176-byte block (d:2, dmin:2, scales:12, qh:32, qs:128)
     if ggml_type in (12, 13):
-      d, dmin = (blocks[:,i:i+2].bitcast(dtypes.float16).cast(dtypes.float32).unsqueeze(-1) for i in [0, 2])
-      s = blocks[:,4:16]  # 12 bytes: 6-bit scales[0-3], 6-bit mins[0-3], high bits[4-7]
-      sc = s[:,0:4].bitwise_and(63).cat(s[:,8:12].bitwise_and(0xF).bitwise_or(s[:,0:4].rshift(6).lshift(4)), dim=-1)
-      mn = s[:,4:8].bitwise_and(63).cat(s[:,8:12].rshift(4).bitwise_or(s[:,4:8].rshift(6).lshift(4)), dim=-1)
-      qs_off = 48 if ggml_type == 13 else 16
-      q = Tensor.stack((qs:=blocks[:,qs_off:qs_off+128].reshape(-1,4,32)).bitwise_and(0xF), qs.rshift(4), dim=2).reshape(-1,8,32)
+      # reinterpret as uint32 for 4x wider memory loads (4 bytes/load instead of 1)
+      w = blocks.reshape(-1, nelements_nbytes[1]//4, 4).bitcast(dtypes.uint32).squeeze(-1)
+      d = w[:,0].bitwise_and(0xFFFF).cast(dtypes.uint16).bitcast(dtypes.float16).cast(dtypes.float32).reshape(-1, 1, 1)
+      dmin = w[:,0].rshift(16).cast(dtypes.uint16).bitcast(dtypes.float16).cast(dtypes.float32).reshape(-1, 1, 1)
+      s0, s1, s2 = w[:,1], w[:,2], w[:,3]  # 3 scale words = 12 bytes
+      sc = Tensor.stack(s0.bitwise_and(0x3F), s0.rshift(8).bitwise_and(0x3F),
+                        s0.rshift(16).bitwise_and(0x3F), s0.rshift(24).bitwise_and(0x3F),
+                        s2.bitwise_and(0xF).bitwise_or(s0.rshift(6).bitwise_and(3).lshift(4)),
+                        s2.rshift(8).bitwise_and(0xF).bitwise_or(s0.rshift(14).bitwise_and(3).lshift(4)),
+                        s2.rshift(16).bitwise_and(0xF).bitwise_or(s0.rshift(22).bitwise_and(3).lshift(4)),
+                        s2.rshift(24).bitwise_and(0xF).bitwise_or(s0.rshift(30).bitwise_and(3).lshift(4)), dim=-1)
+      mn = Tensor.stack(s1.bitwise_and(0x3F), s1.rshift(8).bitwise_and(0x3F),
+                        s1.rshift(16).bitwise_and(0x3F), s1.rshift(24).bitwise_and(0x3F),
+                        s2.rshift(4).bitwise_and(0xF).bitwise_or(s1.rshift(6).bitwise_and(3).lshift(4)),
+                        s2.rshift(12).bitwise_and(0xF).bitwise_or(s1.rshift(14).bitwise_and(3).lshift(4)),
+                        s2.rshift(20).bitwise_and(0xF).bitwise_or(s1.rshift(22).bitwise_and(3).lshift(4)),
+                        s2.rshift(28).bitwise_and(0xF).bitwise_or(s1.rshift(30).bitwise_and(3).lshift(4)), dim=-1)
+      qs_w_off = 12 if ggml_type == 13 else 4
+      qs = w[:,qs_w_off:qs_w_off+32].reshape(-1, 4, 8)  # (n_blocks, 4groups, 8words) uint32
+      q_lo = Tensor.stack(qs.bitwise_and(0xF), qs.rshift(8).bitwise_and(0xF),
+                          qs.rshift(16).bitwise_and(0xF), qs.rshift(24).bitwise_and(0xF), dim=-1).reshape(-1, 4, 32)
+      q_hi = Tensor.stack(qs.rshift(4).bitwise_and(0xF), qs.rshift(12).bitwise_and(0xF),
+                          qs.rshift(20).bitwise_and(0xF), qs.rshift(28).bitwise_and(0xF), dim=-1).reshape(-1, 4, 32)
+      q = Tensor.stack(q_lo, q_hi, dim=2).reshape(-1, 8, 32)
       if ggml_type == 13: q = q + q_to_uint8(blocks[:,16:48], 1).reshape(-1, 8, 32) * 16
       return (d * sc.unsqueeze(-1) * q - dmin * mn.unsqueeze(-1)).flatten(-2)
     if ggml_type == 14:
