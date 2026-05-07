@@ -8,8 +8,17 @@ from tinygrad.uop.ops import resolve
 @functools.cache
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> Tensor:
   freqs = 1.0 / (theta ** (Tensor.arange(0, dim, 2)[:(dim // 2)] / dim))
-  freqs = Tensor.arange(end).unsqueeze(dim=1) * freqs.unsqueeze(dim=0)
-  return freqs.cos().cat(freqs.sin(), dim=-1).contiguous()
+  angles = Tensor.arange(end).unsqueeze(dim=1) * freqs.unsqueeze(dim=0)
+  return angles.cos().cat(angles.sin(), dim=-1).contiguous()
+
+def compute_mrope_freqs(positions: Tensor, dim: int, theta: float, sections: tuple, interleaved: bool = True) -> Tensor:
+  freqs = 1.0 / (theta ** (Tensor.arange(0, dim, 2)[:(dim // 2)] / dim))
+  n = sum(s for s in sections if s)
+  if interleaved: axis = [j % 3 if j % 3 < len(sections) and j < 3 * sections[j % 3] else 0 for j in range(n)]
+  else: axis = [i for i, s in enumerate(sections) for _ in range(s) if s]
+  angles = Tensor.stack(*[positions[:, a:a+1].float() * freqs[j:j+1] for j, a in enumerate(axis)], dim=-1).squeeze(-2)
+  if n < dim // 2: angles = angles.cat(Tensor.zeros(positions.shape[0], dim // 2 - n), dim=-1)
+  return angles.cos().cat(angles.sin(), dim=-1).contiguous()
 
 class ExpertWeights:
   """Like nn.Linear but with num_experts dimension. Weight shape: (num_experts, out_features, in_features)."""
@@ -53,6 +62,7 @@ class TransformerConfig:
   head_dim: int
   rope_theta: float
   rope_dim: int
+  rope_sections: tuple
   v_head_dim: int
   max_context: int = 0
   qk_norm: int = 0
@@ -124,7 +134,7 @@ class FFNBlock:
   def _reusable_prefix_len(self, prefix_len:int, cached_len:int) -> int: return prefix_len
   # return writes that reset this block's state after a cache mismatch
   def _state_reset_ops(self) -> list[Tensor]: return []
-  def _init_state(self, x:Tensor): raise NotImplementedError
+  def _init_state(self, x:Tensor, freqs_cis:Tensor|None=None): raise NotImplementedError
   def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor: raise NotImplementedError
 
   def __call__(self, x: Tensor, start_pos: int|UOp):
@@ -182,10 +192,12 @@ class TransformerBlock(FFNBlock):
     attn = attn.transpose(1, 2).reshape(B, T, -1)                                    # back to (B,T,D)
     return self.attn_output(attn if not self.config.attn_output_gate else (attn * gate.sigmoid()))
 
-  def _init_state(self, x:Tensor):
+  def _init_state(self, x:Tensor, freqs_cis:Tensor|None=None):
     if not hasattr(self, "cache_kv"):
       # TODO: how is the dtype of this determined?
       self.cache_kv = Tensor.empty(2, x.shape[0], self.config.n_kv_heads, self.config.max_context, self.config.head_dim, device=x.device)
+    if freqs_cis is not None: self.freqs_cis = freqs_cis
+    elif not hasattr(self, "freqs_cis"):
       self.freqs_cis = precompute_freqs_cis(self.config.rope_dim, self.config.max_context, self.config.rope_theta)
 
 class MLATransformerBlock(FFNBlock):
@@ -229,9 +241,11 @@ class MLATransformerBlock(FFNBlock):
     attn = ((attn @ v) @ self.attn_v_b["weight"].transpose(-1, -2)).transpose(1, 2).reshape(B, T, -1)
     return self.attn_output(attn)
 
-  def _init_state(self, x:Tensor):
+  def _init_state(self, x:Tensor, freqs_cis:Tensor|None=None):
     if not hasattr(self, "cache_k"):
       self.cache_k = Tensor.empty(x.shape[0], 1, self.config.max_context, self.config.kv_lora_rank + self.config.rope_dim, device=x.device)
+    if freqs_cis is not None: self.freqs_cis = freqs_cis
+    elif not hasattr(self, "freqs_cis"):
       self.freqs_cis = precompute_freqs_cis(self.config.rope_dim, self.config.max_context, self.config.rope_theta)
 
 class GatedDeltaNetBlock(FFNBlock):
@@ -286,7 +300,7 @@ class GatedDeltaNetBlock(FFNBlock):
             self.recurrent_state.assign(Tensor.zeros_like(self.recurrent_state))] if hasattr(self, "conv_state") else []
   def _reusable_prefix_len(self, prefix_len:int, cached_len:int) -> int: return 0 if prefix_len != cached_len else prefix_len
 
-  def _init_state(self, x):
+  def _init_state(self, x, freqs_cis=None):
     if not hasattr(self, "conv_state"):
       self.conv_state = Tensor.zeros(x.shape[0], self.ssm_conv_kernel-1, self.conv_channels, device=x.device).clone()
       self.recurrent_state = Tensor.zeros(x.shape[0], self.num_v_heads, self.head_v_dim, self.head_v_dim, device=x.device).clone()
@@ -301,22 +315,24 @@ class Transformer:
     self.token_embd  = nn.Embedding(config.vocab_size, config.dim)
     self.output_norm = nn.RMSNorm(config.dim, config.norm_eps)
     self.output = nn.Linear(config.dim, config.vocab_size, bias=False)
-    self.max_context = config.max_context
+    self.max_context, self.config = config.max_context, config
     self.has_recurrent_block = any(isinstance(b, GatedDeltaNetBlock) for b in self.blk)
     self._cached_tokens: list[int] = []
     # we specialize the JIT for prefill and rollout
     self.prefill_jit = TinyJit(self.forward)
     self.rollout_jit = TinyJit(self.forward)
+    self.embed_jit = TinyJit(self.forward)
 
   def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
-    x = self.token_embd(tokens).float()                   # (B, T, D)
+    x = (tokens if len(tokens.shape) == 3 else self.token_embd(tokens)).float()         # (B, T, D) or (B, T) -> (B, T, D)
     for block in self.blk: x = block(x, start_pos)
     logits = self.output(self.output_norm(x))[:, -1, :]
     # Gumbel-max trick: argmax(logits/temp - log(-log(uniform))) is equivalent to sampling from softmax(logits/temp)
     return (logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1, keepdim=True)
 
   def __call__(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
-    return (self.prefill_jit if resolve(tokens.shape[1] != 1) else self.rollout_jit)(tokens.contiguous(), start_pos, temperature)
+    jit = self.embed_jit if len(tokens.shape) == 3 else self.prefill_jit if resolve(tokens.shape[1] != 1) else self.rollout_jit
+    return jit(tokens.contiguous(), start_pos, temperature)
 
   @staticmethod
   def from_gguf(gguf:Tensor|str|pathlib.Path, max_context:int|None=None,
@@ -342,6 +358,7 @@ class Transformer:
 
     kv_lora_rank = kv.get(f'{arch}.attention.kv_lora_rank', 0)
     head_dim = kv.get(f'{arch}.attention.key_length_mla', kv.get(f'{arch}.attention.key_length', kv[f'{arch}.embedding_length'] // n_heads))
+    rope_sections = tuple(kv.get(f'{arch}.rope.dimension_sections', ()))
     rope_dim = kv.get(f'{arch}.rope.dimension_count', head_dim)
 
     # Permute RoPE weights from interleaved to half-split layout.
@@ -362,7 +379,7 @@ class Transformer:
       vocab_size=len(kv['tokenizer.ggml.tokens']),
       head_dim=head_dim,
       rope_theta=kv[f'{arch}.rope.freq_base'],
-      rope_dim=rope_dim,
+      rope_dim=rope_dim, rope_sections=rope_sections,
       v_head_dim=kv.get(f'{arch}.attention.value_length_mla', kv.get(f'{arch}.attention.value_length', head_dim)),
       max_context=max_context,
       qk_norm=int(state_dict['blk.0.attn_q_norm.weight'].shape[0]) if 'blk.0.attn_q_norm.weight' in state_dict else 0,
@@ -391,7 +408,7 @@ class Transformer:
     prefix_len = sum(1 for _ in itertools.takewhile(lambda ab: ab[0] == ab[1], zip(tokens[:-1], self._cached_tokens)))
     return min(block._reusable_prefix_len(prefix_len, len(self._cached_tokens)) for block in self.blk)
 
-  def generate(self, tokens:list[int], chunk_size:int=32, temperature:float=0.0):
+  def generate(self, tokens:list[int], chunk_size:int=32, temperature:float=0.0, images:list|None=None):
     if self.has_recurrent_block: chunk_size = 1
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
     v_toks = UOp.variable("toks", 1, chunk_size)
@@ -399,16 +416,25 @@ class Transformer:
     temp = Tensor(temperature).contiguous()
     # assign all input tokens once, then slice from start_pos for the model call
     t = Tensor(tokens + [0] * (self.max_context - len(tokens)), dtype="int32").reshape(1, self.max_context)
+    image_embd = None
+    if images:
+      from tinygrad.llm.vision import get_rope_index
+      pos, image_embd = get_rope_index(tokens, images, self.max_context, self.token_embd)
+      mrope_freqs = compute_mrope_freqs(Tensor(pos), self.config.rope_dim, self.config.rope_theta, self.config.rope_sections)
+      for block in self.blk: block._init_state(image_embd[:, :1, :], mrope_freqs)
     # recompute start_pos from what's currently valid in the caches
     start_pos = self.get_start_pos(tokens)
     if start_pos < len(self._cached_tokens) and (resets := [r for b in self.blk for r in b._state_reset_ops()]): Tensor.realize(*resets)
     out, prompt_len = None, len(tokens)
     while len(tokens) < self.max_context:
       sp, nt = v_start_pos.bind(start_pos), v_toks.bind(min(chunk_size, len(tokens) - start_pos))
-      out = self(t[:, sp:sp+nt] if start_pos < prompt_len or out is None else out, sp, temp).realize()
+      if image_embd is not None and start_pos < prompt_len: inp = image_embd[:, sp:sp+nt, :]
+      else: inp = t[:, sp:sp+nt] if start_pos < prompt_len or out is None else out
+      out = self(inp, sp, temp).realize()
       start_pos += nt.val
       # chunked prefill: keep processing until all prompt tokens are consumed
       if start_pos < len(tokens): continue
+      image_embd = None
       tokens.append(int(out.item()))
       self._cached_tokens = tokens[:-1]
       yield tokens[-1]

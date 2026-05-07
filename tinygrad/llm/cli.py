@@ -1,10 +1,11 @@
 from __future__ import annotations
 import sys, argparse, codecs, typing, re, unicodedata, json, uuid, time, pathlib
-from tinygrad import nn
+from tinygrad import Tensor, nn
 from tinygrad.uop.ops import UOp, Ops
 from tinygrad.helpers import partition, DEBUG, Timing, GlobalCounters, stderr_log, colored, Context, fetch
 from tinygrad.viz.serve import TCPServerWithReuse, HTTPRequestHandler
 from tinygrad.llm.model import Transformer
+from tinygrad.llm.vision import VisionEncoder
 
 class SimpleTokenizer:
   def __init__(self, normal_tokens:dict[str, int], special_tokens:dict[str, int], preset:str="llama3",
@@ -81,6 +82,10 @@ class SimpleTokenizer:
     if self.preset == 'glm4': return []
     if self.preset == 'tekken': return self.encode("[/INST]")
     return [self.eos_id]
+  def image(self, n_tokens:int=1):
+    if self.preset == 'qwen2':
+      return self.encode("<|vision_start|>") + [self._special_tokens["<|image_pad|>"]] * n_tokens + self.encode("<|vision_end|>")
+    return self.encode("<image>")
   def prefix(self) -> list[int]:
     return ([] if self.bos_id is None else [self.bos_id]) + (self.encode("<sop>") if self.preset == 'glm4' else [])
   def is_end(self, token_id:int) -> bool: return token_id in (self.eos_id, self.eot_id)
@@ -103,6 +108,13 @@ models = {
   "olmoe": "https://huggingface.co/allenai/OLMoE-1B-7B-0924-Instruct-GGUF/resolve/main/olmoe-1b-7b-0924-instruct-q4_k_m.gguf",
   "moonlight": "https://huggingface.co/gabriellarson/Moonlight-16B-A3B-Instruct-GGUF/resolve/main/Moonlight-16B-A3B-Instruct-Q4_K_M.gguf",
   "glm-4.7-flash": "https://huggingface.co/unsloth/GLM-4.7-Flash-GGUF/resolve/main/GLM-4.7-Flash-Q4_K_M.gguf",
+}
+mmproj_models = {
+  "qwen3.5:0.8b": "https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/mmproj-F16.gguf",
+  "qwen3.5:4b": "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/mmproj-F16.gguf",
+  "qwen3.5:9b": "https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/mmproj-F16.gguf",
+  "qwen3.5:27b": "https://huggingface.co/unsloth/Qwen3.5-27B-GGUF/resolve/main/mmproj-F16.gguf",
+  "qwen3.5:35b-a3b": "https://huggingface.co/unsloth/Qwen3.5-35B-A3B-GGUF/resolve/main/mmproj-F16.gguf",
 }
 
 # *** simple OpenAI API compatible server with web interface on http://localhost:8000/ ***
@@ -155,6 +167,7 @@ class Handler(HTTPRequestHandler):
         elif isinstance(content, list):
           for c in content:
             if c["type"] == "text": ids += tok.encode(c["text"])
+            elif c["type"] == "image_url": ids += tok.image()
             else: raise RuntimeError(f"unhandled type: {c['type']}")
         else: raise RuntimeError(f"unknown content type: {type(content)}")
         if msg["role"] == "assistant" and i == len(body["messages"]) - 1: break
@@ -188,6 +201,7 @@ def main():
   parser.add_argument("--serve", nargs='?', type=int, const=8000, metavar="PORT", help="Run OpenAI compatible API (optional port, default 8000)")
   parser.add_argument("--warmup", action="store_true", help="warmup the JIT")
   parser.add_argument("--benchmark", nargs='?', type=int, const=20, metavar="COUNT", help="Benchmark tok/s (optional count, default 20)")
+  parser.add_argument("--mmproj", type=str, help="Path to mmproj GGUF for vision encoder")
   args = parser.parse_args()
 
   # load the model
@@ -199,11 +213,24 @@ def main():
   # get tokenizer
   tok = SimpleTokenizer.from_gguf_kv(kv)
 
+  # load vision encoder if mmproj available
+  vision_encoder = None
+  mmproj_path = args.mmproj or mmproj_models.get(args.model)
+  if mmproj_path:
+    print(f"loading vision encoder from {mmproj_path}")
+    vision_encoder = VisionEncoder.from_gguf(fetch(mmproj_path))
+    ve_params = nn.state.get_parameters(vision_encoder)
+    ve_sizes = [y.nbytes() for y in UOp.sink(*[x.uop for x in ve_params]).toposort() if y.op is Ops.BUFFER]
+    print(f"vision encoder: {sum(ve_sizes):,} bytes, {sum(x.numel() for x in ve_params):,} params")
+
   # warmup the JIT
   if args.warmup or args.serve:
     # run 2 tokens through the model twice to capture the JIT before serving
     with Context(DEBUG=max(DEBUG.value, 1)):
       for _ in range(2): list(zip(range(2), model.generate([0])))
+      if vision_encoder:
+        sp, temp = UOp.variable("start_pos", 0, model.max_context-1), Tensor(0.0).contiguous()
+        for i in range(2): model.embed_jit(Tensor.zeros(1, 1, model.config.dim).contiguous(), sp.bind(i), temp).realize()
 
   # start server
   if args.serve: LLMServer(('', args.serve), model, model_name, tok).serve_forever()
@@ -220,13 +247,25 @@ def main():
 
   # interactive chat
   ids: list[int] = tok.prefix()
+  if vision_encoder: print("  /image <path>  load an image")
+  pending_images = []
   while 1:
-    try:
-      ids += tok.role("user") + tok.encode(input('>>> ')) + tok.end_turn() + tok.role("assistant")
+    try: line = input('>>> ')
     except EOFError:
       break
+    if vision_encoder and line.startswith("/image "):
+      pending_images.append(vision_encoder.encode_image(line[7:].strip()))
+      print(f"  image loaded ({pending_images[-1][1]*pending_images[-1][2]} tokens)")
+      continue
+    ids += tok.role("user")
+    images = []
+    for embd, nx, ny in pending_images:
+      images.append((embd, len(ids), nx * ny, nx, ny))
+      ids += tok.image(nx * ny)
+    ids += tok.encode(line) + tok.end_turn() + tok.role("assistant")
+    pending_images = []
     dec = tok.stream_decoder()
-    for next_id in model.generate(ids):
+    for next_id in model.generate(ids, images=images or None):
       sys.stdout.write(dec(next_id) if not tok.is_end(next_id) else dec() + "\n\n")
       sys.stdout.flush()
       if tok.is_end(next_id): break
