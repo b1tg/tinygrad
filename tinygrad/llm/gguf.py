@@ -12,11 +12,11 @@ def _ggml_iq_grid(device: str, grid: tuple[int, ...], grid_shape: tuple[int, int
   values = [float((w >> (8*i)) & 0xFF) for w in grid for i in range(grid_shape[1])]
   return Tensor(values, dtype=dtypes.float32, device=device).reshape(grid_shape)
 
-# native types
+# native types {ggml_type: dtype}
 _GGML_NATIVE = {0: dtypes.float32, 1: dtypes.float16, 24: dtypes.int8, 25: dtypes.int16,
                 26: dtypes.int32, 27: dtypes.int64, 28: dtypes.float64, 30: dtypes.bfloat16}
 
-# map to (number of elements, number of bytes)
+# quant types {ggml_type: (number of elements, number of bytes)}
 _GGML_QUANT = {2:(32,18), 3:(32,20), 6:(32,22), 7:(32,24), 8:(32,34),
                12:(256,144), 13:(256,176), 14:(256,210), 18:(256,98), 21:(256,110), 22:(256,82), 23:(256,136), 39:(32,17), 41:(128,18)}
 
