@@ -29,8 +29,10 @@ EVENT_INDEX_PARTIAL_FLUSH = 4 # based on a comment in nvd.h
 WAIT_REG_MEM_FUNCTION_EQ  = 3 # ==
 WAIT_REG_MEM_FUNCTION_NEQ = 4 # !=
 WAIT_REG_MEM_FUNCTION_GEQ = 5 # >=
-AQL_HDR = (1 << hsa.HSA_PACKET_HEADER_BARRIER) | (hsa.HSA_FENCE_SCOPE_SYSTEM << hsa.HSA_PACKET_HEADER_SCACQUIRE_FENCE_SCOPE) \
-        | (hsa.HSA_FENCE_SCOPE_SYSTEM << hsa.HSA_PACKET_HEADER_SCRELEASE_FENCE_SCOPE)
+AMD_OPT_FLUSH = getenv("AMD_OPT_FLUSH", 1)
+def _aql_hdr(acq_fence, rel_fence):
+  return (1 << hsa.HSA_PACKET_HEADER_BARRIER) | (acq_fence << hsa.HSA_PACKET_HEADER_SCACQUIRE_FENCE_SCOPE) \
+       | (rel_fence << hsa.HSA_PACKET_HEADER_SCRELEASE_FENCE_SCOPE)
 
 @dataclass(frozen=True)
 class ProfileSQTTEvent(ProfileEvent): device:str; kern:int; se:int; blob:bytes; itrace:bool; exec_tag:int # noqa: E702
@@ -423,7 +425,9 @@ class AMDComputeAQLQueue(AMDComputeQueue):
   def exec(self, prg:AMDProgram, args_state:CLikeArgsState, global_size:tuple[sint, ...], local_size:tuple[sint, ...]):
     self.bind_args_state(args_state)
     if prg.dev.sqtt_enabled: self.sqtt_setup_exec(prg, global_size)
-    self._q.append(pkt:=hsa.hsa_kernel_dispatch_packet_t(header=AQL_HDR | (hsa.HSA_PACKET_TYPE_KERNEL_DISPATCH << hsa.HSA_PACKET_HEADER_TYPE),
+    hdr = self.dev.aql_hdr_system if getattr(self, '_post_copy_fence', False) else self.dev.aql_hdr
+    self._post_copy_fence = False
+    self._q.append(pkt:=hsa.hsa_kernel_dispatch_packet_t(header=hdr | (hsa.HSA_PACKET_TYPE_KERNEL_DISPATCH << hsa.HSA_PACKET_HEADER_TYPE),
       setup=3<<hsa.HSA_KERNEL_DISPATCH_PACKET_SETUP_DIMENSIONS, private_segment_size=prg.private_segment_size,
       group_segment_size=prg.group_segment_size, kernel_object=prg.aql_prog_addr, kernarg_address=args_state.buf.va_addr))
     self.bind_sints_to_mem(*local_size, mem=(pkt_view:=MMIOInterface(addr=ctypes.addressof(pkt), nbytes=ctypes.sizeof(pkt))), fmt='H', offset=4)
@@ -431,7 +435,7 @@ class AMDComputeAQLQueue(AMDComputeQueue):
     return self
 
   def _pm4_pkt(self, addr:sint, cnt:int) -> bytes:
-    return bytes(array.array('I', [AQL_HDR | (hsa.HSA_PACKET_TYPE_VENDOR_SPECIFIC << hsa.HSA_PACKET_HEADER_TYPE) | (1 << 16),
+    return bytes(array.array('I', [self.dev.aql_hdr | (hsa.HSA_PACKET_TYPE_VENDOR_SPECIFIC << hsa.HSA_PACKET_HEADER_TYPE) | (1 << 16),
       self.pm4.PACKET3(self.pm4.PACKET3_INDIRECT_BUFFER, 2), *data64_le(addr), cnt | self.pm4.INDIRECT_BUFFER_VALID, 10] + [0] * 10))
 
   def _prep_aql(self, q:list, pm4_buf:HCQBuffer) -> list[bytes|hsa.hsa_kernel_dispatch_packet_t]:
@@ -453,7 +457,19 @@ class AMDComputeAQLQueue(AMDComputeQueue):
 
   def _submit(self, dev:AMDDevice):
     cmds = self._cmds if dev == self.binded_device else self._prep_aql(self._q, dev.pm4_ibs.offset(dev.pm4_ib_alloc.alloc(len(self._q) * 4, 16)))
+    saved_first = saved_last = None
+    if dev._post_copy_fence:
+      dispatch_pkts = [c for c in cmds if isinstance(c, hsa.hsa_kernel_dispatch_packet_t)]
+      if dispatch_pkts:
+        first, last = dispatch_pkts[0], dispatch_pkts[-1]
+        saved_first, first.header = first.header, (first.header & ~(0x3 << hsa.HSA_PACKET_HEADER_SCACQUIRE_FENCE_SCOPE)) \
+                                                 | (hsa.HSA_FENCE_SCOPE_SYSTEM << hsa.HSA_PACKET_HEADER_SCACQUIRE_FENCE_SCOPE)
+        saved_last, last.header = last.header, (last.header & ~(0x3 << hsa.HSA_PACKET_HEADER_SCRELEASE_FENCE_SCOPE)) \
+                                              | (hsa.HSA_FENCE_SCOPE_SYSTEM << hsa.HSA_PACKET_HEADER_SCRELEASE_FENCE_SCOPE)
+        dev._post_copy_fence = False
     aql_bytes = b''.join(bytes(c) if isinstance(c, hsa.hsa_kernel_dispatch_packet_t) else c for c in cmds)
+    if saved_first is not None: first.header = saved_first
+    if saved_last is not None: last.header = saved_last
 
     assert len(aql_bytes) < dev.compute_queue.ring.nbytes, "submit is too large for the queue"
     cp_bytes = min(len(aql_bytes), (dev.compute_queue.ring.nbytes - (dev.compute_queue.put_value * 64) % dev.compute_queue.ring.nbytes))
@@ -985,6 +1001,11 @@ class AMDDevice(HCQCompiled):
 
     self.nbio = AMDIP('nbio' if self.target[0] < 12 else 'nbif', self.iface.ip_versions[am.NBIF_HWIP],
                       bases={i: tuple(getattr(self.ip_off, f'NBIO_BASE__INST{i}_SEG{s}', 0) for s in range(9)) for i in range(6)})
+
+    _S, _A = hsa.HSA_FENCE_SCOPE_SYSTEM, hsa.HSA_FENCE_SCOPE_AGENT
+    self.aql_hdr_system = _aql_hdr(_S, _S)
+    self.aql_hdr = _aql_hdr(_S, _A) if self.target[0] == 12 else _aql_hdr(_A, _A) if AMD_OPT_FLUSH else self.aql_hdr_system
+    self._post_copy_fence = False
 
     self.is_aql = getenv("AMD_AQL", int(self.xccs > 1))
     if self.is_aql:

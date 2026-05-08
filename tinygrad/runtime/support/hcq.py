@@ -589,6 +589,7 @@ class HCQAllocator(HCQAllocatorBase, Generic[HCQDeviceType]):
                                   .copy(dest.offset(i), self.b[self.b_next], lsize) \
                                   .signal(self.dev.timeline_signal, self.dev.next_timeline()).submit(self.dev)
         self.b_timeline[self.b_next] = self.dev.timeline_value - 1
+    if hasattr(self.dev, '_post_copy_fence'): self.dev._post_copy_fence = True
 
   def copy_from_disk(self, dest:HCQBuffer, src, size):
     def _get_temp_buf():
@@ -640,3 +641,4 @@ class HCQAllocator(HCQAllocatorBase, Generic[HCQDeviceType]):
       unwrap(dest_dev.hw_compute_queue_t)().wait(src_dev.timeline_signal, src_dev.timeline_value - 1) \
                                            .wait(dest_dev.timeline_signal, dest_dev.timeline_value - 1) \
                                            .signal(dest_dev.timeline_signal, dest_dev.next_timeline()).submit(dest_dev)
+      if hasattr(dest_dev, '_post_copy_fence'): dest_dev._post_copy_fence = True

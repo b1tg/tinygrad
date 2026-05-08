@@ -195,6 +195,7 @@ class HCQGraph(MultiGraphRunner):
 
         dest_queue.signal(dest_out_signal, dest_out_val)
         self.num_rdma_ops[(dest_rdma, src_rdma)] += 1
+        self.comp_queues[dest_dev]._post_copy_fence = True
       elif ast.op is Ops.COPY:
         dest, src = bufs[0], bufs[1]
         uop_replace_j = dict(self.uop_replace[j])
@@ -203,6 +204,7 @@ class HCQGraph(MultiGraphRunner):
           else: cast(HCQAllocator, enqueue_dev.allocator).map(self.hcq_bufs[j][bufid])
         enqueue_queue.copy(self.hcq_bufs[j][0], self.hcq_bufs[j][1], dest.nbytes)
         self.copy_to_devs[cast(HCQCompiled, Device[dest.device])].add(cast(HCQCompiled, Device[src.device]))
+        if dest.device != src.device: self.comp_queues[cast(HCQCompiled, Device[dest.device])]._post_copy_fence = True
 
       # Encode finish profile timestamp (if needed).
       if PROFILE and j * 2 + 1 in self.prof_signal_is_used: enqueue_queue.timestamp(self.prof_signals[j * 2 + 1])
@@ -216,6 +218,8 @@ class HCQGraph(MultiGraphRunner):
 
       self.comp_queues[dev].signal(self.virt_timeline_signals[dev], self.virt_timeline_vals[dev] + 1).bind(dev)
       for copy_q in self._dev_copy_queues(dev): copy_q.bind(dev)
+
+    self.fence_devs = [dev for dev, q in self.comp_queues.items() if getattr(q, '_post_copy_fence', False)]
 
     self.last_timeline: dict[HCQCompiled, tuple[HCQSignal, int]] = {dev: (dev.timeline_signal, 0) for dev in self.devices}
     self.queue_signals_to_reset = [self.signals[q] for q in list(self.comp_queues.values()) + list(self.copy_queues.values()) if q in self.signals]
@@ -294,6 +298,7 @@ class HCQGraph(MultiGraphRunner):
     # Launch graph
     for sig in self.queue_signals_to_reset: sig.value = 0
     for sig in self.kick_signals.values(): sig.value = self.kickoff_value
+    for dev in self.fence_devs: dev._post_copy_fence = True
 
     if wait:
       st = time.perf_counter()
