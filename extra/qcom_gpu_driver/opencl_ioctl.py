@@ -4,7 +4,9 @@ from hexdump import hexdump
 from copy import deepcopy
 import pathlib, sys
 from tinygrad.helpers import to_mv, getenv
-from tinygrad.runtime.autogen import adreno
+try: from tinygrad.runtime.autogen import adreno
+except ImportError: adreno = None  # type: ignore
+from tinygrad.runtime.autogen import mesa
 sys.path.append(pathlib.Path(__file__).parent.parent.parent.as_posix())
 
 IOCTL = getenv("IOCTL", 0)
@@ -23,8 +25,9 @@ for child in xml.getroot():
 CAPTURED_STATE = {}
 
 REGS = {}
-for k, v in adreno.__dict__.items():
-  if k.startswith("REG_") and isinstance(v, int) and v > 1024: REGS[v] = k
+for mod in ([adreno] if adreno else []) + [mesa]:
+  for k, v in mod.__dict__.items():
+    if k.startswith("REG_") and isinstance(v, int) and v > 1024 and v not in REGS: REGS[v] = k
 
 from extra.qcom_gpu_driver import msm_kgsl
 def ioctls_from_header():
@@ -73,8 +76,9 @@ ST6_IBO = 3
 SB6_CS_TEX = 5
 SB6_CS_SHADER = 13
 
-def parse_cmd_buf(dat):
+def parse_cmd_buf(dat, depth=0):
   global CAPTURED_STATE
+  prefix = "  " * depth
 
   ptr = 0
   while ptr < len(dat):
@@ -83,8 +87,14 @@ def parse_cmd_buf(dat):
       # packet with opcode and opcode specific payload (replace pkt3 starting with a5xx)
       opcode, size = ((cmd>>16)&0x7F), cmd&0x3FFF
       vals = struct.unpack("I"*size, dat[ptr+4:ptr+4+4*size])
-      if IOCTL > 0: print(f"{ptr:3X} -- typ 7: {size=:3d}, {opcode=:#x} {ops[opcode]}", hprint(vals))
-      if ops[opcode] == "CP_LOAD_STATE6_FRAG": # for compute shaders CP_LOAD_STATE6_FRAG is used
+      if IOCTL > 0: print(f"{prefix}{ptr:3X} -- typ 7: {size=:3d}, {opcode=:#x} {ops.get(opcode, '?')}", hprint(vals))
+      # follow indirect buffers (CP_INDIRECT_BUFFER_PFE = 0x3f)
+      if opcode == 0x3f and len(vals) >= 3:
+        ib_addr, ib_sz = vals[0] | (vals[1] << 32), vals[2]
+        if IOCTL > 0: print(f"{prefix}  IB @ 0x{ib_addr:012x}, {ib_sz} dwords")
+        try: parse_cmd_buf(get_mem(ib_addr, ib_sz * 4), depth + 1)
+        except Exception: pass
+      if ops.get(opcode) == "CP_LOAD_STATE6_FRAG": # for compute shaders CP_LOAD_STATE6_FRAG is used
         dst_off = vals[0] & 0x3FFF
         state_type = (vals[0]>>14) & 0x3
         state_src = (vals[0]>>16) & 0x3
@@ -223,55 +233,25 @@ def collect_last_launch_state():
   global CAPTURED_STATE
   return deepcopy(CAPTURED_STATE)
 def compare_launch_state(state, good_state):
+  # shared registers (same address on a6xx/a7xx)
   cmp = [
-    (adreno.REG_A6XX_SP_CS_CONFIG, adreno.A6XX_SP_CS_CONFIG_NTEX__MASK),
-    (adreno.REG_A6XX_SP_CS_CONFIG, adreno.A6XX_SP_CS_CONFIG_NSAMP__MASK),
-    (adreno.REG_A6XX_SP_CS_CONFIG, adreno.A6XX_SP_CS_CONFIG_NIBO__MASK),
-    (adreno.REG_A6XX_SP_CS_CONFIG, adreno.A6XX_SP_CS_CONFIG_ENABLED),
-    (adreno.REG_A6XX_SP_CS_CONFIG, adreno.A6XX_SP_CS_CONFIG_BINDLESS_TEX),
-    (adreno.REG_A6XX_SP_CS_CONFIG, adreno.A6XX_SP_CS_CONFIG_BINDLESS_SAMP),
-    (adreno.REG_A6XX_SP_CS_CONFIG, adreno.A6XX_SP_CS_CONFIG_BINDLESS_IBO),
-    (adreno.REG_A6XX_SP_CS_CONFIG, adreno.A6XX_SP_CS_CONFIG_BINDLESS_UBO),
-
-    (adreno.REG_A6XX_SP_CS_CTRL_REG0, adreno.A6XX_SP_CS_CTRL_REG0_HALFREGFOOTPRINT__MASK),
-    (adreno.REG_A6XX_SP_CS_CTRL_REG0, adreno.A6XX_SP_CS_CTRL_REG0_FULLREGFOOTPRINT__MASK),
-    (adreno.REG_A6XX_SP_CS_CTRL_REG0, adreno.A6XX_SP_CS_CTRL_REG0_BRANCHSTACK__MASK),
-    (adreno.REG_A6XX_SP_CS_CTRL_REG0, adreno.A6XX_SP_CS_CTRL_REG0_FULLREGFOOTPRINT__MASK),
-    (adreno.REG_A6XX_SP_CS_CTRL_REG0, adreno.A6XX_SP_CS_CTRL_REG0_THREADMODE__MASK),
-    (adreno.REG_A6XX_SP_CS_CTRL_REG0, adreno.A6XX_SP_CS_CTRL_REG0_EARLYPREAMBLE),
-    (adreno.REG_A6XX_SP_CS_CTRL_REG0, adreno.A6XX_SP_CS_CTRL_REG0_MERGEDREGS),
-
-    (adreno.REG_A6XX_SP_CS_PVT_MEM_PARAM, adreno.A6XX_SP_CS_PVT_MEM_PARAM_MEMSIZEPERITEM__MASK),
-    (adreno.REG_A6XX_SP_CS_PVT_MEM_PARAM, adreno.A6XX_SP_CS_PVT_MEM_PARAM_HWSTACKSIZEPERTHREAD__MASK),
-
-    (adreno.REG_A6XX_SP_CS_UNKNOWN_A9B1, adreno.A6XX_SP_CS_UNKNOWN_A9B1_UNK5),
-    (adreno.REG_A6XX_SP_CS_UNKNOWN_A9B1, adreno.A6XX_SP_CS_UNKNOWN_A9B1_UNK6),
-
-    (adreno.REG_A6XX_SP_CS_BRANCH_COND, 0xffffffff),
-
-    (adreno.REG_A6XX_HLSQ_CS_NDRANGE_0, adreno.A6XX_HLSQ_CS_NDRANGE_0_KERNELDIM__MASK),
-    (adreno.REG_A6XX_HLSQ_CS_NDRANGE_0, adreno.A6XX_HLSQ_CS_NDRANGE_0_LOCALSIZEX__MASK),
-    (adreno.REG_A6XX_HLSQ_CS_NDRANGE_0, adreno.A6XX_HLSQ_CS_NDRANGE_0_LOCALSIZEY__MASK),
-    (adreno.REG_A6XX_HLSQ_CS_NDRANGE_0, adreno.A6XX_HLSQ_CS_NDRANGE_0_LOCALSIZEZ__MASK),
-
-    (adreno.REG_A6XX_HLSQ_CS_NDRANGE_1, 0xffffffff),
-    (adreno.REG_A6XX_HLSQ_CS_NDRANGE_2, 0xffffffff),
-    (adreno.REG_A6XX_HLSQ_CS_NDRANGE_3, 0xffffffff),
-    (adreno.REG_A6XX_HLSQ_CS_NDRANGE_4, 0xffffffff),
-    (adreno.REG_A6XX_HLSQ_CS_NDRANGE_5, 0xffffffff),
-    (adreno.REG_A6XX_HLSQ_CS_NDRANGE_6, 0xffffffff),
-
-    (adreno.REG_A6XX_HLSQ_CS_CNTL_0, 0xffffffff),
-    (adreno.REG_A6XX_HLSQ_CS_CNTL_1, 0xffffffff),
-    (adreno.REG_A6XX_HLSQ_CS_KERNEL_GROUP_X, 0xffffffff),
-    (adreno.REG_A6XX_HLSQ_CS_KERNEL_GROUP_Y, 0xffffffff),
-    (adreno.REG_A6XX_HLSQ_CS_KERNEL_GROUP_Z, 0xffffffff),
+    (mesa.REG_A6XX_SP_CS_CONFIG, 0xffffffff),
+    (mesa.REG_A6XX_SP_CS_CNTL_0, 0xffffffff),
+    (mesa.REG_A6XX_SP_CS_CNTL_1, 0xffffffff),
+    (mesa.REG_A6XX_SP_CS_PVT_MEM_PARAM, 0xffffffff),
+    (mesa.REG_A6XX_SP_CS_PVT_MEM_SIZE, 0xffffffff),
+    (mesa.REG_A6XX_SP_CS_INSTR_SIZE, 0xffffffff),
+    (mesa.REG_A6XX_SP_CS_WIE_CNTL_0, 0xffffffff),
   ]
+  # a7xx NDRANGE registers (0xa9d4+) or a6xx (0xb990+)
+  ndrange_base = mesa.REG_A7XX_SP_CS_NDRANGE_0 if mesa.REG_A7XX_SP_CS_NDRANGE_0 in state or mesa.REG_A7XX_SP_CS_NDRANGE_0 in good_state \
+    else mesa.REG_A6XX_SP_CS_NDRANGE_0
+  for i in range(7): cmp.append((ndrange_base + i, 0xffffffff))
 
   for x,m in cmp:
-    print(f"Field {REGS[x]}, mask: 0x{m:X} cmp: {state.get(x, 0) & m} vs {good_state.get(x, 0) & m}")
+    print(f"Field {REGS.get(x, hex(x))}, mask: 0x{m:X} cmp: {state.get(x, 0) & m} vs {good_state.get(x, 0) & m}")
     if state.get(x, 0) & m != good_state.get(x, 0) & m:
-      return False, f"Field {REGS[x]}, mask: 0x{m:X} mismatch: {state.get(x, 0) & m} vs {good_state.get(x, 0) & m}"
+      return False, f"Field {REGS.get(x, hex(x))}, mask: 0x{m:X} mismatch: {state.get(x, 0) & m} vs {good_state.get(x, 0) & m}"
 
   for n in ['descriptors', 'ibos']:
     if n not in good_state: continue
