@@ -8,15 +8,16 @@ from tinygrad.uop.ops import resolve
 @functools.cache
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> Tensor:
   freqs = 1.0 / (theta ** (Tensor.arange(0, dim, 2)[:(dim // 2)] / dim))
-  angles = Tensor.arange(end).unsqueeze(dim=1) * freqs.unsqueeze(dim=0)
-  return angles.cos().cat(angles.sin(), dim=-1).contiguous()
+  freqs = Tensor.arange(end).unsqueeze(dim=1) * freqs.unsqueeze(dim=0)
+  return freqs.cos().cat(freqs.sin(), dim=-1).contiguous()
 
-def compute_mrope_freqs(positions: Tensor, dim: int, theta: float, sections: tuple, interleaved: bool = True) -> Tensor:
+def compute_mrope_freqs(positions: Tensor, dim: int, theta: float, sections: tuple, vision: bool = False) -> Tensor:
   freqs = 1.0 / (theta ** (Tensor.arange(0, dim, 2)[:(dim // 2)] / dim))
   n = sum(s for s in sections if s)
-  if interleaved: axis = [j % 3 if j % 3 < len(sections) and j < 3 * sections[j % 3] else 0 for j in range(n)]
-  else: axis = [i for i, s in enumerate(sections) for _ in range(s) if s]
-  angles = Tensor.stack(*[positions[:, a:a+1].float() * freqs[j:j+1] for j, a in enumerate(axis)], dim=-1).squeeze(-2)
+  if vision: axis = [i for i, s in enumerate(sections) for _ in range(s) if s]
+  else: axis = [j % 3 if j % 3 < len(sections) and j < 3 * sections[j % 3] else 0 for j in range(n)]
+  parts = [positions[:, a:a+1].float() * freqs[j:j+1] for j, a in enumerate(axis)]
+  angles = parts[0].cat(*parts[1:], dim=-1)
   if n < dim // 2: angles = angles.cat(Tensor.zeros(positions.shape[0], dim // 2 - n), dim=-1)
   return angles.cos().cat(angles.sin(), dim=-1).contiguous()
 
@@ -418,8 +419,9 @@ class Transformer:
     t = Tensor(tokens + [0] * (self.max_context - len(tokens)), dtype="int32").reshape(1, self.max_context)
     image_embd = None
     if images:
-      from tinygrad.llm.vision import get_rope_index
-      pos, image_embd = get_rope_index(tokens, images, self.max_context, self.token_embd)
+      from tinygrad.llm.vision import get_rope_index, scatter_image_embeds
+      pos = get_rope_index(images, self.max_context)
+      image_embd = scatter_image_embeds(self.token_embd(Tensor(tokens, dtype="int32").reshape(1, -1)).float(), images)
       mrope_freqs = compute_mrope_freqs(Tensor(pos), self.config.rope_dim, self.config.rope_theta, self.config.rope_sections)
       for block in self.blk: block._init_state(image_embd[:, :1, :], mrope_freqs)
     # recompute start_pos from what's currently valid in the caches

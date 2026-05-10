@@ -4,23 +4,27 @@ from tinygrad import Tensor, nn
 from tinygrad.llm.gguf import gguf_load
 from tinygrad.llm.model import apply_rope, compute_mrope_freqs
 
-def get_rope_index(tokens: list[int], images: list[tuple], max_context: int, token_embd) -> tuple[list, Tensor]:
-  img_ranges = {img[1]: img for img in images}
-  pos, cp, i = [], 0, 0
-  while i < max_context:
-    if i < len(tokens) and i in img_ranges:
-      _, _, count, nx, ny = img_ranges[i]
+def get_rope_index(images: list[tuple], max_context: int) -> list:
+  pos, cp, img_at = [], 0, {img[1]: img for img in images}
+  for i in range(max_context):
+    if i in img_at:
+      _, _, count, nx, ny = img_at[i]
       pos += [[cp, cp + j // nx, cp + j % nx] for j in range(count)]
       cp += max(nx, ny)
-      i += count
     else:
       pos.append([cp, cp, cp])
       cp += 1
-      i += 1
-  embd = token_embd(Tensor(tokens, dtype="int32").reshape(1, -1)).float()
-  for img_embd, start, count, _, _ in sorted(images, key=lambda x: -x[1]):
-    embd = embd[:, :start].cat(img_embd.reshape(1, count, -1).float(), embd[:, start+count:], dim=1)
-  return pos, embd
+  return pos
+
+def scatter_image_embeds(embd: Tensor, images: list[tuple]) -> Tensor:
+  seq_len = embd.shape[1]
+  idx = Tensor.arange(seq_len).reshape(1, -1, 1)
+  mask = Tensor.zeros(1, seq_len, 1)
+  img_embd_full = Tensor.zeros_like(embd)
+  for ie, start, count, _, _ in images:
+    mask = mask + ((idx >= start) * (idx < start + count)).float()
+    img_embd_full = img_embd_full + ie.reshape(1, count, -1).float().pad(((0, 0), (start, seq_len - start - count), (0, 0)))
+  return mask.where(img_embd_full, embd)
 
 def preprocess_image(img_path: str, patch_size: int = 16, merge_size: int = 2, mean: list|None = None, std: list|None = None) -> Tensor:
   from PIL import Image
@@ -93,7 +97,7 @@ class VisionEncoder:
     x = x + pos_w
 
     pos = [[y+dy, xp+dx] for y in range(0, ph, 2) for xp in range(0, pw, 2) for dy in range(2) for dx in range(2)]
-    freqs_cis = compute_mrope_freqs(Tensor(pos), dh // 2, 10000.0, (dh // 8, dh // 8), interleaved=False)
+    freqs_cis = compute_mrope_freqs(Tensor(pos), dh // 2, 10000.0, (dh // 8, dh // 8), vision=True)
 
     for block in self.v.blk: x = block(x, freqs_cis)
 
