@@ -25,7 +25,7 @@ class TestAttention(unittest.TestCase):
     dim, rope_dim, seqlen = 8, 4, 3
     config = TransformerConfig(num_blocks=1, dim=dim, hidden_dim=16, n_heads=1, n_kv_heads=1,
                                norm_eps=1e-5, vocab_size=32, head_dim=dim, rope_theta=10000.0,
-                               rope_dim=rope_dim, v_head_dim=dim, max_context=8)
+                               rope_dim=rope_dim, rope_sections=(), v_head_dim=dim, max_context=8)
     block = TransformerBlock(config)
 
     x = Tensor.randn(1, seqlen, dim, dtype=dtypes.float32)
@@ -47,7 +47,7 @@ class TestGatedDeltaNetBlock(unittest.TestCase):
   def _make_config(self, **kwargs):
     return TransformerConfig(**({"num_blocks":1, "dim":4, "hidden_dim":8, "n_heads":1, "n_kv_heads":1,
                                  "norm_eps":1e-5, "vocab_size":32, "head_dim":4, "rope_theta":10000.0,
-                                 "rope_dim":4, "v_head_dim":4, "max_context":4, "full_attention_interval":2,
+                                 "rope_dim":4, "rope_sections":(), "v_head_dim":4, "max_context":4, "full_attention_interval":2,
                                  "ssm":SSMConfig(conv_kernel=2, state_size=2, group_count=1, time_step_rank=1, inner_size=2)} | kwargs))
 
   def _make_block(self, config:TransformerConfig) -> GatedDeltaNetBlock:

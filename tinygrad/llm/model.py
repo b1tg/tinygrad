@@ -197,9 +197,8 @@ class TransformerBlock(FFNBlock):
     if not hasattr(self, "cache_kv"):
       # TODO: how is the dtype of this determined?
       self.cache_kv = Tensor.empty(2, x.shape[0], self.config.n_kv_heads, self.config.max_context, self.config.head_dim, device=x.device)
-    if freqs_cis is not None: self.freqs_cis = freqs_cis
-    elif not hasattr(self, "freqs_cis"):
-      self.freqs_cis = precompute_freqs_cis(self.config.rope_dim, self.config.max_context, self.config.rope_theta)
+      self.freqs_cis = precompute_freqs_cis(self.config.rope_dim, self.config.max_context, self.config.rope_theta) if freqs_cis is None else freqs_cis
+    elif freqs_cis is not None: self.freqs_cis = freqs_cis
 
 class MLATransformerBlock(FFNBlock):
   def __init__(self, config:TransformerConfig):
@@ -245,8 +244,6 @@ class MLATransformerBlock(FFNBlock):
   def _init_state(self, x:Tensor, freqs_cis:Tensor|None=None):
     if not hasattr(self, "cache_k"):
       self.cache_k = Tensor.empty(x.shape[0], 1, self.config.max_context, self.config.kv_lora_rank + self.config.rope_dim, device=x.device)
-    if freqs_cis is not None: self.freqs_cis = freqs_cis
-    elif not hasattr(self, "freqs_cis"):
       self.freqs_cis = precompute_freqs_cis(self.config.rope_dim, self.config.max_context, self.config.rope_theta)
 
 class GatedDeltaNetBlock(FFNBlock):

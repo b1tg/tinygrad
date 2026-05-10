@@ -41,34 +41,29 @@ def preprocess_image(img_path: str, patch_size: int = 16, merge_size: int = 2, m
 
 class VisionBlock:
   def __init__(self, n_embd: int, n_head: int, ffn_dim: int, eps: float):
-    self.ln1 = {"weight": Tensor.ones(n_embd), "bias": Tensor.zeros(n_embd)}
-    self.ln2 = {"weight": Tensor.ones(n_embd), "bias": Tensor.zeros(n_embd)}
+    self.ln1, self.ln2 = nn.LayerNorm(n_embd, eps), nn.LayerNorm(n_embd, eps)
     self.attn_qkv = nn.Linear(n_embd, n_embd * 3)
     self.attn_out = nn.Linear(n_embd, n_embd)
     self.ffn_up, self.ffn_down = nn.Linear(n_embd, ffn_dim), nn.Linear(ffn_dim, n_embd)
-    self.n_head, self.eps = n_head, eps
-
-  def _ln(self, x: Tensor, ln: dict) -> Tensor:
-    mean = x.mean(-1, keepdim=True)
-    return (x - mean) / ((x - mean).square().mean(-1, keepdim=True) + self.eps).sqrt() * ln["weight"] + ln["bias"]
+    self.n_head = n_head
 
   def __call__(self, x: Tensor, freqs_cis: Tensor) -> Tensor:
     B, T, D = x.shape
     dh, rot = D // self.n_head, D // self.n_head // 2
-    h = self._ln(x, self.ln1)
+    h = self.ln1(x)
     qkv = self.attn_qkv(h).reshape(B, T, 3, self.n_head, dh)
     q, k, v = qkv[:, :, 0].transpose(1, 2), qkv[:, :, 1].transpose(1, 2), qkv[:, :, 2].transpose(1, 2)
     q = apply_rope(q[..., :rot], freqs_cis).cat(q[..., rot:], dim=-1)
     k = apply_rope(k[..., :rot], freqs_cis).cat(k[..., rot:], dim=-1)
     x = x + self.attn_out(q.scaled_dot_product_attention(k, v).transpose(1, 2).reshape(B, T, D))
-    return x + self.ffn_down(self.ffn_up(self._ln(x, self.ln2)).gelu())
+    return x + self.ffn_down(self.ffn_up(self.ln2(x)).gelu())
 
 class _VisionCore:
   def __init__(self, n_embd, n_head, n_layer, ffn_dim, patch_size, eps, max_pos_embd):
     self.blk = [VisionBlock(n_embd, n_head, ffn_dim, eps) for _ in range(n_layer)]
     self.patch_embd = {"weight": Tensor.zeros(n_embd, 3, patch_size, patch_size), "bias": Tensor.zeros(n_embd)}
     self.patch_embd_1 = {"weight": Tensor.zeros(n_embd, 3, patch_size, patch_size)}
-    self.post_ln = {"weight": Tensor.ones(n_embd), "bias": Tensor.zeros(n_embd)}
+    self.post_ln = nn.LayerNorm(n_embd, eps)
     self.position_embd = {"weight": Tensor.zeros(max_pos_embd, n_embd)}
 
 class VisionEncoder:
@@ -100,10 +95,7 @@ class VisionEncoder:
     freqs_cis = compute_mrope_freqs(Tensor(pos), dh // 2, 10000.0, (dh // 8, dh // 8), vision=True)
 
     for block in self.v.blk: x = block(x, freqs_cis)
-
-    ln = self.v.post_ln
-    mean = x.mean(-1, keepdim=True)
-    x = (x - mean) / ((x - mean).square().mean(-1, keepdim=True) + self.eps).sqrt() * ln["weight"] + ln["bias"]
+    x = self.v.post_ln(x)
 
     x = x.reshape(B, ph * pw // 4, ne * 4)
     x = self.mm_2(self.mm_0(x).gelu())
