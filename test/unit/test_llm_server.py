@@ -31,7 +31,7 @@ class TestTransformerGenerate(unittest.TestCase):
       next(gen)
 
     # should process tokens[6:] = [42, 10, 11, 12] since first 6 have cached k/v
-    toks_shape = captured_inputs[0][0][-1]
+    toks_shape = captured_inputs[0][0][1]
     self.assertEqual(toks_shape.val if isinstance(toks_shape, UOp) else toks_shape, 4)
     self.assertEqual(captured_inputs[0][1], 6)
 
@@ -55,7 +55,7 @@ class TestTransformerGenerate(unittest.TestCase):
       next(gen)
 
     # should process all 3 tokens from start
-    toks_shape = captured_inputs[0][0][-1]
+    toks_shape = captured_inputs[0][0][1]
     self.assertEqual(toks_shape.val if isinstance(toks_shape, UOp) else toks_shape, 3)
     self.assertEqual(captured_inputs[0][1], 0)
 
