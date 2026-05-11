@@ -91,8 +91,8 @@ class VisionEncoder:
     pos_w = pos_w.reshape(1, ph // 2, 2, pw // 2, 2, ne).permute(0, 1, 3, 2, 4, 5).reshape(1, ph * pw, ne)
     x = x + pos_w
 
-    pos = [[y+dy, xp+dx] for y in range(0, ph, 2) for xp in range(0, pw, 2) for dy in range(2) for dx in range(2)]
-    freqs_cis = compute_mrope_freqs(Tensor(pos), dh // 2, 10000.0, (dh // 8, dh // 8), vision=True)
+    pos = Tensor([[y+dy, xp+dx] for y in range(0, ph, 2) for xp in range(0, pw, 2) for dy in range(2) for dx in range(2)])
+    freqs_cis = compute_mrope_freqs(pos, dh // 2, 10000.0, (dh // 8, dh // 8), chunked=True)
 
     for block in self.v.blk: x = block(x, freqs_cis)
     x = self.v.post_ln(x)

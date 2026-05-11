@@ -5,21 +5,19 @@ from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function
 from tinygrad.llm.gguf import gguf_load
 from tinygrad.uop.ops import resolve
 
-@functools.cache
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> Tensor:
-  freqs = 1.0 / (theta ** (Tensor.arange(0, dim, 2)[:(dim // 2)] / dim))
-  freqs = Tensor.arange(end).unsqueeze(dim=1) * freqs.unsqueeze(dim=0)
-  return freqs.cos().cat(freqs.sin(), dim=-1).contiguous()
-
-def compute_mrope_freqs(positions: Tensor, dim: int, theta: float, sections: tuple, vision: bool = False) -> Tensor:
+def compute_mrope_freqs(positions: Tensor, dim: int, theta: float, sections: tuple, chunked: bool = False) -> Tensor:
   freqs = 1.0 / (theta ** (Tensor.arange(0, dim, 2)[:(dim // 2)] / dim))
   n = sum(s for s in sections if s)
-  if vision: axis = [i for i, s in enumerate(sections) for _ in range(s) if s]
+  if chunked: axis = [i for i, s in enumerate(sections) for _ in range(s) if s]
   else: axis = [j % 3 if j % 3 < len(sections) and j < 3 * sections[j % 3] else 0 for j in range(n)]
   parts = [positions[:, a:a+1].float() * freqs[j:j+1] for j, a in enumerate(axis)]
   angles = parts[0].cat(*parts[1:], dim=-1)
   if n < dim // 2: angles = angles.cat(Tensor.zeros(positions.shape[0], dim // 2 - n), dim=-1)
   return angles.cos().cat(angles.sin(), dim=-1).contiguous()
+
+@functools.cache
+def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> Tensor:
+  return compute_mrope_freqs(Tensor.arange(end).reshape(-1, 1), dim, theta, (dim // 2,), chunked=True)
 
 class ExpertWeights:
   """Like nn.Linear but with num_experts dimension. Weight shape: (num_experts, out_features, in_features)."""
