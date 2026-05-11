@@ -319,7 +319,6 @@ class Transformer:
     # we specialize the JIT for prefill and rollout
     self.prefill_jit = TinyJit(self.forward)
     self.rollout_jit = TinyJit(self.forward)
-    self.embed_jit = TinyJit(self.forward)
 
   def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
     x = (tokens if len(tokens.shape) == 3 else self.token_embd(tokens)).float()         # (B, T, D) or (B, T) -> (B, T, D)
@@ -329,8 +328,7 @@ class Transformer:
     return (logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1, keepdim=True)
 
   def __call__(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
-    jit = self.embed_jit if len(tokens.shape) == 3 else self.prefill_jit if resolve(tokens.shape[1] != 1) else self.rollout_jit
-    return jit(tokens.contiguous(), start_pos, temperature)
+    return (self.prefill_jit if len(tokens.shape) == 3 else self.rollout_jit)(tokens.contiguous(), start_pos, temperature)
 
   @staticmethod
   def from_gguf(gguf:Tensor|str|pathlib.Path, max_context:int|None=None,
@@ -413,27 +411,23 @@ class Transformer:
     # TODO: use UOp.variable for temperature once float variables are supported
     temp = Tensor(temperature).contiguous()
     # assign all input tokens once, then slice from start_pos for the model call
-    t = Tensor(tokens + [0] * (self.max_context - len(tokens)), dtype="int32").reshape(1, self.max_context)
-    image_embd = None
+    t = self.token_embd(Tensor(tokens + [0] * (self.max_context - len(tokens)), dtype="int32").reshape(1, self.max_context)).float()
     if images:
       from tinygrad.llm.vision import get_rope_index, scatter_image_embeds
+      t = scatter_image_embeds(t[:, :len(tokens)], images)
       pos = get_rope_index(images, self.max_context)
-      image_embd = scatter_image_embeds(self.token_embd(Tensor(tokens, dtype="int32").reshape(1, -1)).float(), images)
       mrope_freqs = compute_mrope_freqs(Tensor(pos), self.config.rope_dim, self.config.rope_theta, self.config.rope_sections)
-      for block in self.blk: block._init_state(image_embd[:, :1, :], mrope_freqs)
+      for block in self.blk: block._init_state(t[:, :1, :], mrope_freqs)
     # recompute start_pos from what's currently valid in the caches
     start_pos = self.get_start_pos(tokens)
     if start_pos < len(self._cached_tokens) and (resets := [r for b in self.blk for r in b._state_reset_ops()]): Tensor.realize(*resets)
     out, prompt_len = None, len(tokens)
     while len(tokens) < self.max_context:
       sp, nt = v_start_pos.bind(start_pos), v_toks.bind(min(chunk_size, len(tokens) - start_pos))
-      if image_embd is not None and start_pos < prompt_len: inp = image_embd[:, sp:sp+nt, :]
-      else: inp = t[:, sp:sp+nt] if start_pos < prompt_len or out is None else out
-      out = self(inp, sp, temp).realize()
+      out = self(t[:, sp:sp+nt] if start_pos < prompt_len or out is None else out, sp, temp).realize()
       start_pos += nt.val
       # chunked prefill: keep processing until all prompt tokens are consumed
       if start_pos < len(tokens): continue
-      image_embd = None
       tokens.append(int(out.item()))
       self._cached_tokens = tokens[:-1]
       yield tokens[-1]
