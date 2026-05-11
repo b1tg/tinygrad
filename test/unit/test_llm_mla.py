@@ -7,7 +7,7 @@ class TestMLA(unittest.TestCase):
   def _make_config(self, **kwargs):
     return TransformerConfig(**{
       "num_blocks": 1, "dim": 64, "hidden_dim": 128, "n_heads": 4, "n_kv_heads": 1,
-      "norm_eps": 1e-5, "vocab_size": 100, "head_dim": 16, "rope_theta": 10000.0, "rope_dim": 8, "max_context": 32,
+      "norm_eps": 1e-5, "vocab_size": 100, "head_dim": 16, "rope_theta": 10000.0, "rope_dim": 8, "rope_sections": (), "max_context": 32,
       "kv_lora_rank": 16, "v_head_dim": 8,
     } | kwargs)
 
