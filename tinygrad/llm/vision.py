@@ -1,24 +1,35 @@
 import pathlib
+from typing import NamedTuple
 from tinygrad import Tensor, nn
 from tinygrad.llm.gguf import gguf_load
 from tinygrad.llm.model import apply_rope, compute_mrope_freqs
 
-def get_rope_index(images: list[tuple], max_context: int) -> list:
-  pos, cp, img_at = [], 0, {img[1]: img for img in images}
-  for i in range(max_context):
-    _, _, count, nx, ny = img_at.get(i, (None, None, 1, 1, 1))
-    pos += [[cp, cp + j // nx, cp + j % nx] for j in range(count)]
-    cp += max(nx, ny)
-  return pos
+class ImageEmbed(NamedTuple):
+  embd: Tensor    # (n_tokens, dim) vision encoder output
+  start: int      # token position in the sequence
+  n_tokens: int   # nx * ny merged patches
+  nx: int         # grid width after merge
+  ny: int         # grid height after merge
 
-def scatter_image_embeds(embd: Tensor, images: list[tuple]) -> Tensor:
+def get_rope_index(images: list[ImageEmbed], max_context: int) -> list[tuple[int, int, int]]:
+  # time/height/width positions for M-RoPE
+  img_by_start = {img.start: img for img in images}
+  thw, offset = [], 0
+  for i in range(max_context):
+    img = img_by_start.get(i)
+    count, nx, ny = (img.n_tokens, img.nx, img.ny) if img else (1, 1, 1)
+    thw += [(offset, offset + j // nx, offset + j % nx) for j in range(count)]
+    offset += max(nx, ny)
+  return thw
+
+def scatter_image_embeds(embd: Tensor, images: list[ImageEmbed]) -> Tensor:
   seq_len = embd.shape[1]
   idx = Tensor.arange(seq_len).reshape(1, -1, 1)
   mask = Tensor.zeros(1, seq_len, 1)
   img_embd_full = Tensor.zeros_like(embd)
-  for ie, start, count, _, _ in images:
-    mask = mask + ((idx >= start) * (idx < start + count)).float()
-    img_embd_full = img_embd_full + ie.reshape(1, count, -1).float().pad(((0, 0), (start, seq_len - start - count), (0, 0)))
+  for img in images:
+    mask = mask + ((idx >= img.start) * (idx < img.start + img.n_tokens)).float()
+    img_embd_full = img_embd_full + img.embd.reshape(1, img.n_tokens, -1).float().pad(((0,0), (img.start, seq_len-img.start-img.n_tokens), (0,0)))
   return mask.where(img_embd_full, embd)
 
 class VisionBlock:
@@ -48,9 +59,9 @@ class _VisionCore:
     self.position_embd = {"weight": Tensor.zeros(max_pos_embd, n_embd)}
 
 class VisionEncoder:
-  def __init__(self, n_embd:int, n_head:int, n_layer:int, ffn_dim:int, patch_size:int, projection_dim:int, eps:float, max_pos_embd:int,
+  def __init__(self, n_embd:int, n_head:int, n_layer:int, ffn_dim:int, patch_size:int, projection_dim:int, eps:float,
                image_size:int, merge_size:int, image_mean:list[float], image_std:list[float]):
-    self.v = _VisionCore(n_embd, n_head, n_layer, ffn_dim, patch_size, eps, max_pos_embd)
+    self.v = _VisionCore(n_embd, n_head, n_layer, ffn_dim, patch_size, eps, (image_size // patch_size) ** 2)
     ms2 = merge_size * merge_size
     self.mm = {0: nn.Linear(n_embd * ms2, n_embd * ms2), 2: nn.Linear(n_embd * ms2, projection_dim)}
     self.n_embd, self.n_head, self.patch_size, self.image_size, self.merge_size = n_embd, n_head, patch_size, image_size, merge_size
@@ -90,13 +101,11 @@ class VisionEncoder:
     assert kv['general.architecture'] == 'clip'
     ne, nh, nl = kv['clip.vision.embedding_length'], kv['clip.vision.attention.head_count'], kv['clip.vision.block_count']
     ps, proj_dim = kv['clip.vision.patch_size'], kv['clip.vision.projection_dim']
-    eps = kv.get('clip.vision.attention.layer_norm_epsilon', 1e-6)
-    image_size = kv.get('clip.vision.image_size', 768)
-    ffn_dim = int(sd['v.blk.0.ffn_up.weight'].shape[0])
-    max_pos_embd = int(sd['v.position_embd.weight'].shape[0])
-    sd = {k.replace('patch_embd.weight.1', 'patch_embd_1.weight'): v for k, v in sd.items()}
+    eps = kv['clip.vision.attention.layer_norm_epsilon']
+    image_size = kv['clip.vision.image_size']
+    ffn_dim = kv['clip.vision.feed_forward_length']
     merge_size = kv['clip.vision.spatial_merge_size']
-    enc = VisionEncoder(ne, nh, nl, ffn_dim, ps, proj_dim, eps, max_pos_embd, image_size,
-                        merge_size, kv['clip.vision.image_mean'], kv['clip.vision.image_std'])
+    sd = {k.replace('patch_embd.weight.1', 'patch_embd_1.weight'): v for k, v in sd.items()}
+    enc = VisionEncoder(ne, nh, nl, ffn_dim, ps, proj_dim, eps, image_size, merge_size, kv['clip.vision.image_mean'], kv['clip.vision.image_std'])
     nn.state.load_state_dict(enc, sd, verbose=False, consume=True, realize=False)
     return enc

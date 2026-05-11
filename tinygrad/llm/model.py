@@ -5,14 +5,13 @@ from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function
 from tinygrad.llm.gguf import gguf_load
 from tinygrad.uop.ops import resolve
 
-def compute_mrope_freqs(positions: Tensor, dim: int, theta: float, sections: tuple, chunked: bool = False) -> Tensor:
+def compute_mrope_freqs(positions: Tensor, dim: int, theta: float, sections: tuple[int, ...], chunked: bool = False) -> Tensor:
   freqs = 1.0 / (theta ** (Tensor.arange(0, dim, 2)[:(dim // 2)] / dim))
-  n = sum(s for s in sections if s)
-  if chunked: axis = [i for i, s in enumerate(sections) for _ in range(s) if s]
-  else: axis = [j % 3 if j % 3 < len(sections) and j < 3 * sections[j % 3] else 0 for j in range(n)]
-  parts = [positions[:, a:a+1].float() * freqs[j:j+1] for j, a in enumerate(axis)]
-  angles = parts[0].cat(*parts[1:], dim=-1)
-  if n < dim // 2: angles = angles.cat(Tensor.zeros(positions.shape[0], dim // 2 - n), dim=-1)
+  n = sum(sections)
+  if chunked: axis = [i for i, s in enumerate(sections) for _ in range(s)]  # [TTT...HHH...WWW] for ViT
+  else: axis = [j % 3 if j % 3 < len(sections) and j < 3 * sections[j % 3] else 0 for j in range(n)]  # [T,H,W,T,H,W,...] for LLM
+  angles = positions[:, axis].float() * freqs[:n]
+  if n < dim // 2: angles = angles.pad(((0, 0), (0, dim // 2 - n)))
   return angles.cos().cat(angles.sin(), dim=-1).contiguous()
 
 @functools.cache
@@ -61,7 +60,7 @@ class TransformerConfig:
   head_dim: int
   rope_theta: float
   rope_dim: int
-  rope_sections: tuple
+  rope_sections: tuple[int, ...]
   v_head_dim: int
   max_context: int = 0
   qk_norm: int = 0

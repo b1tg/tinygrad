@@ -5,7 +5,7 @@ from tinygrad.uop.ops import UOp, Ops
 from tinygrad.helpers import partition, DEBUG, Timing, GlobalCounters, stderr_log, colored, Context, fetch
 from tinygrad.viz.serve import TCPServerWithReuse, HTTPRequestHandler
 from tinygrad.llm.model import Transformer
-from tinygrad.llm.vision import VisionEncoder
+from tinygrad.llm.vision import VisionEncoder, ImageEmbed
 
 class SimpleTokenizer:
   def __init__(self, normal_tokens:dict[str, int], special_tokens:dict[str, int], preset:str="llama3",
@@ -85,7 +85,7 @@ class SimpleTokenizer:
   def image(self, n_tokens:int=1):
     if self.preset == 'qwen2':
       return self.encode("<|vision_start|>") + [self._special_tokens["<|image_pad|>"]] * n_tokens + self.encode("<|vision_end|>")
-    return self.encode("<image>")
+    raise NotImplementedError(f"image tokens not supported for preset '{self.preset}'")
   def prefix(self) -> list[int]:
     return ([] if self.bos_id is None else [self.bos_id]) + (self.encode("<sop>") if self.preset == 'glm4' else [])
   def is_end(self, token_id:int) -> bool: return token_id in (self.eos_id, self.eot_id)
@@ -167,7 +167,6 @@ class Handler(HTTPRequestHandler):
         elif isinstance(content, list):
           for c in content:
             if c["type"] == "text": ids += tok.encode(c["text"])
-            elif c["type"] == "image_url": ids += tok.image()
             else: raise RuntimeError(f"unhandled type: {c['type']}")
         else: raise RuntimeError(f"unknown content type: {type(content)}")
         if msg["role"] == "assistant" and i == len(body["messages"]) - 1: break
@@ -219,9 +218,8 @@ def main():
   if mmproj_path:
     print(f"loading vision encoder from {mmproj_path}")
     vision_encoder = VisionEncoder.from_gguf(fetch(mmproj_path))
-    ve_params = nn.state.get_parameters(vision_encoder)
-    ve_sizes = [y.nbytes() for y in UOp.sink(*[x.uop for x in ve_params]).toposort() if y.op is Ops.BUFFER]
-    print(f"vision encoder: {sum(ve_sizes):,} bytes, {sum(x.numel() for x in ve_params):,} params")
+    ve_sizes = [y.nbytes() for y in UOp.sink(*[x.uop for x in nn.state.get_parameters(vision_encoder)]).toposort() if y.op is Ops.BUFFER]
+    print(f"vision encoder: {sum(ve_sizes):,} bytes")
 
   # warmup the JIT
   if args.warmup or args.serve:
@@ -247,7 +245,8 @@ def main():
   if vision_encoder: print("  /image <path>  load an image")
   pending_images = []
   while 1:
-    try: line = input('>>> ')
+    try:
+      line = input('>>> ')
     except EOFError:
       break
     if vision_encoder and line.startswith("/image "):
@@ -257,7 +256,7 @@ def main():
     ids += tok.role("user")
     images = []
     for embd, nx, ny in pending_images:
-      images.append((embd, len(ids), nx * ny, nx, ny))
+      images.append(ImageEmbed(embd, start=len(ids), n_tokens=nx * ny, nx=nx, ny=ny))
       ids += tok.image(nx * ny)
     ids += tok.encode(line) + tok.end_turn() + tok.role("assistant")
     pending_images = []
