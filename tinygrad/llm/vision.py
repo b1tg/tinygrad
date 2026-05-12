@@ -4,6 +4,7 @@ from tinygrad import Tensor, nn
 from tinygrad.llm.gguf import gguf_load
 from tinygrad.llm.model import apply_rope, compute_mrope_freqs
 
+
 class ImageEmbed(NamedTuple):
   embd: Tensor    # (n_tokens, dim) vision encoder output
   start: int      # token position in the sequence
@@ -76,7 +77,7 @@ class VisionEncoder:
     n_per_side = self.image_size // self.patch_size
     if ph != n_per_side or pw != n_per_side:
       pos_w = self.v.position_embd["weight"].reshape(1, n_per_side, n_per_side, self.n_embd).permute(0, 3, 1, 2)
-      pos_w = pos_w.interpolate((ph, pw), mode="linear", align_corners=True).contiguous().permute(0, 2, 3, 1)
+      pos_w = pos_w.interpolate((ph, pw), mode="linear").contiguous().permute(0, 2, 3, 1)
     else:
       pos_w = self.v.position_embd["weight"].reshape(1, n_per_side, n_per_side, self.n_embd)
     x = x + pos_w.reshape(1, ph//ms, ms, pw//ms, ms, self.n_embd).permute(0, 1, 3, 2, 4, 5).reshape(1, ph*pw, self.n_embd)
