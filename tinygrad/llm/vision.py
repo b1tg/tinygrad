@@ -71,7 +71,7 @@ class VisionEncoder:
 
   def __call__(self, image: Tensor):
     ms, ms2 = self.merge_size, self.merge_size * self.merge_size
-    ph, pw = image.shape[2] // self.patch_size, image.shape[3] // self.patch_size
+    ph, pw = int(image.shape[2]) // self.patch_size, int(image.shape[3]) // self.patch_size
     x = self.v.patch_embd(image) + self.v.patch_embd_1(image)
     x = x.reshape(-1, self.n_embd, ph//ms, ms, pw//ms, ms).permute(0, 2, 4, 3, 5, 1).reshape(-1, ph*pw, self.n_embd)
     n_per_side = self.image_size // self.patch_size
