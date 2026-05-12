@@ -74,14 +74,15 @@ class VisionEncoder:
     x = self.v.patch_embd(image) + self.v.patch_embd_1(image)
     x = x.reshape(-1, self.n_embd, ph//ms, ms, pw//ms, ms).permute(0, 2, 4, 3, 5, 1).reshape(-1, ph*pw, self.n_embd)
     n_per_side = self.image_size // self.patch_size
-    pos_w = self.v.position_embd["weight"].reshape(1, n_per_side, n_per_side, self.n_embd).permute(0, 3, 1, 2)
     if ph != n_per_side or pw != n_per_side:
-      pos_w = pos_w.interpolate((ph, pw), mode="linear").contiguous()
-    pos_w = pos_w.permute(0, 2, 3, 1)
+      pos_w = self.v.position_embd["weight"].reshape(1, n_per_side, n_per_side, self.n_embd).permute(0, 3, 1, 2)
+      pos_w = pos_w.interpolate((ph, pw), mode="linear", align_corners=True).contiguous().permute(0, 2, 3, 1)
+    else:
+      pos_w = self.v.position_embd["weight"].reshape(1, n_per_side, n_per_side, self.n_embd)
     x = x + pos_w.reshape(1, ph//ms, ms, pw//ms, ms, self.n_embd).permute(0, 1, 3, 2, 4, 5).reshape(1, ph*pw, self.n_embd)
     dh = self.n_embd // self.n_head
     pos = [[y+dy, xp+dx] for y in range(0, ph, ms) for xp in range(0, pw, ms) for dy in range(ms) for dx in range(ms)]
-    freqs = compute_mrope_freqs(Tensor(pos), dh, 10000.0, (dh//4, dh//4), chunked=True)
+    freqs = compute_mrope_freqs(Tensor(pos), dh//2, 10000.0, (dh//4, dh//4), chunked=True)
     for block in self.v.blk: x = block(x, freqs)
     x = self.v.post_ln(x)
     return self.mm[2](self.mm[0](x.reshape(-1, ph*pw//ms2, self.n_embd*ms2)).gelu()), pw//ms, ph//ms

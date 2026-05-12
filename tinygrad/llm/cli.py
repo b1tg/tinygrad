@@ -201,6 +201,7 @@ def main():
   parser.add_argument("--warmup", action="store_true", help="warmup the JIT")
   parser.add_argument("--benchmark", nargs='?', type=int, const=20, metavar="COUNT", help="Benchmark tok/s (optional count, default 20)")
   parser.add_argument("--mmproj", type=str, help="Path to mmproj GGUF for vision encoder")
+  parser.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature (default 0.0 = greedy)")
   args = parser.parse_args()
 
   # load the model
@@ -264,9 +265,10 @@ def main():
       images.append(ImageEmbed(embd, start=len(ids), n_tokens=nx * ny, nx=nx, ny=ny))
       ids += [tok._special_tokens["<|image_pad|>"]] * (nx * ny) + tok.encode("<|vision_end|>")
     ids += tok.encode(line) + tok.end_turn() + tok.role("assistant")
+    if args.temperature > 0: ids += tok.encode("<think>\n")
     pending_images = []
     dec = tok.stream_decoder()
-    for next_id in model.generate(ids, images=images or None):
+    for next_id in model.generate(ids, images=images or None, temperature=args.temperature):
       sys.stdout.write(dec(next_id) if not tok.is_end(next_id) else dec() + "\n\n")
       sys.stdout.flush()
       if tok.is_end(next_id): break
