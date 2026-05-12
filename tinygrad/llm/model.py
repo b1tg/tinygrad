@@ -8,9 +8,13 @@ from tinygrad.uop.ops import resolve
 def compute_mrope_freqs(positions: Tensor, dim: int, theta: float, sections: tuple[int, ...], chunked: bool = False) -> Tensor:
   freqs = 1.0 / (theta ** (Tensor.arange(0, dim, 2)[:(dim // 2)] / dim))
   n = sum(sections)
-  if chunked: axis = [i for i, s in enumerate(sections) for _ in range(s)]  # [TTT...HHH...WWW] for ViT
-  else: axis = [j % 3 if j % 3 < len(sections) and j < 3 * sections[j % 3] else 0 for j in range(n)]  # [T,H,W,T,H,W,...] for LLM
-  angles = positions[:, axis].float() * freqs[:n]
+  if chunked:
+    # ViT: each section gets independent frequencies (reset at section boundaries, like ggml indep_sects)
+    angles = positions[:, [i for i, s in enumerate(sections) for _ in range(s)]].float() * Tensor.cat(*[freqs[:s] for s in sections if s])
+  else:
+    # LLM decoder: interleaved [T,H,W,T,H,W,...], shared frequency progression
+    axis = [j % 3 if j % 3 < len(sections) and j < 3 * sections[j % 3] else 0 for j in range(n)]
+    angles = positions[:, axis].float() * freqs[:n]
   if n < dim // 2: angles = angles.pad(((0, 0), (0, dim // 2 - n)))
   return angles.cos().cat(angles.sin(), dim=-1).contiguous()
 

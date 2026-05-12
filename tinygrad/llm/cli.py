@@ -212,10 +212,10 @@ def main():
   # get tokenizer
   tok = SimpleTokenizer.from_gguf_kv(kv)
 
-  # load vision encoder if mmproj available
+  # load vision encoder if --mmproj specified
   vision_encoder = None
-  mmproj_path = args.mmproj or mmproj_models.get(args.model)
-  if mmproj_path:
+  if args.mmproj:
+    mmproj_path = mmproj_models.get(args.mmproj, args.mmproj)
     print(f"loading vision encoder from {mmproj_path}")
     vision_encoder = VisionEncoder.from_gguf(fetch(mmproj_path))
     ve_sizes = [y.nbytes() for y in UOp.sink(*[x.uop for x in nn.state.get_parameters(vision_encoder)]).toposort() if y.op is Ops.BUFFER]
@@ -242,7 +242,7 @@ def main():
 
   # interactive chat
   ids: list[int] = tok.prefix()
-  if vision_encoder: print("  /image <path>  load an image")
+  if vision_encoder: print("/image <path>  load an image")
   pending_images = []
   while 1:
     try:
@@ -250,14 +250,19 @@ def main():
     except EOFError:
       break
     if vision_encoder and line.startswith("/image "):
-      pending_images.append(vision_encoder.encode_image(line[7:].strip()))
-      print(f"  image loaded ({pending_images[-1][1]*pending_images[-1][2]} tokens)")
+      try:
+        pending_images.append(vision_encoder.encode_image(line[7:].strip()))
+      except Exception as e:
+        print(f"  {e}")
+        continue
+      print(f"image loaded ({pending_images[-1][1]*pending_images[-1][2]} tokens)")
       continue
     ids += tok.role("user")
     images = []
     for embd, nx, ny in pending_images:
+      ids += tok.encode("<|vision_start|>")
       images.append(ImageEmbed(embd, start=len(ids), n_tokens=nx * ny, nx=nx, ny=ny))
-      ids += tok.image(nx * ny)
+      ids += [tok._special_tokens["<|image_pad|>"]] * (nx * ny) + tok.encode("<|vision_end|>")
     ids += tok.encode(line) + tok.end_turn() + tok.role("assistant")
     pending_images = []
     dec = tok.stream_decoder()

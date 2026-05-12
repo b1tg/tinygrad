@@ -504,6 +504,8 @@ jobs:
         uses: ./.github/actions/setup-tinygrad
         with:
           key: apps_llm
+      - name: Test 1B VL (qwen3.5 image)
+        run: printf '/image test/models/efficientnet/car.jpg\nWhat is in this image? Answer with only one word.\n' | MAX_BUFFER_SIZE=0 python3 -m tinygrad.llm --model qwen3.5:0.8b --mmproj qwen3.5:0.8b | tee /dev/stderr | grep -i car
       - name: Test 1B LLM (llama)
         run: echo "What's a male chicken called? Answer with only one word." | MAX_BUFFER_SIZE=0 python3 -m tinygrad.llm --model llama3.2:1b | tee /dev/stderr | grep -i rooster
       - name: Test 1B LLM (llama q4)

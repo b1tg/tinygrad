@@ -14,12 +14,13 @@ class ImageEmbed(NamedTuple):
 def get_rope_index(images: list[ImageEmbed], max_context: int) -> list[tuple[int, int, int]]:
   # time/height/width positions for M-RoPE
   img_by_start = {img.start: img for img in images}
-  thw, offset = [], 0
-  for i in range(max_context):
+  thw, offset, i = [], 0, 0
+  while i < max_context:
     img = img_by_start.get(i)
     count, nx, ny = (img.n_tokens, img.nx, img.ny) if img else (1, 1, 1)
     thw += [(offset, offset + j // nx, offset + j % nx) for j in range(count)]
     offset += max(nx, ny)
+    i += count
   return thw
 
 def scatter_image_embeds(embd: Tensor, images: list[ImageEmbed]) -> Tensor:
@@ -45,8 +46,8 @@ class VisionBlock:
     h = self.ln1(x)
     qkv = self.attn_qkv(h).reshape(B, T, 3, self.n_head, dh)
     q, k, v = qkv[:, :, 0].transpose(1, 2), qkv[:, :, 1].transpose(1, 2), qkv[:, :, 2].transpose(1, 2)
-    q = apply_rope(q[..., :dh//2], freqs_cis).cat(q[..., dh//2:], dim=-1)
-    k = apply_rope(k[..., :dh//2], freqs_cis).cat(k[..., dh//2:], dim=-1)
+    q = apply_rope(q, freqs_cis)
+    k = apply_rope(k, freqs_cis)
     x = x + self.attn_out(q.scaled_dot_product_attention(k, v).transpose(1, 2).reshape(B, T, -1))
     return x + self.ffn_down(self.ffn_up(self.ln2(x)).gelu())
 
@@ -72,11 +73,15 @@ class VisionEncoder:
     ph, pw = image.shape[2] // self.patch_size, image.shape[3] // self.patch_size
     x = self.v.patch_embd(image) + self.v.patch_embd_1(image)
     x = x.reshape(-1, self.n_embd, ph//ms, ms, pw//ms, ms).permute(0, 2, 4, 3, 5, 1).reshape(-1, ph*pw, self.n_embd)
-    pos = self.v.position_embd["weight"].reshape(1, self.image_size//self.patch_size, self.image_size//self.patch_size, self.n_embd)[:, :ph, :pw, :]
-    x = x + pos.reshape(1, ph//ms, ms, pw//ms, ms, self.n_embd).permute(0, 1, 3, 2, 4, 5).reshape(1, ph*pw, self.n_embd)
+    n_per_side = self.image_size // self.patch_size
+    pos_w = self.v.position_embd["weight"].reshape(1, n_per_side, n_per_side, self.n_embd).permute(0, 3, 1, 2)
+    if ph != n_per_side or pw != n_per_side:
+      pos_w = pos_w.interpolate((ph, pw), mode="linear").contiguous()
+    pos_w = pos_w.permute(0, 2, 3, 1)
+    x = x + pos_w.reshape(1, ph//ms, ms, pw//ms, ms, self.n_embd).permute(0, 1, 3, 2, 4, 5).reshape(1, ph*pw, self.n_embd)
     dh = self.n_embd // self.n_head
-    freqs = compute_mrope_freqs(Tensor([[y+dy, xp+dx] for y in range(0, ph, ms) for xp in range(0, pw, ms) for dy in range(ms) for dx in range(ms)]),
-                                dh//2, 10000.0, (dh//8, dh//8), chunked=True)
+    pos = [[y+dy, xp+dx] for y in range(0, ph, ms) for xp in range(0, pw, ms) for dy in range(ms) for dx in range(ms)]
+    freqs = compute_mrope_freqs(Tensor(pos), dh, 10000.0, (dh//4, dh//4), chunked=True)
     for block in self.v.blk: x = block(x, freqs)
     x = self.v.post_ln(x)
     return self.mm[2](self.mm[0](x.reshape(-1, ph*pw//ms2, self.n_embd*ms2)).gelu()), pw//ms, ph//ms
