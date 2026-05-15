@@ -335,6 +335,17 @@ class TestMultiTensor(unittest.TestCase):
   def test_matmul_shard_1_0(self): return self._test_matmul_shard_axis(1, 0, devices_2)
   def test_matmul_shard_1_1(self): return self._test_matmul_shard_axis(1, 1, devices_2)
 
+  def test_matmul_sharded_weight_symbolic_seq(self):
+    W = (Tensor.arange(64*64).reshape(64, 64) % 13).cast(dtypes.float16).realize()
+    W_shard = W.shard(devices_2, axis=-1).contiguous().realize()
+    X = (Tensor.arange(1*32*64).reshape(1, 32, 64) % 7).cast(dtypes.float16).realize()
+    for seq_len in (1, 7, 32):
+      seq = UOp.variable("seq", 1, 32)
+      with Context(NOOPT=1):
+        out = (X[:, :seq.bind(seq_len), :].to(devices_2) @ W_shard.T).contiguous().realize()
+      expected = (X[:, 0:seq_len, :] @ W.T).realize()
+      np.testing.assert_allclose(out[:, 0:seq_len, :].numpy(), expected.numpy(), atol=1e-2, rtol=1e-2)
+
   def test_double_matmul_shard_X_0(self): return self._test_double_matmul_shard_axis(0, None, devices_2)
   def test_double_matmul_shard_X_1(self): return self._test_double_matmul_shard_axis(1, None, devices_2)
   def test_double_matmul_shard_W_0(self): return self._test_double_matmul_shard_axis(None, 0, devices_2)

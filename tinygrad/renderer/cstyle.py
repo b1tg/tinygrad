@@ -2,12 +2,27 @@ from typing import Literal, Callable, cast
 import math, sys, struct
 from collections import defaultdict, Counter
 from tinygrad.codegen.opt import tc
-from tinygrad.uop.ops import GroupOp, Ops, UOp, PatternMatcher, UPat, range_str, axis_letters
+from tinygrad.uop.ops import GroupOp, Ops, UOp, PatternMatcher, UPat, range_str, axis_letters, resolve
 from tinygrad.helpers import strip_parens, getenv, prod, dedup, Target, CPU_COUNT
 from tinygrad.dtype import ImageDType, dtypes, DType, PtrDType, AddrSpace, truncate, float_to_bf16
 from tinygrad.renderer import Renderer
 from tinygrad.codegen.late.devectorizer import no_vectorized_alu
 
+
+def render_index(ctx, x:UOp):
+  buf, idxs = x.src[0], x.src[1:]
+  idxs = tuple(idx.src[0] if idx.op is Ops.CAST and idx.dtype == dtypes.weakint else idx for idx in idxs)
+  if len(idxs) == 1:
+    idx = idxs[0]
+    return f"({ctx[buf]}+{strip_parens(ctx[idx]) if idx.arg == Ops.ADD else ctx[idx]})"
+  shape = buf.shape if len(idxs) == len(buf.shape) else tuple(idx.vmax+1 for idx in idxs)
+  strides = [prod(shape[i+1:]) for i in range(len(shape))]
+  terms = []
+  for idx, stride in zip(idxs, strides):
+    if not resolve(stride != 0): continue
+    ridx = strip_parens(ctx[idx]) if idx.arg == Ops.ADD else ctx[idx]
+    terms.append(ridx if stride == 1 else f"{ridx}*{stride}")
+  return f"({ctx[buf]}+{'+'.join(terms) if terms else '0'})"
 
 base_rewrite = PatternMatcher([
   (UPat(Ops.DEFINE_REG, name="x"), lambda ctx,x: f"{ctx.render_dtype(x.dtype.base)} {ctx[x]}[{x.dtype.size}];"),
@@ -44,7 +59,7 @@ base_rewrite = PatternMatcher([
   # default const render
   (UPat(Ops.CONST, name="x"), lambda ctx,x: str(x.arg)),
   # new load/store
-  (UPat.var("buf").index(UPat.var('idx')), lambda ctx,buf,idx: f"({ctx[buf]}+{strip_parens(ctx[idx]) if idx.arg == Ops.ADD else ctx[idx]})"),
+  (UPat(Ops.INDEX, name="x"), render_index),
   (UPat(Ops.LOAD, src=(UPat.var('bidx'),)), lambda ctx,bidx: f"(*{ctx[bidx]})"),
   (UPat(Ops.LOAD, src=(UPat.var("bidx"), UPat.var("var"), UPat.var("gate"))), lambda ctx,bidx,var,gate: f"({ctx[gate]}?*{ctx[bidx]}:{ctx[var]})"),
   (UPat(Ops.STORE, src=(UPat.var('bidx'), UPat.var("var")), allow_any_len=True), lambda ctx,bidx,var: f"*{ctx[bidx]} = {ctx[var]};"),
@@ -152,6 +167,7 @@ class CStyleLanguage(Renderer):
       if dt.addrspace == AddrSpace.LOCAL and self.smem_prefix_for_cast: prefix = self.smem_prefix
       if dt.addrspace == AddrSpace.GLOBAL: prefix = self.buffer_prefix
       return prefix + self.render_dtype(dt.base) + "*"
+    if dt.scalar() == dtypes.weakint: return "int" + (str(dt.count) if dt.count > 1 else "")
     if dt.count > 1: return self.type_map.get(scalar:=dt.scalar(), scalar.name).replace(" ", "_") + str(dt.count)
     return self.type_map.get(scalar:=dt.scalar(), scalar.name)
 
