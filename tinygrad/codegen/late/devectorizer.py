@@ -74,6 +74,11 @@ def expand_index(ctx, buf:UOp, vec:UOp):
   # generate the individual indexes
   return UOp(Ops.STACK, buf.dtype, tuple(buf.index(vec.gep(i), ptr=True) for i in range(vec.dtype.count)))
 
+def split_multidim_vectorized_load(load:UOp, idx:UOp):
+  if idx.dtype.vcount == 1 or len(idx.src) <= 2: return None
+  idxs = tuple(idx.replace(dtype=idx.dtype.scalar(), src=tuple(s.gep(i) if s.dtype.vcount > 1 else s for s in idx.src)) for i in range(idx.dtype.vcount))
+  return UOp(Ops.STACK, load.dtype, tuple(i.load(dtype=load.dtype.scalar()) for i in idxs))
+
 def fold_expanded_index(midx:UOp):
   buf = midx.src[0].src[0]
   if not all(s.src[0] is buf for s in midx.src): return None
@@ -130,6 +135,7 @@ def gep_on_store(gep:UOp, st:UOp):
   return gep.src[0].store(st.gep(new_arg))
 
 load_store_folding = PatternMatcher([
+  (UPat(Ops.LOAD, src=(UPat(Ops.INDEX, name="idx"),), name="load"), split_multidim_vectorized_load),
   (UPat(Ops.INDEX, src=(UPat(Ops.STACK, src=UPat(GroupOp.Defines).or_after(name="buf")), UPat.var("vec"))), expand_index),
   (UPat(Ops.STACK, src=UPat(Ops.INDEX), name="midx"), fold_expanded_index),
   # GEP after LOAD

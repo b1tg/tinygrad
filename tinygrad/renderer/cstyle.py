@@ -15,7 +15,12 @@ def render_index(ctx, x:UOp):
   if len(idxs) == 1:
     idx = idxs[0]
     return f"({ctx[buf]}+{strip_parens(ctx[idx]) if idx.arg == Ops.ADD else ctx[idx]})"
-  shape = buf.shape if len(idxs) == len(buf.shape) else tuple(idx.vmax+1 for idx in idxs)
+  if len(idxs) == len(buf.shape): shape = buf.shape
+  else:
+    trailing = next((i for i, idx in enumerate(reversed(idxs)) if idx.op is not Ops.CONST or idx.arg != 0), len(idxs)-1)
+    infer_axis = len(idxs)-1-trailing
+    shape = tuple(max(idx.vmax+1, 1) for idx in idxs[:infer_axis])
+    shape += (buf.ptrdtype.size//prod(shape),) + (1,)*trailing
   strides = [prod(shape[i+1:]) for i in range(len(shape))]
   terms = []
   for idx, stride in zip(idxs, strides):

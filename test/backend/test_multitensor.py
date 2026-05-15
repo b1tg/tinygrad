@@ -339,11 +339,11 @@ class TestMultiTensor(unittest.TestCase):
     W = (Tensor.arange(64*64).reshape(64, 64) % 13).cast(dtypes.float16).realize()
     W_shard = W.shard(devices_2, axis=-1).contiguous().realize()
     X = (Tensor.arange(1*32*64).reshape(1, 32, 64) % 7).cast(dtypes.float16).realize()
-    for seq_len in (1, 7, 32):
+    for start_pos, seq_len in ((0, 1), (3, 7), (16, 8), (0, 32)):
+      sp = UOp.variable("sp", 0, 31)
       seq = UOp.variable("seq", 1, 32)
-      with Context(NOOPT=1):
-        out = (X[:, :seq.bind(seq_len), :].to(devices_2) @ W_shard.T).contiguous().realize()
-      expected = (X[:, 0:seq_len, :] @ W.T).realize()
+      out = (X[:, sp.bind(start_pos):sp.bind(start_pos)+seq.bind(seq_len), :].to(devices_2) @ W_shard.T).contiguous().realize()
+      expected = (X[:, start_pos:start_pos+seq_len, :] @ W.T).realize()
       np.testing.assert_allclose(out[:, 0:seq_len, :].numpy(), expected.numpy(), atol=1e-2, rtol=1e-2)
 
   def test_double_matmul_shard_X_0(self): return self._test_double_matmul_shard_axis(0, None, devices_2)
