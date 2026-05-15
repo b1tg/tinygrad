@@ -72,13 +72,17 @@ from tinygrad.engine.realize import capturing, pm_flatten_linear
 from tinygrad.schedule.rangeify import get_kernel_graph
 from tinygrad.helpers import CAPTURING
 from tinygrad.uop.ops import PatternMatcher, UPat
+from tinygrad.dtype import ImageDType, PtrDType
 
 def create_new_buffer(ctx:tuple[dict[UOp, UOp], tuple[UOp, ...]], b:UOp):
   if (ret:=ctx[0].get(b, None)) is None: ctx[0][b] = ret = UOp.new_buffer(b.device, b.arg, b.dtype)
   return ret
 
+def resolve_sched_param(ctx:tuple[dict[UOp, UOp], tuple[UOp, ...]], x:UOp):
+  if isinstance(x.dtype, (PtrDType, ImageDType)) or x.arg < len(ctx[1]): return ctx[1][x.arg]
+
 pm_post_sched_cache = PatternMatcher([
-  (UPat(Ops.PARAM, name="x"), lambda ctx,x: ctx[1][x.arg]),
+  (UPat(Ops.PARAM, name="x"), resolve_sched_param),
   # create new BUFFERs for LUNIQUE BUFFERs from rangeify
   (UPat(Ops.BUFFER, src=(UPat(Ops.LUNIQUE), UPat(Ops.DEVICE)), name="b"), create_new_buffer),
 ])

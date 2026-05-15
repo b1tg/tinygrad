@@ -10,11 +10,27 @@ from hypothesis import assume, given, settings, strategies as strat
 from tinygrad import nn, dtypes, Device, Tensor, Variable
 from tinygrad.device import is_dtype_supported
 from tinygrad.dtype import DType
-from tinygrad.uop.ops import UOp, Ops, UPat
+from tinygrad.schedule import pm_post_sched_cache
+from tinygrad.uop.ops import UOp, Ops, UPat, graph_rewrite
 from tinygrad.helpers import CI, DEBUG, OSX, GlobalCounters, Context, getenv, all_same, temp
 from tinygrad.engine.realize import compile_linear, run_linear
 
 class KernelCountException(Exception): pass
+
+class TestScheduleCacheRewrite(unittest.TestCase):
+  def test_post_sched_cache_keeps_symbolic_params(self):
+    buf_arg = UOp.new_buffer(Device.DEFAULT, 4, dtypes.float)
+    bound_var = UOp.variable("start_pos", 0, 1024).bind(3)
+    buf_param = UOp.param(0, dtypes.float.ptr(4), device=Device.DEFAULT)
+    bound_param = UOp.param(1, dtypes.int, vmin_vmax=(0, 1024), name="start_pos")
+    stale_param = UOp.param(7, dtypes.int, vmin_vmax=(0, 1024), name="seq_len")
+    sink = UOp(Ops.SINK, dtypes.void, (buf_param, bound_param, stale_param))
+
+    rewritten = graph_rewrite(sink, pm_post_sched_cache, ctx=({}, (buf_arg, bound_var)), walk=True)
+    self.assertIn(buf_arg, rewritten.src)
+    self.assertIn(bound_var, rewritten.src)
+    self.assertIn(stale_param, rewritten.src)
+
 def check_schedule(t:Tensor|list[Tensor]|UOp, allowed:int, to_prerealize:list[Tensor]|None=None, filter_sink=True):
   if to_prerealize:
     with Context(DEBUG=0, TRACK_MATCH_STATS=0): Tensor.realize(*to_prerealize)

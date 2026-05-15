@@ -346,6 +346,19 @@ class TestMultiTensor(unittest.TestCase):
       expected = (X[:, start_pos:start_pos+seq_len, :] @ W.T).realize()
       np.testing.assert_allclose(out[:, 0:seq_len, :].numpy(), expected.numpy(), atol=1e-2, rtol=1e-2)
 
+  def test_rand_like_symbolic_multi_tensor(self):
+    W = Tensor.randn(8, 8).cast(dtypes.float16).realize().shard(devices_2, axis=-1).contiguous().realize()
+    X = Tensor.randn(1, 32, 8).cast(dtypes.float16).realize()
+    seq = UOp.variable("seq", 1, 32)
+    out = (X[:, :seq.bind(3), :].to(devices_2) @ W.T).contiguous().realize()
+
+    Tensor.manual_seed(1337)
+    rand = Tensor.rand_like(out).realize()
+    Tensor.manual_seed(1337)
+    expected = Tensor.rand(1, seq.bind(3), 8, dtype=out.dtype).realize()
+    self.assertEqual(rand.device, devices_2)
+    np.testing.assert_equal(rand[:, :3, :].numpy(), expected[:, :3, :].numpy())
+
   def test_double_matmul_shard_X_0(self): return self._test_double_matmul_shard_axis(0, None, devices_2)
   def test_double_matmul_shard_X_1(self): return self._test_double_matmul_shard_axis(1, None, devices_2)
   def test_double_matmul_shard_W_0(self): return self._test_double_matmul_shard_axis(None, 0, devices_2)

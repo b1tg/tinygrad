@@ -580,12 +580,16 @@ class Tensor(OpMixin):
     """
     dt = to_dtype(dtype or dtypes.default_float)
     if not dtypes.is_float(dt): raise ValueError(f"rand only supports float dtypes, got {dt}")
-    if not all_int(shape:=argfix(*shape)) or not all(s >= 0 for s in shape): raise ValueError(f"invalid input {shape=}")
+    shape = argfix(*shape)
+    def valid_dim(s): return s >= 0 if isinstance(s, int) else isinstance(s, UOp) and isinstance(s.vmin, int) and isinstance(s.vmax, int) and s.vmin >= 0
+    if not all(valid_dim(s) for s in shape):
+      raise ValueError(f"invalid input {shape=}")
     if device is not None and not isinstance(device, str): raise ValueError(f"rand only supports single device, got {device=}")
     device = cast(str, canonicalize_device(device))
 
     # if shape has 0, return zero tensor
-    if (numel := prod(shape)) == 0: return Tensor.zeros(shape, device=device, dtype=dt, requires_grad=requires_grad)
+    max_shape = tuple(int(s.vmax) if isinstance(s, UOp) else s for s in shape)
+    if (numel := prod(max_shape)) == 0: return Tensor.zeros(shape, device=device, dtype=dt, requires_grad=requires_grad)
     num = ceildiv(numel * dt.itemsize, 4)
     key, counter = Tensor._next_counter(device, num)
     bits = Tensor.random_bits(key, counter, num)
