@@ -37,7 +37,21 @@ def _q4k(raw:UOp, idx:UOp) -> UOp:
   mn = (g < 4).where(u8(base+8+g) & 63, (u8(base+8+g) >> 4) | ((u8(base+4+g) >> 6) << 4)).cast(dtypes.float)
   return half(base) * sc * q - half(base+2) * mn
 
-def _expert_matmul_q4k_kernel(output:UOp, x:UOp, raw:UOp, sel:UOp, in_features:int) -> UOp:
+def _q5k(raw:UOp, idx:UOp) -> UOp:
+  block, inb = idx // 256, idx % 256
+  base, g, j = block * 176, inb // 32, inb % 32
+  def u8(off): return raw.index(off).cast(dtypes.uint16)
+  def half(off): return (u8(off) | (u8(off+1) << 8)).bitcast(dtypes.float16).cast(dtypes.float)
+  qb = u8(base + 48 + (g//2)*32 + j)
+  q = ((g % 2).eq(0).where(qb & 15, qb >> 4) + (((u8(base+16+j) >> g) & 1) << 4)).cast(dtypes.float)
+  sc = (g < 4).where(u8(base+4+g) & 63, (u8(base+8+g) & 15) | ((u8(base+g) >> 6) << 4)).cast(dtypes.float)
+  mn = (g < 4).where(u8(base+8+g) & 63, (u8(base+8+g) >> 4) | ((u8(base+4+g) >> 6) << 4)).cast(dtypes.float)
+  return half(base) * sc * q - half(base+2) * mn
+
+def _qk(raw:UOp, idx:UOp, typ:int) -> UOp:
+  return _q4k(raw, idx) if typ == 12 else _q5k(raw, idx)
+
+def _expert_matmul_q4k_kernel(output:UOp, x:UOp, raw:UOp, sel:UOp, in_features:int, typ:int=12) -> UOp:
   B, T, K, OUT, xk = output.shape[-4], output.shape[-3], output.shape[-2], output.shape[-1], x.shape[-2]
   output, x, raw, sel = output.flatten(), x.flatten(), raw.flatten(), sel.flatten()
   b = UOp.range(B, 1, AxisType.LOOP)
@@ -47,7 +61,7 @@ def _expert_matmul_q4k_kernel(output:UOp, x:UOp, raw:UOp, sel:UOp, in_features:i
   r = UOp.range(in_features, 0, AxisType.REDUCE)
   e = sel.index(b*T*K + t*K + k).cast(dtypes.weakint)
   xv = x.index(b*T*xk*in_features + t*xk*in_features + (k if xk != 1 else 0)*in_features + r)
-  ret = (xv * _q4k(raw, e*OUT*in_features + o*in_features + r)).cast(dtypes.float).reduce(r, arg=Ops.ADD).cast(output.dtype.base)
+  ret = (xv * _qk(raw, e*OUT*in_features + o*in_features + r, typ)).cast(dtypes.float).reduce(r, arg=Ops.ADD).cast(output.dtype.base)
   off = b*T*K*OUT + t*K*OUT + k*OUT + o
   return output.index(off, ptr=True).store(ret).end(b, t, k, o).sink(arg=KernelInfo(name=f"expert_matmul_q4k_{x.shape}_{OUT}_{in_features}", beam=-1))
 
@@ -96,14 +110,15 @@ class ExpertWeights:
       if self.weight.uop.axis == 2: x = _reshard_last(x, self.weight.device)
       elif not isinstance(x.device, tuple): x = x.to(self.weight.device)
       if not isinstance(sel.device, tuple): sel = sel.to(self.weight.device)
-      if getenv("EXPERT_Q4K_CUSTOM", 1) and getattr(self.weight, "_gguf_type", None) == 12 and self.weight.uop.axis == 1:
+      if getenv("EXPERT_Q4K_CUSTOM", 1) and getattr(self.weight, "_gguf_type", None) in (12, 13) and self.weight.uop.axis == 1:
         return Tensor.custom_kernel(_expert_output((*sel.shape, self.weight.shape[1]), self.weight, len(sel.shape)), x,
                                     self.weight._gguf_raw, sel, fxn=functools.partial(_expert_matmul_q4k_kernel,
-                                                                                      in_features=self.weight.shape[2]))[0]
-      if getenv("EXPERT_Q4K_CUSTOM", 1) and getattr(self.weight, "_gguf_type", None) == 12 and self.weight.uop.axis == 2:
+                                                                                      in_features=self.weight.shape[2],
+                                                                                      typ=self.weight._gguf_type))[0]
+      if getenv("EXPERT_Q4K_CUSTOM", 1) and getattr(self.weight, "_gguf_type", None) in (12, 13) and self.weight.uop.axis == 2:
         ret = _expert_output((len(self.weight.device), *sel.shape, self.weight.shape[1]), self.weight, 0)
         return Tensor.custom_kernel(ret, x, self.weight._gguf_raw, sel, fxn=functools.partial(_expert_matmul_q4k_kernel,
-                                    in_features=self.weight.uop.shard_shape[2]))[0].sum(axis=0)
+                                    in_features=self.weight.uop.shard_shape[2], typ=self.weight._gguf_type))[0].sum(axis=0)
       if self.weight.uop.base.op is Ops.BUFFER and x.shape[-1] == self.weight.shape[-1] and self.weight.uop.axis == 1:
         return Tensor.custom_kernel(_expert_output((*sel.shape, self.weight.shape[1]), self.weight, len(sel.shape)), x, self.weight, sel,
                                     fxn=_expert_matmul_kernel)[0]

@@ -203,6 +203,19 @@ class TestGGUF(unittest.TestCase):
         _, sd = gguf_load(p, devices=("CPU:0", "CPU:1"), shard_axis=lambda *args: axis)
         np.testing.assert_equal(sd["blk.0.ffn_gate_exps.weight"].numpy(), full["blk.0.ffn_gate_exps.weight"].numpy())
 
+  def test_q4_k_expert_tensor_shard_keeps_raw(self):
+    os.makedirs("/tmp/b1", exist_ok=True)
+    arr = np.arange(2*4*512, dtype=np.float32).reshape(2, 4, 512)
+    block_size, type_size = GGML_QUANT_SIZES[GGMLQuantizationType.Q4_K]
+    data = bytes((i % 256 for i in range(arr.size // block_size * type_size)))
+    with tempfile.TemporaryDirectory(dir="/tmp/b1") as d:
+      p = pathlib.Path(d) / "test.gguf"
+      p.write_bytes(self._build_gguf([("blk.0.ffn_down_exps.weight", arr.shape, GGMLQuantizationType.Q4_K.value, data)],
+        [("general.architecture", "llama"), ("llama.block_count", 1)]))
+      _, sd = gguf_load(p, devices=("CPU:0", "CPU:1"), shard_axis=lambda *args: 2)
+      self.assertEqual(sd["blk.0.ffn_down_exps.weight"].shape, arr.shape)
+      self.assertEqual(sd["blk.0.ffn_down_exps.weight"]._gguf_raw.device[-1], "CPU:1")
+
   def _test_dequantization(self, qtype: GGMLQuantizationType):
     block_size, type_size = GGML_QUANT_SIZES[qtype]
     n_el, n_bytes = ggml_test_block_count * block_size, ggml_test_block_count * type_size
