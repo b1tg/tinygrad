@@ -55,6 +55,21 @@ class TestLLMShard(unittest.TestCase):
     out = sharded(Tensor([[[0]]], dtype="int32"), Tensor.ones(1, 1, 1, 256)).to("CPU")
     self.assertEqual(out.tolist(), [[[[256.0, 4352.0]]]])
 
+  def test_expert_weight_iq4xs_raw_tensor_shard(self):
+    def block(q):
+      b = bytearray(136)
+      b[0:2], b[2:4], b[4:8], b[8:136] = struct.pack("<e", 1.0), struct.pack("<H", 0xAAAA), bytes([0x11]*4), bytes([q | (q << 4)] * 128)
+      return bytes(b)
+    devs = ("CPU:0", "CPU:1")
+    raw0 = Tensor(block(8), dtype=dtypes.uint8, device="CPU").to(devs[0]).realize()
+    raw1 = Tensor(block(9), dtype=dtypes.uint8, device="CPU").to(devs[1]).realize()
+    sharded = ExpertWeights(1, 256, 2)
+    sharded.weight.replace(Tensor.zeros(1, 2, 256).shard(devs, axis=1))
+    sharded.weight._gguf_raw = Tensor(raw0.uop.mstack(raw1.uop).multi(0))
+    sharded.weight._gguf_type = 23
+    out = sharded(Tensor([[[0]]], dtype="int32"), Tensor.ones(1, 1, 1, 256)).to("CPU")
+    self.assertEqual(out.tolist(), [[[[256.0, 3328.0]]]])
+
   def test_expert_weight_q4k_fused_tensor_shard(self):
     def block(q):
       b = bytearray(144)

@@ -173,7 +173,7 @@ def _gguf_load_sharded_tensor(tensor:Tensor, off:int, dims:tuple[int, ...], typ:
   rows, cols, dcnt = prod(shape[:-1]), shape[-1], len(devices)
   if shape[axis] % dcnt != 0: raise RuntimeError(f"GGUF raw tensor shard axis is uneven: {shape=} {axis=} {dcnt=}")
   row_nbytes = _gguf_row_nbytes(cols, typ)
-  need_raw, raw_parts = keep_raw and typ in (12, 13), []
+  need_raw, raw_parts = keep_raw and typ in (12, 13, 23), []
   def load(raw:Tensor, dims:tuple[int, ...], dev:str) -> Tensor:
     raw = raw.to(dev).realize()
     if need_raw: raw_parts.append(raw)
