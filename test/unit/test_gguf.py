@@ -172,6 +172,34 @@ class TestGGUF(unittest.TestCase):
       self.assertEqual(sd["token_embd.weight"].device, devs[0])
       np.testing.assert_equal(sd["blk.2.weight"].numpy(), [2.0]*4)
 
+  def test_q8_0_tensor_shard_load(self):
+    os.makedirs("/tmp/b1", exist_ok=True)
+    arr = (np.arange(4*64, dtype=np.float32).reshape(4, 64) - 128) / 3
+    data = quantize(arr.reshape(-1), GGMLQuantizationType.Q8_0).tobytes()
+    with tempfile.TemporaryDirectory(dir="/tmp/b1") as d:
+      p = pathlib.Path(d) / "test.gguf"
+      p.write_bytes(self._build_gguf([("blk.0.ffn_down.weight", arr.shape, GGMLQuantizationType.Q8_0.value, data)],
+        [("general.architecture", "llama"), ("llama.block_count", 1)]))
+      _, full = gguf_load(p)
+      for axis in (0, 1):
+        _, sd = gguf_load(p, devices=("CPU:0", "CPU:1"), shard_axis=lambda *args: axis)
+        np.testing.assert_equal(sd["blk.0.ffn_down.weight"].numpy(), full["blk.0.ffn_down.weight"].numpy())
+        _, sd = gguf_load(p, devices=("CPU:0", "CPU:1"), shard_axis=lambda *args: axis, dtype="float16")
+        np.testing.assert_equal(sd["blk.0.ffn_down.weight"].numpy(), full["blk.0.ffn_down.weight"].cast("float16").numpy())
+
+  def test_q8_0_3d_tensor_shard_load(self):
+    os.makedirs("/tmp/b1", exist_ok=True)
+    arr = (np.arange(4*8*64, dtype=np.float32).reshape(4, 8, 64) - 1024) / 7
+    data = quantize(arr.reshape(-1), GGMLQuantizationType.Q8_0).tobytes()
+    with tempfile.TemporaryDirectory(dir="/tmp/b1") as d:
+      p = pathlib.Path(d) / "test.gguf"
+      p.write_bytes(self._build_gguf([("blk.0.ffn_gate_exps.weight", arr.shape, GGMLQuantizationType.Q8_0.value, data)],
+        [("general.architecture", "llama"), ("llama.block_count", 1)]))
+      _, full = gguf_load(p)
+      for axis in (0, 1, 2):
+        _, sd = gguf_load(p, devices=("CPU:0", "CPU:1"), shard_axis=lambda *args: axis)
+        np.testing.assert_equal(sd["blk.0.ffn_gate_exps.weight"].numpy(), full["blk.0.ffn_gate_exps.weight"].numpy())
+
   def _test_dequantization(self, qtype: GGMLQuantizationType):
     block_size, type_size = GGML_QUANT_SIZES[qtype]
     n_el, n_bytes = ggml_test_block_count * block_size, ggml_test_block_count * type_size

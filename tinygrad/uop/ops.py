@@ -576,9 +576,12 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
       if src_axis is None: return None
       arg_acc:list[sint] = list(itertools.accumulate(self.marg, operator.mul, initial=1))
       # new_axis is the last one that preserves prod(prior to new_axis) and must not move items between shards
-      new_axis = len(arg_acc) - arg_acc[::-1].index(prod(self.src[0].shape[:src_axis])) - 1
-      if self.shape[new_axis] % len(self.device) != 0: raise RuntimeError(f"reshape {self.src[0].shape} -> {self.shape} moved items between shards")
-      return new_axis
+      old_prod = ssimplify(prod(self.src[0].shape[:src_axis]))
+      dcnt = len(self.device) if isinstance(self.device, tuple) else 1
+      for new_axis in reversed(range(len(arg_acc))):
+        axis = min(new_axis, len(self.shape)-1)
+        if ssimplify(arg_acc[new_axis]) == old_prod and resolve(self.shape[axis] % dcnt == 0, False): return axis
+      raise RuntimeError(f"reshape {self.src[0].shape} -> {self.shape} moved items between shards")
     if self.op is Ops.PERMUTE: return self.marg.index(src_axis) if src_axis is not None else None
     return src_axis
 

@@ -157,6 +157,8 @@ def load_state_dict(model, state_dict:dict[str, Tensor], strict=True, verbose=Tr
         if isinstance(state_dict[k].device, tuple): v.replace(state_dict[k])
         else: v.replace(state_dict[k].shard(v.device, v.uop.axis))
       else: v.replace(state_dict[k].to(v.device))
+      for a in ("_gguf_raw", "_gguf_type"):
+        if hasattr(state_dict[k], a): setattr(v, a, getattr(state_dict[k], a))
       if realize: v.realize()
       if consume: del state_dict[k]
       ret.append(v)
