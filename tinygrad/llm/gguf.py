@@ -151,6 +151,18 @@ def _gguf_read_cols(path:pathlib.Path, off:int, rows:int, row_nbytes:int, col_of
       out[r*col_nbytes:(r+1)*col_nbytes] = f.read(col_nbytes)
   return Tensor(bytes(out), dtype=dtypes.uint8, device="CPU")
 
+def _gguf_read_col_parts(path:pathlib.Path, off:int, rows:int, row_nbytes:int, dcnt:int, col_nbytes:int) -> list[Tensor]:
+  out = [bytearray(rows*col_nbytes) for _ in range(dcnt)]
+  chunk_rows = getenv("GGUF_SHARD_READ_ROWS", 4096)
+  with path.open("rb") as f:
+    for r0 in range(0, rows, chunk_rows):
+      nr = min(chunk_rows, rows-r0)
+      f.seek(off + r0*row_nbytes)
+      buf = f.read(nr*row_nbytes)
+      for i,o in enumerate(out):
+        for r in range(nr): o[(r0+r)*col_nbytes:(r0+r+1)*col_nbytes] = buf[r*row_nbytes+i*col_nbytes:r*row_nbytes+(i+1)*col_nbytes]
+  return [Tensor(bytes(o), dtype=dtypes.uint8, device="CPU") for o in out]
+
 def _gguf_read(path:pathlib.Path, off:int, nbytes:int) -> Tensor:
   with path.open("rb") as f:
     f.seek(off)
@@ -191,8 +203,9 @@ def _gguf_load_sharded_tensor(tensor:Tensor, off:int, dims:tuple[int, ...], typ:
       if typ in _GGML_QUANT and ncols % _GGML_QUANT[typ][0] != 0: raise RuntimeError(f"GGUF raw column shard splits quant blocks: {shape=} {typ=}")
       col_nbytes = _gguf_row_nbytes(ncols, typ)
       if path is not None:
-        parts = [load(_gguf_read_cols(path, off, rows, row_nbytes, i*col_nbytes, col_nbytes),
-                      tuple(reversed((*shape[:-1], ncols))), dev) for i,dev in enumerate(devices)]
+        raws = _gguf_read_col_parts(path, off, rows, row_nbytes, dcnt, col_nbytes) if need_raw else [
+          _gguf_read_cols(path, off, rows, row_nbytes, i*col_nbytes, col_nbytes) for i in range(dcnt)]
+        parts = [load(raw, tuple(reversed((*shape[:-1], ncols))), dev) for raw,dev in zip(raws, devices)]
       else:
         src = tensor[off:off+rows*row_nbytes].reshape(rows, row_nbytes)
         parts = [load(src[:, i*col_nbytes:(i+1)*col_nbytes].contiguous().flatten(),
