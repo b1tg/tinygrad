@@ -236,7 +236,7 @@ def _gguf_parse(tensor: Tensor, devices:tuple[str,...]|None=None, n_blk:int|None
       n = prod(dims)
       if shard_axis is not None and (axis:=shard_axis(name, dims, typ, meta)) is not None:
         try:
-          keep_raw = getenv("EXPERT_Q4K_CUSTOM", 1) and ("ffn_gate_exps.weight" in name or "ffn_up_exps.weight" in name)
+          keep_raw = getenv("EXPERT_Q4K_CUSTOM", 1) and "_exps.weight" in name
           state_dict[name] = _gguf_load_sharded_tensor(tensor, data_start + off, dims, typ, devices, axis, path, dtype, keep_raw)
         except RuntimeError as e:
           if "splits quant blocks" not in str(e): raise

@@ -431,7 +431,7 @@ class Transformer:
     load_dtype = 'float16' if devices and getenv("HALF", 1) else None
     kv, state_dict = gguf_load(gguf, devices=devices, shard_axis=_gguf_shard_axis if devices else None, dtype=load_dtype)
     arch = kv['general.architecture']
-    if devices and kv.get('general.file_type') in (0, 1, 7, 32): realize = True
+    if devices and getenv("GGUF_REALIZE_SHARDED", 0) and kv.get('general.file_type') in (0, 1, 7, 32): realize = True
 
     # all state items should be float16, not float32
     if load_dtype is None: state_dict = {k:v.cast('float16') if getenv("HALF", 1) else v for k,v in state_dict.items()}
