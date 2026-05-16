@@ -49,6 +49,13 @@ def _q5k(raw:UOp, idx:UOp) -> UOp:
   return half(base) * sc * q - half(base+2) * mn
 
 def _qk(raw:UOp, idx:UOp, typ:int) -> UOp:
+  if typ == 2:
+    block, inb = idx // 32, idx % 32
+    base = block * 18
+    def u8(off): return raw.index(off).cast(dtypes.uint16)
+    qb = u8(base + 2 + inb % 16)
+    q = (inb < 16).where(qb & 15, qb >> 4).cast(dtypes.float)
+    return (u8(base) | (u8(base+1) << 8)).bitcast(dtypes.float16).cast(dtypes.float) * (q - 8)
   if typ == 12: return _q4k(raw, idx)
   if typ == 13: return _q5k(raw, idx)
   block, inb = idx // 256, idx % 256
@@ -123,12 +130,12 @@ class ExpertWeights:
       if self.weight.uop.axis == 2: x = _reshard_last(x, self.weight.device)
       elif not isinstance(x.device, tuple): x = x.to(self.weight.device)
       if not isinstance(sel.device, tuple): sel = sel.to(self.weight.device)
-      if getenv("EXPERT_Q4K_CUSTOM", 1) and getattr(self.weight, "_gguf_type", None) in (12, 13, 23) and self.weight.uop.axis == 1:
+      if getenv("EXPERT_Q4K_CUSTOM", 1) and getattr(self.weight, "_gguf_type", None) in (2, 12, 13, 23) and self.weight.uop.axis == 1:
         return Tensor.custom_kernel(_expert_output((*sel.shape, self.weight.shape[1]), self.weight, len(sel.shape)), x,
                                     self.weight._gguf_raw, sel, fxn=functools.partial(_expert_matmul_q4k_kernel,
                                                                                       in_features=self.weight.shape[2],
                                                                                       typ=self.weight._gguf_type))[0]
-      if getenv("EXPERT_Q4K_CUSTOM", 1) and getattr(self.weight, "_gguf_type", None) in (12, 13, 23) and self.weight.uop.axis == 2:
+      if getenv("EXPERT_Q4K_CUSTOM", 1) and getattr(self.weight, "_gguf_type", None) in (2, 12, 13, 23) and self.weight.uop.axis == 2:
         ret = _expert_output((len(self.weight.device), *sel.shape, self.weight.shape[1]), self.weight, 0)
         return Tensor.custom_kernel(ret, x, self.weight._gguf_raw, sel, fxn=functools.partial(_expert_matmul_q4k_kernel,
                                     in_features=self.weight.uop.shard_shape[2], typ=self.weight._gguf_type))[0].sum(axis=0)
