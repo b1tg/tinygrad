@@ -149,6 +149,9 @@ class TestGGUF(unittest.TestCase):
       self.assertEqual(kv["split.count"], 2)
       np.testing.assert_equal(ts["a"].numpy(), a)
       np.testing.assert_equal(ts["b"].numpy(), b)
+      _, ts = gguf_load(d / "test-00001-of-00002.gguf", devices=("CPU:0", "CPU:1"),
+                        shard_axis=lambda name,dims,typ,kv: (kv["general.architecture"] and None))
+      np.testing.assert_equal(ts["b"].numpy(), b)
 
       # missing part 2
       (d / "test-00002-of-00002.gguf").unlink()

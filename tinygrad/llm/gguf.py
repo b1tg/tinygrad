@@ -206,7 +206,7 @@ def _gguf_load_sharded_tensor(tensor:Tensor, off:int, dims:tuple[int, ...], typ:
 
 def _gguf_parse(tensor: Tensor, devices:tuple[str,...]|None=None, n_blk:int|None=None,
                 shard_axis:Callable[[str, tuple[int, ...], int, dict], int|None]|None=None,
-                path:pathlib.Path|None=None, dtype:str|None=None) -> tuple[dict, dict[str, Tensor]]:
+                path:pathlib.Path|None=None, dtype:str|None=None, base_kv:dict|None=None) -> tuple[dict, dict[str, Tensor]]:
   r = io.BufferedReader(TensorIO(tensor), 1_000_000)
   magic, version, n_tensors, n_kv = r.read(4), read_int32(r), read_int64(r), read_int64(r)
   if magic != b"GGUF" or version not in [2, 3]: raise ValueError("Invalid GGUF format!")
@@ -219,13 +219,14 @@ def _gguf_parse(tensor: Tensor, devices:tuple[str,...]|None=None, n_blk:int|None
   t_infos = [ (read_str(r), tuple(read_uint64(r) for _ in range(read_uint32(r))), read_int32(r), read_uint64(r)) for _ in range(n_tensors) ]
   alignment, pos = kv_data.get("general.alignment", 32), r.tell()
   data_start = round_up(pos, alignment)
+  meta = kv_data if base_kv is None else {**base_kv, **kv_data}
 
   if devices:
-    if n_blk is None: n_blk = kv_data[f'{kv_data["general.architecture"]}.block_count']
+    if n_blk is None: n_blk = meta[f'{meta["general.architecture"]}.block_count']
     state_dict = {}
     for name, dims, typ, off in t_infos:
       n = prod(dims)
-      if shard_axis is not None and (axis:=shard_axis(name, dims, typ, kv_data)) is not None:
+      if shard_axis is not None and (axis:=shard_axis(name, dims, typ, meta)) is not None:
         try:
           keep_raw = getenv("EXPERT_Q4K_CUSTOM", 1) and ("ffn_gate_exps.weight" in name or "ffn_up_exps.weight" in name)
           state_dict[name] = _gguf_load_sharded_tensor(tensor, data_start + off, dims, typ, devices, axis, path, dtype, keep_raw)
@@ -269,5 +270,5 @@ def gguf_load(fn: Tensor|str|pathlib.Path, devices:tuple[str,...]|None=None,
   if kv.get('split.count', 1) <= 1: return kv, sd
   if isinstance(fn, Tensor): raise ValueError("multi-part GGUF requires a path argument (got Tensor)")
   n_blk = kv[f'{kv["general.architecture"]}.block_count']
-  for pp in _gguf_split_paths(pathlib.Path(fn), kv)[1:]: sd.update(_gguf_parse(Tensor(pp), devices, n_blk, shard_axis, pp, dtype)[1])
+  for pp in _gguf_split_paths(pathlib.Path(fn), kv)[1:]: sd.update(_gguf_parse(Tensor(pp), devices, n_blk, shard_axis, pp, dtype, kv)[1])
   return kv, sd
