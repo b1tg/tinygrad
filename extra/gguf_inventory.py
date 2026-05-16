@@ -97,7 +97,11 @@ def parse(p, base_kv=None):
   meta = kv if base_kv is None else {**base_kv, **kv}
   infos = []
   for _ in range(nt):
-    name = r.s(); nd = r.rd("<I"); dims = tuple(r.rd("<Q") for _ in range(nd)); typ = r.rd("<I"); r.rd("<Q")
+    name = r.s()
+    nd = r.rd("<I")
+    dims = tuple(r.rd("<Q") for _ in range(nd))
+    typ = r.rd("<I")
+    r.rd("<Q")
     shape = tuple(reversed(dims))
     infos.append((name, shape, typ, nbytes(dims, typ), shard_axis(name, len(dims), meta)))
   return kv, infos
@@ -122,3 +126,6 @@ print("\nBY tensor type")
 bytype = collections.Counter()
 for _,_,typ,nb,_ in infos: bytype[tname(typ)] += nb
 for t, nb in bytype.most_common(): print(f"{nb/1e9:9.2f} GB  {t}")
+if len(sys.argv) > 2:
+  ndev = int(sys.argv[2])
+  print(f"\nraw bytes / {ndev} devices lower bound: {sum(nb for *_,nb,_ in infos)/ndev/1e9:.2f} GB/device")

@@ -191,7 +191,7 @@ def _gguf_load_sharded_tensor(tensor:Tensor, off:int, dims:tuple[int, ...], typ:
     if need_raw: raw_parts.append(raw)
     if need_raw: return Tensor.zeros(tuple(reversed(dims)), dtype=dtypes.float16 if dtype == "float16" else dtypes.float32, device=dev)
     return _gguf_load_tensor(raw, dims, typ, dev, dtype)
-  if path is not None and axis == len(shape)-1 and getenv("GGUF_SHARD_FAST_LOAD", 1):
+  if path is not None and axis == len(shape)-1 and not need_raw and getenv("GGUF_SHARD_FAST_LOAD", 1):
     tensor, off, path = _gguf_read(path, off, rows*row_nbytes), 0, None
   if axis == 0:
     n0, rows_per = shape[0] // dcnt, prod(shape[1:-1])
