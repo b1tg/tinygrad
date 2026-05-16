@@ -100,6 +100,20 @@ class TestLLMShard(unittest.TestCase):
     expected = (gate(sel, x).silu() * up(sel, x)).to("CPU").realize()
     self.assertLess(float((_expert_ffn_q4k(gate, up, sel, x).to("CPU") - expected).abs().max().item()), 1e-3)
 
+  def test_expert_weight_q4_0_fused_tensor_shard(self):
+    def block(q):
+      return struct.pack("<e", 1.0) + bytes([q | (q << 4)] * 16)
+    devs, sel, x = ("CPU:0", "CPU:1"), Tensor([[[0]]], dtype="int32"), Tensor.ones(1, 1, 1, 32)
+    gate, up = ExpertWeights(1, 32, 2), ExpertWeights(1, 32, 2)
+    for ew, q0, q1 in ((gate, 9, 10), (up, 11, 12)):
+      raw0 = Tensor(block(q0), dtype=dtypes.uint8, device="CPU").to(devs[0]).realize()
+      raw1 = Tensor(block(q1), dtype=dtypes.uint8, device="CPU").to(devs[1]).realize()
+      ew.weight.replace(Tensor.zeros(1, 2, 32).shard(devs, axis=1))
+      ew.weight._gguf_raw = Tensor(raw0.uop.mstack(raw1.uop).multi(0))
+      ew.weight._gguf_type = 2
+    expected = (gate(sel, x).silu() * up(sel, x)).to("CPU").realize()
+    self.assertLess(float((_expert_ffn_q4k(gate, up, sel, x).to("CPU") - expected).abs().max().item()), 1e-3)
+
   def test_expert_weight_q4k_raw_input_shard(self):
     def block(q):
       b = bytearray(144)

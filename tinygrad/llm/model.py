@@ -85,7 +85,7 @@ def _expert_matmul_q4k_kernel(output:UOp, x:UOp, raw:UOp, sel:UOp, in_features:i
   off = b*T*K*OUT + t*K*OUT + k*OUT + o
   return output.index(off, ptr=True).store(ret).end(b, t, k, o).sink(arg=KernelInfo(name=f"expert_matmul_q4k_{x.shape}_{OUT}_{in_features}", beam=-1))
 
-def _expert_ffn_q4k_kernel(output:UOp, x:UOp, gate_raw:UOp, up_raw:UOp, sel:UOp, in_features:int) -> UOp:
+def _expert_ffn_q4k_kernel(output:UOp, x:UOp, gate_raw:UOp, up_raw:UOp, sel:UOp, in_features:int, typ:int=12) -> UOp:
   B, T, K, OUT, xk = output.shape[0], output.shape[1], output.shape[2], output.shape[3], x.shape[-2]
   output, x, gate_raw, up_raw, sel = output.flatten(), x.flatten(), gate_raw.flatten(), up_raw.flatten(), sel.flatten()
   b = UOp.range(B, 1, AxisType.LOOP)
@@ -96,8 +96,8 @@ def _expert_ffn_q4k_kernel(output:UOp, x:UOp, gate_raw:UOp, up_raw:UOp, sel:UOp,
   e = sel.index(b*T*K + t*K + k).cast(dtypes.weakint)
   xv = x.index(b*T*xk*in_features + t*xk*in_features + (k if xk != 1 else 0)*in_features + r)
   off = e*OUT*in_features + o*in_features + r
-  gate = (xv * _q4k(gate_raw, off)).cast(dtypes.float).reduce(r, arg=Ops.ADD)
-  up = (xv * _q4k(up_raw, off)).cast(dtypes.float).reduce(r, arg=Ops.ADD)
+  gate = (xv * _qk(gate_raw, off, typ)).cast(dtypes.float).reduce(r, arg=Ops.ADD)
+  up = (xv * _qk(up_raw, off, typ)).cast(dtypes.float).reduce(r, arg=Ops.ADD)
   ret = (gate * (gate.const_like(1.0) + (gate * gate.const_like(-1/math.log(2))).alu(Ops.EXP2)).alu(Ops.RECIPROCAL) * up).cast(output.dtype.base)
   return output.index(b*T*K*OUT + t*K*OUT + k*OUT + o, ptr=True).store(ret).end(b, t, k, o).sink(
     arg=KernelInfo(name=f"expert_ffn_q4k_{x.shape}_{OUT}_{in_features}", beam=-1))
@@ -112,13 +112,13 @@ def _reshard_last(x:Tensor, devices:tuple[str, ...]) -> Tensor:
 
 def _expert_ffn_q4k(gate:ExpertWeights, up:ExpertWeights, sel:Tensor, x:Tensor) -> Tensor|None:
   if not (getenv("EXPERT_Q4K_FUSED", 1) and isinstance(gate.weight.device, tuple) and gate.weight.device == up.weight.device): return None
-  if not (getattr(gate.weight, "_gguf_type", None) == getattr(up.weight, "_gguf_type", None) == 12 and
+  if not (getattr(gate.weight, "_gguf_type", None) == getattr(up.weight, "_gguf_type", None) in (2, 12, 13, 23) and
           gate.weight.uop.axis == up.weight.uop.axis == 1): return None
   if not isinstance(x.device, tuple): x = x.to(gate.weight.device)
   if not isinstance(sel.device, tuple): sel = sel.to(gate.weight.device)
   return Tensor.custom_kernel(_expert_output((*sel.shape, gate.weight.shape[1]), gate.weight, len(sel.shape)), x,
                               gate.weight._gguf_raw, up.weight._gguf_raw, sel,
-                              fxn=functools.partial(_expert_ffn_q4k_kernel, in_features=gate.weight.shape[2]))[0]
+                              fxn=functools.partial(_expert_ffn_q4k_kernel, in_features=gate.weight.shape[2], typ=gate.weight._gguf_type))[0]
 
 class ExpertWeights:
   """Like nn.Linear but with num_experts dimension. Weight shape: (num_experts, out_features, in_features)."""
