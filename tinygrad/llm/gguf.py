@@ -149,7 +149,12 @@ def _gguf_read_cols(path:pathlib.Path, off:int, rows:int, row_nbytes:int, col_of
     for r in range(rows):
       f.seek(off + r*row_nbytes + col_off)
       out[r*col_nbytes:(r+1)*col_nbytes] = f.read(col_nbytes)
-  return Tensor(bytes(out), dtype=dtypes.uint8)
+  return Tensor(bytes(out), dtype=dtypes.uint8, device="CPU")
+
+def _gguf_read(path:pathlib.Path, off:int, nbytes:int) -> Tensor:
+  with path.open("rb") as f:
+    f.seek(off)
+    return Tensor(f.read(nbytes), dtype=dtypes.uint8, device="CPU")
 
 def _gguf_read_ranges(path:pathlib.Path, ranges:list[tuple[int, int]]) -> Tensor:
   out = bytearray(sum(sz for _,sz in ranges))
@@ -159,7 +164,7 @@ def _gguf_read_ranges(path:pathlib.Path, ranges:list[tuple[int, int]]) -> Tensor
       f.seek(off)
       out[pos:pos+sz] = f.read(sz)
       pos += sz
-  return Tensor(bytes(out), dtype=dtypes.uint8)
+  return Tensor(bytes(out), dtype=dtypes.uint8, device="CPU")
 
 def _gguf_load_sharded_tensor(tensor:Tensor, off:int, dims:tuple[int, ...], typ:int, devices:tuple[str, ...], axis:int,
                               path:pathlib.Path|None=None, dtype:str|None=None, keep_raw:bool=False) -> Tensor:
@@ -173,6 +178,8 @@ def _gguf_load_sharded_tensor(tensor:Tensor, off:int, dims:tuple[int, ...], typ:
     raw = raw.to(dev).realize()
     if need_raw: raw_parts.append(raw)
     return _gguf_load_tensor(raw, dims, typ, dev, dtype)
+  if path is not None and axis != 0 and getenv("GGUF_SHARD_FAST_LOAD", 1):
+    tensor, off, path = _gguf_read(path, off, rows*row_nbytes), 0, None
   if axis == 0:
     n0, rows_per = shape[0] // dcnt, prod(shape[1:-1])
     parts = [load(tensor[off+i*n0*rows_per*row_nbytes:off+(i+1)*n0*rows_per*row_nbytes], tuple(reversed((n0, *shape[1:]))), dev)
@@ -186,7 +193,7 @@ def _gguf_load_sharded_tensor(tensor:Tensor, off:int, dims:tuple[int, ...], typ:
         parts = [load(_gguf_read_cols(path, off, rows, row_nbytes, i*col_nbytes, col_nbytes),
                       tuple(reversed((*shape[:-1], ncols))), dev) for i,dev in enumerate(devices)]
       else:
-        src = tensor[off:off+rows*row_nbytes].to(devices[0]).realize().reshape(rows, row_nbytes)
+        src = tensor[off:off+rows*row_nbytes].reshape(rows, row_nbytes)
         parts = [load(src[:, i*col_nbytes:(i+1)*col_nbytes].contiguous().flatten(),
                       tuple(reversed((*shape[:-1], ncols))), dev) for i,dev in enumerate(devices)]
     else:
@@ -195,8 +202,9 @@ def _gguf_load_sharded_tensor(tensor:Tensor, off:int, dims:tuple[int, ...], typ:
       if path is not None:
         parts = [load(_gguf_read_ranges(path, r), tuple(reversed((shape[0], nrows, cols))), dev) for r,dev in zip(ranges, devices)]
       else:
-        parts = [load(functools.reduce(lambda a,b: a.cat(b), [tensor[o:o+sz] for o,sz in r]),
-                      tuple(reversed((shape[0], nrows, cols))), dev) for r,dev in zip(ranges, devices)]
+        src = tensor[off:off+rows*row_nbytes].reshape(shape[0], shape[1], row_nbytes)
+        parts = [load(src[:, i*nrows:(i+1)*nrows, :].contiguous().flatten(),
+                      tuple(reversed((shape[0], nrows, cols))), dev) for i,dev in enumerate(devices)]
   if dtype is None: parts = [x.realize() for x in parts]
   ret = Tensor(parts[0].uop.mstack(*(x.uop for x in parts[1:])).multi(axis))
   if need_raw:
