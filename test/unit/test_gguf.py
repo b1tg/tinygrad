@@ -218,6 +218,20 @@ class TestGGUF(unittest.TestCase):
       self.assertEqual(sd["blk.0.ffn_down_exps.weight"].shape, arr.shape)
       self.assertEqual(sd["blk.0.ffn_down_exps.weight"]._gguf_raw.device[-1], "CPU:1")
 
+  def test_deepseek2_mla_attn_q8_not_kept_raw(self):
+    os.makedirs("/tmp/b1", exist_ok=True)
+    arr = (np.arange(2*32, dtype=np.float32).reshape(2, 32) - 32) / 8
+    data = quantize(arr.reshape(-1), GGMLQuantizationType.Q8_0).tobytes()
+    with tempfile.TemporaryDirectory(dir="/tmp/b1") as d:
+      p = pathlib.Path(d) / "test.gguf"
+      p.write_bytes(self._build_gguf([
+        ("blk.0.attn_kv_a_mqa.weight", arr.shape, GGMLQuantizationType.Q8_0.value, data),
+        ("blk.0.ffn_down.weight", arr.shape, GGMLQuantizationType.Q8_0.value, data)],
+        [("general.architecture", "deepseek2"), ("deepseek2.block_count", 1), ("deepseek2.attention.kv_lora_rank", 16)]))
+      _, sd = gguf_load(p, keep_q8=True)
+      self.assertFalse(hasattr(sd["blk.0.attn_kv_a_mqa.weight"], "_gguf_raw"))
+      self.assertTrue(hasattr(sd["blk.0.ffn_down.weight"], "_gguf_raw"))
+
   def _test_dequantization(self, qtype: GGMLQuantizationType):
     block_size, type_size = GGML_QUANT_SIZES[qtype]
     n_el, n_bytes = ggml_test_block_count * block_size, ggml_test_block_count * type_size

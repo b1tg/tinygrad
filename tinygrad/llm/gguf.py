@@ -150,9 +150,12 @@ def _gguf_raw_tensor(raw:Tensor, dims:tuple[int, ...], typ:int, dev:str, dtype:s
   ret._gguf_type, ret._gguf_shape = typ, tuple(reversed(dims))
   return ret
 
-def _keep_raw_q8(name:str, typ:int, keep_q8:bool=False) -> bool:
-  return keep_q8 and typ == 8 and name.endswith(".weight") and name != "token_embd.weight" and "norm" not in name and \
-    (getenv("KEEP_Q8_ATTN", 1) or ".attn_" not in name)
+def _keep_raw_q8(name:str, typ:int, keep_q8:bool=False, kv:dict|None=None) -> bool:
+  if not (keep_q8 and typ == 8 and name.endswith(".weight") and name != "token_embd.weight" and "norm" not in name): return False
+  arch = kv.get("general.architecture") if kv is not None else None
+  if arch is not None and kv.get(f"{arch}.attention.kv_lora_rank", 0) and ".attn_" in name: return False
+  if arch == "llama" and (".attn_q.weight" in name or ".attn_k.weight" in name): return False
+  return getenv("KEEP_Q8_ATTN", 1) or ".attn_" not in name
 
 def _gguf_read_cols(path:pathlib.Path, off:int, rows:int, row_nbytes:int, col_off:int, col_nbytes:int) -> Tensor:
   out = bytearray(rows*col_nbytes)
@@ -261,18 +264,18 @@ def _gguf_parse(tensor: Tensor, devices:tuple[str,...]|None=None, n_blk:int|None
       n = prod(dims)
       if shard_axis is not None and (axis:=shard_axis(name, dims, typ, meta)) is not None:
         try:
-          keep_raw = (getenv("EXPERT_Q4K_CUSTOM", 1) and "_exps.weight" in name) or _keep_raw_q8(name, typ, keep_q8)
+          keep_raw = (getenv("EXPERT_Q4K_CUSTOM", 1) and "_exps.weight" in name) or _keep_raw_q8(name, typ, keep_q8, meta)
           state_dict[name] = _gguf_load_sharded_tensor(tensor, data_start + off, dims, typ, devices, axis, path, dtype, keep_raw)
         except RuntimeError as e:
           if "splits quant blocks" not in str(e): raise
           dev = block_device(devices, int(name.split('.')[1]), n_blk) if name.startswith('blk.') else devices[0]
           raw = tensor[data_start + off : data_start + off + _gguf_nbytes(n, typ)]
-          state_dict[name] = _gguf_raw_tensor(raw, dims, typ, dev, dtype) if _keep_raw_q8(name, typ, keep_q8) else \
+          state_dict[name] = _gguf_raw_tensor(raw, dims, typ, dev, dtype) if _keep_raw_q8(name, typ, keep_q8, meta) else \
             _gguf_load_tensor(raw, dims, typ, dev, dtype)
       else:
         dev = block_device(devices, int(name.split('.')[1]), n_blk) if name.startswith('blk.') else devices[0]
         raw = tensor[data_start + off : data_start + off + _gguf_nbytes(n, typ)]
-        state_dict[name] = _gguf_raw_tensor(raw, dims, typ, dev, dtype) if _keep_raw_q8(name, typ, keep_q8) else \
+        state_dict[name] = _gguf_raw_tensor(raw, dims, typ, dev, dtype) if _keep_raw_q8(name, typ, keep_q8, meta) else \
           _gguf_load_tensor(raw, dims, typ, dev, dtype)
   else:
     # TODO: remove the need for copy to default device
@@ -281,7 +284,7 @@ def _gguf_parse(tensor: Tensor, devices:tuple[str,...]|None=None, n_blk:int|None
     for name, dims, typ, off in t_infos:
       n = prod(dims)
       raw = tensor[data_start + off:data_start + off + _gguf_nbytes(n, typ)]
-      state_dict[name] = _gguf_raw_tensor(raw, dims, typ, tensor.device, dtype) if _keep_raw_q8(name, typ, keep_q8) else \
+      state_dict[name] = _gguf_raw_tensor(raw, dims, typ, tensor.device, dtype) if _keep_raw_q8(name, typ, keep_q8, meta) else \
         ggml_data_to_tensor(tensor[data_start + off:], n, typ).reshape(*reversed(dims))
   return kv_data, state_dict
 
