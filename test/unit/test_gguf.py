@@ -3,7 +3,7 @@ from tinygrad import dtypes, Tensor, fetch, Device
 from tinygrad.helpers import disable_gc
 from tinygrad.llm.gguf import _ggml_iq_grid, ggml_data_to_tensor, gguf_load
 from tinygrad.llm.model import Linear
-from tinygrad.uop.ops import Ops
+from tinygrad.uop.ops import Ops, UOp
 from tinygrad.runtime.autogen import ggml_common as _ggml
 from tinygrad.device import is_dtype_supported
 import numpy as np
@@ -231,6 +231,19 @@ class TestGGUF(unittest.TestCase):
       _, sd = gguf_load(p, keep_q8=True)
       self.assertFalse(hasattr(sd["blk.0.attn_kv_a_mqa.weight"], "_gguf_raw"))
       self.assertTrue(hasattr(sd["blk.0.ffn_down.weight"], "_gguf_raw"))
+
+  def test_keep_q8_path_does_not_keep_whole_file(self):
+    os.makedirs("/tmp/b1", exist_ok=True)
+    arr = (np.arange(2*32, dtype=np.float32).reshape(2, 32) - 32) / 8
+    data = quantize(arr.reshape(-1), GGMLQuantizationType.Q8_0).tobytes()
+    with tempfile.TemporaryDirectory(dir="/tmp/b1") as d:
+      p = pathlib.Path(d) / "test.gguf"
+      p.write_bytes(self._build_gguf([("blk.0.ffn_down.weight", arr.shape, GGMLQuantizationType.Q8_0.value, data)],
+        [("general.architecture", "llama"), ("llama.block_count", 1)]))
+      _, sd = gguf_load(p, keep_q8=True)
+      tensors = list(sd.values()) + [x._gguf_raw for x in sd.values() if hasattr(x, "_gguf_raw")]
+      bufs = [u.nbytes() for u in UOp.sink(*(x.uop for x in tensors)).toposort() if u.op is Ops.BUFFER]
+      self.assertNotIn(p.stat().st_size, bufs)
 
   def _test_dequantization(self, qtype: GGMLQuantizationType):
     block_size, type_size = GGML_QUANT_SIZES[qtype]

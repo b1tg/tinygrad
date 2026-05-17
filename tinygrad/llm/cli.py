@@ -199,9 +199,11 @@ def main():
   model, kv = Transformer.from_gguf(gguf, args.max_context, shard=args.shard, shard_mode=args.sm)
   load_tm = time.perf_counter() - st
   model_name = kv.get('general.name') or kv.get('general.basename') or args.model
-  file_sizes = [y.nbytes() for y in UOp.sink(*[x.uop for x in nn.state.get_parameters(model)]).toposort() if y.op is Ops.BUFFER]
+  params = nn.state.get_parameters(model)
+  raw = [x._gguf_raw for x in params if hasattr(x, "_gguf_raw")]
+  file_sizes = [y.nbytes() for y in UOp.sink(*[x.uop for x in params+raw]).toposort() if y.op is Ops.BUFFER]
   print(f"using model \"{model_name}\" with {sum(file_sizes):,} bytes and "
-        f"{sum(prod(getattr(x, '_gguf_shape', x.shape)) for x in nn.state.get_parameters(model)):,} params, load {load_tm:.2f}s")
+        f"{sum(prod(getattr(x, '_gguf_shape', x.shape)) for x in params):,} params, load {load_tm:.2f}s")
 
   # get tokenizer
   tok = SimpleTokenizer.from_gguf_kv(kv)

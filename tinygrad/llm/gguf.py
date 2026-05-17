@@ -139,11 +139,11 @@ def _gguf_nbytes(n:int, typ:int) -> int:
 def _gguf_row_nbytes(cols:int, typ:int) -> int:
   return cols * _GGML_NATIVE[typ].itemsize if typ in _GGML_NATIVE else (cols // _GGML_QUANT[typ][0]) * _GGML_QUANT[typ][1]
 
-def _gguf_load_tensor(raw:Tensor, dims:tuple[int, ...], typ:int, dev:str, dtype:str|None=None) -> Tensor:
+def _gguf_load_tensor(raw:Tensor, dims:tuple[int, ...], typ:int, dev:str|None, dtype:str|None=None) -> Tensor:
   ret = ggml_data_to_tensor(raw.to(dev).realize(), prod(dims), typ).reshape(*reversed(dims))
   return ret.cast(dtype) if dtype is not None else ret
 
-def _gguf_raw_tensor(raw:Tensor, dims:tuple[int, ...], typ:int, dev:str, dtype:str|None=None) -> Tensor:
+def _gguf_raw_tensor(raw:Tensor, dims:tuple[int, ...], typ:int, dev:str|None, dtype:str|None=None) -> Tensor:
   ret = Tensor.empty(0, dtype=dtypes.float16 if dtype == "float16" else dtypes.float32, device=dev)
   raw = (raw.bitcast(dtypes.uint16) if typ == 8 else raw).to(dev).realize()
   ret._gguf_raw = raw
@@ -278,14 +278,23 @@ def _gguf_parse(tensor: Tensor, devices:tuple[str,...]|None=None, n_blk:int|None
         state_dict[name] = _gguf_raw_tensor(raw, dims, typ, dev, dtype) if _keep_raw_q8(name, typ, keep_q8, meta) else \
           _gguf_load_tensor(raw, dims, typ, dev, dtype)
   else:
-    # TODO: remove the need for copy to default device
-    tensor = tensor.to(None).realize()
     state_dict = {}
-    for name, dims, typ, off in t_infos:
-      n = prod(dims)
-      raw = tensor[data_start + off:data_start + off + _gguf_nbytes(n, typ)]
-      state_dict[name] = _gguf_raw_tensor(raw, dims, typ, tensor.device, dtype) if _keep_raw_q8(name, typ, keep_q8, meta) else \
-        ggml_data_to_tensor(tensor[data_start + off:], n, typ).reshape(*reversed(dims))
+    if path is not None and keep_q8:
+      with path.open("rb") as f:
+        for name, dims, typ, off in t_infos:
+          n = prod(dims)
+          f.seek(data_start + off)
+          raw = Tensor(f.read(_gguf_nbytes(n, typ)), dtype=dtypes.uint8, device="CPU")
+          state_dict[name] = _gguf_raw_tensor(raw, dims, typ, None, dtype) if _keep_raw_q8(name, typ, keep_q8, meta) else \
+            _gguf_load_tensor(raw, dims, typ, None, dtype)
+    else:
+      # TODO: remove the need for copy to default device
+      tensor = tensor.to(None).realize()
+      for name, dims, typ, off in t_infos:
+        n = prod(dims)
+        raw = tensor[data_start + off:data_start + off + _gguf_nbytes(n, typ)]
+        state_dict[name] = _gguf_raw_tensor(raw, dims, typ, tensor.device, dtype) if _keep_raw_q8(name, typ, keep_q8, meta) else \
+          ggml_data_to_tensor(tensor[data_start + off:], n, typ).reshape(*reversed(dims))
   return kv_data, state_dict
 
 def _gguf_split_paths(path: pathlib.Path, kv: dict) -> list[pathlib.Path]:
