@@ -2,9 +2,10 @@
 import unittest
 import numpy as np
 from tinygrad.tensor import Tensor
-from tinygrad.helpers import Timing, Context, cdiv
+from tinygrad.helpers import Timing, Context, Target, cdiv
 from tinygrad.dtype import dtypes, ConstFloat  # noqa: F401
 from tinygrad.device import Device
+from tinygrad.renderer.cstyle import ClangRenderer, HIPRenderer
 from tinygrad.uop.ops import Ops, UOp, UPat, exec_alu
 from tinygrad.uop.spec import spec_shared
 from tinygrad.uop.symbolic import sym
@@ -161,6 +162,44 @@ class TestGatedStoreRewrite(unittest.TestCase):
     gated_uops = tuple(uops[uops.index(ifs[0])+1:uops.index(endifs[0])])
     self.assertEqual(len(gated_uops), 2)
     for x in gated_uops: self.assertIs(x.op, Ops.STORE)
+
+class TestDot4Render(unittest.TestCase):
+  @staticmethod
+  def _i8x4(x): return x.bitcast(dtypes.int8.vec(4)).cast(dtypes.int32.vec(4))
+  @staticmethod
+  def _lane(x, s:int): return (((x.cast(dtypes.uint32) >> s) & 0xff).cast(dtypes.int8)).cast(dtypes.int32)
+
+  def _dot4(self, a, b):
+    av, bv = self._i8x4(a), self._i8x4(b)
+    return UOp(Ops.REDUCE, dtypes.int, (av*bv,), (Ops.ADD, ()))
+  def _scalar_dot4(self, a, b): return sum(self._lane(a, s) * self._lane(b, s) for s in (0, 8, 16, 24))
+  def _packed(self, q, bitcast=False):
+    ret = UOp.const(dtypes.uint32 if bitcast else dtypes.int, 0)
+    for i in range(4):
+      qi = q.index(UOp.const(dtypes.int, i), ptr=True).load()
+      ret = ret + (((qi.cast(dtypes.uint32) if bitcast else qi & 0xf).cast(ret.dtype)) << (8*i))
+    return ret.bitcast(dtypes.int) if bitcast else ret
+  def _src(self, ren, build):
+    out, x, y = [UOp(Ops.PARAM, dtypes.int32.ptr(), (), i) for i in range(3)]
+    q, idx = UOp(Ops.PARAM, dtypes.uint8.ptr(), (), 3), UOp.const(dtypes.int, 0)
+    a, b = x.index(idx, ptr=True).load(), y.index(idx, ptr=True).load()
+    return ren.render(to_uops_list([out.index(idx, ptr=True).store(build(out, a, b, q, idx))], ren=ren))
+
+  def test_hip_uses_dot4(self):
+    cases = (
+      lambda out,a,b,q,idx: self._dot4(a, b),
+      lambda out,a,b,q,idx: self._dot4(a, self._packed(q)),
+      lambda out,a,b,q,idx: self._dot4(a, self._packed(q, True)),
+      lambda out,a,b,q,idx: out.index(idx, ptr=True).load() + self._dot4(a, b),
+      lambda out,a,b,q,idx: out.index(idx, ptr=True).load() + self._dot4(a, self._packed(q, True)),
+    )
+    for build in cases:
+      self.assertIn("__builtin_amdgcn_sdot4", self._src(HIPRenderer(Target("AMD", arch="gfx942")), build))
+      self.assertIn("__builtin_amdgcn_sudot4", self._src(HIPRenderer(Target("AMD", arch="gfx1100")), build))
+    self.assertIn("__builtin_amdgcn_sudot4", self._src(HIPRenderer(Target("AMD", arch="gfx1100")), lambda _,a,b,__,___: self._scalar_dot4(a, b)))
+
+  def test_clang_keeps_scalar_ops(self):
+    self.assertNotIn("__builtin_amdgcn_sdot4", self._src(ClangRenderer(Target("CPU")), lambda _,a,b,__,___: self._dot4(a, b)))
 
 @unittest.skipIf(Device.DEFAULT == "METAL", "compiler bug")
 @unittest.skipUnless(Ops.SHR in Device[Device.DEFAULT].renderer.code_for_op, "fast_idiv requires SHR")

@@ -150,14 +150,20 @@ def load_state_dict(model, state_dict:dict[str, Tensor], strict=True, verbose=Tr
       if k not in state_dict and not strict:
         if DEBUG >= 1: print(f"WARNING: not loading {k}")
         continue
-      if v.shape != state_dict[k].shape:
-        if {(), (1,)} == {state_dict[k].shape, v.shape}: state_dict[k] = state_dict[k].reshape(v.shape)
-        else: raise ValueError(f'Shape mismatch in layer `{k}`: Expected shape {v.shape}, but found {state_dict[k].shape} in state dict.')
-      if isinstance(v.device, tuple):
+      state_shape = state_dict[k]._gguf_shape if hasattr(state_dict[k], "_gguf_type") else state_dict[k].shape
+      if v.shape != state_shape:
+        if {(), (1,)} == {state_shape, v.shape}: state_dict[k] = state_dict[k].reshape(v.shape)
+        else: raise ValueError(f'Shape mismatch in layer `{k}`: Expected shape {v.shape}, but found {state_shape} in state dict.')
+      if hasattr(state_dict[k], "_gguf_type"): v.uop = state_dict[k].to(v.device).uop
+      elif isinstance(v.device, tuple):
         if isinstance(state_dict[k].device, tuple): v.replace(state_dict[k])
         else: v.replace(state_dict[k].shard(v.device, v.uop.axis))
       else: v.replace(state_dict[k].to(v.device))
-      if realize: v.realize()
+      if hasattr(state_dict[k], "_gguf_type"):
+        v._gguf_type, v._gguf_shape = state_dict[k]._gguf_type, state_dict[k]._gguf_shape
+        for attr in ("_gguf_q8_scale", "_gguf_q8_qs", "_gguf_k_meta", "_gguf_k_qs", "_gguf_k_qh"):
+          if hasattr(state_dict[k], attr): setattr(v, attr, getattr(state_dict[k], attr).to(v.device).realize())
+      if realize and not hasattr(v, "_gguf_type"): v.realize()
       if consume: del state_dict[k]
       ret.append(v)
   return ret

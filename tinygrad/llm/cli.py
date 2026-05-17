@@ -2,7 +2,7 @@ from __future__ import annotations
 import sys, argparse, codecs, typing, re, unicodedata, json, uuid, time, pathlib
 from tinygrad import nn
 from tinygrad.uop.ops import UOp, Ops
-from tinygrad.helpers import partition, DEBUG, Timing, GlobalCounters, stderr_log, colored, Context, fetch, profile_marker
+from tinygrad.helpers import partition, prod, DEBUG, Timing, GlobalCounters, stderr_log, colored, Context, fetch, profile_marker
 from tinygrad.viz.serve import TCPServerWithReuse, HTTPRequestHandler
 from tinygrad.llm.model import Transformer
 
@@ -193,8 +193,12 @@ def main():
   # load the model
   model, kv = Transformer.from_gguf(fetch(models.get(args.model, args.model)), args.max_context)
   model_name = kv.get('general.name') or kv.get('general.basename') or args.model
-  file_sizes = [y.nbytes() for y in UOp.sink(*[x.uop for x in nn.state.get_parameters(model)]).toposort() if y.op is Ops.BUFFER]
-  print(f"using model \"{model_name}\" with {sum(file_sizes):,} bytes and {sum(x.numel() for x in nn.state.get_parameters(model)):,} params")
+  params = nn.state.get_parameters(model)
+  file_sizes = [y.nbytes() for y in UOp.sink(*[x.uop for x in params]).toposort() if y.op is Ops.BUFFER]
+  raw_attrs = ("_gguf_q8_scale", "_gguf_q8_qs", "_gguf_k_meta", "_gguf_k_qs", "_gguf_k_qh")
+  total_bytes = sum(file_sizes) + sum(getattr(x, attr).nbytes() for x in params for attr in raw_attrs if hasattr(x, attr))
+  total_params = sum(prod(getattr(x, '_gguf_shape', x.shape)) for x in params)
+  print(f"using model \"{model_name}\" with {total_bytes:,} bytes and {total_params:,} params")
 
   # get tokenizer
   tok = SimpleTokenizer.from_gguf_kv(kv)

@@ -2,6 +2,7 @@ import os, struct, unittest, tempfile, pathlib, sys
 from tinygrad import dtypes, Tensor, fetch, Device
 from tinygrad.helpers import disable_gc
 from tinygrad.llm.gguf import _ggml_iq_grid, ggml_data_to_tensor, gguf_load
+from tinygrad.llm.model import ExpertWeights, Linear
 from tinygrad.runtime.autogen import ggml_common as _ggml
 from tinygrad.device import is_dtype_supported
 import numpy as np
@@ -245,6 +246,55 @@ class TestGGUFGEMV(unittest.TestCase):
   def test_gguf_gemv_mxfp4(self): self._test_gguf_gemv(GGMLQuantizationType.MXFP4)
   @unittest.skipUnless(is_dtype_supported(dtypes.bfloat16), "Backend must support bfloat16")
   def test_gguf_gemv_bf16(self): self._test_gguf_gemv(GGMLQuantizationType.BF16)
+
+  @staticmethod
+  def _set_raw(dst, src):
+    for attr in ("_gguf_type", "_gguf_shape", "_gguf_q8_scale", "_gguf_q8_qs", "_gguf_k_meta", "_gguf_k_qs", "_gguf_k_qh"):
+      if hasattr(src, attr): setattr(dst, attr, getattr(src, attr))
+
+  def test_raw_quant_linear(self):
+    rng = np.random.default_rng(42)
+    for qtype, rows, cols, atol in ((GGMLQuantizationType.Q8_0, 64, 128, 1e-2), (GGMLQuantizationType.Q4_K, 64, 256, 5e-1),
+                                    (GGMLQuantizationType.Q5_K, 64, 256, 5e-1)):
+      q_data = quantize(rng.standard_normal(rows * cols).astype(np.float32), qtype) if qtype == GGMLQuantizationType.Q8_0 else \
+        rng.integers(0, 256, size=(rows * cols // GGML_QUANT_SIZES[qtype][0], GGML_QUANT_SIZES[qtype][1]), dtype=np.uint8)
+      if qtype != GGMLQuantizationType.Q8_0:
+        q_data[:, :4] = np.float16(rng.standard_normal(q_data.shape[0] * 2)).view(np.uint8).reshape(q_data.shape[0], 4)
+      q_data = q_data.flatten()
+      buf = TestGGUF._build_gguf([("output.weight", (rows, cols), qtype.value, q_data.tobytes())],
+                                 [("general.architecture", "test"), ("test.embedding_length", 4096)])
+      _, tensors = gguf_load(Tensor(np.frombuffer(buf, dtype=np.uint8).copy()), keep_q8=True)
+      lin, x = Linear(cols, rows, bias=False), rng.standard_normal((2, cols)).astype(np.float32)
+      self._set_raw(lin.weight, tensors["output.weight"])
+      xb, w = x.reshape(2, cols//32, 32), dequantize(q_data, qtype).reshape(rows, cols)
+      xs = np.max(np.abs(xb), axis=-1, keepdims=True) / 127.0
+      xq = np.trunc(xb / np.maximum(xs, 1e-12) + np.where(xb >= 0, 0.5, -0.5))
+      np.testing.assert_allclose(lin(Tensor(x)).numpy(), (xq * xs).reshape(2, cols) @ w.T, atol=atol, rtol=2e-2)
+
+  def test_raw_k_expert(self):
+    rng, old = np.random.default_rng(42), os.environ.get("RAW_MOE")
+    try:
+      os.environ["RAW_MOE"] = "1"
+      for qtype in (GGMLQuantizationType.Q4_K, GGMLQuantizationType.Q5_K):
+        experts, rows, cols = 3, 5, 256
+        q_data = rng.integers(0, 256, size=(experts * rows * cols // GGML_QUANT_SIZES[qtype][0], GGML_QUANT_SIZES[qtype][1]), dtype=np.uint8)
+        q_data[:, :4] = np.float16(rng.standard_normal(q_data.shape[0] * 2)).view(np.uint8).reshape(q_data.shape[0], 4)
+        name = "blk.0.ffn_gate_exps.weight"
+        buf = TestGGUF._build_gguf([(name, (experts, rows, cols), qtype.value, q_data.tobytes())],
+                                   [("general.architecture", "test"), ("test.embedding_length", 4096), ("test.expert_count", experts)])
+        _, tensors = gguf_load(Tensor(np.frombuffer(buf, dtype=np.uint8).copy()), keep_q8=True)
+        ew, x = ExpertWeights(experts, cols, rows), rng.standard_normal((2, 1, cols)).astype(np.float32)
+        sel = np.array([[[0, 2]], [[1, 0]]], dtype=np.int32)
+        self._set_raw(ew.weight, tensors[name])
+        out = ew(Tensor(sel), Tensor(x).unsqueeze(2)).numpy()
+        xb, w = x.reshape(2, 1, 1, cols//32, 32), dequantize(q_data.flatten(), qtype).reshape(experts, rows, cols)
+        xs = np.max(np.abs(xb), axis=-1, keepdims=True) / 127.0
+        xq = np.trunc(xb / np.maximum(xs, 1e-12) + np.where(xb >= 0, 0.5, -0.5))
+        ref = np.stack([((xq * xs).reshape(2, 1, 1, cols))[b, t, 0] @ w[sel[b, t]].transpose(0, 2, 1) for b in range(2) for t in range(1)])
+        np.testing.assert_allclose(out, ref.reshape(2, 1, 2, rows), atol=6e-1, rtol=2e-2)
+    finally:
+      if old is None: os.environ.pop("RAW_MOE", None)
+      else: os.environ["RAW_MOE"] = old
 
 class TestGGUFGC(unittest.TestCase):
   def test_gguf_load_no_tensor_leak(self):

@@ -1,9 +1,90 @@
 from __future__ import annotations
 import functools, itertools, pathlib
 from dataclasses import dataclass, replace
-from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function
+from tinygrad import Device, Tensor, dtypes, nn, UOp, TinyJit, getenv, function
+from tinygrad.helpers import prod
 from tinygrad.llm.gguf import gguf_load
-from tinygrad.uop.ops import resolve
+from tinygrad.uop.ops import Ops, resolve
+
+_vecdot4: dict[str, bool] = {}
+def _set_vecdot4(dev:str):
+  if dev not in _vecdot4:
+    ren = Device[dev].renderer
+    _vecdot4[dev] = hasattr(ren, "is_cdna") and ren.is_cdna(ren.target.arch)
+def _q8_i32x4(x:Tensor) -> Tensor: return x.bitcast(dtypes.int8.vec(4)).cast(dtypes.int32.vec(4))
+def _q8_i8(x:Tensor, s:int) -> Tensor: return (((x.cast(dtypes.uint32) >> s) & 0xff).cast(dtypes.int8)).cast(dtypes.int32)
+def _amd_vecdot4(x:Tensor) -> bool:
+  dev = x.device[0] if isinstance(x.device, tuple) else x.device
+  return isinstance(dev, str) and _vecdot4.get(dev, False)
+def _q8_dot4(x:Tensor, w:Tensor) -> Tensor:
+  if not _amd_vecdot4(x):
+    return _q8_i8(x, 0) * _q8_i8(w, 0) + _q8_i8(x, 8) * _q8_i8(w, 8) + _q8_i8(x, 16) * _q8_i8(w, 16) + _q8_i8(x, 24) * _q8_i8(w, 24)
+  dot = _q8_i32x4(x) * _q8_i32x4(w)
+  return dot._apply_uop(lambda u: UOp(Ops.REDUCE, dtypes.int, (u,), (Ops.ADD, ())))
+
+def _q_to_uint8(x:Tensor, b:int) -> Tensor:
+  shift = Tensor.stack(*[Tensor(2**(i*b), device=x.device, dtype=x.dtype) for i in range(8//b)])
+  return x.unsqueeze(-1).expand((*x.shape, 8//b)).div(shift, rounding_mode="trunc").bitwise_and(0xff >> (8-b)).transpose(-1, -2).flatten(-2)
+
+def _q8_act(x:Tensor, in_features:int, need_sum=False) -> tuple[Tensor, ...]:
+  if (ret:=getattr(x, "_q8_act", {}).get((in_features, need_sum))) is not None: return ret
+  n, xb = prod(x.shape[:-1]), x.float().reshape(prod(x.shape[:-1]), in_features//32, 32)
+  xs = (xb.maximum(-xb).max(axis=-1, keepdim=True) / 127.0).contiguous()
+  xq = ((xb / xs.maximum(1e-12)) + (xb >= 0).where(0.5, -0.5)).cast(dtypes.int8)
+  x4 = xq.reshape(n, in_features//32, 8, 4).bitcast(dtypes.int32).squeeze(-1).contiguous()
+  ret = (xs, x4, xq.cast(dtypes.int32).sum(axis=-1).contiguous()) if need_sum else (xs, x4)
+  x._q8_act = {**getattr(x, "_q8_act", {}), (in_features, need_sum):ret}
+  return ret
+
+def _k_quants(weight:Tensor, device:str, shape:tuple[int, ...], sel:Tensor|None=None):
+  meta, qs = weight._gguf_k_meta.to(device).reshape(*shape, 16), weight._gguf_k_qs.to(device).reshape(*shape, 4, 32)
+  if sel is not None: meta, qs = meta[sel], qs[sel]
+  d, dmin = (meta[..., i:i+2].bitcast(dtypes.float16).squeeze(-1).cast(dtypes.float32).unsqueeze(-1) for i in (0, 2))
+  s = meta[..., 4:16]
+  sc = d * s[..., 0:4].bitwise_and(63).cat(s[..., 8:12].bitwise_and(0xF).bitwise_or(s[..., 0:4].rshift(6).lshift(4)), dim=-1).cast(dtypes.float32)
+  mn = dmin * s[..., 4:8].bitwise_and(63).cat(s[..., 8:12].rshift(4).bitwise_or(s[..., 4:8].rshift(6).lshift(4)), dim=-1).cast(dtypes.float32)
+  q = Tensor.stack(qs.bitwise_and(0xF), qs.rshift(4), dim=-2).reshape(*meta.shape[:-1], 8, 32)
+  if weight._gguf_type == 13:
+    qh = weight._gguf_k_qh.to(device).reshape(*shape, 32)
+    q = q + _q_to_uint8(qh if sel is None else qh[sel], 1).reshape(*meta.shape[:-1], 8, 32) * 16
+  return sc, mn, q.reshape(*meta.shape[:-1], 8, 8, 4).bitcast(dtypes.int32).squeeze(-1)
+
+def _linear_gguf_quant(x:Tensor, weight:Tensor, bias:Tensor|None) -> Tensor|None:
+  if (typ:=getattr(weight, "_gguf_type", None)) not in (8, 12, 13): return None
+  out_features, in_features = weight._gguf_shape
+  if x.shape[-1] != in_features or in_features % 32: return None
+  n = prod(x.shape[:-1])
+  if typ == 8:
+    xs, x4 = _q8_act(x, in_features)
+    ws = weight._gguf_q8_scale.to(x.device).reshape(out_features, in_features//32).cast(dtypes.float32)
+    w4 = weight._gguf_q8_qs.to(x.device).reshape(out_features, in_features//32, 8)
+    dot = _q8_dot4(x4.reshape(n, 1, in_features//32, 8), w4.reshape(1, out_features, in_features//32, 8)).sum(axis=-1).cast(dtypes.float32)
+    ret = (dot * xs.reshape(n, 1, in_features//32) * ws.reshape(1, out_features, in_features//32)).sum(axis=-1).cast(x.dtype)
+  else:
+    if in_features % 256: return None
+    xs, x4, xsum = _q8_act(x, in_features, True)
+    nb = in_features//256
+    sc, mn, w4 = _k_quants(weight, x.device, (out_features, nb))
+    dot = _q8_dot4(x4.reshape(n, 1, nb, 8, 8), w4.reshape(1, out_features, nb, 8, 8)).sum(axis=-1).cast(dtypes.float32)
+    ret = (xs.reshape(n, 1, nb, 8) * (dot * sc.reshape(1, out_features, nb, 8) - \
+      xsum.reshape(n, 1, nb, 8).cast(dtypes.float32) * mn.reshape(1, out_features, nb, 8))).sum(axis=(-1, -2)).cast(x.dtype)
+  return (ret if bias is None else ret + bias).reshape(*x.shape[:-1], out_features)
+
+class Linear(nn.Linear):
+  def __call__(self, x:Tensor) -> Tensor: return ret if (ret:=_linear_gguf_quant(x, self.weight, self.bias)) is not None else super().__call__(x)
+
+def _expert_gguf_quant(sel:Tensor, x:Tensor, weight:Tensor) -> Tensor|None:
+  if getattr(weight, "_gguf_type", None) not in (12, 13) or len(weight._gguf_shape) != 3: return None
+  num_experts, out_features, in_features = weight._gguf_shape
+  if x.shape[-1] != in_features or in_features % 256: return None
+  xs, x4, xsum = _q8_act(x, in_features, True)
+  nb = in_features//256
+  sc, mn, w4 = _k_quants(weight, x.device, (num_experts, out_features, nb), sel)
+  x4 = x4.reshape(*x.shape[:-1], nb, 8, 8).unsqueeze(-4)
+  dot = _q8_dot4(x4, w4).sum(axis=-1).cast(dtypes.float32)
+  xs = xs.reshape(*x.shape[:-1], 1, nb, 8)
+  xsum = xsum.reshape(*x.shape[:-1], 1, nb, 8).cast(dtypes.float32)
+  return (xs * (dot * sc - xsum * mn)).sum(axis=(-1, -2)).cast(x.dtype)
 
 @functools.cache
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, device:str|None=None) -> Tensor:
@@ -17,6 +98,7 @@ class ExpertWeights:
     self.weight = Tensor.zeros(num_experts, out_features, in_features)
   def __call__(self, sel:Tensor, x:Tensor) -> Tensor:
     # sel: (B, T, k), x: (B, T, 1, in) or (B, T, k, in) -> output: (B, T, k, out)
+    if getenv("RAW_MOE", 0) and (ret:=_expert_gguf_quant(sel, x, self.weight)) is not None: return ret
     return (x.unsqueeze(-2) @ self.weight[sel].transpose(-1, -2)).contiguous().squeeze(-2)
 
 def apply_rope(x:Tensor, freqs_cis:Tensor) -> Tensor:
@@ -82,20 +164,20 @@ class FFNBlock:
 
     # --- feed-forward (MoE or dense) -------------------------------------
     if config.num_experts > 0:
-      self.ffn_gate_inp = nn.Linear(config.dim, config.num_experts, bias=False)  # router
+      self.ffn_gate_inp = Linear(config.dim, config.num_experts, bias=False)  # router
       if config.expert_bias: self.exp_probs_b = {"bias": Tensor.zeros(config.num_experts)}
       self.ffn_gate_exps = ExpertWeights(config.num_experts, config.dim, config.hidden_dim)
       self.ffn_up_exps = ExpertWeights(config.num_experts, config.dim, config.hidden_dim)
       self.ffn_down_exps = ExpertWeights(config.num_experts, config.hidden_dim, config.dim)
       if config.shared_expert_dim > 0:
-        self.ffn_gate_shexp = nn.Linear(config.dim, config.shared_expert_dim, bias=False)
-        self.ffn_up_shexp = nn.Linear(config.dim, config.shared_expert_dim, bias=False)
-        self.ffn_down_shexp = nn.Linear(config.shared_expert_dim, config.dim, bias=False)
+        self.ffn_gate_shexp = Linear(config.dim, config.shared_expert_dim, bias=False)
+        self.ffn_up_shexp = Linear(config.dim, config.shared_expert_dim, bias=False)
+        self.ffn_down_shexp = Linear(config.shared_expert_dim, config.dim, bias=False)
         if config.shared_expert_gate: self.ffn_gate_inp_shexp = {"weight": Tensor.zeros(config.dim)}
     else:
-      self.ffn_gate    = nn.Linear(config.dim, config.hidden_dim, bias=False)
-      self.ffn_up      = nn.Linear(config.dim, config.hidden_dim, bias=False)
-      self.ffn_down    = nn.Linear(config.hidden_dim, config.dim, bias=False)
+      self.ffn_gate    = Linear(config.dim, config.hidden_dim, bias=False)
+      self.ffn_up      = Linear(config.dim, config.hidden_dim, bias=False)
+      self.ffn_down    = Linear(config.hidden_dim, config.dim, bias=False)
 
   def _feed_forward(self, x:Tensor) -> Tensor:
     if hasattr(self, 'ffn_gate_exps'):
@@ -144,10 +226,10 @@ class TransformerBlock(FFNBlock):
     # --- attention projections (all linear, bias-free) ------------------
     q_proj_out       = config.head_dim * config.n_heads * (2 if config.attn_output_gate else 1)
     kv_proj_out      = config.head_dim * config.n_kv_heads
-    self.attn_q      = nn.Linear(config.dim, q_proj_out,  bias=config.qkv_bias)
-    self.attn_k      = nn.Linear(config.dim, kv_proj_out, bias=config.qkv_bias)
-    self.attn_v      = nn.Linear(config.dim, kv_proj_out, bias=config.qkv_bias)
-    self.attn_output = nn.Linear(config.head_dim * config.n_heads, config.dim, bias=False)
+    self.attn_q      = Linear(config.dim, q_proj_out,  bias=config.qkv_bias)
+    self.attn_k      = Linear(config.dim, kv_proj_out, bias=config.qkv_bias)
+    self.attn_v      = Linear(config.dim, kv_proj_out, bias=config.qkv_bias)
+    self.attn_output = Linear(config.head_dim * config.n_heads, config.dim, bias=False)
     if config.qk_norm: self.attn_q_norm, self.attn_k_norm = nn.RMSNorm(config.qk_norm, config.norm_eps), nn.RMSNorm(config.qk_norm, config.norm_eps)
 
   def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
@@ -193,16 +275,16 @@ class MLATransformerBlock(FFNBlock):
     super().__init__(config)
     qk_nope_head_dim = config.head_dim - config.rope_dim
     if config.q_lora_rank > 0:
-      self.attn_q_a = nn.Linear(config.dim, config.q_lora_rank, bias=False)
+      self.attn_q_a = Linear(config.dim, config.q_lora_rank, bias=False)
       self.attn_q_a_norm = nn.RMSNorm(config.q_lora_rank, config.norm_eps)
-      self.attn_q_b = nn.Linear(config.q_lora_rank, config.n_heads * config.head_dim, bias=False)
+      self.attn_q_b = Linear(config.q_lora_rank, config.n_heads * config.head_dim, bias=False)
     else:
-      self.attn_q = nn.Linear(config.dim, config.n_heads * config.head_dim, bias=False)
-    self.attn_kv_a_mqa = nn.Linear(config.dim, config.kv_lora_rank + config.rope_dim, bias=False)
+      self.attn_q = Linear(config.dim, config.n_heads * config.head_dim, bias=False)
+    self.attn_kv_a_mqa = Linear(config.dim, config.kv_lora_rank + config.rope_dim, bias=False)
     self.attn_kv_a_norm = nn.RMSNorm(config.kv_lora_rank, config.norm_eps)
     self.attn_k_b = {"weight": Tensor.zeros(config.n_heads, config.kv_lora_rank, qk_nope_head_dim)}
     self.attn_v_b = {"weight": Tensor.zeros(config.n_heads, config.v_head_dim, config.kv_lora_rank)}
-    self.attn_output = nn.Linear(config.n_heads * config.v_head_dim, config.dim, bias=False)
+    self.attn_output = Linear(config.n_heads * config.v_head_dim, config.dim, bias=False)
 
   def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
     B, T, _ = x.shape
@@ -241,12 +323,12 @@ class GatedDeltaNetBlock(FFNBlock):
     assert self.num_v_heads % self.num_k_heads == 0
     self.head_v_dim, self.ssm_conv_kernel = ssm.inner_size // ssm.time_step_rank, ssm.conv_kernel
     self.conv_channels, self.q_dim = ssm.inner_size + 2*ssm.group_count*ssm.state_size, ssm.state_size*ssm.group_count
-    self.attn_qkv, self.attn_gate = nn.Linear(config.dim, self.conv_channels, bias=False), nn.Linear(config.dim, ssm.inner_size, bias=False)
-    self.ssm_alpha, self.ssm_beta = nn.Linear(config.dim, self.num_v_heads, bias=False), nn.Linear(config.dim, self.num_v_heads, bias=False)
+    self.attn_qkv, self.attn_gate = Linear(config.dim, self.conv_channels, bias=False), Linear(config.dim, ssm.inner_size, bias=False)
+    self.ssm_alpha, self.ssm_beta = Linear(config.dim, self.num_v_heads, bias=False), Linear(config.dim, self.num_v_heads, bias=False)
     self.ssm_conv1d = {"weight": Tensor.zeros(self.conv_channels, self.ssm_conv_kernel)}
     self.ssm_dt = {"bias": Tensor.zeros(self.num_v_heads)}
     self.ssm_a = Tensor.zeros(self.num_v_heads)
-    self.ssm_norm, self.ssm_out = nn.RMSNorm(self.head_v_dim, config.norm_eps), nn.Linear(ssm.inner_size, config.dim, bias=False)
+    self.ssm_norm, self.ssm_out = nn.RMSNorm(self.head_v_dim, config.norm_eps), Linear(ssm.inner_size, config.dim, bias=False)
 
   def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
     B, T, _ = x.shape
@@ -300,7 +382,7 @@ class Transformer:
                                block_cls(dense_config if i < config.leading_dense_blocks else config) for i in range(config.num_blocks)]
     self.token_embd  = nn.Embedding(config.vocab_size, config.dim)
     self.output_norm = nn.RMSNorm(config.dim, config.norm_eps)
-    self.output = nn.Linear(config.dim, config.vocab_size, bias=False)
+    self.output = Linear(config.dim, config.vocab_size, bias=False)
     self.max_context = config.max_context
     self.has_recurrent_block = any(isinstance(b, GatedDeltaNetBlock) for b in self.blk)
     self._cached_tokens: list[int] = []
@@ -322,10 +404,12 @@ class Transformer:
   def from_gguf(gguf:Tensor|str|pathlib.Path, max_context:int|None=None,
                 realize=bool(getenv("REALIZE", 0))) -> tuple[Transformer, dict]:
     # TODO: remove the need for copy to default device
-    kv, state_dict = gguf_load(gguf.to(None).realize() if isinstance(gguf, Tensor) else gguf)
+    if Device.DEFAULT == "AMD": _set_vecdot4(Device.DEFAULT)
+    kv, state_dict = gguf_load(gguf.to(None).realize() if isinstance(gguf, Tensor) else gguf,
+                               keep_q8=getenv("KEEP_Q8", 1) and Device.DEFAULT == "AMD")
 
     # all state items should be float16, not float32
-    state_dict = {k:v.cast('float16') if getenv("HALF", 1) else v for k,v in state_dict.items()}
+    state_dict = {k:v if hasattr(v, "_gguf_type") or not getenv("HALF", 1) else v.cast('float16') for k,v in state_dict.items()}
 
     # some models like Llama 3.2 don't have an output.weight, they just tie to the token_embd.weight
     if 'output.weight' not in state_dict: state_dict['output.weight'] = state_dict['token_embd.weight']
@@ -383,8 +467,9 @@ class Transformer:
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:
-      for s in (params:=nn.state.get_parameters(model)): s.replace(s.contiguous())
-      Tensor.realize(*params)
+      for s in (params:=nn.state.get_parameters(model)):
+        if not hasattr(s, "_gguf_type"): s.replace(s.contiguous())
+      Tensor.realize(*[s for s in params if not hasattr(s, "_gguf_type")])
     return model, kv
 
   def get_start_pos(self, tokens:list[int]) -> int:

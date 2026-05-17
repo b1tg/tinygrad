@@ -3,7 +3,7 @@ from typing import Any, Callable
 
 from tinygrad.tensor import Tensor
 from tinygrad.dtype import dtypes
-from tinygrad.helpers import prod, round_up
+from tinygrad.helpers import prod, round_up, getenv
 from tinygrad.nn.state import TensorIO
 
 # ggml packs each iq grid entry as N bytes (N=4 for uint32 grids, N=8 for uint64 grids) in a single word. See ggml-common.h.
@@ -130,10 +130,41 @@ readers: dict[int, Callable[[io.BufferedIOBase], Any]] = { 8: read_str, 9: read_
     [ (0,"c",1), (1,"b",1), (2,"H",2), (3,"h",2), (4,"I",4), (5,"i",4), (6,"f",4), (7,"?",1), (10,"Q",8), (11,"q",8), (12,"d",8) ] } }
 read_uint32, read_int32, read_uint64, read_int64 = readers[4], readers[5], readers[10], readers[11]
 
-def _gguf_parse(tensor: Tensor) -> tuple[dict, dict[str, Tensor]]:
+def _gguf_nbytes(n:int, typ:int) -> int:
+  if (dt:=_GGML_NATIVE.get(typ)) is not None: return dt.itemsize * n
+  if (ne:=_GGML_QUANT.get(typ)) is not None: return n // ne[0] * ne[1]
+  raise ValueError(f"GGML type '{typ}' is not supported!")
+
+def _keep_raw_quant(name:str, dims:tuple[int, ...], typ:int, kv:dict) -> bool:
+  arch = kv.get('general.architecture')
+  if kv.get(f'{arch}.embedding_length', 0) < 2048: return False
+  if kv.get(f'{arch}.expert_count', 0):
+    return bool(getenv("RAW_MOE", 0)) and typ in (12, 13) and len(dims) == 3 and "_exps.weight" in name
+  if typ not in (8, 12, 13) or len(dims) != 2 or not name.endswith(".weight") or name == "token_embd.weight" or "norm" in name: return False
+  if "_exps.weight" in name or (arch == "llama" and (".attn_q.weight" in name or ".attn_k.weight" in name)): return False
+  return not (kv.get(f'{arch}.attention.kv_lora_rank', 0) and ".attn_" in name)
+
+def _gguf_raw_tensor(raw:Tensor, dims:tuple[int, ...], typ:int) -> Tensor:
+  ret = Tensor.empty(0, dtype=dtypes.uint8)
+  if typ == 8:
+    blocks = raw.to(None).realize().reshape(-1, 34)
+    ret._gguf_q8_scale = blocks[:, :2].bitcast(dtypes.float16).squeeze(-1).contiguous().realize()
+    ret._gguf_q8_qs = blocks[:, 2:].reshape(-1, 8, 4).bitcast(dtypes.int32).squeeze(-1).contiguous().realize()
+  elif typ in (12, 13):
+    blocks = raw.to(None).realize().reshape(-1, _GGML_QUANT[typ][1])
+    ret._gguf_k_meta = blocks[:, :16].contiguous().realize()
+    if typ == 13: ret._gguf_k_qh = blocks[:, 16:48].contiguous().realize()
+    ret._gguf_k_qs = blocks[:, 48 if typ == 13 else 16:(48 if typ == 13 else 16)+128].contiguous().realize()
+  ret._gguf_type, ret._gguf_shape = typ, tuple(reversed(dims))
+  return ret
+
+def _gguf_parse(tensor: Tensor|pathlib.Path, base_kv:dict|None=None, keep_q8=False) -> tuple[dict, dict[str, Tensor]]:
   # TODO: remove the need for copy to default device
-  tensor = tensor.to(None).realize()
-  r = io.BufferedReader(TensorIO(tensor), 1_000_000)
+  if isinstance(tensor, pathlib.Path):
+    r = open(tensor, "rb")
+  else:
+    tensor = tensor.to(None).realize()
+    r = io.BufferedReader(TensorIO(tensor), 1_000_000)
   magic, version, n_tensors, n_kv = r.read(4), read_int32(r), read_int64(r), read_int64(r)
   if magic != b"GGUF" or version not in [2, 3]: raise ValueError("Invalid GGUF format!")
 
@@ -146,8 +177,27 @@ def _gguf_parse(tensor: Tensor) -> tuple[dict, dict[str, Tensor]]:
   alignment, pos = kv_data.get("general.alignment", 32), r.tell()
   data_start = round_up(pos, alignment)
 
-  state_dict = {name: ggml_data_to_tensor(tensor[data_start + off:], prod(dims), typ).reshape(*reversed(dims)) for name, dims, typ, off in t_infos}
+  kv = base_kv or kv_data
+  def load_tensor(name, dims, typ, off):
+    if isinstance(tensor, pathlib.Path):
+      r.seek(data_start + off)
+      raw = Tensor(r.read(_gguf_nbytes(prod(dims), typ)), dtype=dtypes.uint8)
+    else: raw = tensor[data_start + off:]
+    if keep_q8 and _keep_raw_quant(name, dims, typ, kv): return _gguf_raw_tensor(raw, dims, typ)
+    return ggml_data_to_tensor(raw.to(None).realize() if isinstance(tensor, pathlib.Path) else raw, prod(dims), typ).reshape(*reversed(dims))
+  state_dict = {name: load_tensor(name, dims, typ, off) for name, dims, typ, off in t_infos}
+  r.close()
   return kv_data, state_dict
+
+def _gguf_read_kv(fn: pathlib.Path) -> dict:
+  with open(fn, "rb") as r:
+    magic, version, _, n_kv = r.read(4), read_int32(r), read_int64(r), read_int64(r)
+    if magic != b"GGUF" or version not in [2, 3]: raise ValueError("Invalid GGUF format!")
+    kv = {}
+    for _ in range(n_kv):
+      k, typ = read_str(r), read_int32(r)
+      kv[k] = readers[typ](r)
+    return kv
 
 def _gguf_split_paths(path: pathlib.Path, kv: dict) -> list[pathlib.Path]:
   if (total := kv.get('split.count', 1)) <= 1: return [path]
@@ -155,7 +205,7 @@ def _gguf_split_paths(path: pathlib.Path, kv: dict) -> list[pathlib.Path]:
   if not (m := re.match(r"^(.*)-00001-of-\d{5}\.gguf$", str(path))): raise ValueError(f"first split path must end with -00001-of-NNNNN.gguf: {path}")
   return [pathlib.Path(f"{m.group(1)}-{i:05d}-of-{total:05d}.gguf") for i in range(1, total+1)]
 
-def gguf_load(fn: Tensor|str|pathlib.Path) -> tuple[dict, dict[str, Tensor]]:
+def gguf_load(fn: Tensor|str|pathlib.Path, keep_q8=False) -> tuple[dict, dict[str, Tensor]]:
   """
   Loads a .gguf file, returning the `kv_data` and `state_dict`. Multi-part splits are auto-merged when loaded by path.
 
@@ -170,8 +220,11 @@ def gguf_load(fn: Tensor|str|pathlib.Path) -> tuple[dict, dict[str, Tensor]]:
 
   NOTE: The provided tensor must be on a device that supports execution.
   """
-  kv, sd = _gguf_parse(fn if isinstance(fn, Tensor) else Tensor(pathlib.Path(fn)))
+  if keep_q8 and not isinstance(fn, Tensor):
+    kv0 = _gguf_read_kv(pathlib.Path(fn))
+    if kv0.get(f"{kv0.get('general.architecture')}.expert_count", 0) and not getenv("RAW_MOE", 0): keep_q8 = False
+  kv, sd = _gguf_parse(fn if isinstance(fn, Tensor) else pathlib.Path(fn) if keep_q8 else Tensor(pathlib.Path(fn)), keep_q8=keep_q8)
   if kv.get('split.count', 1) <= 1: return kv, sd
   if isinstance(fn, Tensor): raise ValueError("multi-part GGUF requires a path argument (got Tensor)")
-  for pp in _gguf_split_paths(pathlib.Path(fn), kv)[1:]: sd.update(_gguf_parse(Tensor(pp))[1])
+  for pp in _gguf_split_paths(pathlib.Path(fn), kv)[1:]: sd.update(_gguf_parse(pp if keep_q8 else Tensor(pp), kv, keep_q8)[1])
   return kv, sd

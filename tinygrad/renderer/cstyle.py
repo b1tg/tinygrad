@@ -8,6 +8,14 @@ from tinygrad.dtype import ImageDType, dtypes, DType, PtrDType, AddrSpace, trunc
 from tinygrad.renderer import Renderer
 from tinygrad.codegen.late.devectorizer import no_vectorized_alu
 
+def _packed_i8_lane(x:UOp) -> tuple[UOp, int]|None:
+  if x.op is Ops.GEP and len(x.arg) == 1 and x.src[0].dtype in dtypes.int32s and 0 < x.arg[0] < 4: return x.src[0], x.arg[0]
+  if x.dtype in dtypes.int32s: return x, 0
+  return None
+
+def _render_packed_i8_bitcast(ctx, x:UOp) -> str|None:
+  if x.dtype != dtypes.int8 or (m:=_packed_i8_lane(x.src[0])) is None: return None
+  return f"__builtin_bit_cast(signed char, (unsigned char)(((unsigned int){ctx[m[0]]})>>{8*m[1]}u))"
 
 base_rewrite = PatternMatcher([
   (UPat(Ops.DEFINE_REG, name="x"), lambda ctx,x: f"{ctx.render_dtype(x.dtype.base)} {ctx[x]}[{x.dtype.size}];"),
@@ -23,6 +31,7 @@ base_rewrite = PatternMatcher([
   (UPat(Ops.CAST, name="x"), lambda ctx,x:
     f"__builtin_convertvector({ctx[x.src[0]]}, {ctx.render_dtype(x.dtype)})" if x.dtype.count > 1 and not isinstance(x.dtype, PtrDType) else None),
   (UPat(Ops.CAST, name="x"), lambda ctx,x: f"({ctx.render_cast(x.dtype, ctx[x.src[0]])})"),
+  (UPat(Ops.BITCAST, name="x"), _render_packed_i8_bitcast),
   (UPat(Ops.BITCAST, name="x"), lambda ctx,x:
     f"__builtin_bit_cast({ctx.render_dtype(x.dtype)}, ({ctx.render_dtype(x.src[0].dtype)})({ctx[x.src[0]]}))"),
   (UPat(Ops.DEFINE_LOCAL, name="x"), lambda ctx,x: f"{ctx.smem_align}{ctx.smem_prefix}{ctx.render_dtype(x.dtype.base)} {ctx[x]}[{x.dtype.size}];"),
@@ -462,6 +471,53 @@ class NVCCRenderer(CUDARenderer):
 def fp8_index(dtype: DType): return (dtypes.fp8e4m3, dtypes.fp8e5m2).index(dtype.scalar())
 def _ocml(op): return lambda x,dtype: f"__ocml_{op}_f{ {dtypes.half:16, dtypes.double:64}.get(dtype, 32)}({x})"
 
+def _dot4_lane(x:UOp) -> tuple[UOp, int]|None:
+  if x.op is not Ops.CAST or x.dtype != dtypes.int: return None
+  if x.src[0].op is Ops.BITCAST and x.src[0].dtype == dtypes.int8: return _packed_i8_lane(x.src[0].src[0])
+  if (x:=x.src[0]).op is not Ops.CAST or x.dtype != dtypes.int8: return None
+  if (x:=x.src[0]).op is not Ops.AND: return None
+  if (x.src[0].op is Ops.CONST and x.src[0].arg == 255): x = x.src[1]
+  elif x.src[1].op is Ops.CONST and x.src[1].arg == 255: x = x.src[0]
+  else: return None
+  lane = 0
+  if x.op is Ops.SHR:
+    if x.src[1].op is not Ops.CONST or x.src[1].arg not in (0, 8, 16, 24): return None
+    lane, x = x.src[1].arg // 8, x.src[0]
+  if x.op is Ops.CAST and x.dtype == dtypes.uint32: x = x.src[0]
+  if x.op is Ops.BITCAST and x.dtype in dtypes.int32s: x = x.src[0]
+  return (x, lane) if x.dtype in dtypes.int32s else None
+
+def _dot4_match_terms(ts:list[UOp]) -> tuple[UOp, UOp, UOp|None]|None:
+  candidates = [(ts, None)] if len(ts) == 4 else [([t for j,t in enumerate(ts) if j != i], ts[i]) for i in range(len(ts))] if len(ts) == 5 else []
+  for dots, acc in candidates:
+    if acc is not None and acc.dtype != dtypes.int: continue
+    lanes = {}
+    for t in dots:
+      if t.op is not Ops.MUL or (a:=_dot4_lane(t.src[0])) is None or (b:=_dot4_lane(t.src[1])) is None or a[1] != b[1]: break
+      if a[1] in lanes: break
+      lanes[a[1]] = (a[0], b[0])
+    else:
+      if set(lanes) != {0, 1, 2, 3}: continue
+      a, b = next(iter(lanes.values()))
+      if all(lanes[s] in ((a, b), (b, a)) for s in (0, 1, 2, 3)): return a, b, acc
+  return None
+
+def _dot4_terms(x:UOp) -> list[UOp]: return _dot4_terms(x.src[0]) + _dot4_terms(x.src[1]) if x.op is Ops.ADD else [x]
+
+def _render_dot4(ctx, x:UOp) -> str|None:
+  def dot4(a, b, acc):
+    if ctx.is_cdna(ctx.target.arch): return f"__builtin_amdgcn_sdot4({a}, {b}, {acc}, false)"
+    if ctx.is_rdna3(ctx.target.arch): return f"__builtin_amdgcn_sudot4(true, {a}, true, {b}, {acc}, false)"
+    return None
+  if (m:=_dot4_match_terms(_dot4_terms(x))) is not None:
+    return dot4(ctx[m[0]], ctx[m[1]], 0 if m[2] is None else ctx[m[2]])
+  for dot, acc in ((x.src[0], x.src[1]), (x.src[1], x.src[0])):
+    if (m:=_dot4_match_terms(_dot4_terms(dot))) is not None and m[2] is None and acc.dtype == dtypes.int:
+      return dot4(ctx[m[0]], ctx[m[1]], ctx[acc])
+  return None
+
+dot4_rewrite = PatternMatcher([(UPat(Ops.ADD, dtype=dtypes.int, name="x"), _render_dot4)])
+
 class HIPRenderer(CStyleLanguage):
   shared_max = 65536
   # NOTE: this is only really needed on gfx12, even though gfx11 reports the same limitation
@@ -470,6 +526,10 @@ class HIPRenderer(CStyleLanguage):
 
   @staticmethod
   def is_cdna(arch): return arch.split(":")[0] in {"gfx942", "gfx950"}
+  @staticmethod
+  def is_rdna3(arch): return arch.split(":")[0] in {"gfx1100", "gfx1101", "gfx1102"}
+  @staticmethod
+  def has_dot4(arch): return HIPRenderer.is_cdna(arch) or HIPRenderer.is_rdna3(arch)
   @staticmethod
   def is_cdna4(arch): return arch.split(":")[0] == "gfx950"
   def __init__(self, target:Target, use_hipcc=False): # gfx942 => MI300, gfx1100 => RX 7900, gfx1201 => RX 9700
@@ -487,6 +547,7 @@ class HIPRenderer(CStyleLanguage):
         (UPat(Ops.CAST, dtypes.float, (UPat.var("y", dtypes.fp8s),), name="x",),
           lambda ctx,x,y: f"__builtin_amdgcn_cvt_f32_{('fp8', 'bf8')[fp8_index(y.dtype)]}((unsigned int){ctx[x.src[0]]}, 0)"),
       ]) + base_rewrite
+    if self.has_dot4(target.arch): self.string_rewrite = dot4_rewrite + self.string_rewrite
 
   # https://clang.llvm.org/docs/AttributeReference.html#amdgpu-flat-work-group-size
   # NOTE: this makes hlb_cifar10 twice as fast, there may be more gains in tweaking these parameters
