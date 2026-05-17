@@ -2,7 +2,7 @@ from __future__ import annotations
 import sys, argparse, codecs, typing, re, unicodedata, json, uuid, time, pathlib
 from tinygrad import nn
 from tinygrad.uop.ops import UOp, Ops
-from tinygrad.helpers import partition, DEBUG, Timing, GlobalCounters, stderr_log, colored, Context, fetch, profile_marker
+from tinygrad.helpers import partition, DEBUG, Timing, GlobalCounters, stderr_log, colored, Context, fetch, profile_marker, prod
 from tinygrad.viz.serve import TCPServerWithReuse, HTTPRequestHandler
 from tinygrad.llm.model import Transformer
 
@@ -188,18 +188,20 @@ def main():
   parser.add_argument("--serve", nargs='?', type=int, const=8000, metavar="PORT", help="Run OpenAI compatible API (optional port, default 8000)")
   parser.add_argument("--warmup", action="store_true", help="warmup the JIT")
   parser.add_argument("--benchmark", nargs='?', type=int, const=20, metavar="COUNT", help="Benchmark tok/s (optional count, default 20)")
-  parser.add_argument("--shard", type=int, default=1, help="Shard model tensors across N devices")
+  parser.add_argument("--shard", type=int, default=1, help="Shard model across N devices")
+  parser.add_argument("--sm", "-sm", "--split-mode", choices=("layer", "tensor"), default="tensor", help="Shard split mode")
   args = parser.parse_args()
 
   # load the model
   model_arg = models.get(args.model, args.model)
   st = time.perf_counter()
-  model, kv = Transformer.from_gguf(model_arg if pathlib.Path(model_arg).is_file() else fetch(model_arg), args.max_context, shard=args.shard)
+  gguf = model_arg if pathlib.Path(model_arg).is_file() else fetch(model_arg)
+  model, kv = Transformer.from_gguf(gguf, args.max_context, shard=args.shard, shard_mode=args.sm)
   load_tm = time.perf_counter() - st
   model_name = kv.get('general.name') or kv.get('general.basename') or args.model
   file_sizes = [y.nbytes() for y in UOp.sink(*[x.uop for x in nn.state.get_parameters(model)]).toposort() if y.op is Ops.BUFFER]
   print(f"using model \"{model_name}\" with {sum(file_sizes):,} bytes and "
-        f"{sum(x.numel() for x in nn.state.get_parameters(model)):,} params, load {load_tm:.2f}s")
+        f"{sum(prod(getattr(x, '_gguf_shape', x.shape)) for x in nn.state.get_parameters(model)):,} params, load {load_tm:.2f}s")
 
   # get tokenizer
   tok = SimpleTokenizer.from_gguf_kv(kv)

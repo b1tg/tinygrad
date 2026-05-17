@@ -3,6 +3,7 @@ import functools, itertools, math, pathlib
 from dataclasses import dataclass, replace
 from tinygrad import Device, Tensor, nn, UOp, TinyJit, dtypes, getenv, function
 from tinygrad.llm.gguf import gguf_load, block_device
+from tinygrad.helpers import prod
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops, resolve
 
 @functools.cache
@@ -71,6 +72,45 @@ def _qk(raw:UOp, idx:UOp, typ:int) -> UOp:
   sc = (sl | (((u8(base+2) | (u8(base+3) << 8)) >> (g*2) & 3) << 4)).cast(dtypes.float) - 32
   return half(base) * sc * lut.cast(dtypes.float)
 
+def _q8_0_shape(weight:Tensor) -> tuple[int, int]|None:
+  if not (hasattr(weight, "_gguf_raw") and getattr(weight, "_gguf_type", None) == 8 and not isinstance(weight.device, tuple)): return None
+  return getattr(weight, "_gguf_shape", weight.shape)
+
+def _q8_0_act(x:Tensor, in_features:int) -> tuple[Tensor, Tensor]:
+  n = prod(x.shape[:-1])
+  xb = x.float().reshape(n, in_features//32, 32)
+  xs = xb.maximum(-xb).max(axis=-1, keepdim=True) / 127.0
+  x4 = ((xb / (xs + 1e-12 + xb*0)) + (xb >= 0).where(0.5, -0.5)).cast(dtypes.int8).reshape(
+    n, in_features//32, 8, 4).bitcast(dtypes.int32).squeeze(-1)
+  return x4, xs
+
+def _q8_0_shared(x:Tensor, *weights:Tensor) -> tuple[Tensor, Tensor]|None:
+  shapes = [_q8_0_shape(w) for w in weights]
+  if any(s is None for s in shapes): return None
+  in_features = shapes[0][1]
+  if x.shape[-1] != in_features or in_features % 32 or any(s[1] != in_features for s in shapes): return None
+  return _q8_0_act(x, in_features)
+
+def _linear_q8_0(x:Tensor, weight:Tensor, bias:Tensor|None=None, q8:tuple[Tensor, Tensor]|None=None) -> Tensor|None:
+  if (shape:=_q8_0_shape(weight)) is None: return None
+  out_features, in_features = shape
+  if x.shape[-1] != in_features or x.shape[-1] % 32: return None
+  bs, n = x.shape[:-1], prod(x.shape[:-1])
+  x4, xs = q8 if q8 is not None else _q8_0_act(x, in_features)
+  wb = weight._gguf_raw.to(x.device).reshape(out_features, in_features//32, 17)
+  ws = wb[:, :, 0].bitcast(dtypes.float16).cast(dtypes.float).reshape(out_features, in_features//32)
+  w16 = wb[:, :, 1:].reshape(out_features, in_features//32, 8, 2)
+  w4 = (w16[:, :, :, 0].cast(dtypes.uint32) | (w16[:, :, :, 1].cast(dtypes.uint32) << 16)).bitcast(dtypes.int32)
+  ret = x4.reshape(n, 1, in_features//32, 8).alu(Ops.DOT4I8, w4.reshape(1, out_features, in_features//32, 8)).cast(dtypes.float)
+  ret = (ret * xs.reshape(n, 1, in_features//32, 1) * ws.reshape(1, out_features, in_features//32, 1)).sum(axis=(-1, -2)).cast(x.dtype)
+  ret = ret.reshape(*bs, out_features)
+  return ret if bias is None else ret + bias
+
+class Linear(nn.Linear):
+  def __call__(self, x:Tensor) -> Tensor:
+    if (ret:=_linear_q8_0(x, self.weight, self.bias)) is not None: return ret
+    return x.linear(self.weight.transpose(), self.bias)
+
 def _expert_matmul_q4k_kernel(output:UOp, x:UOp, raw:UOp, sel:UOp, in_features:int, typ:int=12) -> UOp:
   B, T, K, OUT, xk = output.shape[-4], output.shape[-3], output.shape[-2], output.shape[-1], x.shape[-2]
   output, x, raw, sel = output.flatten(), x.flatten(), raw.flatten(), sel.flatten()
@@ -109,6 +149,10 @@ def _expert_output(shape:tuple[int, ...], ref:Tensor, axis:int) -> Tensor:
 def _reshard_last(x:Tensor, devices:tuple[str, ...]) -> Tensor:
   if isinstance(x.device, tuple) and x.uop.axis == x.ndim-1: return x
   return (x.to(devices[0]) if isinstance(x.device, tuple) else x).shard(devices, axis=-1)
+
+def _select_replicated(x:Tensor, device:str) -> Tensor:
+  if isinstance(x.device, tuple) and x.uop.axis is None: return Tensor(x.uop.mselect(x.device.index(device)), requires_grad=x.requires_grad)
+  return x.to(device)
 
 def _expert_ffn_q4k(gate:ExpertWeights, up:ExpertWeights, sel:Tensor, x:Tensor) -> Tensor|None:
   if not (getenv("EXPERT_Q4K_FUSED", 1) and isinstance(gate.weight.device, tuple) and gate.weight.device == up.weight.device): return None
@@ -210,20 +254,20 @@ class FFNBlock:
 
     # --- feed-forward (MoE or dense) -------------------------------------
     if config.num_experts > 0:
-      self.ffn_gate_inp = nn.Linear(config.dim, config.num_experts, bias=False)  # router
+      self.ffn_gate_inp = Linear(config.dim, config.num_experts, bias=False)  # router
       if config.expert_bias: self.exp_probs_b = {"bias": Tensor.zeros(config.num_experts)}
       self.ffn_gate_exps = ExpertWeights(config.num_experts, config.dim, config.hidden_dim)
       self.ffn_up_exps = ExpertWeights(config.num_experts, config.dim, config.hidden_dim)
       self.ffn_down_exps = ExpertWeights(config.num_experts, config.hidden_dim, config.dim)
       if config.shared_expert_dim > 0:
-        self.ffn_gate_shexp = nn.Linear(config.dim, config.shared_expert_dim, bias=False)
-        self.ffn_up_shexp = nn.Linear(config.dim, config.shared_expert_dim, bias=False)
-        self.ffn_down_shexp = nn.Linear(config.shared_expert_dim, config.dim, bias=False)
+        self.ffn_gate_shexp = Linear(config.dim, config.shared_expert_dim, bias=False)
+        self.ffn_up_shexp = Linear(config.dim, config.shared_expert_dim, bias=False)
+        self.ffn_down_shexp = Linear(config.shared_expert_dim, config.dim, bias=False)
         if config.shared_expert_gate: self.ffn_gate_inp_shexp = {"weight": Tensor.zeros(config.dim)}
     else:
-      self.ffn_gate    = nn.Linear(config.dim, config.hidden_dim, bias=False)
-      self.ffn_up      = nn.Linear(config.dim, config.hidden_dim, bias=False)
-      self.ffn_down    = nn.Linear(config.hidden_dim, config.dim, bias=False)
+      self.ffn_gate    = Linear(config.dim, config.hidden_dim, bias=False)
+      self.ffn_up      = Linear(config.dim, config.hidden_dim, bias=False)
+      self.ffn_down    = Linear(config.hidden_dim, config.dim, bias=False)
 
   def _feed_forward(self, x:Tensor) -> Tensor:
     if hasattr(self, 'ffn_gate_exps'):
@@ -256,7 +300,11 @@ class FFNBlock:
     # TODO: remove the need for this contiguous
     dev = x.device
     if isinstance(self.ffn_gate.weight.device, tuple) and not isinstance(x.device, tuple): x = x.to(self.ffn_gate.weight.device)
-    h = self.ffn_gate(x).silu().contiguous() * self.ffn_up(x)
+    if (q8:=_q8_0_shared(x, self.ffn_gate.weight, self.ffn_up.weight)) is not None:
+      gate = _linear_q8_0(x, self.ffn_gate.weight, self.ffn_gate.bias, q8)
+      h = gate.silu().contiguous() * _linear_q8_0(x, self.ffn_up.weight, self.ffn_up.bias, q8)
+    else:
+      h = self.ffn_gate(x).silu().contiguous() * self.ffn_up(x)
     ret = self.ffn_down(h)
     return ret.to(dev) if ret.device != dev else ret
 
@@ -284,14 +332,18 @@ class TransformerBlock(FFNBlock):
     # --- attention projections (all linear, bias-free) ------------------
     q_proj_out       = config.head_dim * config.n_heads * (2 if config.attn_output_gate else 1)
     kv_proj_out      = config.head_dim * config.n_kv_heads
-    self.attn_q      = nn.Linear(config.dim, q_proj_out,  bias=config.qkv_bias)
-    self.attn_k      = nn.Linear(config.dim, kv_proj_out, bias=config.qkv_bias)
-    self.attn_v      = nn.Linear(config.dim, kv_proj_out, bias=config.qkv_bias)
-    self.attn_output = nn.Linear(config.head_dim * config.n_heads, config.dim, bias=False)
+    self.attn_q      = Linear(config.dim, q_proj_out,  bias=config.qkv_bias)
+    self.attn_k      = Linear(config.dim, kv_proj_out, bias=config.qkv_bias)
+    self.attn_v      = Linear(config.dim, kv_proj_out, bias=config.qkv_bias)
+    self.attn_output = Linear(config.head_dim * config.n_heads, config.dim, bias=False)
     if config.qk_norm: self.attn_q_norm, self.attn_k_norm = nn.RMSNorm(config.qk_norm, config.norm_eps), nn.RMSNorm(config.qk_norm, config.norm_eps)
 
   def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
-    q, k, v = self.attn_q(x), self.attn_k(x), self.attn_v(x)
+    if (q8:=_q8_0_shared(x, self.attn_q.weight, self.attn_k.weight, self.attn_v.weight)) is not None:
+      q, k, v = (_linear_q8_0(x, self.attn_q.weight, self.attn_q.bias, q8), _linear_q8_0(x, self.attn_k.weight, self.attn_k.bias, q8),
+                 _linear_q8_0(x, self.attn_v.weight, self.attn_v.bias, q8))
+    else:
+      q, k, v = self.attn_q(x), self.attn_k(x), self.attn_v(x)
     if self.config.qk_norm and self.config.qk_norm != self.config.head_dim: q, k = self.attn_q_norm(q), self.attn_k_norm(k)
 
     B, T, _ = x.shape
@@ -333,16 +385,16 @@ class MLATransformerBlock(FFNBlock):
     super().__init__(config)
     qk_nope_head_dim = config.head_dim - config.rope_dim
     if config.q_lora_rank > 0:
-      self.attn_q_a = nn.Linear(config.dim, config.q_lora_rank, bias=False)
+      self.attn_q_a = Linear(config.dim, config.q_lora_rank, bias=False)
       self.attn_q_a_norm = nn.RMSNorm(config.q_lora_rank, config.norm_eps)
-      self.attn_q_b = nn.Linear(config.q_lora_rank, config.n_heads * config.head_dim, bias=False)
+      self.attn_q_b = Linear(config.q_lora_rank, config.n_heads * config.head_dim, bias=False)
     else:
-      self.attn_q = nn.Linear(config.dim, config.n_heads * config.head_dim, bias=False)
-    self.attn_kv_a_mqa = nn.Linear(config.dim, config.kv_lora_rank + config.rope_dim, bias=False)
+      self.attn_q = Linear(config.dim, config.n_heads * config.head_dim, bias=False)
+    self.attn_kv_a_mqa = Linear(config.dim, config.kv_lora_rank + config.rope_dim, bias=False)
     self.attn_kv_a_norm = nn.RMSNorm(config.kv_lora_rank, config.norm_eps)
     self.attn_k_b = {"weight": Tensor.zeros(config.n_heads, config.kv_lora_rank, qk_nope_head_dim)}
     self.attn_v_b = {"weight": Tensor.zeros(config.n_heads, config.v_head_dim, config.kv_lora_rank)}
-    self.attn_output = nn.Linear(config.n_heads * config.v_head_dim, config.dim, bias=False)
+    self.attn_output = Linear(config.n_heads * config.v_head_dim, config.dim, bias=False)
 
   def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
     B, T, _ = x.shape
@@ -381,12 +433,12 @@ class GatedDeltaNetBlock(FFNBlock):
     assert self.num_v_heads % self.num_k_heads == 0
     self.head_v_dim, self.ssm_conv_kernel = ssm.inner_size // ssm.time_step_rank, ssm.conv_kernel
     self.conv_channels, self.q_dim = ssm.inner_size + 2*ssm.group_count*ssm.state_size, ssm.state_size*ssm.group_count
-    self.attn_qkv, self.attn_gate = nn.Linear(config.dim, self.conv_channels, bias=False), nn.Linear(config.dim, ssm.inner_size, bias=False)
-    self.ssm_alpha, self.ssm_beta = nn.Linear(config.dim, self.num_v_heads, bias=False), nn.Linear(config.dim, self.num_v_heads, bias=False)
+    self.attn_qkv, self.attn_gate = Linear(config.dim, self.conv_channels, bias=False), Linear(config.dim, ssm.inner_size, bias=False)
+    self.ssm_alpha, self.ssm_beta = Linear(config.dim, self.num_v_heads, bias=False), Linear(config.dim, self.num_v_heads, bias=False)
     self.ssm_conv1d = {"weight": Tensor.zeros(self.conv_channels, self.ssm_conv_kernel)}
     self.ssm_dt = {"bias": Tensor.zeros(self.num_v_heads)}
     self.ssm_a = Tensor.zeros(self.num_v_heads)
-    self.ssm_norm, self.ssm_out = nn.RMSNorm(self.head_v_dim, config.norm_eps), nn.Linear(ssm.inner_size, config.dim, bias=False)
+    self.ssm_norm, self.ssm_out = nn.RMSNorm(self.head_v_dim, config.norm_eps), Linear(ssm.inner_size, config.dim, bias=False)
 
   def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
     B, T, _ = x.shape
@@ -440,7 +492,7 @@ class Transformer:
                                block_cls(dense_config if i < config.leading_dense_blocks else config) for i in range(config.num_blocks)]
     self.token_embd  = nn.Embedding(config.vocab_size, config.dim)
     self.output_norm = nn.RMSNorm(config.dim, config.norm_eps)
-    self.output = nn.Linear(config.dim, config.vocab_size, bias=False)
+    self.output = Linear(config.dim, config.vocab_size, bias=False)
     self.max_context = config.max_context
     self.has_recurrent_block = any(isinstance(b, GatedDeltaNetBlock) for b in self.blk)
     self._cached_tokens: list[int] = []
@@ -451,7 +503,9 @@ class Transformer:
   def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
     x = self.token_embd(tokens.to(self.token_embd.weight.device)).float()                   # (B, T, D)
     for block in self.blk: x = block(x.to(getattr(block.attn_norm, "weight").device), start_pos)
-    logits = self.output(self.output_norm(x.to(self.output.weight.device)))[:, -1, :]
+    x = self.output_norm(x.to(self.output_norm.weight.device))
+    if not isinstance(self.output.weight.device, tuple): x = _select_replicated(x, self.output.weight.device)
+    logits = self.output(x)[:, -1, :]
     # Gumbel-max trick: argmax(logits/temp - log(-log(uniform))) is equivalent to sampling from softmax(logits/temp)
     return (logits / temperature.to(logits.device).maximum(1e-12) -
             (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1, keepdim=True)
@@ -461,15 +515,21 @@ class Transformer:
 
   @staticmethod
   def from_gguf(gguf:Tensor|str|pathlib.Path, max_context:int|None=None,
-                realize=bool(getenv("REALIZE", 0)), shard:int=1) -> tuple[Transformer, dict]:
+                realize=bool(getenv("REALIZE", 0)), shard:int=1, shard_mode:str="tensor") -> tuple[Transformer, dict]:
+    if shard_mode not in ("layer", "tensor"): raise ValueError(f"invalid shard_mode {shard_mode!r}")
     devices = tuple(f"{Device.DEFAULT}:{i}" for i in range(shard)) if shard > 1 else None
     load_dtype = 'float16' if devices and getenv("HALF", 1) else None
-    kv, state_dict = gguf_load(gguf, devices=devices, shard_axis=_gguf_shard_axis if devices else None, dtype=load_dtype)
+    kv, state_dict = gguf_load(gguf, devices=devices, shard_axis=_gguf_shard_axis if devices and shard_mode == "tensor" else None,
+                               dtype=load_dtype, keep_q8=getenv("KEEP_Q8", 1) and Device.DEFAULT == "AMD" and (not devices or shard_mode == "layer"))
     arch = kv['general.architecture']
     if devices and getenv("GGUF_REALIZE_SHARDED", 0) and kv.get('general.file_type') in (0, 1, 7, 32): realize = True
 
     # all state items should be float16, not float32
-    if load_dtype is None: state_dict = {k:v.cast('float16') if getenv("HALF", 1) else v for k,v in state_dict.items()}
+    if load_dtype is None and getenv("HALF", 1):
+      for k,v in state_dict.items():
+        state_dict[k] = v.cast('float16')
+        for a in ("_gguf_raw", "_gguf_type", "_gguf_shape"):
+          if hasattr(v, a): setattr(state_dict[k], a, getattr(v, a))
 
     # some models like Llama 3.2 don't have an output.weight, they just tie to the token_embd.weight
     if 'output.weight' not in state_dict: state_dict['output.weight'] = state_dict['token_embd.weight']
@@ -523,7 +583,7 @@ class Transformer:
       qkv_bias='blk.0.attn_q.bias' in state_dict,
       expert_bias=f"blk.{kv.get(f'{arch}.leading_dense_block_count', 0)}.exp_probs_b.bias" in state_dict)
     model = Transformer(config)
-    if devices: shard_weights(model, devices)
+    if devices: shard_weights(model, devices, tensor=shard_mode == "tensor")
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:
@@ -533,7 +593,7 @@ class Transformer:
         for s in params: s.realize()
       else:
         Tensor.realize(*params)
-    if devices and arch == "deepseek2" and config.num_experts and kv.get('general.file_type') not in (0, 1, 32):
+    if devices and shard_mode == "tensor" and arch == "deepseek2" and config.num_experts and kv.get('general.file_type') not in (0, 1, 32):
       model.rollout_jit.beam = 1
     return model, kv
 
@@ -572,7 +632,6 @@ class Transformer:
 def _shard_axis_key(k:str, ndim:int, expert_axis:int|None=0, attention:bool=False) -> int|None:
   if k.endswith(".bias"): return 0 if attention and (".attn_q." in k or ".attn_k." in k or ".attn_v." in k) else None
   if ndim <= 1 or "norm" in k or "scale" in k: return None
-  if k == "output.weight": return 0
   if attention and ".attn_q.weight" in k: return 0
   if attention and ".attn_q_b.weight" in k: return 0
   if attention and (".attn_k_b.weight" in k or ".attn_v_b.weight" in k): return 0
@@ -589,14 +648,15 @@ def _shard_axis(k:str, v:Tensor, expert_axis:int|None=0) -> int|None: return _sh
 
 def _gguf_shard_axis(k:str, dims:tuple[int, ...], typ:int, kv:dict) -> int|None:
   arch = kv["general.architecture"]
-  return _shard_axis_key(k, len(dims), attention=not kv.get(f"{arch}.ssm.conv_kernel", 0))
+  return _shard_axis_key(k, len(dims), attention=getenv("TENSOR_SHARD_ATTN", 0) and not kv.get(f"{arch}.ssm.conv_kernel", 0))
 
-def shard_weights(model:Transformer, devices:tuple[str, ...], expert_axis:int|None=0):
-  tensor_attn = {i: type(b) in (TransformerBlock, MLATransformerBlock) for i,b in enumerate(model.blk)}
+def shard_weights(model:Transformer, devices:tuple[str, ...], expert_axis:int|None=0, tensor:bool=True):
+  tensor_attn = {i: getenv("TENSOR_SHARD_ATTN", 0) and type(b) in (TransformerBlock, MLATransformerBlock) for i,b in enumerate(model.blk)}
   for k,v in nn.state.get_state_dict(model).items():
     bid = int(k.split(".")[1]) if k.startswith("blk.") else None
-    if (axis:=_shard_axis_key(k, v.ndim, expert_axis, tensor_attn.get(bid, False))) is not None: v.shard_(devices, axis=axis)
-    elif bid is not None and tensor_attn[bid]: v.shard_(devices, axis=None)
+    if tensor and (axis:=_shard_axis_key(k, v.ndim, expert_axis, tensor_attn.get(bid, False))) is not None: v.shard_(devices, axis=axis)
+    elif tensor and bid is not None and tensor_attn[bid]: v.shard_(devices, axis=None)
     elif k.startswith("blk."): v.to_(block_device(devices, int(k.split(".")[1]), len(model.blk)))
-    elif k == "token_embd.weight": v.to_(devices[0])
-    else: v.shard_(devices, axis=None)
+    elif k in ("token_embd.weight", "output.weight"): v.to_(devices[0])
+    elif tensor: v.shard_(devices, axis=None)
+    else: v.to_(devices[0])

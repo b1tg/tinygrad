@@ -1068,6 +1068,8 @@ def safe_pow(x, y):
   try: return math.nan if isinstance(p:=pow(x, y), complex) else p
   except ZeroDivisionError: return math.inf
   except ValueError: return math.inf if x > 0 else -math.inf
+def dot4_i8(a, b):
+  return sum(truncate[dtypes.int8]((a >> (8*i)) & 0xff) * truncate[dtypes.int8]((b >> (8*i)) & 0xff) for i in range(4))
 
 python_alu: dict[Ops, Callable]  = {
   Ops.LOG2: lambda x: math.log2(x) if x > 0 else -math.inf if x == 0 else math.nan, Ops.EXP2: safe_exp2,
@@ -1075,7 +1077,7 @@ python_alu: dict[Ops, Callable]  = {
   Ops.SIN: lambda x: math.sin(x) if not math.isinf(x) else math.nan, Ops.POW: safe_pow, Ops.TRUNC: math.trunc,
   Ops.NEG: operator.neg, Ops.ADD: operator.add, Ops.SUB: operator.sub, Ops.MUL: operator.mul, Ops.CMPNE: operator.ne, Ops.CMPLT: operator.lt,
   Ops.XOR: operator.xor, Ops.OR: operator.or_, Ops.AND: operator.and_, Ops.SHR: operator.rshift, Ops.SHL: operator.lshift, Ops.MAX: max,
-  Ops.CMOD: cmod, Ops.CDIV: cdiv, Ops.FLOORDIV: floordiv, Ops.FLOORMOD: floormod,
+  Ops.CMOD: cmod, Ops.CDIV: cdiv, Ops.FLOORDIV: floordiv, Ops.FLOORMOD: floormod, Ops.DOT4I8: dot4_i8,
   Ops.MULACC: lambda x,y,z: (x*y)+z, Ops.WHERE: lambda x,y,z: y if x else z, Ops.CMPEQ: operator.eq}
 
 def exec_alu(op:Ops, dtype:DType, operands, truncate_output=True):

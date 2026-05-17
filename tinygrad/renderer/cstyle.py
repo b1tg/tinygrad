@@ -126,15 +126,23 @@ class CStyleLanguage(Renderer):
     Ops.ADD: lambda a,b,dtype: f"({a}+{b})", Ops.SUB: lambda a,b,dtype: f"({a}-{b})", Ops.MUL: lambda a,b,dtype: f"({a}*{b})",
     Ops.CMOD: lambda a,b,dtype: f"({a}%{b})", Ops.CDIV: lambda a,b,dtype: f"({a}/{b})", Ops.CMPNE: lambda a,b,dtype: f"({a}!={b})",
     Ops.SHR: lambda a,b,dtype: f"({a}>>{b})", Ops.SHL: lambda a,b,dtype: f"({a}<<{b})", Ops.CMPLT: lambda a,b,dtype: f"({a}<{b})",
-    Ops.WHERE: lambda a,b,c,dtype: f"({a}?{b}:{c})", Ops.CMPEQ: lambda a,b,dtype: f"({a}=={b})"}
+    Ops.WHERE: lambda a,b,c,dtype: f"({a}?{b}:{c})", Ops.CMPEQ: lambda a,b,dtype: f"({a}=={b})",
+    Ops.DOT4I8: lambda a,b,dtype: f"tg_dot4_i8({a},{b})"}
 
   string_rewrite = base_rewrite
   extra_matcher = extra_pm
 
   def render_kernel(self, function_name:str, kernel:list[str], bufs:list[tuple[str,tuple[DType,bool]]], uops:list[UOp], prefix=None) -> str:
+    prefix = ([] if prefix is None else list(prefix))
+    if any("tg_dot4_i8" in k for k in kernel):
+      prefix.append("static inline int tg_dot4_i8(int a, int b) { return ((signed char)(((unsigned int)a)>>0))*"
+                    "((signed char)(((unsigned int)b)>>0)) + ((signed char)(((unsigned int)a)>>8))*"
+                    "((signed char)(((unsigned int)b)>>8)) + ((signed char)(((unsigned int)a)>>16))*"
+                    "((signed char)(((unsigned int)b)>>16)) + ((signed char)(((unsigned int)a)>>24))*"
+                    "((signed char)(((unsigned int)b)>>24)); }")
     tmp = ""
     if any(isinstance(dtype, ImageDType) for _,(dtype,_) in bufs):
-      tmp = "const sampler_t smp = CLK_NORMALIZED_COORDS_FALSE | CLK_ADDRESS_CLAMP | CLK_FILTER_NEAREST;\n"
+      tmp += "const sampler_t smp = CLK_NORMALIZED_COORDS_FALSE | CLK_ADDRESS_CLAMP | CLK_FILTER_NEAREST;\n"
     buftypes = [(name, self.render_dtype(dtype, mutable)+self.buffer_suffix if isinstance(dtype, (ImageDType, PtrDType)) else
                 self.arg_int_prefix if dtype == dtypes.int else None) for name,(dtype,mutable) in bufs]
     local_dims = [u.src[0] for u in uops if u.op is Ops.SPECIAL and u.arg[0] == "l"]
@@ -142,7 +150,7 @@ class CStyleLanguage(Renderer):
     prg = ''.join([f"{self.kernel_typedef.format(launch_bounds=launch_bounds)} {function_name}(",] +
     [', '.join([f'{t} {name}' for name,t in buftypes] + self.extra_args)] +
     [") {\n" + tmp] + ['\n'.join(kernel), "\n}"])
-    return prg if prefix is None else "\n".join(prefix)+f"\n{prg}"
+    return prg if not prefix else "\n".join(prefix)+f"\n{prg}"
 
   def render_cast(self, dt:DType, val: str) -> str: return f"({self.render_dtype(dt)})({val})"
   def render_dtype(self, dt:DType, mutable=True) -> str:
@@ -476,9 +484,14 @@ class HIPRenderer(CStyleLanguage):
     super().__init__(target)
     from tinygrad.runtime.support.compiler_amd import HIPCompiler, HIPCCCompiler
     self.compiler, self.tensor_cores = (HIPCCCompiler if use_hipcc else HIPCompiler)(target.arch), tc.get_amd(target.arch)
+    dot4_pm = PatternMatcher([(UPat(Ops.DOT4I8, name="x"),
+      lambda ctx,x,rdna=target.arch.split(":")[0].startswith(("gfx11", "gfx12")):
+        f"__builtin_amdgcn_sudot4(true, {ctx[x.src[0]]}, true, {ctx[x.src[1]]}, 0, false)" if rdna else
+        f"__builtin_amdgcn_sdot4({ctx[x.src[0]]}, {ctx[x.src[1]]}, 0, false)")])
+    self.string_rewrite = dot4_pm + base_rewrite
     if not self.is_cdna4(target.arch): self.extra_matcher += pm_manual_bf16_cast + extra_pm
     if self.is_cdna(target.arch):
-      self.string_rewrite = PatternMatcher([
+      self.string_rewrite = dot4_pm + PatternMatcher([
         (UPat(Ops.WMMA, name="x"), lambda ctx,x: f"__{x.arg[0]}({ctx[x.src[0]]}, {ctx[x.src[1]]}, {ctx[x.src[2]]},"
           f" {fp8_index(x.src[0].dtype)}, {fp8_index(x.src[0].dtype)}, 0, 0, 0, 0)" if x.arg[1][2] == 128 else None),
         (UPat(Ops.WMMA, name="x"), lambda ctx,x: f"__{x.arg[0]}({ctx[x.src[0]]}, {ctx[x.src[1]]}, {ctx[x.src[2]]}, 0, 0, 0)"),

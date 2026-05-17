@@ -2,6 +2,8 @@ import os, struct, unittest, tempfile, pathlib, sys
 from tinygrad import dtypes, Tensor, fetch, Device
 from tinygrad.helpers import disable_gc
 from tinygrad.llm.gguf import _ggml_iq_grid, ggml_data_to_tensor, gguf_load
+from tinygrad.llm.model import Linear
+from tinygrad.uop.ops import Ops
 from tinygrad.runtime.autogen import ggml_common as _ggml
 from tinygrad.device import is_dtype_supported
 import numpy as np
@@ -295,6 +297,38 @@ class TestGGUFGEMV(unittest.TestCase):
     assert np.isfinite(ref).all() and np.isfinite(tensors["weight"].numpy()).all(), f"{qtype.name} has NaN/Inf"
 
   def test_gguf_gemv_q8_0(self): self._test_gguf_gemv(GGMLQuantizationType.Q8_0)
+  def test_gguf_gemv_q8_0_keep_raw(self):
+    rows, cols = 2, 32
+    rng = np.random.default_rng(42)
+    w = rng.standard_normal((rows, cols)).astype(np.float32)
+    q_data = quantize(w.reshape(-1), GGMLQuantizationType.Q8_0)
+
+    buf = bytearray()
+    buf += struct.pack("<4siqq", b"GGUF", 3, 1, 0)
+    buf += struct.pack("<Q", 21) + b"blk.0.ffn_down.weight"
+    buf += struct.pack("<I", 2) + struct.pack("<QQ", cols, rows)
+    buf += struct.pack("<i", GGMLQuantizationType.Q8_0.value) + struct.pack("<Q", 0)
+    buf += b"\x00" * ((32 - len(buf) % 32) % 32)
+    buf += q_data.tobytes()
+
+    _, tensors = gguf_load(Tensor(np.frombuffer(buf, dtype=np.uint8)).to(None), keep_q8=True)
+    weight = tensors["blk.0.ffn_down.weight"]
+    self.assertTrue(hasattr(weight, "_gguf_raw"))
+    self.assertEqual(weight.shape, (0,))
+    self.assertEqual(weight._gguf_shape, (rows, cols))
+    self.assertEqual(weight.nbytes(), 0)
+    self.assertEqual(weight._gguf_raw.nbytes(), q_data.nbytes)
+
+    x = rng.standard_normal((1, cols)).astype(np.float32)
+    y = Linear(cols, rows, bias=False)
+    y.weight = weight
+    out = y(Tensor(x))
+    self.assertIn(Ops.DOT4I8, [u.op for u in out.uop.toposort()])
+
+    xs = np.max(np.abs(x.reshape(1, cols//32, 32)), axis=-1, keepdims=True) / 127.0
+    xq = np.trunc(x.reshape(1, cols//32, 32) / np.maximum(xs, 1e-12) + np.where(x.reshape(1, cols//32, 32) >= 0, 0.5, -0.5))
+    ref = (xq * xs).reshape(1, cols) @ dequantize(q_data, GGMLQuantizationType.Q8_0).reshape(rows, cols).T
+    np.testing.assert_allclose(out.numpy(), ref, atol=1e-3, rtol=1e-3)
   def test_gguf_gemv_q5_0(self): self._test_gguf_gemv(GGMLQuantizationType.Q5_0)
   def test_gguf_gemv_q5_1(self): self._test_gguf_gemv(GGMLQuantizationType.Q5_1)
   def test_gguf_gemv_q4_k(self): self._test_gguf_gemv(GGMLQuantizationType.Q4_K)

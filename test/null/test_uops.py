@@ -2,13 +2,14 @@
 import unittest
 import numpy as np
 from tinygrad.tensor import Tensor
-from tinygrad.helpers import Timing, Context
+from tinygrad.helpers import Timing, Context, Target
 from tinygrad.dtype import dtypes, ConstFloat  # noqa: F401
 from tinygrad.device import Device
 from tinygrad.uop.ops import Ops, UOp, UPat, exec_alu
 from tinygrad.uop.spec import spec_shared
 from tinygrad.uop.symbolic import sym
 from test.helpers import to_uops_list
+from tinygrad.renderer.cstyle import ClangRenderer, HIPRenderer
 
 class TestSafeCast(unittest.TestCase):
   def test_cast_folds(self):
@@ -37,6 +38,10 @@ class TestSafeCast(unittest.TestCase):
     self.assertEqual(a.cast(dtypes.int8).cast(dtypes.float).simplify(), a.cast(dtypes.float))
 
 class TestExecALU(unittest.TestCase):
+  def test_dot4i8(self):
+    def pack(x): return sum((v & 0xff) << (8*i) for i,v in enumerate(x))
+    self.assertEqual(exec_alu(Ops.DOT4I8, dtypes.int32, (pack([1, -2, 3, -4]), pack([-5, 6, -7, 8]))), -70)
+
   def test_sqrt(self):
     self.assertEqual(exec_alu(Ops.SQRT, dtypes.float, (0.0,)), 0.0)
 
@@ -107,6 +112,22 @@ class TestExecALU(unittest.TestCase):
 
     # test no truncate
     self.assertEqual(exec_alu(Ops.ADD, dtypes.uint8, (250, 250), truncate_output=False), 500)
+
+class TestDot4I8Render(unittest.TestCase):
+  def _src(self, ren):
+    out, x, y = [UOp(Ops.PARAM, dtypes.int32.ptr(1), (), i) for i in range(3)]
+    idx = UOp.const(dtypes.int, 0)
+    val = x.index(idx, ptr=True).load().alu(Ops.DOT4I8, y.index(idx, ptr=True).load())
+    return ren.render(to_uops_list([out.index(idx, ptr=True).store(val)], ren=ren))
+
+  def test_c_fallback(self):
+    self.assertIn("tg_dot4_i8", self._src(ClangRenderer(Target("CPU"))))
+
+  def test_hip_builtin(self):
+    src = self._src(HIPRenderer(Target("AMD", arch="gfx942")))
+    self.assertIn("__builtin_amdgcn_sdot4", src)
+    self.assertNotIn("tg_dot4_i8", src)
+    self.assertIn("__builtin_amdgcn_sudot4", self._src(HIPRenderer(Target("AMD", arch="gfx1100"))))
 
 class TestGatedStoreRewrite(unittest.TestCase):
   def test_tiny_gate_store(self):

@@ -143,6 +143,17 @@ def _gguf_load_tensor(raw:Tensor, dims:tuple[int, ...], typ:int, dev:str, dtype:
   ret = ggml_data_to_tensor(raw.to(dev).realize(), prod(dims), typ).reshape(*reversed(dims))
   return ret.cast(dtype) if dtype is not None else ret
 
+def _gguf_raw_tensor(raw:Tensor, dims:tuple[int, ...], typ:int, dev:str, dtype:str|None=None) -> Tensor:
+  ret = Tensor.empty(0, dtype=dtypes.float16 if dtype == "float16" else dtypes.float32, device=dev)
+  raw = (raw.bitcast(dtypes.uint16) if typ == 8 else raw).to(dev).realize()
+  ret._gguf_raw = raw
+  ret._gguf_type, ret._gguf_shape = typ, tuple(reversed(dims))
+  return ret
+
+def _keep_raw_q8(name:str, typ:int, keep_q8:bool=False) -> bool:
+  return keep_q8 and typ == 8 and name.endswith(".weight") and name != "token_embd.weight" and "norm" not in name and \
+    (getenv("KEEP_Q8_ATTN", 1) or ".attn_" not in name)
+
 def _gguf_read_cols(path:pathlib.Path, off:int, rows:int, row_nbytes:int, col_off:int, col_nbytes:int) -> Tensor:
   out = bytearray(rows*col_nbytes)
   with path.open("rb") as f:
@@ -185,7 +196,7 @@ def _gguf_load_sharded_tensor(tensor:Tensor, off:int, dims:tuple[int, ...], typ:
   rows, cols, dcnt = prod(shape[:-1]), shape[-1], len(devices)
   if shape[axis] % dcnt != 0: raise RuntimeError(f"GGUF raw tensor shard axis is uneven: {shape=} {axis=} {dcnt=}")
   row_nbytes = _gguf_row_nbytes(cols, typ)
-  need_raw, raw_parts = keep_raw and typ in (2, 12, 13, 23), []
+  need_raw, raw_parts = keep_raw and typ in (2, 8, 12, 13, 23), []
   def load(raw:Tensor, dims:tuple[int, ...], dev:str) -> Tensor:
     raw = raw.to(dev).realize()
     if need_raw: raw_parts.append(raw)
@@ -228,7 +239,7 @@ def _gguf_load_sharded_tensor(tensor:Tensor, off:int, dims:tuple[int, ...], typ:
 
 def _gguf_parse(tensor: Tensor, devices:tuple[str,...]|None=None, n_blk:int|None=None,
                 shard_axis:Callable[[str, tuple[int, ...], int, dict], int|None]|None=None,
-                path:pathlib.Path|None=None, dtype:str|None=None, base_kv:dict|None=None) -> tuple[dict, dict[str, Tensor]]:
+                path:pathlib.Path|None=None, dtype:str|None=None, base_kv:dict|None=None, keep_q8:bool=False) -> tuple[dict, dict[str, Tensor]]:
   r = io.BufferedReader(TensorIO(tensor), 1_000_000)
   magic, version, n_tensors, n_kv = r.read(4), read_int32(r), read_int64(r), read_int64(r)
   if magic != b"GGUF" or version not in [2, 3]: raise ValueError("Invalid GGUF format!")
@@ -250,19 +261,28 @@ def _gguf_parse(tensor: Tensor, devices:tuple[str,...]|None=None, n_blk:int|None
       n = prod(dims)
       if shard_axis is not None and (axis:=shard_axis(name, dims, typ, meta)) is not None:
         try:
-          keep_raw = getenv("EXPERT_Q4K_CUSTOM", 1) and "_exps.weight" in name
+          keep_raw = (getenv("EXPERT_Q4K_CUSTOM", 1) and "_exps.weight" in name) or _keep_raw_q8(name, typ, keep_q8)
           state_dict[name] = _gguf_load_sharded_tensor(tensor, data_start + off, dims, typ, devices, axis, path, dtype, keep_raw)
         except RuntimeError as e:
           if "splits quant blocks" not in str(e): raise
           dev = block_device(devices, int(name.split('.')[1]), n_blk) if name.startswith('blk.') else devices[0]
-          state_dict[name] = _gguf_load_tensor(tensor[data_start + off : data_start + off + _gguf_nbytes(n, typ)], dims, typ, dev, dtype)
+          raw = tensor[data_start + off : data_start + off + _gguf_nbytes(n, typ)]
+          state_dict[name] = _gguf_raw_tensor(raw, dims, typ, dev, dtype) if _keep_raw_q8(name, typ, keep_q8) else \
+            _gguf_load_tensor(raw, dims, typ, dev, dtype)
       else:
         dev = block_device(devices, int(name.split('.')[1]), n_blk) if name.startswith('blk.') else devices[0]
-        state_dict[name] = _gguf_load_tensor(tensor[data_start + off : data_start + off + _gguf_nbytes(n, typ)], dims, typ, dev, dtype)
+        raw = tensor[data_start + off : data_start + off + _gguf_nbytes(n, typ)]
+        state_dict[name] = _gguf_raw_tensor(raw, dims, typ, dev, dtype) if _keep_raw_q8(name, typ, keep_q8) else \
+          _gguf_load_tensor(raw, dims, typ, dev, dtype)
   else:
     # TODO: remove the need for copy to default device
     tensor = tensor.to(None).realize()
-    state_dict = {name: ggml_data_to_tensor(tensor[data_start + off:], prod(dims), typ).reshape(*reversed(dims)) for name, dims, typ, off in t_infos}
+    state_dict = {}
+    for name, dims, typ, off in t_infos:
+      n = prod(dims)
+      raw = tensor[data_start + off:data_start + off + _gguf_nbytes(n, typ)]
+      state_dict[name] = _gguf_raw_tensor(raw, dims, typ, tensor.device, dtype) if _keep_raw_q8(name, typ, keep_q8) else \
+        ggml_data_to_tensor(tensor[data_start + off:], n, typ).reshape(*reversed(dims))
   return kv_data, state_dict
 
 def _gguf_split_paths(path: pathlib.Path, kv: dict) -> list[pathlib.Path]:
@@ -272,7 +292,8 @@ def _gguf_split_paths(path: pathlib.Path, kv: dict) -> list[pathlib.Path]:
   return [pathlib.Path(f"{m.group(1)}-{i:05d}-of-{total:05d}.gguf") for i in range(1, total+1)]
 
 def gguf_load(fn: Tensor|str|pathlib.Path, devices:tuple[str,...]|None=None,
-              shard_axis:Callable[[str, tuple[int, ...], int, dict], int|None]|None=None, dtype:str|None=None) -> tuple[dict, dict[str, Tensor]]:
+              shard_axis:Callable[[str, tuple[int, ...], int, dict], int|None]|None=None,
+              dtype:str|None=None, keep_q8:bool=False) -> tuple[dict, dict[str, Tensor]]:
   """
   Loads a .gguf file, returning the `kv_data` and `state_dict`. Multi-part splits are auto-merged when loaded by path.
 
@@ -288,9 +309,9 @@ def gguf_load(fn: Tensor|str|pathlib.Path, devices:tuple[str,...]|None=None,
   NOTE: The provided tensor must be on a device that supports execution.
   """
   path = None if isinstance(fn, Tensor) else pathlib.Path(fn)
-  kv, sd = _gguf_parse(fn if isinstance(fn, Tensor) else Tensor(path), devices, shard_axis=shard_axis, path=path, dtype=dtype)
+  kv, sd = _gguf_parse(fn if isinstance(fn, Tensor) else Tensor(path), devices, shard_axis=shard_axis, path=path, dtype=dtype, keep_q8=keep_q8)
   if kv.get('split.count', 1) <= 1: return kv, sd
   if isinstance(fn, Tensor): raise ValueError("multi-part GGUF requires a path argument (got Tensor)")
   n_blk = kv[f'{kv["general.architecture"]}.block_count']
-  for pp in _gguf_split_paths(pathlib.Path(fn), kv)[1:]: sd.update(_gguf_parse(Tensor(pp), devices, n_blk, shard_axis, pp, dtype, kv)[1])
+  for pp in _gguf_split_paths(pathlib.Path(fn), kv)[1:]: sd.update(_gguf_parse(Tensor(pp), devices, n_blk, shard_axis, pp, dtype, kv, keep_q8)[1])
   return kv, sd
