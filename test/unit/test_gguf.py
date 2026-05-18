@@ -158,6 +158,8 @@ class TestGGUF(unittest.TestCase):
   def test_shard_load(self):
     tensors = [(f"blk.{i}.weight", (4,), 0, np.array([float(i)]*4, dtype=np.float32).tobytes()) for i in range(4)]
     tensors.append(("token_embd.weight", (4,), 0, np.array([99.0]*4, dtype=np.float32).tobytes()))
+    tensors.append(("output.weight", (4,), 0, np.array([100.0]*4, dtype=np.float32).tobytes()))
+    tensors.append(("output_norm.weight", (4,), 0, np.array([101.0]*4, dtype=np.float32).tobytes()))
     with tempfile.TemporaryDirectory() as d:
       p = pathlib.Path(d) / "test.gguf"
       p.write_bytes(self._build_gguf(tensors, [("general.architecture", "llama"), ("llama.block_count", 4)]))
@@ -168,8 +170,10 @@ class TestGGUF(unittest.TestCase):
       self.assertEqual(devs[0], devs[1])
       self.assertEqual(devs[2], devs[3])
       self.assertNotEqual(devs[0], devs[2])
-      # non-blk tensors → device 0
+      # input embd stays on device 0; output follows the last block
       self.assertEqual(sd["token_embd.weight"].device, devs[0])
+      self.assertEqual(sd["output.weight"].device, devs[-1])
+      self.assertEqual(sd["output_norm.weight"].device, devs[-1])
       np.testing.assert_equal(sd["blk.2.weight"].numpy(), [2.0]*4)
 
   def _test_dequantization(self, qtype: GGMLQuantizationType):

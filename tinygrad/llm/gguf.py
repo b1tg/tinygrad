@@ -153,7 +153,8 @@ def _gguf_parse(tensor: Tensor, devices:tuple[str,...]|None=None, n_blk:int|None
     for name, dims, typ, off in t_infos:
       n = prod(dims)
       nbytes = n * _GGML_NATIVE[typ].itemsize if typ in _GGML_NATIVE else (n // _GGML_QUANT[typ][0]) * _GGML_QUANT[typ][1]
-      dev = block_device(devices, int(name.split('.')[1]), n_blk) if name.startswith('blk.') else devices[0]
+      if name.startswith('blk.'): dev = block_device(devices, int(name.split('.')[1]), n_blk)
+      else: dev = devices[-1] if name in ("output.weight", "output_norm.weight") else devices[0]
       raw = tensor[data_start + off : data_start + off + nbytes].to(dev).realize()
       state_dict[name] = ggml_data_to_tensor(raw, n, typ).reshape(*reversed(dims))
   else:

@@ -2,7 +2,7 @@ from __future__ import annotations
 import functools, itertools, pathlib
 from dataclasses import dataclass, replace
 from tinygrad import Device, Tensor, nn, UOp, TinyJit, getenv, function
-from tinygrad.llm.gguf import gguf_load, block_device
+from tinygrad.llm.gguf import gguf_load
 from tinygrad.uop.ops import resolve
 
 @functools.cache
@@ -309,7 +309,7 @@ class Transformer:
     self.rollout_jit = TinyJit(self.forward)
 
   def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
-    x = self.token_embd(tokens).float()                   # (B, T, D)
+    x = self.token_embd(tokens.to(self.token_embd.weight.device)).float()                   # (B, T, D)
     for block in self.blk: x = block(x.to(getattr(block.attn_norm, "weight").device), start_pos)
     logits = self.output(self.output_norm(x.to(self.output.weight.device)))[:, -1, :]
     # Gumbel-max trick: argmax(logits/temp - log(-log(uniform))) is equivalent to sampling from softmax(logits/temp)
@@ -328,7 +328,10 @@ class Transformer:
     state_dict = {k:v.cast('float16') if getenv("HALF", 1) else v for k,v in state_dict.items()}
 
     # some models like Llama 3.2 don't have an output.weight, they just tie to the token_embd.weight
-    if 'output.weight' not in state_dict: state_dict['output.weight'] = state_dict['token_embd.weight']
+    if 'output.weight' not in state_dict:
+      if devices:
+        for k in ("token_embd.weight", "output_norm.weight"): state_dict[k] = state_dict[k].to(devices[0])
+      state_dict['output.weight'] = state_dict['token_embd.weight']
 
     arch = kv['general.architecture']
     max_context = min(max_context, kv[f'{arch}.context_length']) if max_context is not None else kv[f'{arch}.context_length']
@@ -381,8 +384,8 @@ class Transformer:
       expert_bias=f"blk.{kv.get(f'{arch}.leading_dense_block_count', 0)}.exp_probs_b.bias" in state_dict)
     model = Transformer(config)
     if devices:
-      for i, blk in enumerate(model.blk):
-        for v in nn.state.get_parameters(blk): v.to_(block_device(devices, i, config.num_blocks))
+      for k,v in nn.state.get_state_dict(model).items():
+        if k in state_dict: v.to_(state_dict[k].device)
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:
@@ -399,7 +402,7 @@ class Transformer:
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
     v_toks = UOp.variable("toks", 1, chunk_size)
     # TODO: use UOp.variable for temperature once float variables are supported
-    temp = Tensor(temperature).contiguous()
+    temp = Tensor(temperature, device=self.output.weight.device).contiguous()
     # assign all input tokens once, then slice from start_pos for the model call
     t = Tensor(tokens + [0] * (self.max_context - len(tokens)), dtype="int32").reshape(1, self.max_context)
     # recompute start_pos from what's currently valid in the caches
