@@ -232,7 +232,8 @@ def no_vectorized_wmma(wmma:UOp):
 def no_vectorized_alu(alu:UOp):
   if alu.dtype.vcount == 1: return None
   if alu.op is Ops.WHERE and alu.src[2].arg is Invalid: return None  # image load/store has cond.where(idx.vec(2), Invalid) as the index
-  alus = tuple(UOp(alu.op, alu.dtype.scalar(), tuple(s.gep(i) for s in alu.src), alu.arg) for i in range(alu.dtype.vcount))
+  def lane(s:UOp, i:int): return s.gep(i if s.dtype.vcount == 1 or i < s.dtype.vcount else i % s.dtype.vcount)
+  alus = tuple(UOp(alu.op, alu.dtype.scalar(), tuple(lane(s, i) for s in alu.src), alu.arg) for i in range(alu.dtype.vcount))
   return UOp(Ops.STACK, alu.dtype, alus)
 
 def no_vectorized_buf(buf:UOp):

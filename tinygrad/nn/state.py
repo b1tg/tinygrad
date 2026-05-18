@@ -150,14 +150,17 @@ def load_state_dict(model, state_dict:dict[str, Tensor], strict=True, verbose=Tr
       if k not in state_dict and not strict:
         if DEBUG >= 1: print(f"WARNING: not loading {k}")
         continue
-      if v.shape != state_dict[k].shape:
-        if {(), (1,)} == {state_dict[k].shape, v.shape}: state_dict[k] = state_dict[k].reshape(v.shape)
-        else: raise ValueError(f'Shape mismatch in layer `{k}`: Expected shape {v.shape}, but found {state_dict[k].shape} in state dict.')
-      if isinstance(v.device, tuple):
-        if isinstance(state_dict[k].device, tuple): v.replace(state_dict[k])
-        else: v.replace(state_dict[k].shard(v.device, v.uop.axis))
-      else: v.replace(state_dict[k].to(v.device))
-      if realize: v.realize()
+      src = state_dict[k]
+      state_shape = src.shape
+      if v.shape != state_shape:
+        if {(), (1,)} == {state_shape, v.shape}: src = state_dict[k] = src.reshape(v.shape)
+        else: raise ValueError(f'Shape mismatch in layer `{k}`: Expected shape {v.shape}, but found {state_shape} in state dict.')
+      if hasattr(src, "load_into"): src.load_into(v)
+      elif isinstance(v.device, tuple):
+        if isinstance(src.device, tuple): v.replace(src)
+        else: v.replace(src.shard(v.device, v.uop.axis))
+      else: v.replace(src.to(v.device))
+      if realize and not hasattr(src, "load_into"): v.realize()
       if consume: del state_dict[k]
       ret.append(v)
   return ret

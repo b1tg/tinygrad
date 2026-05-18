@@ -2,9 +2,10 @@
 import unittest
 import numpy as np
 from tinygrad.tensor import Tensor
-from tinygrad.helpers import Timing, Context, cdiv
+from tinygrad.helpers import Timing, Context, cdiv, Target
 from tinygrad.dtype import dtypes, ConstFloat  # noqa: F401
 from tinygrad.device import Device
+from tinygrad.renderer.cstyle import ClangRenderer, HIPRenderer
 from tinygrad.uop.ops import Ops, UOp, UPat, exec_alu
 from tinygrad.uop.spec import spec_shared
 from tinygrad.uop.symbolic import sym
@@ -161,6 +162,35 @@ class TestGatedStoreRewrite(unittest.TestCase):
     gated_uops = tuple(uops[uops.index(ifs[0])+1:uops.index(endifs[0])])
     self.assertEqual(len(gated_uops), 2)
     for x in gated_uops: self.assertIs(x.op, Ops.STORE)
+
+class TestDot4Render(unittest.TestCase):
+  @staticmethod
+  def _dot4(a, b):
+    av, bv = a.bitcast(dtypes.int8.vec(4)).cast(dtypes.int32.vec(4)), b.bitcast(dtypes.int8.vec(4)).cast(dtypes.int32.vec(4))
+    return UOp(Ops.REDUCE, dtypes.int, (av*bv,), (Ops.ADD, ()))
+  @staticmethod
+  def _lane(x, s:int): return (((x.cast(dtypes.uint32) >> s) & 0xff).cast(dtypes.int8)).cast(dtypes.int32)
+  def _scalar_dot4(self, a, b): return sum(self._lane(a, s) * self._lane(b, s) for s in (0, 8, 16, 24))
+  def _scalar_sum4(self, a): return sum(self._lane(a, s) for s in (0, 8, 16, 24))
+
+  def _src(self, ren, acc=False, scalar=False, sum4=False):
+    out, x, y = (UOp(Ops.PARAM, dtypes.int.ptr(), (), i) for i in range(3))
+    idx = UOp.const(dtypes.int, 0)
+    a, b = x.index(idx, ptr=True).load(), y.index(idx, ptr=True).load()
+    dot = self._scalar_sum4(a) if sum4 else self._scalar_dot4(a, b) if scalar else self._dot4(a, b)
+    val = out.index(idx, ptr=True).load() + dot if acc else dot
+    return ren.render(to_uops_list([out.index(idx, ptr=True).store(val)], ren=ren))
+
+  def test_hip_uses_dot4(self):
+    for acc in (False, True):
+      self.assertIn("__builtin_amdgcn_sdot4", self._src(HIPRenderer(Target("AMD", arch="gfx942")), acc))
+      self.assertIn("__builtin_amdgcn_sudot4", self._src(HIPRenderer(Target("AMD", arch="gfx1100")), acc))
+      self.assertIn("__builtin_amdgcn_sdot4", self._src(HIPRenderer(Target("AMD", arch="gfx942")), acc, scalar=True))
+      self.assertIn("__builtin_amdgcn_sudot4", self._src(HIPRenderer(Target("AMD", arch="gfx1100")), acc, scalar=True))
+      self.assertIn("0x1010101", self._src(HIPRenderer(Target("AMD", arch="gfx942")), acc, sum4=True).lower())
+
+  def test_clang_keeps_vector_reduce(self):
+    self.assertNotIn("__builtin_amdgcn_", self._src(ClangRenderer(Target("CPU"))))
 
 @unittest.skipIf(Device.DEFAULT == "METAL", "compiler bug")
 @unittest.skipUnless(Ops.SHR in Device[Device.DEFAULT].renderer.code_for_op, "fast_idiv requires SHR")

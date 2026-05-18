@@ -2,6 +2,7 @@ import os, struct, unittest, tempfile, pathlib, sys
 from tinygrad import dtypes, Tensor, fetch, Device
 from tinygrad.helpers import disable_gc
 from tinygrad.llm.gguf import _ggml_iq_grid, ggml_data_to_tensor, gguf_load
+from tinygrad.llm.model import Linear
 from tinygrad.runtime.autogen import ggml_common as _ggml
 from tinygrad.device import is_dtype_supported
 import numpy as np
@@ -245,6 +246,25 @@ class TestGGUFGEMV(unittest.TestCase):
   def test_gguf_gemv_mxfp4(self): self._test_gguf_gemv(GGMLQuantizationType.MXFP4)
   @unittest.skipUnless(is_dtype_supported(dtypes.bfloat16), "Backend must support bfloat16")
   def test_gguf_gemv_bf16(self): self._test_gguf_gemv(GGMLQuantizationType.BF16)
+
+  def test_raw_quant_linear(self):
+    rng = np.random.default_rng(42)
+    for qtype, rows, cols, atol in ((GGMLQuantizationType.Q8_0, 64, 128, 1e-2), (GGMLQuantizationType.Q4_K, 64, 256, 5e-1),
+                                    (GGMLQuantizationType.Q5_K, 64, 256, 5e-1)):
+      q_data = quantize(rng.standard_normal(rows * cols).astype(np.float32), qtype) if qtype == GGMLQuantizationType.Q8_0 else \
+        rng.integers(0, 256, size=(rows * cols // GGML_QUANT_SIZES[qtype][0], GGML_QUANT_SIZES[qtype][1]), dtype=np.uint8)
+      if qtype != GGMLQuantizationType.Q8_0:
+        q_data[:, :4] = np.float16(rng.standard_normal(q_data.shape[0] * 2)).view(np.uint8).reshape(q_data.shape[0], 4)
+      q_data = q_data.flatten()
+      buf = TestGGUF._build_gguf([("output.weight", (rows, cols), qtype.value, q_data.tobytes())],
+                                 [("general.architecture", "test"), ("test.embedding_length", 4096)])
+      _, tensors = gguf_load(Tensor(np.frombuffer(buf, dtype=np.uint8).copy()), raw_quant=True)
+      lin, x = Linear(cols, rows, bias=False), rng.standard_normal((2, cols)).astype(np.float32)
+      tensors["output.weight"].load_into(lin.weight)
+      xb, w = x.reshape(2, cols//32, 32), dequantize(q_data, qtype).reshape(rows, cols)
+      xs = np.max(np.abs(xb), axis=-1, keepdims=True) / 127.0
+      xq = np.trunc(xb / np.maximum(xs, 1e-12) + np.where(xb >= 0, 0.5, -0.5))
+      np.testing.assert_allclose(lin(Tensor(x)).numpy(), (xq * xs).reshape(2, cols) @ w.T, atol=atol, rtol=2e-2)
 
 class TestGGUFGC(unittest.TestCase):
   def test_gguf_load_no_tensor_leak(self):
