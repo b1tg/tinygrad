@@ -4,18 +4,15 @@ from dataclasses import dataclass, replace
 from tinygrad import Device, Tensor, dtypes, nn, UOp, TinyJit, getenv, function
 from tinygrad.helpers import prod
 from tinygrad.llm.gguf import gguf_load
-from tinygrad.uop.ops import Ops, resolve
+from tinygrad.uop.ops import resolve
 
-def _q8_i32x4(x:Tensor) -> Tensor: return x.bitcast(dtypes.int8.vec(4)).cast(dtypes.int32.vec(4))
 def _q8_i8(x:Tensor, s:int) -> Tensor: return (((x.cast(dtypes.uint32) >> s) & 0xff).cast(dtypes.int8)).cast(dtypes.int32)
 def _q8_dot4_scalar(x:Tensor, w:Tensor) -> Tensor:
   return _q8_i8(x, 0) * _q8_i8(w, 0) + _q8_i8(x, 8) * _q8_i8(w, 8) + \
     _q8_i8(x, 16) * _q8_i8(w, 16) + _q8_i8(x, 24) * _q8_i8(w, 24)
-def _q8_dot4(x:Tensor, w:Tensor) -> Tensor:
-  dev = x.device[0] if isinstance(x.device, tuple) else x.device
-  if dev != "AMD": return _q8_dot4_scalar(x, w)
-  dot = _q8_i32x4(x) * _q8_i32x4(w)
-  return dot._apply_uop(lambda u: UOp(Ops.REDUCE, dtypes.int, (u,), (Ops.ADD, ())))
+
+def _q_device(q) -> str|tuple[str, ...]:
+  return next(x.device for x in (q.q8_scale, q.q8_qs, q.k_meta, q.k_qs, q.k_qh) if x is not None)
 
 def _q_to_uint8(x:Tensor, b:int) -> Tensor:
   shift = Tensor.stack(*[Tensor(2**(i*b), device=x.device, dtype=x.dtype) for i in range(8//b)])
@@ -46,6 +43,7 @@ def _k_quants(w, device:str, shape:tuple[int, ...]):
 
 def _linear_gguf_quant(x:Tensor, weight:Tensor, bias:Tensor|None) -> Tensor|None:
   if (q:=getattr(weight, "gguf_quant", None)) is None or q.typ not in (8, 12, 13): return None
+  if isinstance(qdev:=_q_device(q), tuple) and x.device != qdev: x = x.to(qdev).contiguous()
   out_features, in_features = q.shape
   if x.shape[-1] != in_features or in_features % 32: return None
   n = prod(x.shape[:-1])
@@ -53,7 +51,7 @@ def _linear_gguf_quant(x:Tensor, weight:Tensor, bias:Tensor|None) -> Tensor|None
     xs, x4 = _q8_act(x, in_features)
     ws = q.q8_scale.to(x.device).reshape(out_features, in_features//32).cast(dtypes.float32)
     w4 = q.q8_qs.to(x.device).reshape(out_features, in_features//32, 8)
-    dot = _q8_dot4(x4.reshape(n, 1, in_features//32, 8), w4.reshape(1, out_features, in_features//32, 8)).sum(axis=-1).cast(dtypes.float32)
+    dot = _q8_dot4_scalar(x4.reshape(n, 1, in_features//32, 8), w4.reshape(1, out_features, in_features//32, 8)).sum(axis=-1).cast(dtypes.float32)
     ret = (dot * xs.reshape(n, 1, in_features//32) * ws.reshape(1, out_features, in_features//32)).sum(axis=-1).cast(x.dtype)
   else:
     if in_features % 256: return None
@@ -66,7 +64,8 @@ def _linear_gguf_quant(x:Tensor, weight:Tensor, bias:Tensor|None) -> Tensor|None
     mdot = _q8_dot4_scalar(x4r, w4r.bitwise_and(0).bitwise_or(0x01010101)).sum(axis=-1).cast(dtypes.float32)
     ret = (xs.reshape(n, 1, nb, 8) * (dot * sc.reshape(1, out_features, nb, 8) - \
       mdot * mn.reshape(1, out_features, nb, 8))).sum(axis=(-1, -2)).cast(x.dtype)
-  return (ret if bias is None else ret + bias).reshape(*x.shape[:-1], out_features)
+  ret = (ret if bias is None else ret + bias).reshape(*x.shape[:-1], out_features)
+  return ret.contiguous() if isinstance(qdev, tuple) else ret
 
 class Linear(nn.Linear):
   def __call__(self, x:Tensor) -> Tensor: return ret if (ret:=_linear_gguf_quant(x, self.weight, self.bias)) is not None else super().__call__(x)
@@ -84,6 +83,13 @@ class ExpertWeights:
   def __call__(self, sel:Tensor, x:Tensor) -> Tensor:
     # sel: (B, T, k), x: (B, T, 1, in) or (B, T, k, in) -> output: (B, T, k, out)
     return (x.unsqueeze(-2) @ self.weight[sel].transpose(-1, -2)).contiguous().squeeze(-2)
+
+def _block_device(devices:tuple[str, ...], i:int, n_blk:int) -> str:
+  return devices[min(i * len(devices) // n_blk, len(devices) - 1)]
+
+def _select_replicated(x:Tensor, device:str) -> Tensor:
+  if isinstance(x.device, tuple) and x.uop.axis is None: return Tensor(x.uop.mselect(x.device.index(device)), requires_grad=x.requires_grad)
+  return x.to(device)
 
 def apply_rope(x:Tensor, freqs_cis:Tensor) -> Tensor:
   assert x.shape[-1] % 2 == 0
@@ -182,9 +188,10 @@ class FFNBlock:
         shexp = self.ffn_down_shexp(self.ffn_gate_shexp(x).silu().contiguous() * self.ffn_up_shexp(x))
         if hasattr(self, 'ffn_gate_inp_shexp'): shexp = shexp * (x * self.ffn_gate_inp_shexp["weight"]).sum(axis=-1, keepdim=True).sigmoid()
         out = out + shexp
-      return out
+      return _select_replicated(out, x.device) if isinstance(x.device, str) else out.to(x.device)
     # TODO: remove the need for this contiguous
-    return self.ffn_down(self.ffn_gate(x).silu().contiguous() * self.ffn_up(x))
+    out = self.ffn_down(self.ffn_gate(x).silu().contiguous() * self.ffn_up(x))
+    return _select_replicated(out, x.device) if isinstance(x.device, str) else out.to(x.device)
 
   # given the token-prefix match, return how much cached state this block can still reuse
   def _reusable_prefix_len(self, prefix_len:int, cached_len:int) -> int: return prefix_len
@@ -375,18 +382,23 @@ class Transformer:
     self.rollout_jit = TinyJit(self.forward)
 
   def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
-    x = self.token_embd(tokens).float()                   # (B, T, D)
-    for block in self.blk: x = block(x, start_pos)
-    logits = self.output(self.output_norm(x))[:, -1, :]
+    x = self.token_embd(tokens.to(self.token_embd.weight.device)).float()                   # (B, T, D)
+    for block in self.blk: x = block(x.to(block.attn_norm.weight.device), start_pos)
+    x = self.output_norm(x.to(self.output_norm.weight.device))
+    if not isinstance(self.output.weight.device, tuple): x = _select_replicated(x, self.output.weight.device)
+    logits = self.output(x)[:, -1, :]
     # Gumbel-max trick: argmax(logits/temp - log(-log(uniform))) is equivalent to sampling from softmax(logits/temp)
-    return (logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1, keepdim=True)
+    return (logits / temperature.to(logits.device).maximum(1e-12) -
+            (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1, keepdim=True)
 
   def __call__(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
     return (self.prefill_jit if resolve(tokens.shape[1] != 1) else self.rollout_jit)(tokens.contiguous(), start_pos, temperature)
 
   @staticmethod
   def from_gguf(gguf:Tensor|str|pathlib.Path, max_context:int|None=None,
-                realize=bool(getenv("REALIZE", 0))) -> tuple[Transformer, dict]:
+                realize=bool(getenv("REALIZE", 0)), shard:int=1, shard_mode:str="tensor") -> tuple[Transformer, dict]:
+    if shard_mode not in ("layer", "tensor"): raise ValueError(f"invalid shard_mode {shard_mode!r}")
+    devices = tuple(f"{Device.DEFAULT}:{i}" for i in range(shard)) if shard > 1 else None
     # TODO: remove the need for copy to default device
     kv, state_dict = gguf_load(gguf.to(None).realize() if isinstance(gguf, Tensor) else gguf, raw_quant=Device.DEFAULT == "AMD")
 
@@ -446,6 +458,7 @@ class Transformer:
       qkv_bias='blk.0.attn_q.bias' in state_dict,
       expert_bias=f"blk.{kv.get(f'{arch}.leading_dense_block_count', 0)}.exp_probs_b.bias" in state_dict)
     model = Transformer(config)
+    if devices: shard_weights(model, devices, tensor=shard_mode == "tensor")
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:
@@ -460,6 +473,8 @@ class Transformer:
 
   def generate(self, tokens:list[int], chunk_size:int=32, temperature:float=0.0):
     if self.has_recurrent_block: chunk_size = 1
+    sharded = any(isinstance(x.device, tuple) for x in nn.state.get_parameters(self))
+    if sharded and len(tokens) > 1: chunk_size = len(tokens)
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
     v_toks = UOp.variable("toks", 1, chunk_size)
     # TODO: use UOp.variable for temperature once float variables are supported
@@ -472,10 +487,30 @@ class Transformer:
     out, prompt_len = None, len(tokens)
     while len(tokens) < self.max_context:
       sp, nt = v_start_pos.bind(start_pos), v_toks.bind(min(chunk_size, len(tokens) - start_pos))
-      out = self(t[:, sp:sp+nt] if start_pos < prompt_len or out is None else out, sp, temp).realize()
+      if sharded:
+        inp = t[:, start_pos:start_pos+nt.val] if start_pos < prompt_len else out
+        out = self(inp, start_pos if start_pos < prompt_len else sp, temp).to(t.device).realize()
+      else:
+        out = self(t[:, sp:sp+nt] if start_pos < prompt_len or out is None else out, sp, temp).realize()
       start_pos += nt.val
       # chunked prefill: keep processing until all prompt tokens are consumed
       if start_pos < len(tokens): continue
       tokens.append(int(out.item()))
       self._cached_tokens = tokens[:-1]
       yield tokens[-1]
+
+def _shard_axis_key(k:str, ndim:int, expert_axis:int|None=None) -> int|None:
+  if k.endswith(".bias") or ndim <= 1 or "norm" in k or "scale" in k: return None
+  if ".ffn_gate_inp.weight" in k: return None
+  if "_exps.weight" in k: return expert_axis
+  if ".ffn_down" in k: return -1
+  if ".ffn_gate" in k or ".ffn_up" in k: return 0
+  return None
+
+def shard_weights(model:Transformer, devices:tuple[str, ...], expert_axis:int|None=None, tensor:bool=True):
+  for k,v in nn.state.get_state_dict(model).items():
+    if tensor and (axis:=_shard_axis_key(k, v.ndim, expert_axis)) is not None: v.shard_(devices, axis=axis)
+    elif k.startswith("blk."): v.to_(_block_device(devices, int(k.split(".")[1]), len(model.blk)))
+    elif k in ("token_embd.weight", "output.weight"): v.to_(devices[0])
+    elif tensor: v.shard_(devices, axis=None)
+    else: v.to_(devices[0])

@@ -249,7 +249,7 @@ class TestGGUFGEMV(unittest.TestCase):
 
   def test_raw_quant_linear(self):
     rng = np.random.default_rng(42)
-    for qtype, rows, cols, atol in ((GGMLQuantizationType.Q8_0, 64, 128, 1e-2), (GGMLQuantizationType.Q4_K, 64, 256, 5e-1),
+    for qtype, rows, cols, atol in ((GGMLQuantizationType.Q8_0, 64, 128, 1e-2), (GGMLQuantizationType.Q4_K, 64, 512, 5e-1),
                                     (GGMLQuantizationType.Q5_K, 64, 256, 5e-1)):
       q_data = quantize(rng.standard_normal(rows * cols).astype(np.float32), qtype) if qtype == GGMLQuantizationType.Q8_0 else \
         rng.integers(0, 256, size=(rows * cols // GGML_QUANT_SIZES[qtype][0], GGML_QUANT_SIZES[qtype][1]), dtype=np.uint8)
@@ -265,6 +265,12 @@ class TestGGUFGEMV(unittest.TestCase):
       xs = np.max(np.abs(xb), axis=-1, keepdims=True) / 127.0
       xq = np.trunc(xb / np.maximum(xs, 1e-12) + np.where(xb >= 0, 0.5, -0.5))
       np.testing.assert_allclose(lin(Tensor(x)).numpy(), (xq * xs).reshape(2, cols) @ w.T, atol=atol, rtol=2e-2)
+      if qtype in (GGMLQuantizationType.Q8_0, GGMLQuantizationType.Q4_K):
+        for axis in (0, -1):
+          lin = Linear(cols, rows, bias=False)
+          lin.weight.shard_(("CPU:0", "CPU:1"), axis=axis)
+          tensors["output.weight"].load_into(lin.weight)
+          np.testing.assert_allclose(lin(Tensor(x)).numpy(), (xq * xs).reshape(2, cols) @ w.T, atol=atol, rtol=2e-2)
 
 class TestGGUFGC(unittest.TestCase):
   def test_gguf_load_no_tensor_leak(self):

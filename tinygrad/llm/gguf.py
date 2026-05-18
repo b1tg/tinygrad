@@ -18,11 +18,28 @@ class GGUFQuantizedTensor:
   k_qh: Tensor|None = None
 
   def nbytes(self) -> int: return sum(x.nbytes() for x in (self.q8_scale, self.q8_qs, self.k_meta, self.k_qs, self.k_qh) if x is not None)
-  def to(self, device): return GGUFQuantizedTensor(self.typ, self.shape, *[
-    x.to(device).realize() if x is not None else None for x in (self.q8_scale, self.q8_qs, self.k_meta, self.k_qs, self.k_qh)])
+  def _part_axis(self, axis:int|None) -> int|None:
+    if axis is None: return None
+    axis %= len(self.shape)
+    if axis not in (0, len(self.shape)-1): raise RuntimeError(f"can't shard raw GGUF tensor {self.shape} on axis {axis}")
+    return 0 if axis == 0 else 1
+  def _logical_parts(self):
+    out, in_features = self.shape
+    if self.typ == 8:
+      return self.q8_scale.reshape(out, in_features//32), self.q8_qs.reshape(out, in_features//32, 8), None, None, None
+    nb = in_features//256
+    return None, None, self.k_meta.reshape(out, nb, 20), self.k_qs.reshape(out, nb, *(4, 8) if self.typ == 12 else (4, 32)), \
+      None if self.k_qh is None else self.k_qh.reshape(out, nb, 32)
+  def to(self, device, axis:int|None=None):
+    axis = self._part_axis(axis) if isinstance(device, tuple) else None
+    parts = self._logical_parts() if isinstance(device, tuple) else (self.q8_scale, self.q8_qs, self.k_meta, self.k_qs, self.k_qh)
+    return GGUFQuantizedTensor(self.typ, self.shape, *[
+      (x.shard(device, axis=axis) if isinstance(device, tuple) else x.to(device)).realize() if x is not None else None
+      for x in parts])
   def load_into(self, dst:Tensor):
+    axis = dst.uop.axis if isinstance(dst.device, tuple) else None
     dst.uop = Tensor.empty(0, dtype=dtypes.uint8, device=dst.device).uop
-    dst.gguf_quant = self.to(dst.device)
+    dst.gguf_quant = self.to(dst.device, axis)
 
 # ggml packs each iq grid entry as N bytes (N=4 for uint32 grids, N=8 for uint64 grids) in a single word. See ggml-common.h.
 @functools.lru_cache(None)

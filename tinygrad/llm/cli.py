@@ -188,10 +188,14 @@ def main():
   parser.add_argument("--serve", nargs='?', type=int, const=8000, metavar="PORT", help="Run OpenAI compatible API (optional port, default 8000)")
   parser.add_argument("--warmup", action="store_true", help="warmup the JIT")
   parser.add_argument("--benchmark", nargs='?', type=int, const=20, metavar="COUNT", help="Benchmark tok/s (optional count, default 20)")
+  parser.add_argument("--shard", type=int, default=1, help="Shard model across N devices")
+  parser.add_argument("--sm", "-sm", "--split-mode", choices=("layer", "tensor"), default="tensor", help="Shard split mode")
   args = parser.parse_args()
 
   # load the model
-  model, kv = Transformer.from_gguf(fetch(models.get(args.model, args.model)), args.max_context)
+  model_arg = models.get(args.model, args.model)
+  model, kv = Transformer.from_gguf(model_arg if pathlib.Path(model_arg).is_file() else fetch(model_arg), args.max_context,
+                                    shard=args.shard, shard_mode=args.sm)
   model_name = kv.get('general.name') or kv.get('general.basename') or args.model
   params = nn.state.get_parameters(model)
   file_sizes = [y.nbytes() for y in UOp.sink(*[x.uop for x in params]).toposort() if y.op is Ops.BUFFER]
