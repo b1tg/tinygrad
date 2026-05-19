@@ -505,8 +505,10 @@ extern "C" __global__ __launch_bounds__(THREADS) void kimi_gate_up_q4_q8_to_q8_0
     int gdot = 0, udot = 0;
     #pragma unroll
     for (int j = 0; j < 16; j += 4) {
-      unsigned char g0 = gb[2 + j + 0], g1 = gb[2 + j + 1], g2 = gb[2 + j + 2], g3 = gb[2 + j + 3];
-      unsigned char u0 = ub[2 + j + 0], u1 = ub[2 + j + 1], u2 = ub[2 + j + 2], u3 = ub[2 + j + 3];
+      uint32_t gp = *reinterpret_cast<const uint32_t*>(gb + 2 + j);
+      uint32_t up = *reinterpret_cast<const uint32_t*>(ub + 2 + j);
+      unsigned char g0 = gp & 255, g1 = (gp >> 8) & 255, g2 = (gp >> 16) & 255, g3 = gp >> 24;
+      unsigned char u0 = up & 255, u1 = (up >> 8) & 255, u2 = (up >> 16) & 255, u3 = up >> 24;
       int xl = xps[block * 8 + (j >> 2)];
       int xh = xps[block * 8 + ((j + 16) >> 2)];
       gdot = __builtin_amdgcn_sdot4(pack4_i8(int(g0 & 15) - 8, int(g1 & 15) - 8, int(g2 & 15) - 8, int(g3 & 15) - 8), xl, gdot, false);
