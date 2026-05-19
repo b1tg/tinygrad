@@ -235,15 +235,18 @@ extern "C" __global__ __launch_bounds__(THREADS) void kimi_output_argmax_q8_0_st
     const unsigned char* __restrict__ xq,
     const unsigned char* __restrict__ w) {
   __shared__ float svals[GROUP];
+  __shared__ unsigned char xqs[(DIM / 32) * Q8_BLOCK_BYTES];
   int tid = threadIdx.x;
   int lane = tid & 31;
   int row_in = tid >> 5;
   int row = blockIdx.x * GROUP + row_in;
+  for (int i = tid; i < (DIM / 32) * Q8_BLOCK_BYTES; i += THREADS) xqs[i] = xq[i];
+  __syncthreads();
   float acc = 0.0f;
   for (int block = lane; block < DIM / 32; block += 32) {
     int xbase = block * Q8_BLOCK_BYTES;
     size_t wbase = (size_t(row) * (DIM / 32) + block) * Q8_BLOCK_BYTES;
-    const unsigned char* xb = xq + xbase;
+    const unsigned char* xb = xqs + xbase;
     const unsigned char* wb = w + wbase;
     float xs = float(*reinterpret_cast<const _Float16*>(xb));
     float ws = float(*reinterpret_cast<const _Float16*>(wb));
