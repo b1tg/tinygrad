@@ -765,8 +765,8 @@ _DOWN_REDUCE_Q4_Q8_0_HIP_SRC = r"""
 constexpr int DIM = 7168;
 constexpr int HIDDEN = 2048;
 constexpr int TOPK = 8;
-constexpr int THREADS = 1024;
-constexpr int ROWS = 16;
+constexpr int THREADS = 512;
+constexpr int ROWS = 8;
 constexpr int WARPS_PER_ROW = 2;
 constexpr int Q4_BLOCK_BYTES = 18;
 constexpr int Q8_BLOCK_BYTES = 34;
@@ -842,7 +842,7 @@ def _down_reduce_q8_kernel(z:UOp, gate_up_q8:UOp, sel:UOp, probs:UOp, down_w:UOp
   mem = _TOPK * (_HIDDEN // _Q4_BLOCK) * _Q8_BLOCK_BYTES + _TOPK * 8 + _DIM * 4 + _TOPK * _DIM * (_HIDDEN // _Q4_BLOCK) * _Q4_BLOCK_BYTES
   ops = _TOPK * _DIM * _HIDDEN * 2 + _TOPK * _DIM * 2
   sink = UOp.sink(
-    UOp.special(_DIM // 16, "gidx0"), UOp.special(1024, "lidx0"), z, gate_up_q8, sel, probs, down_w,
+    UOp.special(_DIM // 8, "gidx0"), UOp.special(512, "lidx0"), z, gate_up_q8, sel, probs, down_w,
     arg=KernelInfo(name="kimi_down_reduce_q4_q8_0", estimates=Estimates(ops=ops, mem=mem)))
   return UOp(Ops.PROGRAM, src=(
     sink, UOp(Ops.DEVICE, arg=device), UOp(Ops.LINEAR, src=(*sink.src, sink)),
