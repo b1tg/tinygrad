@@ -773,7 +773,7 @@ constexpr int ROWS = 8;
 constexpr int WARPS_PER_ROW = 2;
 constexpr int Q4_BLOCK_BYTES = 18;
 constexpr int Q8_BLOCK_BYTES = 34;
-constexpr int XQ_BYTES = TOPK * (HIDDEN / 32) * Q8_BLOCK_BYTES;
+constexpr int XQ_BLOCKS = TOPK * (HIDDEN / 32);
 
 __device__ __forceinline__ int pack4_i8(int a, int b, int c, int d) {
   return (a & 255) | ((b & 255) << 8) | ((c & 255) << 16) | ((d & 255) << 24);
@@ -785,10 +785,17 @@ extern "C" __global__ __launch_bounds__(THREADS) void kimi_down_reduce_q4_q8_0(
     const int* __restrict__ sel,
     const float* __restrict__ probs,
     const unsigned char* __restrict__ down_w) {
-  __shared__ unsigned char xqs[XQ_BYTES];
+  __shared__ int xps[XQ_BLOCKS * 8];
+  __shared__ float xss[XQ_BLOCKS];
   __shared__ float partial[ROWS * WARPS_PER_ROW];
   int tid = threadIdx.x;
-  for (int i = tid; i < XQ_BYTES; i += THREADS) xqs[i] = gate_up_q8[i];
+  for (int i = tid; i < XQ_BLOCKS * 8; i += THREADS) {
+    int block = i >> 3;
+    int j = (i & 7) << 2;
+    const int8_t* xqi = reinterpret_cast<const int8_t*>(gate_up_q8 + block * Q8_BLOCK_BYTES + 2);
+    xps[i] = pack4_i8(int(xqi[j + 0]), int(xqi[j + 1]), int(xqi[j + 2]), int(xqi[j + 3]));
+  }
+  for (int i = tid; i < XQ_BLOCKS; i += THREADS) xss[i] = float(*reinterpret_cast<const _Float16*>(gate_up_q8 + i * Q8_BLOCK_BYTES));
   __syncthreads();
   int lane = tid & 31;
   int warp_in_block = tid >> 5;
@@ -802,18 +809,16 @@ extern "C" __global__ __launch_bounds__(THREADS) void kimi_down_reduce_q4_q8_0(
     float sum = 0.0f;
     for (int block = warp * 32 + lane; block < HIDDEN / 32; block += 32 * WARPS_PER_ROW) {
       size_t wbase = ((size_t(expert) * DIM + row) * (HIDDEN / 32) + block) * Q4_BLOCK_BYTES;
-      int xbase = (k * (HIDDEN / 32) + block) * Q8_BLOCK_BYTES;
+      int xidx = k * (HIDDEN / 32) + block;
       const unsigned char* wb = down_w + wbase;
-      const unsigned char* xb = xqs + xbase;
       float ws = float(*reinterpret_cast<const _Float16*>(wb));
-      float xs = float(*reinterpret_cast<const _Float16*>(xb));
-      const int8_t* xqi = reinterpret_cast<const int8_t*>(xb + 2);
+      float xs = xss[xidx];
       int dot = 0;
       #pragma unroll
       for (int j = 0; j < 16; j += 4) {
         unsigned char w0 = wb[2 + j + 0], w1 = wb[2 + j + 1], w2 = wb[2 + j + 2], w3 = wb[2 + j + 3];
-        int xl = pack4_i8(int(xqi[j + 0]), int(xqi[j + 1]), int(xqi[j + 2]), int(xqi[j + 3]));
-        int xh = pack4_i8(int(xqi[j + 16]), int(xqi[j + 17]), int(xqi[j + 18]), int(xqi[j + 19]));
+        int xl = xps[xidx * 8 + (j >> 2)];
+        int xh = xps[xidx * 8 + ((j + 16) >> 2)];
         dot = __builtin_amdgcn_sdot4(pack4_i8(int(w0 & 15) - 8, int(w1 & 15) - 8, int(w2 & 15) - 8, int(w3 & 15) - 8), xl, dot, false);
         dot = __builtin_amdgcn_sdot4(pack4_i8(int(w0 >> 4) - 8, int(w1 >> 4) - 8, int(w2 >> 4) - 8, int(w3 >> 4) - 8), xh, dot, false);
       }
