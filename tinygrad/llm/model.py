@@ -139,6 +139,7 @@ class FFNBlock:
         probs = vals.softmax(-1) if self.config.norm_topk_prob else logits.softmax(-1).gather(-1, sel)
       probs = probs * self.config.routed_scaling_factor
       custom_kimi_moe = getenv("CUSTOM_KIMI_MOE", 0) or getenv("CUSTOM_KIMI_MOE_Q8", 0)
+      h_q8 = None
       if custom_kimi_moe and str(x.device).startswith("AMD") and resolve(x.shape[0] == 1, False) and \
          resolve(x.shape[1] == 1, False) and self.config.dim == 7168 and self.config.hidden_dim == 2048 and self.config.num_experts_per_tok == 8 and \
          getattr(self.ffn_gate_exps.weight, "_ggml_qtype", None) == 2 and getattr(self.ffn_up_exps.weight, "_ggml_qtype", None) == 2 and \
@@ -146,9 +147,10 @@ class FFNBlock:
         q8_moe = getenv("CUSTOM_KIMI_MOE_Q8", 0)
         from tinygrad.llm.amd_kimi import kimi_down_reduce_q4_0
         if q8_moe:
-          from tinygrad.llm.amd_kimi import kimi_down_reduce_q4_q8_from_q8_0, kimi_gate_up_q4_q8_to_q8_0
+          from tinygrad.llm.amd_kimi import kimi_down_reduce_q4_q8_from_q8_0, kimi_gate_up_q4_q8_to_q8_from_q8_0, kimi_quant_q8_0
+          h_q8 = kimi_quant_q8_0(h)
           out = kimi_down_reduce_q4_q8_from_q8_0(
-            kimi_gate_up_q4_q8_to_q8_0(h, sel, self.ffn_gate_exps.weight._ggml_raw, self.ffn_up_exps.weight._ggml_raw),
+            kimi_gate_up_q4_q8_to_q8_from_q8_0(h_q8, sel, self.ffn_gate_exps.weight._ggml_raw, self.ffn_up_exps.weight._ggml_raw),
             sel, probs, self.ffn_down_exps.weight._ggml_raw)
         else:
           if getenv("CUSTOM_KIMI_GATEUP_Q8", 0):
@@ -170,7 +172,12 @@ class FFNBlock:
         else: x_down = self.ffn_down_exps(sel, (self.ffn_gate_exps(sel, h).silu() * self.ffn_up_exps(sel, h)).contiguous())  # (B, T, k, D)
         out = (x_down * probs.unsqueeze(-1)).sum(axis=2)  # (B, T, D)
       if hasattr(self, 'ffn_gate_shexp'):
-        shexp = self.ffn_down_shexp(self.ffn_gate_shexp(x).silu().contiguous() * self.ffn_up_shexp(x))
+        if getenv("CUSTOM_KIMI_SHARED_Q8", 0) and h_q8 is not None and self.config.dim == 7168 and self.config.shared_expert_dim == 2048 and \
+           getattr(self.ffn_gate_shexp.weight, "_ggml_qtype", None) == 8 and getattr(self.ffn_up_shexp.weight, "_ggml_qtype", None) == 8:
+          from tinygrad.llm.amd_kimi import kimi_shared_gate_up_q8_from_q8_0
+          shexp = self.ffn_down_shexp(kimi_shared_gate_up_q8_from_q8_0(
+            h_q8, self.ffn_gate_shexp.weight._ggml_raw, self.ffn_up_shexp.weight._ggml_raw).reshape(*x.shape[:-1], self.config.shared_expert_dim))
+        else: shexp = self.ffn_down_shexp(self.ffn_gate_shexp(x).silu().contiguous() * self.ffn_up_shexp(x))
         if hasattr(self, 'ffn_gate_inp_shexp'): shexp = shexp * (x * self.ffn_gate_inp_shexp["weight"]).sum(axis=-1, keepdim=True).sigmoid()
         out = out + shexp
       return out

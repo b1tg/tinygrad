@@ -139,9 +139,18 @@ def _attach_q4_0_raw(t:Tensor, raw:Tensor, name:str, shape:tuple[int, ...]) -> T
     t._ggml_raw = raw.reshape(*shape[:-1], shape[-1]//32, 18)
   return t
 
+def _attach_q8_0_raw(t:Tensor, raw:Tensor, name:str, shape:tuple[int, ...]) -> Tensor:
+  if getenv("CUSTOM_KIMI_SHARED_Q8", 0) and name.endswith('_shexp.weight'):
+    t._ggml_qtype = 8
+    t._ggml_raw = raw.reshape(*shape[:-1], shape[-1]//32, 34)
+  return t
+
 def _ggml_tensor(name:str, raw:Tensor, n:int, typ:int, dims:tuple[int, ...]) -> Tensor:
   t = ggml_data_to_tensor(raw, n, typ).reshape(*reversed(dims))
-  return _attach_q4_0_raw(t, raw, name, tuple(reversed(dims))) if typ == 2 else t
+  shape = tuple(reversed(dims))
+  if typ == 2: return _attach_q4_0_raw(t, raw, name, shape)
+  if typ == 8: return _attach_q8_0_raw(t, raw, name, shape)
+  return t
 
 def _gguf_parse(tensor: Tensor, devices:tuple[str,...]|None=None, n_blk:int|None=None) -> tuple[dict, dict[str, Tensor]]:
   r = io.BufferedReader(TensorIO(tensor), 1_000_000)
