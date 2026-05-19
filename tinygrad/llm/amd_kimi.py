@@ -310,6 +310,7 @@ constexpr int TOPK = 8;
 constexpr int THREADS = 1024;
 constexpr int Q4_BLOCK_BYTES = 18;
 constexpr int Q8_BLOCK_BYTES = 34;
+constexpr int XQ_BYTES = (DIM / 32) * Q8_BLOCK_BYTES;
 
 __device__ __forceinline__ int pack4_i8(int a, int b, int c, int d) {
   return (a & 255) | ((b & 255) << 8) | ((c & 255) << 16) | ((d & 255) << 24);
@@ -321,8 +322,11 @@ extern "C" __global__ __launch_bounds__(THREADS) void kimi_gate_up_q4_q8_to_q8_0
     const int* __restrict__ sel,
     const unsigned char* __restrict__ gate_w,
     const unsigned char* __restrict__ up_w) {
+  __shared__ unsigned char xqs[XQ_BYTES];
   __shared__ float vals[32];
   int tid = threadIdx.x;
+  for (int i = tid; i < XQ_BYTES; i += THREADS) xqs[i] = xq[i];
+  __syncthreads();
   int lane = tid & 31;
   int r = tid >> 5;
   int k = blockIdx.x / (HIDDEN / 32);
@@ -335,7 +339,7 @@ extern "C" __global__ __launch_bounds__(THREADS) void kimi_gate_up_q4_q8_to_q8_0
     int xbase = block * Q8_BLOCK_BYTES;
     const unsigned char* gb = gate_w + wbase;
     const unsigned char* ub = up_w + wbase;
-    const unsigned char* xb = xq + xbase;
+    const unsigned char* xb = xqs + xbase;
     float gs = float(*reinterpret_cast<const _Float16*>(gb));
     float us = float(*reinterpret_cast<const _Float16*>(ub));
     float xs = float(*reinterpret_cast<const _Float16*>(xb));
