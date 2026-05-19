@@ -788,6 +788,12 @@ constexpr int XQ_BLOCKS = TOPK * (HIDDEN / 32);
 __device__ __forceinline__ int pack4_i8(int a, int b, int c, int d) {
   return (a & 255) | ((b & 255) << 8) | ((c & 255) << 16) | ((d & 255) << 24);
 }
+__device__ __forceinline__ int q4sign(uint32_t r) {
+  uint32_t s = r & 0x08080808u;
+  return int(r | (s << 1) | (s << 2) | (s << 3) | (s << 4));
+}
+__device__ __forceinline__ int q4lo(uint32_t p) { return q4sign((p & 0x0f0f0f0fu) ^ 0x08080808u); }
+__device__ __forceinline__ int q4hi(uint32_t p) { return q4sign(((p >> 4) & 0x0f0f0f0fu) ^ 0x08080808u); }
 
 extern "C" __global__ __launch_bounds__(THREADS) void kimi_down_reduce_q4_q8_0(
     float* __restrict__ z,
@@ -826,11 +832,11 @@ extern "C" __global__ __launch_bounds__(THREADS) void kimi_down_reduce_q4_q8_0(
       int dot = 0;
       #pragma unroll
       for (int j = 0; j < 16; j += 4) {
-        unsigned char w0 = wb[2 + j + 0], w1 = wb[2 + j + 1], w2 = wb[2 + j + 2], w3 = wb[2 + j + 3];
+        uint32_t wp = *reinterpret_cast<const uint32_t*>(wb + 2 + j);
         int xl = xps[xidx * 8 + (j >> 2)];
         int xh = xps[xidx * 8 + ((j + 16) >> 2)];
-        dot = __builtin_amdgcn_sdot4(pack4_i8(int(w0 & 15) - 8, int(w1 & 15) - 8, int(w2 & 15) - 8, int(w3 & 15) - 8), xl, dot, false);
-        dot = __builtin_amdgcn_sdot4(pack4_i8(int(w0 >> 4) - 8, int(w1 >> 4) - 8, int(w2 >> 4) - 8, int(w3 >> 4) - 8), xh, dot, false);
+        dot = __builtin_amdgcn_sdot4(q4lo(wp), xl, dot, false);
+        dot = __builtin_amdgcn_sdot4(q4hi(wp), xh, dot, false);
       }
       sum += float(dot) * ws * xs;
     }
