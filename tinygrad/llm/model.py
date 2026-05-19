@@ -130,10 +130,16 @@ class FFNBlock:
       h = x.unsqueeze(2)  # (B, T, 1, D) - add expert dim for broadcasting
       logits = self.ffn_gate_inp(x)
       if hasattr(self, 'exp_probs_b'):
-        probs = logits.sigmoid()
-        _, sel = pairwise_topk(probs + self.exp_probs_b["bias"], self.config.num_experts_per_tok)
-        probs = probs.gather(-1, sel)
-        if self.config.norm_topk_prob: probs = probs / probs.sum(axis=-1, keepdim=True)
+        router_topk = getenv("CUSTOM_KIMI_ROUTER_TOPK", 0) and str(x.device).startswith("AMD") and resolve(x.shape[0] == 1, False) and \
+          resolve(x.shape[1] == 1, False) and self.config.num_experts == 384 and self.config.num_experts_per_tok == 8 and self.config.norm_topk_prob
+        if router_topk and logits.dtype == dtypes.float32 and self.exp_probs_b["bias"].dtype == dtypes.float16:
+          from tinygrad.llm.amd_kimi import kimi_router_topk
+          sel, probs = kimi_router_topk(logits, self.exp_probs_b["bias"])
+        else:
+          probs = logits.sigmoid()
+          _, sel = pairwise_topk(probs + self.exp_probs_b["bias"], self.config.num_experts_per_tok)
+          probs = probs.gather(-1, sel)
+          if self.config.norm_topk_prob: probs = probs / probs.sum(axis=-1, keepdim=True)
       else:
         vals, sel = pairwise_topk(logits, self.config.num_experts_per_tok)
         probs = vals.softmax(-1) if self.config.norm_topk_prob else logits.softmax(-1).gather(-1, sel)

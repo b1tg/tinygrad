@@ -7,9 +7,90 @@ from tinygrad.uop.ops import KernelInfo, Ops, UOp
 _DIM, _HIDDEN, _TOPK = 7168, 2048, 8
 _Q4_BLOCK, _Q4_BLOCK_BYTES = 32, 18
 _Q8_BLOCK_BYTES = 34
+_ROUTER_EXPERTS = 384
 
 @Context(ALLOW_DEVICE_USAGE=1)
 def _arch(device:str) -> str: return Device[device].renderer.target.arch
+
+_ROUTER_TOPK_HIP_SRC = r"""
+#include <hip/hip_runtime.h>
+#include <stdint.h>
+
+constexpr int N = 384;
+constexpr int K = 8;
+constexpr int THREADS = 512;
+
+extern "C" __global__ __launch_bounds__(THREADS) void kimi_router_topk(
+    int* __restrict__ sel,
+    float* __restrict__ probs_out,
+    const float* __restrict__ logits,
+    const _Float16* __restrict__ bias) {
+  __shared__ float probs[N];
+  __shared__ float scores[THREADS];
+  __shared__ float best_s[THREADS];
+  __shared__ int best_i[THREADS];
+  __shared__ float norm;
+  int tid = threadIdx.x;
+  if (tid < N) {
+    float x = logits[tid];
+    float p = 1.0f / (1.0f + exp2f(-1.4426950408889634f * x));
+    probs[tid] = p;
+    scores[tid] = p + float(bias[tid]);
+  } else scores[tid] = -3.4028234663852886e38f;
+  __syncthreads();
+  if (tid == 0) norm = 0.0f;
+  #pragma unroll
+  for (int k = 0; k < K; k++) {
+    best_s[tid] = scores[tid];
+    best_i[tid] = tid;
+    __syncthreads();
+    for (int stride = THREADS / 2; stride > 0; stride >>= 1) {
+      if (tid < stride) {
+        float s = best_s[tid + stride];
+        int i = best_i[tid + stride];
+        if (s > best_s[tid] || (s == best_s[tid] && i < best_i[tid])) {
+          best_s[tid] = s;
+          best_i[tid] = i;
+        }
+      }
+      __syncthreads();
+    }
+    int bi = best_i[0];
+    if (tid == 0) {
+      int outk = K - 1 - k;
+      sel[outk] = bi;
+      probs_out[outk] = probs[bi];
+      norm += probs_out[outk];
+    }
+    if (tid == bi) scores[tid] = -3.4028234663852886e38f;
+    __syncthreads();
+  }
+  if (tid < K) probs_out[tid] /= norm;
+}
+"""
+
+@functools.cache
+def _compiled_router_topk(arch:str) -> bytes:
+  from tinygrad.runtime.support.compiler_amd import HIPCCCompiler
+  return HIPCCCompiler(arch).compile_cached(_ROUTER_TOPK_HIP_SRC)
+
+def _router_topk_kernel(sel:UOp, probs:UOp, logits:UOp, bias:UOp, device:str, arch:str) -> UOp:
+  assert sel.numel() == _TOPK and probs.numel() == _TOPK and logits.numel() == _ROUTER_EXPERTS and bias.numel() == _ROUTER_EXPERTS
+  estimates = Estimates(ops=_ROUTER_EXPERTS * 8 + _TOPK * _ROUTER_EXPERTS, mem=(_ROUTER_EXPERTS * 2 + _TOPK * 2) * 4)
+  sink = UOp.sink(
+    UOp.special(1, "gidx0"), UOp.special(512, "lidx0"), sel, probs, logits, bias,
+    arg=KernelInfo(name="kimi_router_topk", estimates=estimates))
+  return UOp(Ops.PROGRAM, src=(
+    sink, UOp(Ops.DEVICE, arg=device), UOp(Ops.LINEAR, src=(*sink.src, sink)),
+    UOp(Ops.SOURCE, arg=_ROUTER_TOPK_HIP_SRC), UOp(Ops.BINARY, arg=_compiled_router_topk(arch))))
+
+def kimi_router_topk(logits:Tensor, bias:Tensor) -> tuple[Tensor, Tensor]:
+  assert logits.numel() == _ROUTER_EXPERTS and bias.numel() == _ROUTER_EXPERTS
+  sel = Tensor.empty(_TOPK, dtype=dtypes.int32, device=logits.device)
+  probs = Tensor.empty(_TOPK, dtype=dtypes.float32, device=logits.device)
+  sel, probs, *_ = Tensor.custom_kernel(
+    sel, probs, logits.reshape(-1), bias.reshape(-1), fxn=functools.partial(_router_topk_kernel, device=logits.device, arch=_arch(logits.device)))
+  return sel.reshape(*logits.shape[:-1], _TOPK), probs.reshape(*logits.shape[:-1], _TOPK)
 
 _GATE_UP_Q4_0_HIP_SRC = r"""
 #include <hip/hip_runtime.h>
