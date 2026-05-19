@@ -140,7 +140,8 @@ def _attach_q4_0_raw(t:Tensor, raw:Tensor, name:str, shape:tuple[int, ...]) -> T
   return t
 
 def _attach_q8_0_raw(t:Tensor, raw:Tensor, name:str, shape:tuple[int, ...]) -> Tensor:
-  if getenv("CUSTOM_KIMI_SHARED_Q8", 0) and name.endswith(('ffn_gate_shexp.weight', 'ffn_up_shexp.weight')):
+  if (getenv("CUSTOM_KIMI_SHARED_Q8", 0) and name.endswith(('ffn_gate_shexp.weight', 'ffn_up_shexp.weight'))) or \
+     (getenv("CUSTOM_KIMI_OUTPUT_ARGMAX_Q8", 0) and name == 'output.weight'):
     t._ggml_qtype = 8
     t._ggml_raw = raw.reshape(*shape[:-1], shape[-1]//32, 34)
   return t

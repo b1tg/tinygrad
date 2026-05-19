@@ -381,7 +381,12 @@ class Transformer:
   def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
     x = self.token_embd(tokens).float()                   # (B, T, D)
     for block in self.blk: x = block(x.to(getattr(block.attn_norm, "weight").device), start_pos)
-    logits = self.output(self.output_norm(x.to(self.output.weight.device)))[:, -1, :]
+    x = self.output_norm(x.to(self.output.weight.device))
+    if getenv("CUSTOM_KIMI_OUTPUT_ARGMAX_Q8", 0) and str(x.device).startswith("AMD") and resolve(x.shape[0] == 1, False) and \
+       resolve(x.shape[1] == 1, False) and self.output.weight.shape == (163840, 7168) and getattr(self.output.weight, "_ggml_qtype", None) == 8:
+      from tinygrad.llm.amd_kimi import kimi_output_argmax_q8_0
+      return kimi_output_argmax_q8_0(x, self.output.weight._ggml_raw)
+    logits = self.output(x)[:, -1, :]
     return logits.argmax(-1, keepdim=True)
     # Gumbel-max trick: argmax(logits/temp - log(-log(uniform))) is equivalent to sampling from softmax(logits/temp)
     return (logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1, keepdim=True)

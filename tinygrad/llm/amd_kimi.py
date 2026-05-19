@@ -7,7 +7,7 @@ from tinygrad.uop.ops import KernelInfo, Ops, UOp
 _DIM, _HIDDEN, _TOPK = 7168, 2048, 8
 _Q4_BLOCK, _Q4_BLOCK_BYTES = 32, 18
 _Q8_BLOCK_BYTES = 34
-_ROUTER_EXPERTS = 384
+_ROUTER_EXPERTS, _VOCAB, _OUT_GROUP = 384, 163840, 32
 
 @Context(ALLOW_DEVICE_USAGE=1)
 def _arch(device:str) -> str: return Device[device].renderer.target.arch
@@ -214,6 +214,157 @@ def kimi_quant_q8_0(x:Tensor) -> Tensor:
   q8 = Tensor.empty((_DIM // _Q4_BLOCK) * _Q8_BLOCK_BYTES, dtype=dtypes.uint8, device=x.device)
   q8, *_ = Tensor.custom_kernel(q8, x.reshape(-1), fxn=functools.partial(_quant_q8_kernel, device=x.device, arch=_arch(x.device)))
   return q8
+
+_OUTPUT_ARGMAX_Q8_0_STAGE1_HIP_SRC = r"""
+#include <hip/hip_runtime.h>
+#include <stdint.h>
+
+constexpr int DIM = 7168;
+constexpr int VOCAB = 163840;
+constexpr int GROUP = 32;
+constexpr int THREADS = 1024;
+constexpr int Q8_BLOCK_BYTES = 34;
+
+__device__ __forceinline__ int pack4_i8(int a, int b, int c, int d) {
+  return (a & 255) | ((b & 255) << 8) | ((c & 255) << 16) | ((d & 255) << 24);
+}
+
+extern "C" __global__ __launch_bounds__(THREADS) void kimi_output_argmax_q8_0_stage1(
+    float* __restrict__ vals,
+    int* __restrict__ idxs,
+    const unsigned char* __restrict__ xq,
+    const unsigned char* __restrict__ w) {
+  __shared__ float svals[GROUP];
+  int tid = threadIdx.x;
+  int lane = tid & 31;
+  int row_in = tid >> 5;
+  int row = blockIdx.x * GROUP + row_in;
+  float acc = 0.0f;
+  for (int block = lane; block < DIM / 32; block += 32) {
+    int xbase = block * Q8_BLOCK_BYTES;
+    size_t wbase = (size_t(row) * (DIM / 32) + block) * Q8_BLOCK_BYTES;
+    const unsigned char* xb = xq + xbase;
+    const unsigned char* wb = w + wbase;
+    float xs = float(*reinterpret_cast<const _Float16*>(xb));
+    float ws = float(*reinterpret_cast<const _Float16*>(wb));
+    const int8_t* xqi = reinterpret_cast<const int8_t*>(xb + 2);
+    const int8_t* wqi = reinterpret_cast<const int8_t*>(wb + 2);
+    int dot = 0;
+    #pragma unroll
+    for (int j = 0; j < 32; j += 4) {
+      int xp = pack4_i8(int(xqi[j + 0]), int(xqi[j + 1]), int(xqi[j + 2]), int(xqi[j + 3]));
+      dot = __builtin_amdgcn_sdot4(pack4_i8(int(wqi[j + 0]), int(wqi[j + 1]), int(wqi[j + 2]), int(wqi[j + 3])), xp, dot, false);
+    }
+    acc += float(dot) * xs * ws;
+  }
+  #pragma unroll
+  for (int delta = 16; delta > 0; delta >>= 1) acc += __shfl_down(acc, delta, 32);
+  if (lane == 0) svals[row_in] = acc;
+  __syncthreads();
+  if (row_in == 0) {
+    float v = svals[lane];
+    int idx = blockIdx.x * GROUP + lane;
+    #pragma unroll
+    for (int delta = 16; delta > 0; delta >>= 1) {
+      float ov = __shfl_down(v, delta, 32);
+      int oi = __shfl_down(idx, delta, 32);
+      if (ov > v || (ov == v && oi < idx)) {
+        v = ov;
+        idx = oi;
+      }
+    }
+    if (lane == 0) {
+      vals[blockIdx.x] = v;
+      idxs[blockIdx.x] = idx;
+    }
+  }
+}
+"""
+
+_OUTPUT_ARGMAX_Q8_0_STAGE2_HIP_SRC = r"""
+#include <hip/hip_runtime.h>
+#include <stdint.h>
+
+constexpr int VOCAB = 163840;
+constexpr int GROUP = 32;
+constexpr int GROUPS = VOCAB / GROUP;
+constexpr int THREADS = 1024;
+
+extern "C" __global__ __launch_bounds__(THREADS) void kimi_output_argmax_q8_0_stage2(
+    int* __restrict__ out,
+    const float* __restrict__ vals,
+    const int* __restrict__ idxs) {
+  __shared__ float sv[THREADS];
+  __shared__ int si[THREADS];
+  int tid = threadIdx.x;
+  float best = -3.4028234663852886e38f;
+  int best_i = 0;
+  for (int i = tid; i < GROUPS; i += THREADS) {
+    float v = vals[i];
+    int idx = idxs[i];
+    if (v > best || (v == best && idx < best_i)) {
+      best = v;
+      best_i = idx;
+    }
+  }
+  sv[tid] = best;
+  si[tid] = best_i;
+  __syncthreads();
+  for (int stride = THREADS / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      float v = sv[tid + stride];
+      int idx = si[tid + stride];
+      if (v > sv[tid] || (v == sv[tid] && idx < si[tid])) {
+        sv[tid] = v;
+        si[tid] = idx;
+      }
+    }
+    __syncthreads();
+  }
+  if (tid == 0) out[0] = si[0];
+}
+"""
+
+@functools.cache
+def _compiled_output_argmax_stage1(arch:str) -> bytes:
+  from tinygrad.runtime.support.compiler_amd import HIPCCCompiler
+  return HIPCCCompiler(arch).compile_cached(_OUTPUT_ARGMAX_Q8_0_STAGE1_HIP_SRC)
+
+@functools.cache
+def _compiled_output_argmax_stage2(arch:str) -> bytes:
+  from tinygrad.runtime.support.compiler_amd import HIPCCCompiler
+  return HIPCCCompiler(arch).compile_cached(_OUTPUT_ARGMAX_Q8_0_STAGE2_HIP_SRC)
+
+def _output_argmax_stage1_kernel(vals:UOp, idxs:UOp, xq:UOp, w:UOp, device:str, arch:str) -> UOp:
+  assert vals.numel() == _VOCAB // _OUT_GROUP and idxs.numel() == _VOCAB // _OUT_GROUP
+  assert xq.numel() == (_DIM // _Q4_BLOCK) * _Q8_BLOCK_BYTES and w.numel() == _VOCAB * (_DIM // _Q4_BLOCK) * _Q8_BLOCK_BYTES
+  mem = _VOCAB * (_DIM // _Q4_BLOCK) * _Q8_BLOCK_BYTES + (_DIM // _Q4_BLOCK) * _Q8_BLOCK_BYTES + (_VOCAB // _OUT_GROUP) * 8
+  sink = UOp.sink(
+    UOp.special(_VOCAB // _OUT_GROUP, "gidx0"), UOp.special(1024, "lidx0"), vals, idxs, xq, w,
+    arg=KernelInfo(name="kimi_output_argmax_q8_0_stage1", estimates=Estimates(ops=_VOCAB * _DIM * 2, mem=mem)))
+  return UOp(Ops.PROGRAM, src=(
+    sink, UOp(Ops.DEVICE, arg=device), UOp(Ops.LINEAR, src=(*sink.src, sink)),
+    UOp(Ops.SOURCE, arg=_OUTPUT_ARGMAX_Q8_0_STAGE1_HIP_SRC), UOp(Ops.BINARY, arg=_compiled_output_argmax_stage1(arch))))
+
+def _output_argmax_stage2_kernel(out:UOp, vals:UOp, idxs:UOp, device:str, arch:str) -> UOp:
+  assert out.numel() == 1 and vals.numel() == _VOCAB // _OUT_GROUP and idxs.numel() == _VOCAB // _OUT_GROUP
+  sink = UOp.sink(
+    UOp.special(1, "gidx0"), UOp.special(1024, "lidx0"), out, vals, idxs,
+    arg=KernelInfo(name="kimi_output_argmax_q8_0_stage2", estimates=Estimates(ops=_VOCAB // _OUT_GROUP, mem=(_VOCAB // _OUT_GROUP) * 8)))
+  return UOp(Ops.PROGRAM, src=(
+    sink, UOp(Ops.DEVICE, arg=device), UOp(Ops.LINEAR, src=(*sink.src, sink)),
+    UOp(Ops.SOURCE, arg=_OUTPUT_ARGMAX_Q8_0_STAGE2_HIP_SRC), UOp(Ops.BINARY, arg=_compiled_output_argmax_stage2(arch))))
+
+def kimi_output_argmax_q8_0(x:Tensor, w:Tensor) -> Tensor:
+  assert x.numel() == _DIM and w.numel() == _VOCAB * (_DIM // _Q4_BLOCK) * _Q8_BLOCK_BYTES
+  xq = kimi_quant_q8_0(x)
+  vals = Tensor.empty(_VOCAB // _OUT_GROUP, dtype=dtypes.float32, device=x.device)
+  idxs = Tensor.empty(_VOCAB // _OUT_GROUP, dtype=dtypes.int32, device=x.device)
+  vals, idxs, *_ = Tensor.custom_kernel(vals, idxs, xq.reshape(-1), w.reshape(-1),
+    fxn=functools.partial(_output_argmax_stage1_kernel, device=x.device, arch=_arch(x.device)))
+  out = Tensor.empty(1, dtype=dtypes.int32, device=x.device)
+  out, *_ = Tensor.custom_kernel(out, vals, idxs, fxn=functools.partial(_output_argmax_stage2_kernel, device=x.device, arch=_arch(x.device)))
+  return out.reshape(*x.shape[:-2], 1)
 
 _GATE_UP_Q4_Q8_0_HIP_SRC = r"""
 #include <hip/hip_runtime.h>
