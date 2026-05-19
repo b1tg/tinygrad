@@ -610,7 +610,8 @@ _DOWN_REDUCE_Q4_Q8_0_HIP_SRC = r"""
 constexpr int DIM = 7168;
 constexpr int HIDDEN = 2048;
 constexpr int TOPK = 8;
-constexpr int THREADS = 32;
+constexpr int THREADS = 64;
+constexpr int WARPS = 2;
 constexpr int Q4_BLOCK_BYTES = 18;
 constexpr int Q8_BLOCK_BYTES = 34;
 
@@ -624,7 +625,10 @@ extern "C" __global__ __launch_bounds__(THREADS) void kimi_down_reduce_q4_q8_0(
     const int* __restrict__ sel,
     const float* __restrict__ probs,
     const unsigned char* __restrict__ down_w) {
+  __shared__ float partial[WARPS];
   int tid = threadIdx.x;
+  int lane = tid & 31;
+  int warp = tid >> 5;
   int row = blockIdx.x;
   float acc = 0.0f;
   #pragma unroll
@@ -652,7 +656,15 @@ extern "C" __global__ __launch_bounds__(THREADS) void kimi_down_reduce_q4_q8_0(
     }
     #pragma unroll
     for (int delta = 16; delta > 0; delta >>= 1) sum += __shfl_down(sum, delta, 32);
-    if (tid == 0) acc += sum * probs[k];
+    if (lane == 0) partial[warp] = sum;
+    __syncthreads();
+    if (tid == 0) {
+      float total = 0.0f;
+      #pragma unroll
+      for (int w = 0; w < WARPS; w++) total += partial[w];
+      acc += total * probs[k];
+    }
+    __syncthreads();
   }
   if (tid == 0) z[row] = acc;
 }
@@ -668,7 +680,7 @@ def _down_reduce_q8_kernel(z:UOp, gate_up_q8:UOp, sel:UOp, probs:UOp, down_w:UOp
   mem = _TOPK * (_HIDDEN // _Q4_BLOCK) * _Q8_BLOCK_BYTES + _TOPK * 8 + _DIM * 4 + _TOPK * _DIM * (_HIDDEN // _Q4_BLOCK) * _Q4_BLOCK_BYTES
   ops = _TOPK * _DIM * _HIDDEN * 2 + _TOPK * _DIM * 2
   sink = UOp.sink(
-    UOp.special(_DIM, "gidx0"), UOp.special(32, "lidx0"), z, gate_up_q8, sel, probs, down_w,
+    UOp.special(_DIM, "gidx0"), UOp.special(64, "lidx0"), z, gate_up_q8, sel, probs, down_w,
     arg=KernelInfo(name="kimi_down_reduce_q4_q8_0", estimates=Estimates(ops=ops, mem=mem)))
   return UOp(Ops.PROGRAM, src=(
     sink, UOp(Ops.DEVICE, arg=device), UOp(Ops.LINEAR, src=(*sink.src, sink)),
