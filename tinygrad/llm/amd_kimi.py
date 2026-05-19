@@ -464,7 +464,7 @@ constexpr int TOPK = 8;
 constexpr int THREADS = 1024;
 constexpr int Q4_BLOCK_BYTES = 18;
 constexpr int Q8_BLOCK_BYTES = 34;
-constexpr int XQ_BYTES = (DIM / 32) * Q8_BLOCK_BYTES;
+constexpr int XQ_BLOCKS = DIM / 32;
 
 __device__ __forceinline__ int pack4_i8(int a, int b, int c, int d) {
   return (a & 255) | ((b & 255) << 8) | ((c & 255) << 16) | ((d & 255) << 24);
@@ -476,10 +476,17 @@ extern "C" __global__ __launch_bounds__(THREADS) void kimi_gate_up_q4_q8_to_q8_0
     const int* __restrict__ sel,
     const unsigned char* __restrict__ gate_w,
     const unsigned char* __restrict__ up_w) {
-  __shared__ unsigned char xqs[XQ_BYTES];
+  __shared__ int xps[XQ_BLOCKS * 8];
+  __shared__ float xss[XQ_BLOCKS];
   __shared__ float vals[32];
   int tid = threadIdx.x;
-  for (int i = tid; i < XQ_BYTES; i += THREADS) xqs[i] = xq[i];
+  for (int i = tid; i < XQ_BLOCKS * 8; i += THREADS) {
+    int block = i >> 3;
+    int j = (i & 7) << 2;
+    const int8_t* xqi = reinterpret_cast<const int8_t*>(xq + block * Q8_BLOCK_BYTES + 2);
+    xps[i] = pack4_i8(int(xqi[j + 0]), int(xqi[j + 1]), int(xqi[j + 2]), int(xqi[j + 3]));
+  }
+  for (int i = tid; i < XQ_BLOCKS; i += THREADS) xss[i] = float(*reinterpret_cast<const _Float16*>(xq + i * Q8_BLOCK_BYTES));
   __syncthreads();
   int lane = tid & 31;
   int r = tid >> 5;
@@ -490,21 +497,18 @@ extern "C" __global__ __launch_bounds__(THREADS) void kimi_gate_up_q4_q8_to_q8_0
   float gacc = 0.0f, uacc = 0.0f;
   for (int block = lane; block < DIM / 32; block += 32) {
     size_t wbase = ((size_t(expert) * HIDDEN + row) * (DIM / 32) + block) * Q4_BLOCK_BYTES;
-    int xbase = block * Q8_BLOCK_BYTES;
     const unsigned char* gb = gate_w + wbase;
     const unsigned char* ub = up_w + wbase;
-    const unsigned char* xb = xqs + xbase;
     float gs = float(*reinterpret_cast<const _Float16*>(gb));
     float us = float(*reinterpret_cast<const _Float16*>(ub));
-    float xs = float(*reinterpret_cast<const _Float16*>(xb));
-    const int8_t* xqi = reinterpret_cast<const int8_t*>(xb + 2);
+    float xs = xss[block];
     int gdot = 0, udot = 0;
     #pragma unroll
     for (int j = 0; j < 16; j += 4) {
       unsigned char g0 = gb[2 + j + 0], g1 = gb[2 + j + 1], g2 = gb[2 + j + 2], g3 = gb[2 + j + 3];
       unsigned char u0 = ub[2 + j + 0], u1 = ub[2 + j + 1], u2 = ub[2 + j + 2], u3 = ub[2 + j + 3];
-      int xl = pack4_i8(int(xqi[j + 0]), int(xqi[j + 1]), int(xqi[j + 2]), int(xqi[j + 3]));
-      int xh = pack4_i8(int(xqi[j + 16]), int(xqi[j + 17]), int(xqi[j + 18]), int(xqi[j + 19]));
+      int xl = xps[block * 8 + (j >> 2)];
+      int xh = xps[block * 8 + ((j + 16) >> 2)];
       gdot = __builtin_amdgcn_sdot4(pack4_i8(int(g0 & 15) - 8, int(g1 & 15) - 8, int(g2 & 15) - 8, int(g3 & 15) - 8), xl, gdot, false);
       udot = __builtin_amdgcn_sdot4(pack4_i8(int(u0 & 15) - 8, int(u1 & 15) - 8, int(u2 & 15) - 8, int(u3 & 15) - 8), xl, udot, false);
       gdot = __builtin_amdgcn_sdot4(pack4_i8(int(g0 >> 4) - 8, int(g1 >> 4) - 8, int(g2 >> 4) - 8, int(g3 >> 4) - 8), xh, gdot, false);
