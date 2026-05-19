@@ -154,9 +154,13 @@ def load_state_dict(model, state_dict:dict[str, Tensor], strict=True, verbose=Tr
         if {(), (1,)} == {state_dict[k].shape, v.shape}: state_dict[k] = state_dict[k].reshape(v.shape)
         else: raise ValueError(f'Shape mismatch in layer `{k}`: Expected shape {v.shape}, but found {state_dict[k].shape} in state dict.')
       if isinstance(v.device, tuple):
-        if isinstance(state_dict[k].device, tuple): v.replace(state_dict[k])
-        else: v.replace(state_dict[k].shard(v.device, v.uop.axis))
-      else: v.replace(state_dict[k].to(v.device))
+        src = state_dict[k] if isinstance(state_dict[k].device, tuple) else state_dict[k].shard(v.device, v.uop.axis)
+      else: src = state_dict[k].to(v.device)
+      v.replace(src)
+      if hasattr(src, "_ggml_qtype"): v._ggml_qtype, v._ggml_raw = src._ggml_qtype, src._ggml_raw
+      elif hasattr(v, "_ggml_qtype"):
+        delattr(v, "_ggml_qtype")
+        delattr(v, "_ggml_raw")
       if realize: v.realize()
       if consume: del state_dict[k]
       ret.append(v)

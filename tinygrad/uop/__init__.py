@@ -68,7 +68,7 @@ class Ops(FastEnum):
   FLOORDIV = auto(); FLOORMOD = auto()
 
   # TernaryOps
-  WHERE = auto(); MULACC = auto()
+  WHERE = auto(); MULACC = auto(); SDOT4 = auto()
 
   # ** 5 -- control flow / consts / custom **
 
@@ -112,7 +112,7 @@ class GroupOp:
   Unary = {Ops.EXP2, Ops.LOG2, Ops.SIN, Ops.SQRT, Ops.RECIPROCAL, Ops.NEG, Ops.TRUNC}
   Binary = {Ops.ADD, Ops.MUL, Ops.CDIV, Ops.MAX, Ops.CMOD, Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ,
             Ops.XOR, Ops.SHL, Ops.SHR, Ops.OR, Ops.AND, Ops.THREEFRY, Ops.SUB, Ops.FDIV, Ops.POW, Ops.FLOORDIV, Ops.FLOORMOD}
-  Ternary = {Ops.WHERE, Ops.MULACC}
+  Ternary = {Ops.WHERE, Ops.MULACC, Ops.SDOT4}
   ALU = set.union(Unary, Binary, Ternary)
 
   # TODO: is BITCAST always Elementwise if it's shape changing?

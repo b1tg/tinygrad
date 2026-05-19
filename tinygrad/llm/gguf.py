@@ -3,7 +3,7 @@ from typing import Any, Callable
 
 from tinygrad.tensor import Tensor
 from tinygrad.dtype import dtypes
-from tinygrad.helpers import prod, round_up
+from tinygrad.helpers import getenv, prod, round_up
 from tinygrad.nn.state import TensorIO
 
 # ggml packs each iq grid entry as N bytes (N=4 for uint32 grids, N=8 for uint64 grids) in a single word. See ggml-common.h.
@@ -133,6 +133,16 @@ read_uint32, read_int32, read_uint64, read_int64 = readers[4], readers[5], reade
 def block_device(devices:tuple[str,...], i:int, n_blk:int) -> str:
   return devices[min(i * len(devices) // n_blk, len(devices) - 1)]
 
+def _attach_q4_0_raw(t:Tensor, raw:Tensor, name:str, shape:tuple[int, ...]) -> Tensor:
+  if (getenv("Q4_EXPERT", 0) or getenv("CUSTOM_KIMI_MOE", 0) or getenv("CUSTOM_KIMI_MOE_Q8", 0)) and name.endswith('_exps.weight'):
+    t._ggml_qtype = 2
+    t._ggml_raw = raw.reshape(*shape[:-1], shape[-1]//32, 18)
+  return t
+
+def _ggml_tensor(name:str, raw:Tensor, n:int, typ:int, dims:tuple[int, ...]) -> Tensor:
+  t = ggml_data_to_tensor(raw, n, typ).reshape(*reversed(dims))
+  return _attach_q4_0_raw(t, raw, name, tuple(reversed(dims))) if typ == 2 else t
+
 def _gguf_parse(tensor: Tensor, devices:tuple[str,...]|None=None, n_blk:int|None=None) -> tuple[dict, dict[str, Tensor]]:
   r = io.BufferedReader(TensorIO(tensor), 1_000_000)
   magic, version, n_tensors, n_kv = r.read(4), read_int32(r), read_int64(r), read_int64(r)
@@ -155,11 +165,16 @@ def _gguf_parse(tensor: Tensor, devices:tuple[str,...]|None=None, n_blk:int|None
       nbytes = n * _GGML_NATIVE[typ].itemsize if typ in _GGML_NATIVE else (n // _GGML_QUANT[typ][0]) * _GGML_QUANT[typ][1]
       dev = block_device(devices, int(name.split('.')[1]), n_blk) if name.startswith('blk.') else devices[0]
       raw = tensor[data_start + off : data_start + off + nbytes].to(dev).realize()
-      state_dict[name] = ggml_data_to_tensor(raw, n, typ).reshape(*reversed(dims))
+      state_dict[name] = _ggml_tensor(name, raw, n, typ, dims)
   else:
     # TODO: remove the need for copy to default device
     tensor = tensor.to(None).realize()
-    state_dict = {name: ggml_data_to_tensor(tensor[data_start + off:], prod(dims), typ).reshape(*reversed(dims)) for name, dims, typ, off in t_infos}
+    state_dict = {}
+    for name, dims, typ, off in t_infos:
+      n = prod(dims)
+      nbytes = n * _GGML_NATIVE[typ].itemsize if typ in _GGML_NATIVE else (n // _GGML_QUANT[typ][0]) * _GGML_QUANT[typ][1]
+      raw = tensor[data_start + off:data_start + off + nbytes]
+      state_dict[name] = _ggml_tensor(name, raw, n, typ, dims)
   return kv_data, state_dict
 
 def _gguf_split_paths(path: pathlib.Path, kv: dict) -> list[pathlib.Path]:

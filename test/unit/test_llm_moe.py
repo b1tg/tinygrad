@@ -1,8 +1,9 @@
-import unittest
+import os, unittest
 import numpy as np
 from dataclasses import replace
-from tinygrad import Tensor
-from tinygrad.llm.model import TransformerBlock, TransformerConfig
+from tinygrad import Tensor, dtypes, getenv
+from tinygrad.llm.gguf import ggml_data_to_tensor
+from tinygrad.llm.model import ExpertWeights, TransformerBlock, TransformerConfig
 
 def _moe_config(dim=8, hidden=16, n_heads=2, num_experts=4, num_experts_per_tok=2):
   return TransformerConfig(
@@ -12,6 +13,28 @@ def _moe_config(dim=8, hidden=16, n_heads=2, num_experts=4, num_experts_per_tok=
     num_experts=num_experts, num_experts_per_tok=num_experts_per_tok)
 
 class TestMoEFeedForward(unittest.TestCase):
+  def test_q4_0_expert_weights(self):
+    num_experts, hidden, dim, k = 4, 8, 32, 2
+    raw = Tensor([x for e in range(num_experts) for h in range(hidden) for x in [0, 60] + [
+      ((i+h+e)&15) | (((15-i+h+e)&15)<<4) for i in range(16)]], dtype=dtypes.uint8).contiguous().realize()
+    w = ggml_data_to_tensor(raw, num_experts*hidden*dim, 2).reshape(num_experts, hidden, dim).cast(dtypes.float16)
+    sel = Tensor([0, 3], dtype=dtypes.int32).reshape(1, 1, k)
+    x = Tensor([127] + list(range(-15, 16)), dtype=dtypes.float16).reshape(1, 1, 1, dim)
+    ref, opt = ExpertWeights(num_experts, dim, hidden), ExpertWeights(num_experts, dim, hidden)
+    ref.weight.replace(w)
+    opt.weight.replace(w)
+    opt.weight._ggml_qtype, opt.weight._ggml_raw = 2, raw.reshape(num_experts, hidden, dim//32, 18)
+    old, old_dot4 = os.environ.get("Q4_EXPERT"), os.environ.get("Q4_DOT4")
+    os.environ["Q4_EXPERT"], os.environ["Q4_DOT4"] = "1", "0"
+    getenv.cache_clear()
+    try: np.testing.assert_allclose(ref(sel, x).numpy(), opt(sel, x).numpy(), rtol=1e-3, atol=1e-2)
+    finally:
+      if old is None: os.environ.pop("Q4_EXPERT")
+      else: os.environ["Q4_EXPERT"] = old
+      if old_dot4 is None: os.environ.pop("Q4_DOT4")
+      else: os.environ["Q4_DOT4"] = old_dot4
+      getenv.cache_clear()
+
   def test_moe_feed_forward(self):
     dim, hidden, n_heads = 8, 16, 2
     num_experts, k = 4, 2
