@@ -469,6 +469,12 @@ constexpr int XQ_BLOCKS = DIM / 32;
 __device__ __forceinline__ int pack4_i8(int a, int b, int c, int d) {
   return (a & 255) | ((b & 255) << 8) | ((c & 255) << 16) | ((d & 255) << 24);
 }
+__device__ __forceinline__ int q4sign(uint32_t r) {
+  uint32_t s = r & 0x08080808u;
+  return int(r | (s << 1) | (s << 2) | (s << 3) | (s << 4));
+}
+__device__ __forceinline__ int q4lo(uint32_t p) { return q4sign((p & 0x0f0f0f0fu) ^ 0x08080808u); }
+__device__ __forceinline__ int q4hi(uint32_t p) { return q4sign(((p >> 4) & 0x0f0f0f0fu) ^ 0x08080808u); }
 
 extern "C" __global__ __launch_bounds__(THREADS) void kimi_gate_up_q4_q8_to_q8_0(
     unsigned char* __restrict__ zq,
@@ -507,14 +513,12 @@ extern "C" __global__ __launch_bounds__(THREADS) void kimi_gate_up_q4_q8_to_q8_0
     for (int j = 0; j < 16; j += 4) {
       uint32_t gp = *reinterpret_cast<const uint32_t*>(gb + 2 + j);
       uint32_t up = *reinterpret_cast<const uint32_t*>(ub + 2 + j);
-      unsigned char g0 = gp & 255, g1 = (gp >> 8) & 255, g2 = (gp >> 16) & 255, g3 = gp >> 24;
-      unsigned char u0 = up & 255, u1 = (up >> 8) & 255, u2 = (up >> 16) & 255, u3 = up >> 24;
       int xl = xps[block * 8 + (j >> 2)];
       int xh = xps[block * 8 + ((j + 16) >> 2)];
-      gdot = __builtin_amdgcn_sdot4(pack4_i8(int(g0 & 15) - 8, int(g1 & 15) - 8, int(g2 & 15) - 8, int(g3 & 15) - 8), xl, gdot, false);
-      udot = __builtin_amdgcn_sdot4(pack4_i8(int(u0 & 15) - 8, int(u1 & 15) - 8, int(u2 & 15) - 8, int(u3 & 15) - 8), xl, udot, false);
-      gdot = __builtin_amdgcn_sdot4(pack4_i8(int(g0 >> 4) - 8, int(g1 >> 4) - 8, int(g2 >> 4) - 8, int(g3 >> 4) - 8), xh, gdot, false);
-      udot = __builtin_amdgcn_sdot4(pack4_i8(int(u0 >> 4) - 8, int(u1 >> 4) - 8, int(u2 >> 4) - 8, int(u3 >> 4) - 8), xh, udot, false);
+      gdot = __builtin_amdgcn_sdot4(q4lo(gp), xl, gdot, false);
+      udot = __builtin_amdgcn_sdot4(q4lo(up), xl, udot, false);
+      gdot = __builtin_amdgcn_sdot4(q4hi(gp), xh, gdot, false);
+      udot = __builtin_amdgcn_sdot4(q4hi(up), xh, udot, false);
     }
     gacc += float(gdot) * gs * xs;
     uacc += float(udot) * us * xs;
