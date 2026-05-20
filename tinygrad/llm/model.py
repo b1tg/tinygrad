@@ -467,6 +467,10 @@ class Transformer:
       for k,v in nn.state.get_state_dict(model).items():
         if k in state_dict: v.to_(state_dict[k].device)
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
+    if getenv("REALIZE_SMALL", 0):
+      params = [p for p in nn.state.get_parameters(model) if p.numel() <= 1_000_000 and not hasattr(p, "_ggml_qtype")]
+      for p in params: p.replace(p.contiguous())
+      Tensor.realize(*params)
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:
       for s in (params:=nn.state.get_parameters(model)): s.replace(s.contiguous())
