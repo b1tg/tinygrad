@@ -17,7 +17,7 @@ def _sdot4(a:Tensor, b:Tensor) -> Tensor: return a.alu(Ops.SDOT4, b, a.const_lik
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, device:str|None=None) -> Tensor:
   freqs = 1.0 / (theta ** (Tensor.arange(0, dim, 2, device=device)[:(dim // 2)] / dim))
   freqs = Tensor.arange(end, device=device).unsqueeze(dim=1) * freqs.unsqueeze(dim=0)
-  return freqs.cos().cat(freqs.sin(), dim=-1).contiguous()
+  return freqs.cos().cat(freqs.sin(), dim=-1).contiguous().realize()
 
 class ExpertWeights:
   """Like nn.Linear but with num_experts dimension. Weight shape: (num_experts, out_features, in_features)."""
