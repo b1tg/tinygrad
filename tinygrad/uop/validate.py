@@ -11,11 +11,6 @@ if z3.get_version() < (4, 12, 4, 0):
 # IDIV is truncated division but z3 does euclidian division (floor if b>0 ceil otherwise); mod by power of two sometimes uses Ops.AND
 def z3_cdiv(a:z3.ArithRef, b:z3.ArithRef) -> z3.ArithRef:return z3.If((a<0), z3.If(0<b, (a+(b-1))/b, (a-(b+1))/b), a/b)
 def z3_floordiv(a:z3.ArithRef, b:z3.ArithRef) -> z3.ArithRef: return z3.If(b > 0, a/b, (-a)/(-b))
-def z3_sbyte(a:z3.ArithRef, sh:int) -> z3.ArithRef:
-  x = (a/(1 << sh)) % 256
-  return z3.If(x >= 128, x-256, x)
-def z3_sdot4(a:z3.ArithRef, b:z3.ArithRef, c:z3.ArithRef) -> z3.ExprRef:
-  return c + sum(z3_sbyte(a, sh)*z3_sbyte(b, sh) for sh in (0, 8, 16, 24))
 def z3_xor(a:z3.ExprRef, b:z3.ExprRef) -> z3.ExprRef:
   if isinstance(a, z3.BoolRef): return a^b
   # x ^ -1 = -(x+1), i.e. bitwise NOT
@@ -25,8 +20,7 @@ def z3_xor(a:z3.ExprRef, b:z3.ExprRef) -> z3.ExprRef:
 z3_alu: dict[Ops, Callable[..., z3.ExprRef]] = python_alu | {Ops.CMOD: lambda a,b: a-z3_cdiv(a,b)*b, Ops.CDIV: z3_cdiv, Ops.FLOORDIV: z3_floordiv,
   Ops.FLOORMOD: lambda a,b: a-z3_floordiv(a,b)*b,
   Ops.SHR: lambda a,b: a/(2**b.as_long()), Ops.SHL: lambda a,b: a*(2**b.as_long()),
-  Ops.AND: lambda a,b: a%(b+1) if isinstance(b, z3.ArithRef) else a&b, Ops.SDOT4: z3_sdot4, Ops.WHERE: z3.If,
-  Ops.XOR: z3_xor, Ops.MAX: lambda a,b: z3.If(a<b, b, a),}
+  Ops.AND: lambda a,b: a%(b+1) if isinstance(b, z3.ArithRef) else a&b, Ops.WHERE: z3.If, Ops.XOR: z3_xor, Ops.MAX: lambda a,b: z3.If(a<b, b, a),}
 def create_bounded(name:str, vmin:int, vmax:int, z3ctx:z3.Context) -> tuple[z3.ArithRef, z3.BoolRef]:
   return (s:=z3.Int(name, ctx=z3ctx)), (vmin <= s)&(s <= vmax)
 
