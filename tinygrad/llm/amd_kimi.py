@@ -18,54 +18,67 @@ _ROUTER_TOPK_HIP_SRC = r"""
 
 constexpr int N = 384;
 constexpr int K = 8;
-constexpr int THREADS = 512;
+constexpr int THREADS = 64;
+constexpr int PER_LANE = N / THREADS;
 
 extern "C" __global__ __launch_bounds__(THREADS) void kimi_router_topk(
     int* __restrict__ sel,
     float* __restrict__ probs_out,
     const float* __restrict__ logits,
     const _Float16* __restrict__ bias) {
-  __shared__ float probs[N];
-  __shared__ float scores[THREADS];
-  __shared__ float best_s[THREADS];
-  __shared__ int best_i[THREADS];
-  __shared__ float norm;
-  int tid = threadIdx.x;
-  if (tid < N) {
-    float x = logits[tid];
-    float p = 1.0f / (1.0f + exp2f(-1.4426950408889634f * x));
-    probs[tid] = p;
-    scores[tid] = p + float(bias[tid]);
-  } else scores[tid] = -3.4028234663852886e38f;
-  __syncthreads();
-  if (tid == 0) norm = 0.0f;
+  __shared__ float ps[K];
+  int lane = threadIdx.x;
+  float p[PER_LANE];
+  float s[PER_LANE];
+  int idx[PER_LANE];
+  #pragma unroll
+  for (int t = 0; t < PER_LANE; t++) {
+    int i = lane + t * THREADS;
+    float x = logits[i];
+    p[t] = 1.0f / (1.0f + exp2f(-1.4426950408889634f * x));
+    s[t] = p[t] + float(bias[i]);
+    idx[t] = i;
+  }
+  float norm = 0.0f;
   #pragma unroll
   for (int k = 0; k < K; k++) {
-    best_s[tid] = scores[tid];
-    best_i[tid] = tid;
-    __syncthreads();
-    for (int stride = THREADS / 2; stride > 0; stride >>= 1) {
-      if (tid < stride) {
-        float s = best_s[tid + stride];
-        int i = best_i[tid + stride];
-        if (s > best_s[tid] || (s == best_s[tid] && i < best_i[tid])) {
-          best_s[tid] = s;
-          best_i[tid] = i;
-        }
+    float bs = -3.4028234663852886e38f;
+    float bp = 0.0f;
+    int bi = N;
+    #pragma unroll
+    for (int t = 0; t < PER_LANE; t++) {
+      float st = s[t];
+      int it = idx[t];
+      if (st > bs || (st == bs && it < bi)) {
+        bs = st;
+        bp = p[t];
+        bi = it;
       }
-      __syncthreads();
     }
-    int bi = best_i[0];
-    if (tid == 0) {
+    #pragma unroll
+    for (int delta = 32; delta > 0; delta >>= 1) {
+      float os = __shfl_down(bs, delta, 64);
+      float op = __shfl_down(bp, delta, 64);
+      int oi = __shfl_down(bi, delta, 64);
+      if (os > bs || (os == bs && oi < bi)) {
+        bs = os;
+        bp = op;
+        bi = oi;
+      }
+    }
+    int win = __shfl(bi, 0, 64);
+    if (lane == 0) {
       int outk = K - 1 - k;
       sel[outk] = bi;
-      probs_out[outk] = probs[bi];
-      norm += probs_out[outk];
+      ps[outk] = bp;
+      norm += bp;
     }
-    if (tid == bi) scores[tid] = -3.4028234663852886e38f;
-    __syncthreads();
+    #pragma unroll
+    for (int t = 0; t < PER_LANE; t++) if (idx[t] == win) s[t] = -3.4028234663852886e38f;
   }
-  if (tid < K) probs_out[tid] /= norm;
+  norm = __shfl(norm, 0, 64);
+  __syncwarp();
+  if (lane < K) probs_out[lane] = ps[lane] / norm;
 }
 """
 
@@ -78,7 +91,7 @@ def _router_topk_kernel(sel:UOp, probs:UOp, logits:UOp, bias:UOp, device:str, ar
   assert sel.numel() == _TOPK and probs.numel() == _TOPK and logits.numel() == _ROUTER_EXPERTS and bias.numel() == _ROUTER_EXPERTS
   estimates = Estimates(ops=_ROUTER_EXPERTS * 8 + _TOPK * _ROUTER_EXPERTS, mem=(_ROUTER_EXPERTS * 2 + _TOPK * 2) * 4)
   sink = UOp.sink(
-    UOp.special(1, "gidx0"), UOp.special(512, "lidx0"), sel, probs, logits, bias,
+    UOp.special(1, "gidx0"), UOp.special(64, "lidx0"), sel, probs, logits, bias,
     arg=KernelInfo(name="kimi_router_topk", estimates=estimates))
   return UOp(Ops.PROGRAM, src=(
     sink, UOp(Ops.DEVICE, arg=device), UOp(Ops.LINEAR, src=(*sink.src, sink)),
@@ -91,82 +104,6 @@ def kimi_router_topk(logits:Tensor, bias:Tensor) -> tuple[Tensor, Tensor]:
   sel, probs, *_ = Tensor.custom_kernel(
     sel, probs, logits.reshape(-1), bias.reshape(-1), fxn=functools.partial(_router_topk_kernel, device=logits.device, arch=_arch(logits.device)))
   return sel.reshape(*logits.shape[:-1], _TOPK), probs.reshape(*logits.shape[:-1], _TOPK)
-
-_GATE_UP_Q4_0_HIP_SRC = r"""
-#include <hip/hip_runtime.h>
-#include <stdint.h>
-
-constexpr int DIM = 7168;
-constexpr int HIDDEN = 2048;
-constexpr int TOPK = 8;
-constexpr int THREADS = 32;
-constexpr int Q4_BLOCK_BYTES = 18;
-
-extern "C" __global__ __launch_bounds__(THREADS) void kimi_gate_up_q4_0(
-    float* __restrict__ z,
-    const float* __restrict__ x,
-    const int* __restrict__ sel,
-    const unsigned char* __restrict__ gate_w,
-    const unsigned char* __restrict__ up_w) {
-  int tid = threadIdx.x;
-  int idx = blockIdx.x;
-  int k = idx / HIDDEN;
-  int row = idx - k * HIDDEN;
-  int expert = sel[k];
-
-  float gacc = 0.0f, uacc = 0.0f;
-  for (int block = tid; block < DIM / 32; block += THREADS) {
-    size_t base = ((size_t(expert) * HIDDEN + row) * (DIM / 32) + block) * Q4_BLOCK_BYTES;
-    const unsigned char* gb = gate_w + base;
-    const unsigned char* ub = up_w + base;
-    float gs = float(*reinterpret_cast<const _Float16*>(gb));
-    float us = float(*reinterpret_cast<const _Float16*>(ub));
-    float gsum = 0.0f, usum = 0.0f;
-    #pragma unroll
-    for (int j = 0; j < 16; j++) {
-      unsigned char gq = gb[2 + j], uq = ub[2 + j];
-      float x0 = x[block * 32 + j];
-      float x1 = x[block * 32 + j + 16];
-      gsum += float((_Float16)(float(int(gq & 15) - 8) * gs)) * x0 + float((_Float16)(float(int(gq >> 4) - 8) * gs)) * x1;
-      usum += float((_Float16)(float(int(uq & 15) - 8) * us)) * x0 + float((_Float16)(float(int(uq >> 4) - 8) * us)) * x1;
-    }
-    gacc += gsum;
-    uacc += usum;
-  }
-  #pragma unroll
-  for (int delta = 16; delta > 0; delta >>= 1) {
-    gacc += __shfl_down(gacc, delta, 32);
-    uacc += __shfl_down(uacc, delta, 32);
-  }
-  if (tid == 0) z[idx] = (gacc / (1.0f + exp2f(-1.4426950408889634f * gacc))) * uacc;
-}
-"""
-
-@functools.cache
-def _compiled_gate_up(arch:str) -> bytes:
-  from tinygrad.runtime.support.compiler_amd import HIPCCCompiler
-  return HIPCCCompiler(arch).compile_cached(_GATE_UP_Q4_0_HIP_SRC)
-
-def _gate_up_kernel(z:UOp, x:UOp, sel:UOp, gate_w:UOp, up_w:UOp, device:str, arch:str) -> UOp:
-  assert z.numel() == _TOPK * _HIDDEN, f"kimi_gate_up_q4_0 expects {_TOPK * _HIDDEN} outputs, got {z.numel()}"
-  assert x.numel() == _DIM, f"kimi_gate_up_q4_0 expects dim={_DIM}, got {x.numel()}"
-  assert sel.numel() == _TOPK, f"kimi_gate_up_q4_0 expects topk={_TOPK}, got {sel.numel()}"
-  mem = _DIM * 4 + _TOPK * _HIDDEN * 4 + 2 * _TOPK * _HIDDEN * (_DIM // _Q4_BLOCK) * _Q4_BLOCK_BYTES
-  ops = _TOPK * _HIDDEN * _DIM * 4 + _TOPK * _HIDDEN * 4
-  sink = UOp.sink(
-    UOp.special(_TOPK * _HIDDEN, "gidx0"), UOp.special(32, "lidx0"), z, x, sel, gate_w, up_w,
-    arg=KernelInfo(name="kimi_gate_up_q4_0", estimates=Estimates(ops=ops, mem=mem)))
-  return UOp(Ops.PROGRAM, src=(
-    sink, UOp(Ops.DEVICE, arg=device), UOp(Ops.LINEAR, src=(*sink.src, sink)),
-    UOp(Ops.SOURCE, arg=_GATE_UP_Q4_0_HIP_SRC), UOp(Ops.BINARY, arg=_compiled_gate_up(arch))))
-
-def kimi_gate_up_q4_0(x:Tensor, sel:Tensor, gate_w:Tensor, up_w:Tensor) -> Tensor:
-  assert x.numel() == _DIM and sel.numel() == _TOPK
-  z = Tensor.empty(_TOPK, _HIDDEN, dtype=dtypes.float32, device=x.device)
-  z, *_ = Tensor.custom_kernel(
-    z, x.reshape(-1), sel.reshape(-1), gate_w.reshape(-1), up_w.reshape(-1),
-    fxn=functools.partial(_gate_up_kernel, device=x.device, arch=_arch(x.device)))
-  return z.reshape(*sel.shape, _HIDDEN)
 
 _QUANT_Q8_0_HIP_SRC = r"""
 #include <hip/hip_runtime.h>
@@ -215,6 +152,126 @@ def kimi_quant_q8_0(x:Tensor) -> Tensor:
   q8, *_ = Tensor.custom_kernel(q8, x.reshape(-1), fxn=functools.partial(_quant_q8_kernel, device=x.device, arch=_arch(x.device)))
   return q8
 
+def _router_quant_src(scale:float) -> str:
+  scale_s = f"{scale:.10g}"
+  if "." not in scale_s and "e" not in scale_s and "E" not in scale_s: scale_s += ".0"
+  return f"""
+#include <hip/hip_runtime.h>
+#include <stdint.h>
+constexpr int DIM = {_DIM};
+constexpr int N = {_ROUTER_EXPERTS};
+constexpr int K = {_TOPK};
+constexpr int THREADS = 64;
+constexpr int Q8_BLOCKS = DIM / 32;
+constexpr int Q8_BLOCK_BYTES = {_Q8_BLOCK_BYTES};
+constexpr int PER_LANE = N / THREADS;
+constexpr float SCALE = {scale_s}f;
+extern "C" __global__ __launch_bounds__(THREADS) void kimi_router_quant_q8_0(
+    float* __restrict__ sel_probs,
+    unsigned char* __restrict__ q8,
+    const float* __restrict__ logits,
+    const _Float16* __restrict__ bias,
+    const float* __restrict__ x) {{
+  int tid = threadIdx.x;
+  if (blockIdx.x < Q8_BLOCKS) {{
+    if (tid < 32) {{
+      int block = blockIdx.x;
+      float v = x[block * 32 + tid];
+      float m = fabsf(v);
+      #pragma unroll
+      for (int delta = 16; delta > 0; delta >>= 1) m = fmaxf(m, __shfl_down(m, delta, 32));
+      m = __shfl(m, 0, 32);
+      float d = m / 127.0f;
+      int q = d > 0.0f ? int(rintf(v / d)) : 0;
+      q = q < -128 ? -128 : (q > 127 ? 127 : q);
+      int base = block * Q8_BLOCK_BYTES;
+      if (tid == 0) *reinterpret_cast<_Float16*>(q8 + base) = (_Float16)d;
+      q8[base + 2 + tid] = (unsigned char)(int8_t)q;
+    }}
+    return;
+  }}
+  __shared__ float ps[K];
+  int lane = tid;
+  float p[PER_LANE];
+  float s[PER_LANE];
+  int idx[PER_LANE];
+  #pragma unroll
+  for (int t = 0; t < PER_LANE; t++) {{
+    int i = lane + t * THREADS;
+    float y = logits[i];
+    p[t] = 1.0f / (1.0f + exp2f(-1.4426950408889634f * y));
+    s[t] = p[t] + float(bias[i]);
+    idx[t] = i;
+  }}
+  float norm = 0.0f;
+  #pragma unroll
+  for (int k = 0; k < K; k++) {{
+    float bs = -3.4028234663852886e38f;
+    float bp = 0.0f;
+    int bi = N;
+    #pragma unroll
+    for (int t = 0; t < PER_LANE; t++) {{
+      float st = s[t];
+      int it = idx[t];
+      if (st > bs || (st == bs && it < bi)) {{
+        bs = st;
+        bp = p[t];
+        bi = it;
+      }}
+    }}
+    #pragma unroll
+    for (int delta = 32; delta > 0; delta >>= 1) {{
+      float os = __shfl_down(bs, delta, 64);
+      float op = __shfl_down(bp, delta, 64);
+      int oi = __shfl_down(bi, delta, 64);
+      if (os > bs || (os == bs && oi < bi)) {{
+        bs = os;
+        bp = op;
+        bi = oi;
+      }}
+    }}
+    int win = __shfl(bi, 0, 64);
+    if (lane == 0) {{
+      int outk = K - 1 - k;
+      sel_probs[outk] = float(bi);
+      ps[outk] = bp;
+      norm += bp;
+    }}
+    #pragma unroll
+    for (int t = 0; t < PER_LANE; t++) if (idx[t] == win) s[t] = -3.4028234663852886e38f;
+  }}
+  norm = __shfl(norm, 0, 64);
+  __syncwarp();
+  if (lane < K) sel_probs[K + lane] = ps[lane] / norm * SCALE;
+}}
+"""
+
+@functools.cache
+def _compiled_router_quant(arch:str, scale:float) -> bytes:
+  from tinygrad.runtime.support.compiler_amd import HIPCCCompiler
+  return HIPCCCompiler(arch).compile_cached(_router_quant_src(scale))
+
+def _router_quant_kernel(sel_probs:UOp, q8:UOp, logits:UOp, bias:UOp, x:UOp, device:str, arch:str, scale:float) -> UOp:
+  assert sel_probs.numel() == _TOPK * 2 and q8.numel() == (_DIM // _Q4_BLOCK) * _Q8_BLOCK_BYTES
+  assert logits.numel() == _ROUTER_EXPERTS and bias.numel() == _ROUTER_EXPERTS and x.numel() == _DIM
+  mem = (_ROUTER_EXPERTS * 2 + _TOPK * 2) * 4 + _DIM * 4 + (_DIM // _Q4_BLOCK) * _Q8_BLOCK_BYTES
+  sink = UOp.sink(
+    UOp.special(_DIM // _Q4_BLOCK + 1, "gidx0"), UOp.special(64, "lidx0"), sel_probs, q8, logits, bias, x,
+    arg=KernelInfo(name="kimi_router_quant_q8_0", estimates=Estimates(
+      ops=_DIM * 10 + _ROUTER_EXPERTS * 8 + _TOPK * _ROUTER_EXPERTS, mem=mem)))
+  return UOp(Ops.PROGRAM, src=(
+    sink, UOp(Ops.DEVICE, arg=device), UOp(Ops.LINEAR, src=(*sink.src, sink)),
+    UOp(Ops.SOURCE, arg=_router_quant_src(scale)), UOp(Ops.BINARY, arg=_compiled_router_quant(arch, scale))))
+
+def kimi_router_quant_q8_0(logits:Tensor, bias:Tensor, x:Tensor, scale:float) -> tuple[Tensor, Tensor]:
+  assert logits.numel() == _ROUTER_EXPERTS and bias.numel() == _ROUTER_EXPERTS and x.numel() == _DIM
+  sel_probs = Tensor.empty(_TOPK * 2, dtype=dtypes.float32, device=x.device)
+  q8 = Tensor.empty((_DIM // _Q4_BLOCK) * _Q8_BLOCK_BYTES, dtype=dtypes.uint8, device=x.device)
+  sel_probs, q8, *_ = Tensor.custom_kernel(
+    sel_probs, q8, logits.reshape(-1), bias.reshape(-1), x.reshape(-1),
+    fxn=functools.partial(_router_quant_kernel, device=x.device, arch=_arch(x.device), scale=float(scale)))
+  return sel_probs, q8
+
 _OUTPUT_ARGMAX_Q8_0_STAGE1_HIP_SRC = r"""
 #include <hip/hip_runtime.h>
 #include <stdint.h>
@@ -243,6 +300,7 @@ extern "C" __global__ __launch_bounds__(THREADS) void kimi_output_argmax_q8_0_st
   for (int i = tid; i < (DIM / 32) * Q8_BLOCK_BYTES; i += THREADS) xqs[i] = xq[i];
   __syncthreads();
   float acc = 0.0f;
+  #pragma unroll
   for (int block = lane; block < DIM / 32; block += 32) {
     int xbase = block * Q8_BLOCK_BYTES;
     size_t wbase = (size_t(row) * (DIM / 32) + block) * Q8_BLOCK_BYTES;
@@ -369,91 +427,6 @@ def kimi_output_argmax_q8_0(x:Tensor, w:Tensor) -> Tensor:
   out, *_ = Tensor.custom_kernel(out, vals, idxs, fxn=functools.partial(_output_argmax_stage2_kernel, device=x.device, arch=_arch(x.device)))
   return out.reshape(*x.shape[:-2], 1)
 
-_GATE_UP_Q4_Q8_0_HIP_SRC = r"""
-#include <hip/hip_runtime.h>
-#include <stdint.h>
-
-constexpr int DIM = 7168;
-constexpr int HIDDEN = 2048;
-constexpr int TOPK = 8;
-constexpr int THREADS = 32;
-constexpr int Q4_BLOCK_BYTES = 18;
-constexpr int Q8_BLOCK_BYTES = 34;
-
-__device__ __forceinline__ int pack4_i8(int a, int b, int c, int d) {
-  return (a & 255) | ((b & 255) << 8) | ((c & 255) << 16) | ((d & 255) << 24);
-}
-
-extern "C" __global__ __launch_bounds__(THREADS) void kimi_gate_up_q4_q8_0(
-    float* __restrict__ z,
-    const unsigned char* __restrict__ xq,
-    const int* __restrict__ sel,
-    const unsigned char* __restrict__ gate_w,
-    const unsigned char* __restrict__ up_w) {
-  int tid = threadIdx.x;
-  int idx = blockIdx.x;
-  int k = idx / HIDDEN;
-  int row = idx - k * HIDDEN;
-  int expert = sel[k];
-  float gacc = 0.0f, uacc = 0.0f;
-  for (int block = tid; block < DIM / 32; block += THREADS) {
-    size_t wbase = ((size_t(expert) * HIDDEN + row) * (DIM / 32) + block) * Q4_BLOCK_BYTES;
-    int xbase = block * Q8_BLOCK_BYTES;
-    const unsigned char* gb = gate_w + wbase;
-    const unsigned char* ub = up_w + wbase;
-    const unsigned char* xb = xq + xbase;
-    float gs = float(*reinterpret_cast<const _Float16*>(gb));
-    float us = float(*reinterpret_cast<const _Float16*>(ub));
-    float xs = float(*reinterpret_cast<const _Float16*>(xb));
-    const int8_t* xqi = reinterpret_cast<const int8_t*>(xb + 2);
-    int gdot = 0, udot = 0;
-    #pragma unroll
-    for (int j = 0; j < 16; j += 4) {
-      unsigned char g0 = gb[2 + j + 0], g1 = gb[2 + j + 1], g2 = gb[2 + j + 2], g3 = gb[2 + j + 3];
-      unsigned char u0 = ub[2 + j + 0], u1 = ub[2 + j + 1], u2 = ub[2 + j + 2], u3 = ub[2 + j + 3];
-      int xl = pack4_i8(int(xqi[j + 0]), int(xqi[j + 1]), int(xqi[j + 2]), int(xqi[j + 3]));
-      int xh = pack4_i8(int(xqi[j + 16]), int(xqi[j + 17]), int(xqi[j + 18]), int(xqi[j + 19]));
-      gdot = __builtin_amdgcn_sdot4(pack4_i8(int(g0 & 15) - 8, int(g1 & 15) - 8, int(g2 & 15) - 8, int(g3 & 15) - 8), xl, gdot, false);
-      udot = __builtin_amdgcn_sdot4(pack4_i8(int(u0 & 15) - 8, int(u1 & 15) - 8, int(u2 & 15) - 8, int(u3 & 15) - 8), xl, udot, false);
-      gdot = __builtin_amdgcn_sdot4(pack4_i8(int(g0 >> 4) - 8, int(g1 >> 4) - 8, int(g2 >> 4) - 8, int(g3 >> 4) - 8), xh, gdot, false);
-      udot = __builtin_amdgcn_sdot4(pack4_i8(int(u0 >> 4) - 8, int(u1 >> 4) - 8, int(u2 >> 4) - 8, int(u3 >> 4) - 8), xh, udot, false);
-    }
-    gacc += float(gdot) * gs * xs;
-    uacc += float(udot) * us * xs;
-  }
-  #pragma unroll
-  for (int delta = 16; delta > 0; delta >>= 1) {
-    gacc += __shfl_down(gacc, delta, 32);
-    uacc += __shfl_down(uacc, delta, 32);
-  }
-  if (tid == 0) z[idx] = (gacc / (1.0f + exp2f(-1.4426950408889634f * gacc))) * uacc;
-}
-"""
-
-@functools.cache
-def _compiled_gate_up_q8(arch:str) -> bytes:
-  from tinygrad.runtime.support.compiler_amd import HIPCCCompiler
-  return HIPCCCompiler(arch).compile_cached(_GATE_UP_Q4_Q8_0_HIP_SRC)
-
-def _gate_up_q8_kernel(z:UOp, xq:UOp, sel:UOp, gate_w:UOp, up_w:UOp, device:str, arch:str) -> UOp:
-  assert z.numel() == _TOPK * _HIDDEN and xq.numel() == (_DIM // _Q4_BLOCK) * _Q8_BLOCK_BYTES and sel.numel() == _TOPK
-  mem = _TOPK * _HIDDEN * 4 + (_DIM // _Q4_BLOCK) * _Q8_BLOCK_BYTES + 2 * _TOPK * _HIDDEN * (_DIM // _Q4_BLOCK) * _Q4_BLOCK_BYTES
-  ops = _TOPK * _HIDDEN * _DIM * 4
-  sink = UOp.sink(
-    UOp.special(_TOPK * _HIDDEN, "gidx0"), UOp.special(32, "lidx0"), z, xq, sel, gate_w, up_w,
-    arg=KernelInfo(name="kimi_gate_up_q4_q8_0", estimates=Estimates(ops=ops, mem=mem)))
-  return UOp(Ops.PROGRAM, src=(
-    sink, UOp(Ops.DEVICE, arg=device), UOp(Ops.LINEAR, src=(*sink.src, sink)),
-    UOp(Ops.SOURCE, arg=_GATE_UP_Q4_Q8_0_HIP_SRC), UOp(Ops.BINARY, arg=_compiled_gate_up_q8(arch))))
-
-def kimi_gate_up_q4_q8_0(x:Tensor, sel:Tensor, gate_w:Tensor, up_w:Tensor) -> Tensor:
-  assert x.numel() == _DIM and sel.numel() == _TOPK
-  z = Tensor.empty(_TOPK, _HIDDEN, dtype=dtypes.float32, device=x.device)
-  z, *_ = Tensor.custom_kernel(
-    z, kimi_quant_q8_0(x), sel.reshape(-1), gate_w.reshape(-1), up_w.reshape(-1),
-    fxn=functools.partial(_gate_up_q8_kernel, device=x.device, arch=_arch(x.device)))
-  return z.reshape(*sel.shape, _HIDDEN)
-
 _GATE_UP_Q4_Q8_TO_Q8_0_HIP_SRC = r"""
 #include <hip/hip_runtime.h>
 #include <stdint.h>
@@ -469,12 +442,8 @@ constexpr int XQ_BLOCKS = DIM / 32;
 __device__ __forceinline__ int pack4_i8(int a, int b, int c, int d) {
   return (a & 255) | ((b & 255) << 8) | ((c & 255) << 16) | ((d & 255) << 24);
 }
-__device__ __forceinline__ int q4sign(uint32_t r) {
-  uint32_t s = r & 0x08080808u;
-  return int(r | (s << 1) | (s << 2) | (s << 3) | (s << 4));
-}
-__device__ __forceinline__ int q4lo(uint32_t p) { return q4sign((p & 0x0f0f0f0fu) ^ 0x08080808u); }
-__device__ __forceinline__ int q4hi(uint32_t p) { return q4sign(((p >> 4) & 0x0f0f0f0fu) ^ 0x08080808u); }
+__device__ __forceinline__ int q4lo(uint32_t p) { return int(((p & 0x0f0f0f0fu) + 0x78787878u) ^ 0x80808080u); }
+__device__ __forceinline__ int q4hi(uint32_t p) { return int((((p >> 4) & 0x0f0f0f0fu) + 0x78787878u) ^ 0x80808080u); }
 
 extern "C" __global__ __launch_bounds__(THREADS) void kimi_gate_up_q4_q8_to_q8_0(
     unsigned char* __restrict__ zq,
@@ -572,9 +541,35 @@ def kimi_gate_up_q4_q8_to_q8_from_q8_0(xq:Tensor, sel:Tensor, gate_w:Tensor, up_
     fxn=functools.partial(_gate_up_to_q8_kernel, device=xq.device, arch=_arch(xq.device)))
   return zq
 
-def kimi_gate_up_q4_q8_to_q8_0(x:Tensor, sel:Tensor, gate_w:Tensor, up_w:Tensor) -> Tensor:
-  assert x.numel() == _DIM and sel.numel() == _TOPK
-  return kimi_gate_up_q4_q8_to_q8_from_q8_0(kimi_quant_q8_0(x), sel, gate_w, up_w)
+_GATE_UP_Q4_Q8_TO_Q8_SEL_PROBS_HIP_SRC = _GATE_UP_Q4_Q8_TO_Q8_0_HIP_SRC.replace(
+  "kimi_gate_up_q4_q8_to_q8_0", "kimi_gate_up_q4_q8_to_q8_sel_probs_0").replace(
+  "const int* __restrict__ sel,", "const float* __restrict__ sel_probs,").replace(
+  "int expert = sel[k];", "int expert = int(sel_probs[k]);")
+
+@functools.cache
+def _compiled_gate_up_to_q8_sel_probs(arch:str) -> bytes:
+  from tinygrad.runtime.support.compiler_amd import HIPCCCompiler
+  return HIPCCCompiler(arch).compile_cached(_GATE_UP_Q4_Q8_TO_Q8_SEL_PROBS_HIP_SRC)
+
+def _gate_up_to_q8_sel_probs_kernel(zq:UOp, xq:UOp, sel_probs:UOp, gate_w:UOp, up_w:UOp, device:str, arch:str) -> UOp:
+  assert zq.numel() == _TOPK * (_HIDDEN // _Q4_BLOCK) * _Q8_BLOCK_BYTES and xq.numel() == (_DIM // _Q4_BLOCK) * _Q8_BLOCK_BYTES
+  assert sel_probs.numel() == _TOPK * 2
+  mem = _TOPK * (_HIDDEN // _Q4_BLOCK) * _Q8_BLOCK_BYTES + (_DIM // _Q4_BLOCK) * _Q8_BLOCK_BYTES + \
+    2 * _TOPK * _HIDDEN * (_DIM // _Q4_BLOCK) * _Q4_BLOCK_BYTES
+  sink = UOp.sink(
+    UOp.special(_TOPK * (_HIDDEN // _Q4_BLOCK), "gidx0"), UOp.special(1024, "lidx0"), zq, xq, sel_probs, gate_w, up_w,
+    arg=KernelInfo(name="kimi_gate_up_q4_q8_to_q8_sel_probs_0", estimates=Estimates(ops=_TOPK * _HIDDEN * _DIM * 4, mem=mem)))
+  return UOp(Ops.PROGRAM, src=(
+    sink, UOp(Ops.DEVICE, arg=device), UOp(Ops.LINEAR, src=(*sink.src, sink)),
+    UOp(Ops.SOURCE, arg=_GATE_UP_Q4_Q8_TO_Q8_SEL_PROBS_HIP_SRC), UOp(Ops.BINARY, arg=_compiled_gate_up_to_q8_sel_probs(arch))))
+
+def kimi_gate_up_q4_q8_to_q8_from_sel_probs_q8_0(xq:Tensor, sel_probs:Tensor, gate_w:Tensor, up_w:Tensor) -> Tensor:
+  assert xq.numel() == (_DIM // _Q4_BLOCK) * _Q8_BLOCK_BYTES and sel_probs.numel() == _TOPK * 2
+  zq = Tensor.empty(_TOPK * (_HIDDEN // _Q4_BLOCK) * _Q8_BLOCK_BYTES, dtype=dtypes.uint8, device=xq.device)
+  zq, *_ = Tensor.custom_kernel(
+    zq, xq.reshape(-1), sel_probs.reshape(-1), gate_w.reshape(-1), up_w.reshape(-1),
+    fxn=functools.partial(_gate_up_to_q8_sel_probs_kernel, device=xq.device, arch=_arch(xq.device)))
+  return zq
 
 _SHARED_GATE_UP_Q8_0_HIP_SRC = r"""
 #include <hip/hip_runtime.h>
@@ -582,7 +577,8 @@ _SHARED_GATE_UP_Q8_0_HIP_SRC = r"""
 
 constexpr int DIM = 7168;
 constexpr int HIDDEN = 2048;
-constexpr int THREADS = 32;
+constexpr int ROWS = 8;
+constexpr int THREADS = ROWS * 32;
 constexpr int Q8_BLOCK_BYTES = 34;
 
 __device__ __forceinline__ int pack4_i8(int a, int b, int c, int d) {
@@ -595,9 +591,10 @@ extern "C" __global__ __launch_bounds__(THREADS) void kimi_shared_gate_up_q8_0(
     const unsigned char* __restrict__ gate_w,
     const unsigned char* __restrict__ up_w) {
   int tid = threadIdx.x;
-  int row = blockIdx.x;
+  int lane = tid & 31;
+  int row = blockIdx.x * ROWS + (tid >> 5);
   float gacc = 0.0f, uacc = 0.0f;
-  for (int block = tid; block < DIM / 32; block += THREADS) {
+  for (int block = lane; block < DIM / 32; block += 32) {
     int xbase = block * Q8_BLOCK_BYTES;
     size_t wbase = (size_t(row) * (DIM / 32) + block) * Q8_BLOCK_BYTES;
     const unsigned char* xb = xq + xbase;
@@ -624,7 +621,7 @@ extern "C" __global__ __launch_bounds__(THREADS) void kimi_shared_gate_up_q8_0(
     gacc += __shfl_down(gacc, delta, 32);
     uacc += __shfl_down(uacc, delta, 32);
   }
-  if (tid == 0) z[row] = (gacc / (1.0f + exp2f(-1.4426950408889634f * gacc))) * uacc;
+  if (lane == 0) z[row] = (gacc / (1.0f + exp2f(-1.4426950408889634f * gacc))) * uacc;
 }
 """
 
@@ -638,7 +635,7 @@ def _shared_gate_up_q8_kernel(z:UOp, xq:UOp, gate_w:UOp, up_w:UOp, device:str, a
   assert gate_w.numel() == _HIDDEN * (_DIM // _Q4_BLOCK) * _Q8_BLOCK_BYTES and up_w.numel() == _HIDDEN * (_DIM // _Q4_BLOCK) * _Q8_BLOCK_BYTES
   mem = _HIDDEN * 4 + (_DIM // _Q4_BLOCK) * _Q8_BLOCK_BYTES + 2 * _HIDDEN * (_DIM // _Q4_BLOCK) * _Q8_BLOCK_BYTES
   sink = UOp.sink(
-    UOp.special(_HIDDEN, "gidx0"), UOp.special(32, "lidx0"), z, xq, gate_w, up_w,
+    UOp.special(_HIDDEN // 8, "gidx0"), UOp.special(256, "lidx0"), z, xq, gate_w, up_w,
     arg=KernelInfo(name="kimi_shared_gate_up_q8_0", estimates=Estimates(ops=_HIDDEN * _DIM * 4, mem=mem)))
   return UOp(Ops.PROGRAM, src=(
     sink, UOp(Ops.DEVICE, arg=device), UOp(Ops.LINEAR, src=(*sink.src, sink)),
@@ -651,125 +648,6 @@ def kimi_shared_gate_up_q8_from_q8_0(xq:Tensor, gate_w:Tensor, up_w:Tensor) -> T
     z, xq.reshape(-1), gate_w.reshape(-1), up_w.reshape(-1),
     fxn=functools.partial(_shared_gate_up_q8_kernel, device=xq.device, arch=_arch(xq.device)))
   return z
-
-_DOWN_REDUCE_Q4_0_HIP_SRC = r"""
-#include <hip/hip_runtime.h>
-#include <stdint.h>
-
-constexpr int DIM = 7168;
-constexpr int HIDDEN = 2048;
-constexpr int TOPK = 8;
-constexpr int THREADS = 32;
-constexpr int Q4_BLOCK_BYTES = 18;
-
-extern "C" __global__ __launch_bounds__(THREADS) void kimi_down_reduce_q4_0(
-    float* __restrict__ z,
-    const float* __restrict__ gate_up,
-    const int* __restrict__ sel,
-    const float* __restrict__ probs,
-    const unsigned char* __restrict__ down_w) {
-  int tid = threadIdx.x;
-  int row = blockIdx.x;
-  float acc = 0.0f;
-  #pragma unroll
-  for (int k = 0; k < TOPK; k++) {
-    int expert = sel[k];
-    float sum = 0.0f;
-    for (int block = tid; block < HIDDEN / 32; block += THREADS) {
-      size_t base = ((size_t(expert) * DIM + row) * (HIDDEN / 32) + block) * Q4_BLOCK_BYTES;
-      const unsigned char* wb = down_w + base;
-      float ws = float(*reinterpret_cast<const _Float16*>(wb));
-      #pragma unroll
-      for (int j = 0; j < 16; j++) {
-        unsigned char wq = wb[2 + j];
-        float x0 = gate_up[k * HIDDEN + block * 32 + j];
-        float x1 = gate_up[k * HIDDEN + block * 32 + j + 16];
-        sum += float((_Float16)(float(int(wq & 15) - 8) * ws)) * x0 + float((_Float16)(float(int(wq >> 4) - 8) * ws)) * x1;
-      }
-    }
-    #pragma unroll
-    for (int delta = 16; delta > 0; delta >>= 1) sum += __shfl_down(sum, delta, 32);
-    if (tid == 0) acc += sum * probs[k];
-  }
-  if (tid == 0) z[row] = acc;
-}
-"""
-
-@functools.cache
-def _compiled_down_reduce(arch:str) -> bytes:
-  from tinygrad.runtime.support.compiler_amd import HIPCCCompiler
-  return HIPCCCompiler(arch).compile_cached(_DOWN_REDUCE_Q4_0_HIP_SRC)
-
-def _down_reduce_kernel(z:UOp, gate_up:UOp, sel:UOp, probs:UOp, down_w:UOp, device:str, arch:str) -> UOp:
-  assert z.numel() == _DIM, f"kimi_down_reduce_q4_0 expects dim={_DIM}, got {z.numel()}"
-  assert gate_up.numel() == _TOPK * _HIDDEN, f"kimi_down_reduce_q4_0 expects {_TOPK * _HIDDEN} gate_up, got {gate_up.numel()}"
-  assert sel.numel() == _TOPK and probs.numel() == _TOPK
-  mem = _TOPK * _HIDDEN * 4 + _TOPK * 8 + _DIM * 4 + _TOPK * _DIM * (_HIDDEN // _Q4_BLOCK) * _Q4_BLOCK_BYTES
-  ops = _TOPK * _DIM * _HIDDEN * 2 + _TOPK * _DIM * 2
-  sink = UOp.sink(
-    UOp.special(_DIM, "gidx0"), UOp.special(32, "lidx0"), z, gate_up, sel, probs, down_w,
-    arg=KernelInfo(name="kimi_down_reduce_q4_0", estimates=Estimates(ops=ops, mem=mem)))
-  return UOp(Ops.PROGRAM, src=(
-    sink, UOp(Ops.DEVICE, arg=device), UOp(Ops.LINEAR, src=(*sink.src, sink)),
-    UOp(Ops.SOURCE, arg=_DOWN_REDUCE_Q4_0_HIP_SRC), UOp(Ops.BINARY, arg=_compiled_down_reduce(arch))))
-
-def kimi_down_reduce_q4_0(gate_up:Tensor, sel:Tensor, probs:Tensor, down_w:Tensor) -> Tensor:
-  assert gate_up.numel() == _TOPK * _HIDDEN and sel.numel() == _TOPK and probs.numel() == _TOPK
-  z = Tensor.empty(_DIM, dtype=dtypes.float32, device=gate_up.device)
-  z, *_ = Tensor.custom_kernel(
-    z, gate_up.reshape(-1), sel.reshape(-1), probs.reshape(-1), down_w.reshape(-1),
-    fxn=functools.partial(_down_reduce_kernel, device=gate_up.device, arch=_arch(gate_up.device)))
-  return z.reshape(*probs.shape[:-1], _DIM)
-
-_QUANT_GATE_UP_Q8_0_HIP_SRC = r"""
-#include <hip/hip_runtime.h>
-#include <stdint.h>
-
-constexpr int HIDDEN = 2048;
-constexpr int TOPK = 8;
-constexpr int THREADS = 32;
-constexpr int Q8_BLOCK_BYTES = 34;
-
-extern "C" __global__ __launch_bounds__(THREADS) void kimi_quant_gate_up_q8_0(
-    unsigned char* __restrict__ q8,
-    const float* __restrict__ x) {
-  int tid = threadIdx.x;
-  int block = blockIdx.x;
-  float v = x[block * 32 + tid];
-  float m = fabsf(v);
-  #pragma unroll
-  for (int delta = 16; delta > 0; delta >>= 1) m = fmaxf(m, __shfl_down(m, delta, 32));
-  m = __shfl(m, 0, 32);
-  float d = m / 127.0f;
-  int q = d > 0.0f ? int(rintf(v / d)) : 0;
-  q = q < -128 ? -128 : (q > 127 ? 127 : q);
-  int base = block * Q8_BLOCK_BYTES;
-  if (tid == 0) *reinterpret_cast<_Float16*>(q8 + base) = (_Float16)d;
-  q8[base + 2 + tid] = (unsigned char)(int8_t)q;
-}
-"""
-
-@functools.cache
-def _compiled_quant_gate_up_q8(arch:str) -> bytes:
-  from tinygrad.runtime.support.compiler_amd import HIPCCCompiler
-  return HIPCCCompiler(arch).compile_cached(_QUANT_GATE_UP_Q8_0_HIP_SRC)
-
-def _quant_gate_up_q8_kernel(q8:UOp, x:UOp, device:str, arch:str) -> UOp:
-  assert q8.numel() == _TOPK * (_HIDDEN // _Q4_BLOCK) * _Q8_BLOCK_BYTES and x.numel() == _TOPK * _HIDDEN
-  sink = UOp.sink(
-    UOp.special(_TOPK * (_HIDDEN // _Q4_BLOCK), "gidx0"), UOp.special(32, "lidx0"), q8, x,
-    arg=KernelInfo(name="kimi_quant_gate_up_q8_0", estimates=Estimates(
-      ops=_TOPK * _HIDDEN * 10, mem=_TOPK * _HIDDEN * 4 + _TOPK * (_HIDDEN // _Q4_BLOCK) * _Q8_BLOCK_BYTES)))
-  return UOp(Ops.PROGRAM, src=(
-    sink, UOp(Ops.DEVICE, arg=device), UOp(Ops.LINEAR, src=(*sink.src, sink)),
-    UOp(Ops.SOURCE, arg=_QUANT_GATE_UP_Q8_0_HIP_SRC), UOp(Ops.BINARY, arg=_compiled_quant_gate_up_q8(arch))))
-
-def kimi_quant_gate_up_q8_0(gate_up:Tensor) -> Tensor:
-  assert gate_up.numel() == _TOPK * _HIDDEN
-  q8 = Tensor.empty(_TOPK * (_HIDDEN // _Q4_BLOCK) * _Q8_BLOCK_BYTES, dtype=dtypes.uint8, device=gate_up.device)
-  q8, *_ = Tensor.custom_kernel(
-    q8, gate_up.reshape(-1), fxn=functools.partial(_quant_gate_up_q8_kernel, device=gate_up.device, arch=_arch(gate_up.device)))
-  return q8
 
 _DOWN_REDUCE_Q4_Q8_0_HIP_SRC = r"""
 #include <hip/hip_runtime.h>
@@ -788,12 +666,8 @@ constexpr int XQ_BLOCKS = TOPK * (HIDDEN / 32);
 __device__ __forceinline__ int pack4_i8(int a, int b, int c, int d) {
   return (a & 255) | ((b & 255) << 8) | ((c & 255) << 16) | ((d & 255) << 24);
 }
-__device__ __forceinline__ int q4sign(uint32_t r) {
-  uint32_t s = r & 0x08080808u;
-  return int(r | (s << 1) | (s << 2) | (s << 3) | (s << 4));
-}
-__device__ __forceinline__ int q4lo(uint32_t p) { return q4sign((p & 0x0f0f0f0fu) ^ 0x08080808u); }
-__device__ __forceinline__ int q4hi(uint32_t p) { return q4sign(((p >> 4) & 0x0f0f0f0fu) ^ 0x08080808u); }
+__device__ __forceinline__ int q4lo(uint32_t p) { return int(((p & 0x0f0f0f0fu) + 0x78787878u) ^ 0x80808080u); }
+__device__ __forceinline__ int q4hi(uint32_t p) { return int((((p >> 4) & 0x0f0f0f0fu) + 0x78787878u) ^ 0x80808080u); }
 
 extern "C" __global__ __launch_bounds__(THREADS) void kimi_down_reduce_q4_q8_0(
     float* __restrict__ z,
@@ -803,7 +677,6 @@ extern "C" __global__ __launch_bounds__(THREADS) void kimi_down_reduce_q4_q8_0(
     const unsigned char* __restrict__ down_w) {
   __shared__ int xps[XQ_BLOCKS * 8];
   __shared__ float xss[XQ_BLOCKS];
-  __shared__ float partial[ROWS * WARPS_PER_ROW];
   int tid = threadIdx.x;
   for (int i = tid; i < XQ_BLOCKS * 8; i += THREADS) {
     int block = i >> 3;
@@ -842,15 +715,8 @@ extern "C" __global__ __launch_bounds__(THREADS) void kimi_down_reduce_q4_q8_0(
     }
     #pragma unroll
     for (int delta = 16; delta > 0; delta >>= 1) sum += __shfl_down(sum, delta, 32);
-    if (lane == 0) partial[row_in * WARPS_PER_ROW + warp] = sum;
-    __syncthreads();
-    if (warp == 0 && lane == 0) {
-      float total = 0.0f;
-      #pragma unroll
-      for (int w = 0; w < WARPS_PER_ROW; w++) total += partial[row_in * WARPS_PER_ROW + w];
-      acc += total * probs[k];
-    }
-    __syncthreads();
+    float other = __shfl(sum, 32, 64);
+    if (warp == 0 && lane == 0) acc += (sum + other) * probs[k];
   }
   if (warp == 0 && lane == 0) z[row] = acc;
 }
@@ -880,6 +746,33 @@ def kimi_down_reduce_q4_q8_from_q8_0(gate_up_q8:Tensor, sel:Tensor, probs:Tensor
     fxn=functools.partial(_down_reduce_q8_kernel, device=gate_up_q8.device, arch=_arch(gate_up_q8.device)))
   return z.reshape(*probs.shape[:-1], _DIM)
 
-def kimi_down_reduce_q4_q8_0(gate_up:Tensor, sel:Tensor, probs:Tensor, down_w:Tensor) -> Tensor:
-  assert gate_up.numel() == _TOPK * _HIDDEN and sel.numel() == _TOPK and probs.numel() == _TOPK
-  return kimi_down_reduce_q4_q8_from_q8_0(kimi_quant_gate_up_q8_0(gate_up), sel, probs, down_w)
+_DOWN_REDUCE_Q4_Q8_SEL_PROBS_HIP_SRC = _DOWN_REDUCE_Q4_Q8_0_HIP_SRC.replace(
+  "probs[k]", "sel_probs[TOPK + k]").replace(
+  "kimi_down_reduce_q4_q8_0", "kimi_down_reduce_q4_q8_sel_probs_0").replace(
+  "const int* __restrict__ sel,\n    const float* __restrict__ probs,",
+  "const float* __restrict__ sel_probs,").replace(
+  "int expert = sel[k];", "int expert = int(sel_probs[k]);")
+
+@functools.cache
+def _compiled_down_reduce_q8_sel_probs(arch:str) -> bytes:
+  from tinygrad.runtime.support.compiler_amd import HIPCCCompiler
+  return HIPCCCompiler(arch).compile_cached(_DOWN_REDUCE_Q4_Q8_SEL_PROBS_HIP_SRC)
+
+def _down_reduce_q8_sel_probs_kernel(z:UOp, gate_up_q8:UOp, sel_probs:UOp, down_w:UOp, device:str, arch:str) -> UOp:
+  assert z.numel() == _DIM and gate_up_q8.numel() == _TOPK * (_HIDDEN // _Q4_BLOCK) * _Q8_BLOCK_BYTES and sel_probs.numel() == _TOPK * 2
+  mem = _TOPK * (_HIDDEN // _Q4_BLOCK) * _Q8_BLOCK_BYTES + _TOPK * 8 + _DIM * 4 + _TOPK * _DIM * (_HIDDEN // _Q4_BLOCK) * _Q4_BLOCK_BYTES
+  ops = _TOPK * _DIM * _HIDDEN * 2 + _TOPK * _DIM * 2
+  sink = UOp.sink(
+    UOp.special(_DIM // 8, "gidx0"), UOp.special(512, "lidx0"), z, gate_up_q8, sel_probs, down_w,
+    arg=KernelInfo(name="kimi_down_reduce_q4_q8_sel_probs_0", estimates=Estimates(ops=ops, mem=mem)))
+  return UOp(Ops.PROGRAM, src=(
+    sink, UOp(Ops.DEVICE, arg=device), UOp(Ops.LINEAR, src=(*sink.src, sink)),
+    UOp(Ops.SOURCE, arg=_DOWN_REDUCE_Q4_Q8_SEL_PROBS_HIP_SRC), UOp(Ops.BINARY, arg=_compiled_down_reduce_q8_sel_probs(arch))))
+
+def kimi_down_reduce_q4_q8_from_sel_probs_q8_0(gate_up_q8:Tensor, sel_probs:Tensor, down_w:Tensor) -> Tensor:
+  assert gate_up_q8.numel() == _TOPK * (_HIDDEN // _Q4_BLOCK) * _Q8_BLOCK_BYTES and sel_probs.numel() == _TOPK * 2
+  z = Tensor.empty(_DIM, dtype=dtypes.float32, device=gate_up_q8.device)
+  z, *_ = Tensor.custom_kernel(
+    z, gate_up_q8.reshape(-1), sel_probs.reshape(-1), down_w.reshape(-1),
+    fxn=functools.partial(_down_reduce_q8_sel_probs_kernel, device=gate_up_q8.device, arch=_arch(gate_up_q8.device)))
+  return z

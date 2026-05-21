@@ -134,7 +134,7 @@ def block_device(devices:tuple[str,...], i:int, n_blk:int) -> str:
   return devices[min(i * len(devices) // n_blk, len(devices) - 1)]
 
 def _attach_q4_0_raw(t:Tensor, raw:Tensor, name:str, shape:tuple[int, ...]) -> Tensor:
-  if (getenv("Q4_EXPERT", 0) or getenv("CUSTOM_KIMI_MOE", 0) or getenv("CUSTOM_KIMI_MOE_Q8", 0)) and name.endswith('_exps.weight'):
+  if getenv("CUSTOM_KIMI_MOE_Q8", 0) and name.endswith('_exps.weight'):
     t._ggml_qtype = 2
     t._ggml_raw = raw.reshape(*shape[:-1], shape[-1]//32, 18)
   return t
@@ -147,8 +147,8 @@ def _attach_q8_0_raw(t:Tensor, raw:Tensor, name:str, shape:tuple[int, ...]) -> T
   return t
 
 def _ggml_tensor(name:str, raw:Tensor, n:int, typ:int, dims:tuple[int, ...]) -> Tensor:
-  t = ggml_data_to_tensor(raw, n, typ).reshape(*reversed(dims))
   shape = tuple(reversed(dims))
+  t = ggml_data_to_tensor(raw, n, typ).reshape(*shape)
   if typ == 2: return _attach_q4_0_raw(t, raw, name, shape)
   if typ == 8: return _attach_q8_0_raw(t, raw, name, shape)
   return t
