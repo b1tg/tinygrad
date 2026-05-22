@@ -157,10 +157,14 @@ def load_state_dict(model, state_dict:dict[str, Tensor], strict=True, verbose=Tr
         src = state_dict[k] if isinstance(state_dict[k].device, tuple) else state_dict[k].shard(v.device, v.uop.axis)
       else: src = state_dict[k].to(v.device)
       v.replace(src)
-      if hasattr(src, "_ggml_qtype"): v._ggml_qtype, v._ggml_raw = src._ggml_qtype, src._ggml_raw
+      if hasattr(src, "_ggml_qtype"):
+        v._ggml_qtype = src._ggml_qtype
+        if hasattr(src, "_ggml_raw"): v._ggml_raw = src._ggml_raw
+        if hasattr(src, "_ggml_raw_split"): v._ggml_raw_split = src._ggml_raw_split
       elif hasattr(v, "_ggml_qtype"):
         delattr(v, "_ggml_qtype")
-        delattr(v, "_ggml_raw")
+        if hasattr(v, "_ggml_raw"): delattr(v, "_ggml_raw")
+        if hasattr(v, "_ggml_raw_split"): delattr(v, "_ggml_raw_split")
       if realize: v.realize()
       if consume: del state_dict[k]
       ret.append(v)

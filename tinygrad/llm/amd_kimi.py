@@ -1,16 +1,24 @@
 import functools
+from dataclasses import replace
 
 from tinygrad import Context, Device, Tensor, dtypes
 from tinygrad.renderer import Estimates
-from tinygrad.uop.ops import KernelInfo, Ops, UOp
+from tinygrad.uop.ops import KernelInfo, Ops, ProgramInfo, UOp
 
 _DIM, _HIDDEN, _TOPK = 7168, 2048, 8
 _Q4_BLOCK, _Q4_BLOCK_BYTES = 32, 18
 _Q8_BLOCK_BYTES = 34
 _ROUTER_EXPERTS, _VOCAB, _OUT_GROUP = 384, 163840, 32
+_MLA_H, _MLA_D, _MLA_C, _MLA_THREADS = 64, 576, 512, 512
 
 @Context(ALLOW_DEVICE_USAGE=1)
 def _arch(device:str) -> str: return Device[device].renderer.target.arch
+
+def _custom_program(sink:UOp, device:str, source:str, binary:bytes, outs:tuple[int, ...]=(0,)) -> UOp:
+  info = ProgramInfo.from_sink(sink)
+  info = replace(info, outs=outs, ins=tuple(i for i in info.globals if i not in outs))
+  return UOp(Ops.PROGRAM, src=(
+    sink, UOp(Ops.DEVICE, arg=device), UOp(Ops.LINEAR, src=(*sink.src, sink)), UOp(Ops.SOURCE, arg=source), UOp(Ops.BINARY, arg=binary)), arg=info)
 
 _ROUTER_TOPK_HIP_SRC = r"""
 #include <hip/hip_runtime.h>
@@ -93,9 +101,7 @@ def _router_topk_kernel(sel:UOp, probs:UOp, logits:UOp, bias:UOp, device:str, ar
   sink = UOp.sink(
     UOp.special(1, "gidx0"), UOp.special(64, "lidx0"), sel, probs, logits, bias,
     arg=KernelInfo(name="kimi_router_topk", estimates=estimates))
-  return UOp(Ops.PROGRAM, src=(
-    sink, UOp(Ops.DEVICE, arg=device), UOp(Ops.LINEAR, src=(*sink.src, sink)),
-    UOp(Ops.SOURCE, arg=_ROUTER_TOPK_HIP_SRC), UOp(Ops.BINARY, arg=_compiled_router_topk(arch))))
+  return _custom_program(sink, device, _ROUTER_TOPK_HIP_SRC, _compiled_router_topk(arch), outs=(0, 1))
 
 def kimi_router_topk(logits:Tensor, bias:Tensor) -> tuple[Tensor, Tensor]:
   assert logits.numel() == _ROUTER_EXPERTS and bias.numel() == _ROUTER_EXPERTS
@@ -142,9 +148,7 @@ def _quant_q8_kernel(q8:UOp, x:UOp, device:str, arch:str) -> UOp:
   sink = UOp.sink(
     UOp.special(_DIM // _Q4_BLOCK, "gidx0"), UOp.special(32, "lidx0"), q8, x,
     arg=KernelInfo(name="kimi_quant_q8_0", estimates=Estimates(ops=_DIM * 10, mem=_DIM * 4 + (_DIM // _Q4_BLOCK) * _Q8_BLOCK_BYTES)))
-  return UOp(Ops.PROGRAM, src=(
-    sink, UOp(Ops.DEVICE, arg=device), UOp(Ops.LINEAR, src=(*sink.src, sink)),
-    UOp(Ops.SOURCE, arg=_QUANT_Q8_0_HIP_SRC), UOp(Ops.BINARY, arg=_compiled_quant_q8(arch))))
+  return _custom_program(sink, device, _QUANT_Q8_0_HIP_SRC, _compiled_quant_q8(arch))
 
 def kimi_quant_q8_0(x:Tensor) -> Tensor:
   assert x.numel() == _DIM
@@ -259,9 +263,7 @@ def _router_quant_kernel(sel_probs:UOp, q8:UOp, logits:UOp, bias:UOp, x:UOp, dev
     UOp.special(_DIM // _Q4_BLOCK + 1, "gidx0"), UOp.special(64, "lidx0"), sel_probs, q8, logits, bias, x,
     arg=KernelInfo(name="kimi_router_quant_q8_0", estimates=Estimates(
       ops=_DIM * 10 + _ROUTER_EXPERTS * 8 + _TOPK * _ROUTER_EXPERTS, mem=mem)))
-  return UOp(Ops.PROGRAM, src=(
-    sink, UOp(Ops.DEVICE, arg=device), UOp(Ops.LINEAR, src=(*sink.src, sink)),
-    UOp(Ops.SOURCE, arg=_router_quant_src(scale)), UOp(Ops.BINARY, arg=_compiled_router_quant(arch, scale))))
+  return _custom_program(sink, device, _router_quant_src(scale), _compiled_router_quant(arch, scale), outs=(0, 1))
 
 def kimi_router_quant_q8_0(logits:Tensor, bias:Tensor, x:Tensor, scale:float) -> tuple[Tensor, Tensor]:
   assert logits.numel() == _ROUTER_EXPERTS and bias.numel() == _ROUTER_EXPERTS and x.numel() == _DIM
@@ -403,18 +405,14 @@ def _output_argmax_stage1_kernel(vals:UOp, idxs:UOp, xq:UOp, w:UOp, device:str, 
   sink = UOp.sink(
     UOp.special(_VOCAB // _OUT_GROUP, "gidx0"), UOp.special(1024, "lidx0"), vals, idxs, xq, w,
     arg=KernelInfo(name="kimi_output_argmax_q8_0_stage1", estimates=Estimates(ops=_VOCAB * _DIM * 2, mem=mem)))
-  return UOp(Ops.PROGRAM, src=(
-    sink, UOp(Ops.DEVICE, arg=device), UOp(Ops.LINEAR, src=(*sink.src, sink)),
-    UOp(Ops.SOURCE, arg=_OUTPUT_ARGMAX_Q8_0_STAGE1_HIP_SRC), UOp(Ops.BINARY, arg=_compiled_output_argmax_stage1(arch))))
+  return _custom_program(sink, device, _OUTPUT_ARGMAX_Q8_0_STAGE1_HIP_SRC, _compiled_output_argmax_stage1(arch), outs=(0, 1))
 
 def _output_argmax_stage2_kernel(out:UOp, vals:UOp, idxs:UOp, device:str, arch:str) -> UOp:
   assert out.numel() == 1 and vals.numel() == _VOCAB // _OUT_GROUP and idxs.numel() == _VOCAB // _OUT_GROUP
   sink = UOp.sink(
     UOp.special(1, "gidx0"), UOp.special(1024, "lidx0"), out, vals, idxs,
     arg=KernelInfo(name="kimi_output_argmax_q8_0_stage2", estimates=Estimates(ops=_VOCAB // _OUT_GROUP, mem=(_VOCAB // _OUT_GROUP) * 8)))
-  return UOp(Ops.PROGRAM, src=(
-    sink, UOp(Ops.DEVICE, arg=device), UOp(Ops.LINEAR, src=(*sink.src, sink)),
-    UOp(Ops.SOURCE, arg=_OUTPUT_ARGMAX_Q8_0_STAGE2_HIP_SRC), UOp(Ops.BINARY, arg=_compiled_output_argmax_stage2(arch))))
+  return _custom_program(sink, device, _OUTPUT_ARGMAX_Q8_0_STAGE2_HIP_SRC, _compiled_output_argmax_stage2(arch))
 
 def kimi_output_argmax_q8_0(x:Tensor, w:Tensor) -> Tensor:
   assert x.numel() == _DIM and w.numel() == _VOCAB * (_DIM // _Q4_BLOCK) * _Q8_BLOCK_BYTES
@@ -426,6 +424,101 @@ def kimi_output_argmax_q8_0(x:Tensor, w:Tensor) -> Tensor:
   out = Tensor.empty(1, dtype=dtypes.int32, device=x.device)
   out, *_ = Tensor.custom_kernel(out, vals, idxs, fxn=functools.partial(_output_argmax_stage2_kernel, device=x.device, arch=_arch(x.device)))
   return out.reshape(*x.shape[:-2], 1)
+
+def _mla_softv_symbolic_src(max_context:int) -> str:
+  return f"""
+#include <hip/hip_runtime.h>
+constexpr int H = {_MLA_H};
+constexpr int D = {_MLA_D};
+constexpr int C = {_MLA_C};
+constexpr int MAX_CONTEXT = {max_context};
+constexpr int THREADS = {_MLA_THREADS};
+constexpr float LOG2E = 1.4426950408889634f;
+extern "C" __global__ __launch_bounds__(THREADS) void kimi_mla_softv_symbolic(
+    float* __restrict__ out, const float* __restrict__ scores, const float* __restrict__ cache, int start_pos) {{
+  __shared__ float probs[4096];
+  __shared__ float red[THREADS];
+  int n = start_pos + 1;
+  int tid = threadIdx.x;
+  int h = blockIdx.x;
+  if (n <= 64) {{
+    float m = tid < n ? scores[h * MAX_CONTEXT + tid] : -3.4028234663852886e38f;
+    if (tid < 64) {{
+      #pragma unroll
+      for (int off = 32; off > 0; off >>= 1) m = fmaxf(m, __shfl_down(m, off, 64));
+      if (tid == 0) red[0] = m;
+    }}
+    __syncthreads();
+    m = red[0];
+    float ss = 0.0f;
+    if (tid < n) {{
+      ss = exp2f((scores[h * MAX_CONTEXT + tid] - m) * LOG2E);
+      probs[tid] = ss;
+    }}
+    if (tid < 64) {{
+      #pragma unroll
+      for (int off = 32; off > 0; off >>= 1) ss += __shfl_down(ss, off, 64);
+      if (tid == 0) red[0] = ss;
+    }}
+    __syncthreads();
+    ss = red[0];
+    for (int c = tid; c < C; c += THREADS) {{
+      float acc = 0.0f;
+      for (int t = 0; t < n; t++) acc += probs[t] * cache[t * D + c];
+      out[h * C + c] = acc / ss;
+    }}
+    return;
+  }}
+  float m = -3.4028234663852886e38f;
+  for (int t = tid; t < n; t += THREADS) m = fmaxf(m, scores[h * MAX_CONTEXT + t]);
+  red[tid] = m;
+  __syncthreads();
+  for (int off = THREADS / 2; off > 0; off >>= 1) {{
+    if (tid < off) red[tid] = fmaxf(red[tid], red[tid + off]);
+    __syncthreads();
+  }}
+  m = red[0];
+  float ss = 0.0f;
+  for (int t = tid; t < n; t += THREADS) {{
+    float p = exp2f((scores[h * MAX_CONTEXT + t] - m) * LOG2E);
+    probs[t] = p;
+    ss += p;
+  }}
+  red[tid] = ss;
+  __syncthreads();
+  for (int off = THREADS / 2; off > 0; off >>= 1) {{
+    if (tid < off) red[tid] += red[tid + off];
+    __syncthreads();
+  }}
+  ss = red[0];
+  for (int c = tid; c < C; c += THREADS) {{
+    float acc = 0.0f;
+    for (int t = 0; t < n; t++) acc += probs[t] * cache[t * D + c];
+    out[h * C + c] = acc / ss;
+  }}
+}}
+"""
+
+@functools.cache
+def _compiled_mla_softv_symbolic(arch:str, max_context:int) -> bytes:
+  from tinygrad.runtime.support.compiler_amd import HIPCCCompiler
+  return HIPCCCompiler(arch).compile_cached(_mla_softv_symbolic_src(max_context))
+
+def _mla_softv_symbolic_kernel(out:UOp, scores:UOp, cache:UOp, device:str, arch:str, start_pos:UOp, max_context:int) -> UOp:
+  assert out.numel() == _MLA_H * _MLA_C and cache.numel() == max_context * _MLA_D
+  sink = UOp.sink(
+    UOp.special(_MLA_H, "gidx0"), UOp.special(_MLA_THREADS, "lidx0"), out, scores, cache, start_pos,
+    arg=KernelInfo(name="kimi_mla_softv_symbolic", estimates=Estimates(ops=_MLA_H * max_context * _MLA_C * 2,
+      mem=(max_context * (_MLA_H + _MLA_D) + _MLA_H * _MLA_C) * 4)))
+  return _custom_program(sink, device, _mla_softv_symbolic_src(max_context), _compiled_mla_softv_symbolic(arch, max_context))
+
+def kimi_mla_softv_symbolic(scores:Tensor, cache:Tensor, start_pos:UOp, max_context:int) -> Tensor:
+  assert cache.numel() == max_context * _MLA_D
+  out = Tensor.empty(_MLA_H * _MLA_C, dtype=dtypes.float32, device=scores.device)
+  out, *_ = Tensor.custom_kernel(out, scores, cache,
+    fxn=functools.partial(_mla_softv_symbolic_kernel, device=scores.device, arch=_arch(scores.device), start_pos=start_pos,
+                          max_context=max_context))
+  return out.reshape(1, _MLA_H, 1, _MLA_C)
 
 _GATE_UP_Q4_Q8_TO_Q8_0_HIP_SRC = r"""
 #include <hip/hip_runtime.h>
@@ -529,9 +622,7 @@ def _gate_up_to_q8_kernel(zq:UOp, xq:UOp, sel:UOp, gate_w:UOp, up_w:UOp, device:
   sink = UOp.sink(
     UOp.special(_TOPK * (_HIDDEN // _Q4_BLOCK), "gidx0"), UOp.special(1024, "lidx0"), zq, xq, sel, gate_w, up_w,
     arg=KernelInfo(name="kimi_gate_up_q4_q8_to_q8_0", estimates=Estimates(ops=ops, mem=mem)))
-  return UOp(Ops.PROGRAM, src=(
-    sink, UOp(Ops.DEVICE, arg=device), UOp(Ops.LINEAR, src=(*sink.src, sink)),
-    UOp(Ops.SOURCE, arg=_GATE_UP_Q4_Q8_TO_Q8_0_HIP_SRC), UOp(Ops.BINARY, arg=_compiled_gate_up_to_q8(arch))))
+  return _custom_program(sink, device, _GATE_UP_Q4_Q8_TO_Q8_0_HIP_SRC, _compiled_gate_up_to_q8(arch))
 
 def kimi_gate_up_q4_q8_to_q8_from_q8_0(xq:Tensor, sel:Tensor, gate_w:Tensor, up_w:Tensor) -> Tensor:
   assert xq.numel() == (_DIM // _Q4_BLOCK) * _Q8_BLOCK_BYTES and sel.numel() == _TOPK
@@ -541,8 +632,55 @@ def kimi_gate_up_q4_q8_to_q8_from_q8_0(xq:Tensor, sel:Tensor, gate_w:Tensor, up_
     fxn=functools.partial(_gate_up_to_q8_kernel, device=xq.device, arch=_arch(xq.device)))
   return zq
 
+_GATE_UP_Q4_Q8_TO_Q8_SPLIT_HIP_SRC = _GATE_UP_Q4_Q8_TO_Q8_0_HIP_SRC.replace(
+  "kimi_gate_up_q4_q8_to_q8_0", "kimi_gate_up_q4_q8_to_q8_split_0").replace(
+  "constexpr int XQ_BLOCKS = DIM / 32;",
+  "constexpr int XQ_BLOCKS = DIM / 32;\nconstexpr size_t BLOCKS_TOTAL = 384ull * HIDDEN * (DIM / 32);").replace(
+"""    size_t wbase = ((size_t(expert) * HIDDEN + row) * (DIM / 32) + block) * Q4_BLOCK_BYTES;
+    const unsigned char* gb = gate_w + wbase;
+    const unsigned char* ub = up_w + wbase;
+    float gs = float(*reinterpret_cast<const _Float16*>(gb));
+    float us = float(*reinterpret_cast<const _Float16*>(ub));""",
+"""    size_t widx = (size_t(expert) * HIDDEN + row) * (DIM / 32) + block;
+    size_t sbase = widx * 2;
+    size_t qbase = BLOCKS_TOTAL * 2 + widx * 16;
+    const unsigned char* gb = gate_w + qbase;
+    const unsigned char* ub = up_w + qbase;
+    float gs = float(*reinterpret_cast<const _Float16*>(gate_w + sbase));
+    float us = float(*reinterpret_cast<const _Float16*>(up_w + sbase));""").replace(
+  "uint32_t gp = *reinterpret_cast<const uint32_t*>(gb + 2 + j);",
+  "uint32_t gp = *reinterpret_cast<const uint32_t*>(gb + j);").replace(
+  "uint32_t up = *reinterpret_cast<const uint32_t*>(ub + 2 + j);",
+  "uint32_t up = *reinterpret_cast<const uint32_t*>(ub + j);")
+
+@functools.cache
+def _compiled_gate_up_to_q8_split(arch:str) -> bytes:
+  from tinygrad.runtime.support.compiler_amd import HIPCCCompiler
+  return HIPCCCompiler(arch).compile_cached(_GATE_UP_Q4_Q8_TO_Q8_SPLIT_HIP_SRC)
+
+def _gate_up_to_q8_split_kernel(zq:UOp, xq:UOp, sel:UOp, gate_w:UOp, up_w:UOp, device:str, arch:str) -> UOp:
+  assert zq.numel() == _TOPK * (_HIDDEN // _Q4_BLOCK) * _Q8_BLOCK_BYTES and xq.numel() == (_DIM // _Q4_BLOCK) * _Q8_BLOCK_BYTES
+  assert sel.numel() == _TOPK and gate_w.numel() == _ROUTER_EXPERTS * _HIDDEN * (_DIM // _Q4_BLOCK) * _Q4_BLOCK_BYTES
+  mem = _TOPK * (_HIDDEN // _Q4_BLOCK) * _Q8_BLOCK_BYTES + (_DIM // _Q4_BLOCK) * _Q8_BLOCK_BYTES + \
+    2 * _TOPK * _HIDDEN * (_DIM // _Q4_BLOCK) * _Q4_BLOCK_BYTES
+  sink = UOp.sink(
+    UOp.special(_TOPK * (_HIDDEN // _Q4_BLOCK), "gidx0"), UOp.special(1024, "lidx0"), zq, xq, sel, gate_w, up_w,
+    arg=KernelInfo(name="kimi_gate_up_q4_q8_to_q8_split_0", estimates=Estimates(ops=_TOPK * _HIDDEN * _DIM * 4, mem=mem)))
+  return _custom_program(sink, device, _GATE_UP_Q4_Q8_TO_Q8_SPLIT_HIP_SRC, _compiled_gate_up_to_q8_split(arch))
+
+def kimi_gate_up_q4_q8_to_q8_split_from_q8_0(xq:Tensor, sel:Tensor, gate_w:Tensor, up_w:Tensor) -> Tensor:
+  zq = Tensor.empty(_TOPK * (_HIDDEN // _Q4_BLOCK) * _Q8_BLOCK_BYTES, dtype=dtypes.uint8, device=xq.device)
+  zq, *_ = Tensor.custom_kernel(
+    zq, xq.reshape(-1), sel.reshape(-1), gate_w.reshape(-1), up_w.reshape(-1),
+    fxn=functools.partial(_gate_up_to_q8_split_kernel, device=xq.device, arch=_arch(xq.device)))
+  return zq
+
 _GATE_UP_Q4_Q8_TO_Q8_SEL_PROBS_HIP_SRC = _GATE_UP_Q4_Q8_TO_Q8_0_HIP_SRC.replace(
   "kimi_gate_up_q4_q8_to_q8_0", "kimi_gate_up_q4_q8_to_q8_sel_probs_0").replace(
+  "const int* __restrict__ sel,", "const float* __restrict__ sel_probs,").replace(
+  "int expert = sel[k];", "int expert = int(sel_probs[k]);")
+_GATE_UP_Q4_Q8_TO_Q8_SPLIT_SEL_PROBS_HIP_SRC = _GATE_UP_Q4_Q8_TO_Q8_SPLIT_HIP_SRC.replace(
+  "kimi_gate_up_q4_q8_to_q8_split_0", "kimi_gate_up_q4_q8_to_q8_split_sel_probs_0").replace(
   "const int* __restrict__ sel,", "const float* __restrict__ sel_probs,").replace(
   "int expert = sel[k];", "int expert = int(sel_probs[k]);")
 
@@ -559,9 +697,7 @@ def _gate_up_to_q8_sel_probs_kernel(zq:UOp, xq:UOp, sel_probs:UOp, gate_w:UOp, u
   sink = UOp.sink(
     UOp.special(_TOPK * (_HIDDEN // _Q4_BLOCK), "gidx0"), UOp.special(1024, "lidx0"), zq, xq, sel_probs, gate_w, up_w,
     arg=KernelInfo(name="kimi_gate_up_q4_q8_to_q8_sel_probs_0", estimates=Estimates(ops=_TOPK * _HIDDEN * _DIM * 4, mem=mem)))
-  return UOp(Ops.PROGRAM, src=(
-    sink, UOp(Ops.DEVICE, arg=device), UOp(Ops.LINEAR, src=(*sink.src, sink)),
-    UOp(Ops.SOURCE, arg=_GATE_UP_Q4_Q8_TO_Q8_SEL_PROBS_HIP_SRC), UOp(Ops.BINARY, arg=_compiled_gate_up_to_q8_sel_probs(arch))))
+  return _custom_program(sink, device, _GATE_UP_Q4_Q8_TO_Q8_SEL_PROBS_HIP_SRC, _compiled_gate_up_to_q8_sel_probs(arch))
 
 def kimi_gate_up_q4_q8_to_q8_from_sel_probs_q8_0(xq:Tensor, sel_probs:Tensor, gate_w:Tensor, up_w:Tensor) -> Tensor:
   assert xq.numel() == (_DIM // _Q4_BLOCK) * _Q8_BLOCK_BYTES and sel_probs.numel() == _TOPK * 2
@@ -569,6 +705,28 @@ def kimi_gate_up_q4_q8_to_q8_from_sel_probs_q8_0(xq:Tensor, sel_probs:Tensor, ga
   zq, *_ = Tensor.custom_kernel(
     zq, xq.reshape(-1), sel_probs.reshape(-1), gate_w.reshape(-1), up_w.reshape(-1),
     fxn=functools.partial(_gate_up_to_q8_sel_probs_kernel, device=xq.device, arch=_arch(xq.device)))
+  return zq
+
+@functools.cache
+def _compiled_gate_up_to_q8_split_sel_probs(arch:str) -> bytes:
+  from tinygrad.runtime.support.compiler_amd import HIPCCCompiler
+  return HIPCCCompiler(arch).compile_cached(_GATE_UP_Q4_Q8_TO_Q8_SPLIT_SEL_PROBS_HIP_SRC)
+
+def _gate_up_to_q8_split_sel_probs_kernel(zq:UOp, xq:UOp, sel_probs:UOp, gate_w:UOp, up_w:UOp, device:str, arch:str) -> UOp:
+  assert zq.numel() == _TOPK * (_HIDDEN // _Q4_BLOCK) * _Q8_BLOCK_BYTES and xq.numel() == (_DIM // _Q4_BLOCK) * _Q8_BLOCK_BYTES
+  assert sel_probs.numel() == _TOPK * 2 and gate_w.numel() == _ROUTER_EXPERTS * _HIDDEN * (_DIM // _Q4_BLOCK) * _Q4_BLOCK_BYTES
+  mem = _TOPK * (_HIDDEN // _Q4_BLOCK) * _Q8_BLOCK_BYTES + (_DIM // _Q4_BLOCK) * _Q8_BLOCK_BYTES + \
+    2 * _TOPK * _HIDDEN * (_DIM // _Q4_BLOCK) * _Q4_BLOCK_BYTES
+  sink = UOp.sink(
+    UOp.special(_TOPK * (_HIDDEN // _Q4_BLOCK), "gidx0"), UOp.special(1024, "lidx0"), zq, xq, sel_probs, gate_w, up_w,
+    arg=KernelInfo(name="kimi_gate_up_q4_q8_to_q8_split_sel_probs_0", estimates=Estimates(ops=_TOPK * _HIDDEN * _DIM * 4, mem=mem)))
+  return _custom_program(sink, device, _GATE_UP_Q4_Q8_TO_Q8_SPLIT_SEL_PROBS_HIP_SRC, _compiled_gate_up_to_q8_split_sel_probs(arch))
+
+def kimi_gate_up_q4_q8_to_q8_split_from_sel_probs_q8_0(xq:Tensor, sel_probs:Tensor, gate_w:Tensor, up_w:Tensor) -> Tensor:
+  zq = Tensor.empty(_TOPK * (_HIDDEN // _Q4_BLOCK) * _Q8_BLOCK_BYTES, dtype=dtypes.uint8, device=xq.device)
+  zq, *_ = Tensor.custom_kernel(
+    zq, xq.reshape(-1), sel_probs.reshape(-1), gate_w.reshape(-1), up_w.reshape(-1),
+    fxn=functools.partial(_gate_up_to_q8_split_sel_probs_kernel, device=xq.device, arch=_arch(xq.device)))
   return zq
 
 _SHARED_GATE_UP_Q8_0_HIP_SRC = r"""
@@ -637,9 +795,7 @@ def _shared_gate_up_q8_kernel(z:UOp, xq:UOp, gate_w:UOp, up_w:UOp, device:str, a
   sink = UOp.sink(
     UOp.special(_HIDDEN // 8, "gidx0"), UOp.special(256, "lidx0"), z, xq, gate_w, up_w,
     arg=KernelInfo(name="kimi_shared_gate_up_q8_0", estimates=Estimates(ops=_HIDDEN * _DIM * 4, mem=mem)))
-  return UOp(Ops.PROGRAM, src=(
-    sink, UOp(Ops.DEVICE, arg=device), UOp(Ops.LINEAR, src=(*sink.src, sink)),
-    UOp(Ops.SOURCE, arg=_SHARED_GATE_UP_Q8_0_HIP_SRC), UOp(Ops.BINARY, arg=_compiled_shared_gate_up_q8(arch))))
+  return _custom_program(sink, device, _SHARED_GATE_UP_Q8_0_HIP_SRC, _compiled_shared_gate_up_q8(arch))
 
 def kimi_shared_gate_up_q8_from_q8_0(xq:Tensor, gate_w:Tensor, up_w:Tensor) -> Tensor:
   assert xq.numel() == (_DIM // _Q4_BLOCK) * _Q8_BLOCK_BYTES
@@ -734,9 +890,7 @@ def _down_reduce_q8_kernel(z:UOp, gate_up_q8:UOp, sel:UOp, probs:UOp, down_w:UOp
   sink = UOp.sink(
     UOp.special(_DIM // 8, "gidx0"), UOp.special(512, "lidx0"), z, gate_up_q8, sel, probs, down_w,
     arg=KernelInfo(name="kimi_down_reduce_q4_q8_0", estimates=Estimates(ops=ops, mem=mem)))
-  return UOp(Ops.PROGRAM, src=(
-    sink, UOp(Ops.DEVICE, arg=device), UOp(Ops.LINEAR, src=(*sink.src, sink)),
-    UOp(Ops.SOURCE, arg=_DOWN_REDUCE_Q4_Q8_0_HIP_SRC), UOp(Ops.BINARY, arg=_compiled_down_reduce_q8(arch))))
+  return _custom_program(sink, device, _DOWN_REDUCE_Q4_Q8_0_HIP_SRC, _compiled_down_reduce_q8(arch))
 
 def kimi_down_reduce_q4_q8_from_q8_0(gate_up_q8:Tensor, sel:Tensor, probs:Tensor, down_w:Tensor) -> Tensor:
   assert gate_up_q8.numel() == _TOPK * (_HIDDEN // _Q4_BLOCK) * _Q8_BLOCK_BYTES and sel.numel() == _TOPK and probs.numel() == _TOPK
@@ -765,9 +919,7 @@ def _down_reduce_q8_sel_probs_kernel(z:UOp, gate_up_q8:UOp, sel_probs:UOp, down_
   sink = UOp.sink(
     UOp.special(_DIM // 8, "gidx0"), UOp.special(512, "lidx0"), z, gate_up_q8, sel_probs, down_w,
     arg=KernelInfo(name="kimi_down_reduce_q4_q8_sel_probs_0", estimates=Estimates(ops=ops, mem=mem)))
-  return UOp(Ops.PROGRAM, src=(
-    sink, UOp(Ops.DEVICE, arg=device), UOp(Ops.LINEAR, src=(*sink.src, sink)),
-    UOp(Ops.SOURCE, arg=_DOWN_REDUCE_Q4_Q8_SEL_PROBS_HIP_SRC), UOp(Ops.BINARY, arg=_compiled_down_reduce_q8_sel_probs(arch))))
+  return _custom_program(sink, device, _DOWN_REDUCE_Q4_Q8_SEL_PROBS_HIP_SRC, _compiled_down_reduce_q8_sel_probs(arch))
 
 def kimi_down_reduce_q4_q8_from_sel_probs_q8_0(gate_up_q8:Tensor, sel_probs:Tensor, down_w:Tensor) -> Tensor:
   assert gate_up_q8.numel() == _TOPK * (_HIDDEN // _Q4_BLOCK) * _Q8_BLOCK_BYTES and sel_probs.numel() == _TOPK * 2
@@ -775,4 +927,70 @@ def kimi_down_reduce_q4_q8_from_sel_probs_q8_0(gate_up_q8:Tensor, sel_probs:Tens
   z, *_ = Tensor.custom_kernel(
     z, gate_up_q8.reshape(-1), sel_probs.reshape(-1), down_w.reshape(-1),
     fxn=functools.partial(_down_reduce_q8_sel_probs_kernel, device=gate_up_q8.device, arch=_arch(gate_up_q8.device)))
+  return z
+
+_DOWN_REDUCE_Q4_Q8_SPLIT_HIP_SRC = _DOWN_REDUCE_Q4_Q8_0_HIP_SRC.replace(
+  "kimi_down_reduce_q4_q8_0", "kimi_down_reduce_q4_q8_split_0").replace(
+  "constexpr int XQ_BLOCKS = TOPK * (HIDDEN / 32);",
+  "constexpr int XQ_BLOCKS = TOPK * (HIDDEN / 32);\nconstexpr size_t BLOCKS_TOTAL = 384ull * DIM * (HIDDEN / 32);").replace(
+"""      size_t wbase = ((size_t(expert) * DIM + row) * (HIDDEN / 32) + block) * Q4_BLOCK_BYTES;
+      int xidx = k * (HIDDEN / 32) + block;
+      const unsigned char* wb = down_w + wbase;
+      float ws = float(*reinterpret_cast<const _Float16*>(wb));""",
+"""      size_t widx = (size_t(expert) * DIM + row) * (HIDDEN / 32) + block;
+      int xidx = k * (HIDDEN / 32) + block;
+      const unsigned char* wb = down_w + BLOCKS_TOTAL * 2 + widx * 16;
+      float ws = float(*reinterpret_cast<const _Float16*>(down_w + widx * 2));""").replace(
+  "uint32_t wp = *reinterpret_cast<const uint32_t*>(wb + 2 + j);",
+  "uint32_t wp = *reinterpret_cast<const uint32_t*>(wb + j);")
+
+@functools.cache
+def _compiled_down_reduce_q8_split(arch:str) -> bytes:
+  from tinygrad.runtime.support.compiler_amd import HIPCCCompiler
+  return HIPCCCompiler(arch).compile_cached(_DOWN_REDUCE_Q4_Q8_SPLIT_HIP_SRC)
+
+def _down_reduce_q8_split_kernel(z:UOp, gate_up_q8:UOp, sel:UOp, probs:UOp, down_w:UOp, device:str, arch:str) -> UOp:
+  assert z.numel() == _DIM and gate_up_q8.numel() == _TOPK * (_HIDDEN // _Q4_BLOCK) * _Q8_BLOCK_BYTES and sel.numel() == _TOPK
+  assert down_w.numel() == _ROUTER_EXPERTS * _DIM * (_HIDDEN // _Q4_BLOCK) * _Q4_BLOCK_BYTES
+  mem = _TOPK * (_HIDDEN // _Q4_BLOCK) * _Q8_BLOCK_BYTES + _TOPK * 8 + _DIM * 4 + _TOPK * _DIM * (_HIDDEN // _Q4_BLOCK) * _Q4_BLOCK_BYTES
+  ops = _TOPK * _DIM * _HIDDEN * 2 + _TOPK * _DIM * 2
+  sink = UOp.sink(
+    UOp.special(_DIM // 8, "gidx0"), UOp.special(512, "lidx0"), z, gate_up_q8, sel, probs, down_w,
+    arg=KernelInfo(name="kimi_down_reduce_q4_q8_split_0", estimates=Estimates(ops=ops, mem=mem)))
+  return _custom_program(sink, device, _DOWN_REDUCE_Q4_Q8_SPLIT_HIP_SRC, _compiled_down_reduce_q8_split(arch))
+
+def kimi_down_reduce_q4_q8_split_from_q8_0(gate_up_q8:Tensor, sel:Tensor, probs:Tensor, down_w:Tensor) -> Tensor:
+  z = Tensor.empty(_DIM, dtype=dtypes.float32, device=gate_up_q8.device)
+  z, *_ = Tensor.custom_kernel(
+    z, gate_up_q8.reshape(-1), sel.reshape(-1), probs.reshape(-1), down_w.reshape(-1),
+    fxn=functools.partial(_down_reduce_q8_split_kernel, device=gate_up_q8.device, arch=_arch(gate_up_q8.device)))
+  return z.reshape(*probs.shape[:-1], _DIM)
+
+_DOWN_REDUCE_Q4_Q8_SPLIT_SEL_PROBS_HIP_SRC = _DOWN_REDUCE_Q4_Q8_SPLIT_HIP_SRC.replace(
+  "probs[k]", "sel_probs[TOPK + k]").replace(
+  "kimi_down_reduce_q4_q8_split_0", "kimi_down_reduce_q4_q8_split_sel_probs_0").replace(
+  "const int* __restrict__ sel,\n    const float* __restrict__ probs,",
+  "const float* __restrict__ sel_probs,").replace(
+  "int expert = sel[k];", "int expert = int(sel_probs[k]);")
+
+@functools.cache
+def _compiled_down_reduce_q8_split_sel_probs(arch:str) -> bytes:
+  from tinygrad.runtime.support.compiler_amd import HIPCCCompiler
+  return HIPCCCompiler(arch).compile_cached(_DOWN_REDUCE_Q4_Q8_SPLIT_SEL_PROBS_HIP_SRC)
+
+def _down_reduce_q8_split_sel_probs_kernel(z:UOp, gate_up_q8:UOp, sel_probs:UOp, down_w:UOp, device:str, arch:str) -> UOp:
+  assert z.numel() == _DIM and gate_up_q8.numel() == _TOPK * (_HIDDEN // _Q4_BLOCK) * _Q8_BLOCK_BYTES and sel_probs.numel() == _TOPK * 2
+  assert down_w.numel() == _ROUTER_EXPERTS * _DIM * (_HIDDEN // _Q4_BLOCK) * _Q4_BLOCK_BYTES
+  mem = _TOPK * (_HIDDEN // _Q4_BLOCK) * _Q8_BLOCK_BYTES + _TOPK * 8 + _DIM * 4 + _TOPK * _DIM * (_HIDDEN // _Q4_BLOCK) * _Q4_BLOCK_BYTES
+  ops = _TOPK * _DIM * _HIDDEN * 2 + _TOPK * _DIM * 2
+  sink = UOp.sink(
+    UOp.special(_DIM // 8, "gidx0"), UOp.special(512, "lidx0"), z, gate_up_q8, sel_probs, down_w,
+    arg=KernelInfo(name="kimi_down_reduce_q4_q8_split_sel_probs_0", estimates=Estimates(ops=ops, mem=mem)))
+  return _custom_program(sink, device, _DOWN_REDUCE_Q4_Q8_SPLIT_SEL_PROBS_HIP_SRC, _compiled_down_reduce_q8_split_sel_probs(arch))
+
+def kimi_down_reduce_q4_q8_split_from_sel_probs_q8_0(gate_up_q8:Tensor, sel_probs:Tensor, down_w:Tensor) -> Tensor:
+  z = Tensor.empty(_DIM, dtype=dtypes.float32, device=gate_up_q8.device)
+  z, *_ = Tensor.custom_kernel(
+    z, gate_up_q8.reshape(-1), sel_probs.reshape(-1), down_w.reshape(-1),
+    fxn=functools.partial(_down_reduce_q8_split_sel_probs_kernel, device=gate_up_q8.device, arch=_arch(gate_up_q8.device)))
   return z

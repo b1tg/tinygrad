@@ -19,6 +19,10 @@ class ExpertWeights:
     # sel: (B, T, k), x: (B, T, 1, in) or (B, T, k, in) -> output: (B, T, k, out)
     return (x.unsqueeze(-2) @ self.weight[sel].transpose(-1, -2)).contiguous().squeeze(-2)
 
+class RawWeight:
+  def __init__(self, qtype:int, raw_split:Tensor):
+    self._ggml_qtype, self._ggml_raw_split = qtype, raw_split
+
 def apply_rope(x:Tensor, freqs_cis:Tensor) -> Tensor:
   assert x.shape[-1] % 2 == 0
   cos, sin = freqs_cis.reshape(1, 1, x.shape[2], -1).chunk(2, dim=-1)
@@ -128,17 +132,41 @@ class FFNBlock:
       if kimi_moe_ok:
         if sel_probs is not None:
           from tinygrad.llm.amd_kimi import kimi_down_reduce_q4_q8_from_sel_probs_q8_0, kimi_gate_up_q4_q8_to_q8_from_sel_probs_q8_0
-          out = kimi_down_reduce_q4_q8_from_sel_probs_q8_0(
-            kimi_gate_up_q4_q8_to_q8_from_sel_probs_q8_0(
-              h_q8, sel_probs, self.ffn_gate_exps.weight._ggml_raw, self.ffn_up_exps.weight._ggml_raw),
-            sel_probs, self.ffn_down_exps.weight._ggml_raw)
+          if hasattr(self.ffn_gate_exps.weight, "_ggml_raw_split") and hasattr(self.ffn_up_exps.weight, "_ggml_raw_split"):
+            from tinygrad.llm.amd_kimi import kimi_gate_up_q4_q8_to_q8_split_from_sel_probs_q8_0
+            gate_up = kimi_gate_up_q4_q8_to_q8_split_from_sel_probs_q8_0(
+              h_q8, sel_probs, self.ffn_gate_exps.weight._ggml_raw_split, self.ffn_up_exps.weight._ggml_raw_split)
+            if hasattr(self.ffn_down_exps.weight, "_ggml_raw_split"):
+              from tinygrad.llm.amd_kimi import kimi_down_reduce_q4_q8_split_from_sel_probs_q8_0
+              out = kimi_down_reduce_q4_q8_split_from_sel_probs_q8_0(gate_up, sel_probs, self.ffn_down_exps.weight._ggml_raw_split)
+            else: out = kimi_down_reduce_q4_q8_from_sel_probs_q8_0(gate_up, sel_probs, self.ffn_down_exps.weight._ggml_raw)
+          else:
+            gate_up = kimi_gate_up_q4_q8_to_q8_from_sel_probs_q8_0(
+              h_q8, sel_probs, self.ffn_gate_exps.weight._ggml_raw, self.ffn_up_exps.weight._ggml_raw)
+            if hasattr(self.ffn_down_exps.weight, "_ggml_raw_split"):
+              from tinygrad.llm.amd_kimi import kimi_down_reduce_q4_q8_split_from_sel_probs_q8_0
+              out = kimi_down_reduce_q4_q8_split_from_sel_probs_q8_0(gate_up, sel_probs, self.ffn_down_exps.weight._ggml_raw_split)
+            else: out = kimi_down_reduce_q4_q8_from_sel_probs_q8_0(gate_up, sel_probs, self.ffn_down_exps.weight._ggml_raw)
         else:
           from tinygrad.llm.amd_kimi import kimi_down_reduce_q4_q8_from_q8_0, kimi_gate_up_q4_q8_to_q8_from_q8_0, kimi_quant_q8_0
           h_q8 = kimi_quant_q8_0(h)
-          out = kimi_down_reduce_q4_q8_from_q8_0(
-            kimi_gate_up_q4_q8_to_q8_from_q8_0(h_q8, sel, self.ffn_gate_exps.weight._ggml_raw, self.ffn_up_exps.weight._ggml_raw),
-            sel, probs, self.ffn_down_exps.weight._ggml_raw)
+          if hasattr(self.ffn_gate_exps.weight, "_ggml_raw_split") and hasattr(self.ffn_up_exps.weight, "_ggml_raw_split"):
+            from tinygrad.llm.amd_kimi import kimi_gate_up_q4_q8_to_q8_split_from_q8_0
+            gate_up = kimi_gate_up_q4_q8_to_q8_split_from_q8_0(
+              h_q8, sel, self.ffn_gate_exps.weight._ggml_raw_split, self.ffn_up_exps.weight._ggml_raw_split)
+          else:
+            gate_up = kimi_gate_up_q4_q8_to_q8_from_q8_0(h_q8, sel, self.ffn_gate_exps.weight._ggml_raw, self.ffn_up_exps.weight._ggml_raw)
+          if hasattr(self.ffn_down_exps.weight, "_ggml_raw_split"):
+            from tinygrad.llm.amd_kimi import kimi_down_reduce_q4_q8_split_from_q8_0
+            out = kimi_down_reduce_q4_q8_split_from_q8_0(gate_up, sel, probs, self.ffn_down_exps.weight._ggml_raw_split)
+          else: out = kimi_down_reduce_q4_q8_from_q8_0(gate_up, sel, probs, self.ffn_down_exps.weight._ggml_raw)
       else:
+        if hasattr(self.ffn_gate_exps.weight, "_ggml_raw_split") or hasattr(self.ffn_down_exps.weight, "_ggml_raw_split"):
+          raise RuntimeError(f"split MoE raw fell back: dev={x.device} shape={x.shape} dim={self.config.dim} hidden={self.config.hidden_dim} "
+                             f"topk={self.config.num_experts_per_tok} qtypes="
+                             f"{getattr(self.ffn_gate_exps.weight, '_ggml_qtype', None)},"
+                             f"{getattr(self.ffn_up_exps.weight, '_ggml_qtype', None)},"
+                             f"{getattr(self.ffn_down_exps.weight, '_ggml_qtype', None)}")
         x_down = self.ffn_down_exps(sel, (self.ffn_gate_exps(sel, h).silu() * self.ffn_up_exps(sel, h)).contiguous())  # (B, T, k, D)
         out = (x_down * probs.unsqueeze(-1)).sum(axis=2)  # (B, T, D)
       if hasattr(self, 'ffn_gate_shexp'):
@@ -250,7 +278,7 @@ class MLATransformerBlock(FFNBlock):
     else: q_proj = self.attn_q(x)
     q = q_proj.reshape(B, T, self.config.n_heads, self.config.head_dim).transpose(1, 2)
     q_nope, q_rope = q[..., :q_nope_head_dim], q[..., q_nope_head_dim:]
-    q = (q_nope @ self.attn_k_b["weight"].transpose(-1, -2)).cat(apply_rope(q_rope, self.freqs_cis[start_pos:start_pos+T]), dim=-1)
+    q_nope = q_nope @ self.attn_k_b["weight"].transpose(-1, -2)
 
     kv_a = self.attn_kv_a_mqa(x) if qakv_a is None else qakv_a[..., self.config.q_lora_rank:]
     c_kv = self.attn_kv_a_norm(kv_a[..., :self.config.kv_lora_rank])
@@ -259,14 +287,26 @@ class MLATransformerBlock(FFNBlock):
       self.freqs_cis[start_pos:start_pos+T])
 
     k_store = c_kv.reshape(B, 1, T, self.config.kv_lora_rank).cat(k_rope.reshape(B, 1, T, self.config.rope_dim), dim=-1)
-    k = Tensor(self.cache_k.uop.after(self.cache_k[:, :, start_pos:start_pos+T, :].uop.store(k_store.uop)))[:, :, 0:start_pos+T, :]
+    cache_k = Tensor(self.cache_k.uop.after(self.cache_k[:, :, start_pos:start_pos+T, :].uop.store(k_store.uop)))
+    k = cache_k[:, :, 0:start_pos+T, :]
     v = k[..., :self.config.kv_lora_rank]
 
-    mask = Tensor.full((1, 1, T, start_pos+T), float("-inf"), dtype=x.dtype, device=x.device).triu(start_pos+1) if resolve(T != 1) else None
-    attn = q @ k.transpose(-1, -2) * (1.0 / self.config.head_dim ** 0.5)
-    if mask is not None: attn = attn + mask
-    attn = attn.softmax(-1)
-    attn = ((attn @ v) @ self.attn_v_b["weight"].transpose(-1, -2)).transpose(1, 2).reshape(B, T, -1)
+    if getenv("CUSTOM_KIMI_MLA_SOFTV", 0) and str(x.device).startswith("AMD") and resolve(B == 1, False) and resolve(T == 1, False) and \
+         self.config.n_heads == 64 and self.config.head_dim == 192 and self.config.kv_lora_rank == 512 and self.config.rope_dim == 64 and \
+         self.config.max_context <= getenv("CUSTOM_KIMI_MLA_SOFTV_MAX_CONTEXT", 4096):
+      from tinygrad.llm.amd_kimi import kimi_mla_softv_symbolic
+      q = q_nope.cat(apply_rope(q_rope, self.freqs_cis[start_pos:start_pos+T]), dim=-1)
+      attn = q @ k.transpose(-1, -2) * (1.0 / self.config.head_dim ** 0.5)
+      attn = kimi_mla_softv_symbolic(attn, cache_k, start_pos, self.config.max_context)
+    else:
+      q_rope = apply_rope(q_rope, self.freqs_cis[start_pos:start_pos+T])
+      q = q_nope.cat(q_rope, dim=-1)
+      mask = Tensor.full((1, 1, T, start_pos+T), float("-inf"), dtype=x.dtype, device=x.device).triu(start_pos+1) if resolve(T != 1) else None
+      attn = q @ k.transpose(-1, -2) * (1.0 / self.config.head_dim ** 0.5)
+      if mask is not None: attn = attn + mask
+      attn = attn.softmax(-1)
+      attn = attn @ v
+    attn = (attn @ self.attn_v_b["weight"].transpose(-1, -2)).transpose(1, 2).reshape(B, T, -1)
     return self.attn_output(attn)
 
   def _init_state(self, x:Tensor):
@@ -351,7 +391,8 @@ class Transformer:
   def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
     x = self.token_embd(tokens).float()                   # (B, T, D)
     for block in self.blk: x = block(x.to(getattr(block.attn_norm, "weight").device), start_pos)
-    x = self.output_norm(x.to(self.output.weight.device))
+    x = x.to(self.output.weight.device)
+    x = self.output_norm(x)
     if getenv("CUSTOM_KIMI_OUTPUT_ARGMAX_Q8", 0) and str(x.device).startswith("AMD") and resolve(x.shape[0] == 1, False) and \
        resolve(x.shape[1] == 1, False) and self.output.weight.shape == (163840, 7168) and getattr(self.output.weight, "_ggml_qtype", None) == 8:
       from tinygrad.llm.amd_kimi import kimi_output_argmax_q8_0
@@ -375,7 +416,9 @@ class Transformer:
       for k,v in state_dict.items():
         w = v.cast('float16')
         if hasattr(v, "_ggml_qtype"):
-          w._ggml_qtype, w._ggml_raw = v._ggml_qtype, v._ggml_raw
+          w._ggml_qtype = v._ggml_qtype
+          if hasattr(v, "_ggml_raw"): w._ggml_raw = v._ggml_raw
+          if hasattr(v, "_ggml_raw_split"): w._ggml_raw_split = v._ggml_raw_split
         new_state_dict[k] = w
       state_dict = new_state_dict
 
@@ -436,6 +479,13 @@ class Transformer:
       for k,v in nn.state.get_state_dict(model).items():
         if k in state_dict: v.to_(state_dict[k].device)
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
+    if getenv("CUSTOM_KIMI_GATEUP_SPLIT_Q4", 0) or getenv("CUSTOM_KIMI_DOWN_SPLIT_Q4", 0):
+      for b in model.blk:
+        if hasattr(b, "ffn_gate_exps") and hasattr(b.ffn_gate_exps.weight, "_ggml_raw_split"):
+          b.ffn_gate_exps.weight = RawWeight(b.ffn_gate_exps.weight._ggml_qtype, b.ffn_gate_exps.weight._ggml_raw_split)
+          b.ffn_up_exps.weight = RawWeight(b.ffn_up_exps.weight._ggml_qtype, b.ffn_up_exps.weight._ggml_raw_split)
+        if hasattr(b, "ffn_down_exps") and hasattr(b.ffn_down_exps.weight, "_ggml_raw_split"):
+          b.ffn_down_exps.weight = RawWeight(b.ffn_down_exps.weight._ggml_qtype, b.ffn_down_exps.weight._ggml_raw_split)
     if small:=getenv("REALIZE_SMALL", 0):
       small = 1_000_000 if small == 1 else small
       params = [p for p in nn.state.get_parameters(model) if p.numel() <= small and not hasattr(p, "_ggml_qtype")]
@@ -460,6 +510,7 @@ class Transformer:
 
   def generate(self, tokens:list[int], chunk_size:int=32, temperature:float=0.0):
     if self.has_recurrent_block: chunk_size = 1
+    if getenv("CUSTOM_KIMI_GATEUP_SPLIT_Q4", 0) or getenv("CUSTOM_KIMI_DOWN_SPLIT_Q4", 0): chunk_size = 1
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
     v_toks = UOp.variable("toks", 1, chunk_size)
     # TODO: use UOp.variable for temperature once float variables are supported
@@ -471,9 +522,14 @@ class Transformer:
     if start_pos < len(self._cached_tokens) and (resets := [r for b in self.blk for r in b._state_reset_ops()]): Tensor.realize(*resets)
     out, prompt_len = None, len(tokens)
     while len(tokens) < self.max_context:
-      sp, nt = v_start_pos.bind(start_pos), v_toks.bind(min(chunk_size, len(tokens) - start_pos))
-      out = self(t[:, sp:sp+nt] if start_pos < prompt_len or out is None else out, sp, temp).realize()
-      start_pos += nt.val
+      sp = v_start_pos.bind(start_pos)
+      if prefill:=start_pos < prompt_len or out is None:
+        nt = min(chunk_size, len(tokens) - start_pos)
+        inp = t[:, sp:sp+v_toks.bind(nt)]
+      else:
+        nt, inp = 1, out
+      out = (self.prefill_jit if prefill else self.rollout_jit)(inp.contiguous(), sp, temp).realize()
+      start_pos += nt
       # chunked prefill: keep processing until all prompt tokens are consumed
       if start_pos < len(tokens): continue
       tokens.append(int(out.item()))

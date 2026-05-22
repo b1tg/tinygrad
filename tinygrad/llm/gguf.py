@@ -139,6 +139,13 @@ def _attach_q4_0_raw(t:Tensor, raw:Tensor, name:str, shape:tuple[int, ...]) -> T
     t._ggml_raw = raw.reshape(*shape[:-1], shape[-1]//32, 18)
   return t
 
+def _q4_0_split_tensor(raw:Tensor, shape:tuple[int, ...]) -> Tensor:
+  t = Tensor.empty(*shape, dtype=dtypes.float16, device=raw.device)
+  r = raw.reshape(-1, 18)
+  t._ggml_qtype = 2
+  t._ggml_raw_split = r[:, :2].flatten().cat(r[:, 2:].flatten(), dim=0).contiguous().realize()
+  return t
+
 def _attach_q8_0_raw(t:Tensor, raw:Tensor, name:str, shape:tuple[int, ...]) -> Tensor:
   if (getenv("CUSTOM_KIMI_SHARED_Q8", 0) and name.endswith(('ffn_gate_shexp.weight', 'ffn_up_shexp.weight'))) or \
      (getenv("CUSTOM_KIMI_OUTPUT_ARGMAX_Q8", 0) and name == 'output.weight'):
@@ -148,6 +155,9 @@ def _attach_q8_0_raw(t:Tensor, raw:Tensor, name:str, shape:tuple[int, ...]) -> T
 
 def _ggml_tensor(name:str, raw:Tensor, n:int, typ:int, dims:tuple[int, ...]) -> Tensor:
   shape = tuple(reversed(dims))
+  if typ == 2 and ((getenv("CUSTOM_KIMI_GATEUP_SPLIT_Q4", 0) and name.endswith(('ffn_gate_exps.weight', 'ffn_up_exps.weight'))) or
+                   (getenv("CUSTOM_KIMI_DOWN_SPLIT_Q4", 0) and name.endswith('ffn_down_exps.weight'))):
+    return _q4_0_split_tensor(raw, shape)
   t = ggml_data_to_tensor(raw, n, typ).reshape(*shape)
   if typ == 2: return _attach_q4_0_raw(t, raw, name, shape)
   if typ == 8: return _attach_q8_0_raw(t, raw, name, shape)
