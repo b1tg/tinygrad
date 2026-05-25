@@ -2,6 +2,7 @@ import functools
 from dataclasses import replace
 
 from tinygrad import Context, Device, Tensor, dtypes
+from tinygrad.dtype import AddrSpace
 from tinygrad.renderer import Estimates
 from tinygrad.uop.ops import KernelInfo, Ops, ProgramInfo, UOp
 
@@ -155,6 +156,100 @@ def kimi_quant_q8_0(x:Tensor) -> Tensor:
   q8 = Tensor.empty((_DIM // _Q4_BLOCK) * _Q8_BLOCK_BYTES, dtype=dtypes.uint8, device=x.device)
   q8, *_ = Tensor.custom_kernel(q8, x.reshape(-1), fxn=functools.partial(_quant_q8_kernel, device=x.device, arch=_arch(x.device)))
   return q8
+
+def _ci(x:int) -> UOp: return UOp.const(dtypes.weakint, x)
+def _gated(idx:UOp, gate:UOp) -> UOp: return gate.where(idx, UOp.invalid().cast(idx.dtype))
+def _better(os:UOp, oi:UOp, bs:UOp, bi:UOp) -> UOp: return (os > bs) | (os.eq(bs) & (oi < bi))
+def _sigmoid(x:UOp) -> UOp: return 1.0 / (1.0 + (x * -1.4426950408889634).alu(Ops.EXP2))
+def _abs_u(x:UOp) -> UOp: return (x < 0.0).where(x * -1.0, x)
+def _max_u(a:UOp, b:UOp) -> UOp: return (a < b).where(b, a)
+def _round_i32(x:UOp) -> UOp:
+  ax = _abs_u(x)
+  n = ax.alu(Ops.TRUNC).cast(dtypes.int32)
+  frac = ax - n.cast(dtypes.float32)
+  inc = (frac > 0.5) | (frac.eq(0.5) & ((n & 1).ne(0)))
+  return (x < 0.0).where((n + inc.cast(dtypes.int32)) * -1, n + inc.cast(dtypes.int32))
+
+def _store_f16_bytes(raw:UOp, off:UOp, val:UOp, gate:UOp) -> UOp:
+  hb = val.cast(dtypes.float16).bitcast(dtypes.uint16)
+  return UOp.group(raw.index(_gated(off, gate)).store((hb & 255).cast(dtypes.uint8)),
+                   raw.index(_gated(off + 1, gate)).store(((hb >> 8) & 255).cast(dtypes.uint8)))
+
+def _router_quant_uop_kernel(sel_probs:UOp, q8:UOp, logits:UOp, bias:UOp, x:UOp, scale:float) -> UOp:
+  qblocks, gid, lane = _DIM // _Q4_BLOCK, UOp.special(_DIM // _Q4_BLOCK + 1, "gidx0"), UOp.special(64, "lidx0")
+  qgate, rgate, l32 = gid < qblocks, gid.eq(qblocks), lane < _Q4_BLOCK
+  sm = UOp.placeholder((64,), dtypes.float32, 2, addrspace=AddrSpace.LOCAL)
+  xi = (qgate & l32).where(gid * _Q4_BLOCK + lane, _ci(0))
+  v = (qgate & l32).where(x[xi], UOp.const(dtypes.float32, 0.0))
+  st = sm.index(lane).store(_abs_u(v)).barrier()
+  for off in (32, 16, 8, 4, 2, 1):
+    s, gate = sm.after(st), lane < off
+    st = s.index(_gated(lane, gate)).store(_max_u(s.index(lane), s.index(gate.where(lane + off, lane)))).barrier()
+  d = sm.after(st).index(_ci(0)) / 127.0
+  q = (d > 0.0).where(_round_i32(v / d), UOp.const(dtypes.int32, 0))
+  q = (q < -128).where(UOp.const(dtypes.int32, -128), (q > 127).where(UOp.const(dtypes.int32, 127), q))
+  base = gid * _Q8_BLOCK_BYTES
+  qstores = UOp.group(_store_f16_bytes(q8, base, d, qgate & lane.eq(0)),
+                      q8.index(_gated(base + 2 + lane, qgate & l32)).store((q & 255).cast(dtypes.uint8)))
+
+  neg_inf = UOp.const(dtypes.float32, -3.4028234663852886e38)
+  bs_mem = UOp.placeholder((64,), dtypes.float32, 4, addrspace=AddrSpace.LOCAL)
+  bp_mem = UOp.placeholder((64,), dtypes.float32, 5, addrspace=AddrSpace.LOCAL)
+  bi_mem = UOp.placeholder((64,), dtypes.int32, 6, addrspace=AddrSpace.LOCAL)
+  p, s, idx = [], [], []
+  for t in range(_ROUTER_EXPERTS // 64):
+    i = lane + t * 64
+    pp = _sigmoid(logits[i])
+    p.append(pp)
+    s.append(rgate.where(pp + bias[i].cast(dtypes.float32), neg_inf))
+    idx.append(i.cast(dtypes.int32))
+  outs = []
+  nreg = UOp.placeholder((1,), dtypes.float32, 27, addrspace=AddrSpace.REG)
+  st = nreg.after(st).index(_ci(0)).store(0.0)
+  for k in range(_TOPK):
+    bs, bp, bi = neg_inf, UOp.const(dtypes.float32, 0.0), UOp.const(dtypes.int32, _ROUTER_EXPERTS)
+    for t in range(_ROUTER_EXPERTS // 64):
+      b = _better(s[t], idx[t], bs, bi)
+      bs, bp, bi = b.where(s[t], bs), b.where(p[t], bp), b.where(idx[t], bi)
+    bsm, bpm, bim = bs_mem.after(st), bp_mem.after(st), bi_mem.after(st)
+    st = UOp.group(bsm.index(lane).store(bs), bpm.index(lane).store(bp), bim.index(lane).store(bi)).barrier()
+    off = 32
+    while off:
+      bsm, bpm, bim, gate = bs_mem.after(st), bp_mem.after(st), bi_mem.after(st), lane < off
+      oi_idx = gate.where(lane + off, lane)
+      os, op, oi = bsm.index(oi_idx), bpm.index(oi_idx), bim.index(oi_idx)
+      b = _better(os, oi, bsm.index(lane), bim.index(lane))
+      st = UOp.group(
+        bsm.index(_gated(lane, gate)).store(b.where(os, bsm.index(lane))),
+        bpm.index(_gated(lane, gate)).store(b.where(op, bpm.index(lane))),
+        bim.index(_gated(lane, gate)).store(b.where(oi, bim.index(lane)))).barrier()
+      off //= 2
+    bpm, bim, outk = bp_mem.after(st), bi_mem.after(st), _TOPK - 1 - k
+    bp0, bi0 = bpm.index(_ci(0)), bim.index(_ci(0))
+    rid = UOp.placeholder((1,), dtypes.int32, 11 + k * 2, addrspace=AddrSpace.REG)
+    rp = UOp.placeholder((1,), dtypes.float32, 12 + k * 2, addrspace=AddrSpace.REG)
+    st = UOp.group(rid.index(_ci(0)).store(bi0), rp.index(_ci(0)).store(bp0),
+                   nreg.after(st).index(_ci(0)).store(nreg.after(st).index(_ci(0)) + bp0))
+    outs.append((outk, rp, rid))
+    win = rid.after(st).index(_ci(0))
+    for t in range(_ROUTER_EXPERTS // 64): s[t] = idx[t].eq(win).where(neg_inf, s[t])
+  vals = [(outk, rp.after(st).index(_ci(0)), rid.after(st).index(_ci(0))) for outk,rp,rid in outs]
+  norm = nreg.after(st).index(_ci(0))
+  rstores = []
+  for outk,rp,rid in vals:
+    rstores += [sel_probs.index(_gated(_ci(outk), rgate & lane.eq(0))).store(rid.cast(dtypes.float32)),
+                sel_probs.index(_gated(_ci(_TOPK + outk), rgate & lane.eq(0))).store(rp.alu(Ops.FDIV, norm) * scale)]
+  return UOp.sink(gid, lane, UOp.group(qstores, *rstores),
+    arg=KernelInfo(name="kimi_router_quant_q8_0_uop", estimates=Estimates(
+      ops=_DIM * 10 + _ROUTER_EXPERTS * 8 + _TOPK * _ROUTER_EXPERTS, mem=_DIM * 4 + (_DIM // _Q4_BLOCK) * _Q8_BLOCK_BYTES)))
+
+def kimi_router_quant_q8_0_uop(logits:Tensor, bias:Tensor, x:Tensor, scale:float) -> tuple[Tensor, Tensor]:
+  assert logits.numel() == _ROUTER_EXPERTS and bias.numel() == _ROUTER_EXPERTS and x.numel() == _DIM
+  sel_probs = Tensor.empty(_TOPK * 2, dtype=dtypes.float32, device=x.device)
+  q8 = Tensor.empty((_DIM // _Q4_BLOCK) * _Q8_BLOCK_BYTES, dtype=dtypes.uint8, device=x.device)
+  sel_probs, q8, *_ = Tensor.custom_kernel(sel_probs, q8, logits.reshape(-1), bias.reshape(-1), x.reshape(-1),
+    fxn=functools.partial(_router_quant_uop_kernel, scale=float(scale)))
+  return sel_probs, q8
 
 def _router_quant_src(scale:float) -> str:
   scale_s = f"{scale:.10g}"

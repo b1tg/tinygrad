@@ -493,7 +493,7 @@ class HIPRenderer(CStyleLanguage):
   kernel_typedef = 'extern "C" __attribute__((global)) void __attribute__((amdgpu_flat_work_group_size(1, {launch_bounds})))'
   code_for_workitem = {"g": lambda x: f"__ockl_get_group_id({x})", "l": lambda x: f"__ockl_get_local_id({x})",
                        "i": lambda x: f"(__ockl_get_group_id({x})*__ockl_get_local_size({x})+__ockl_get_local_id({x}))"}
-  code_for_op = {**CStyleLanguage.code_for_op, Ops.TRUNC: _ocml("trunc"), Ops.SIN: _ocml("sin"),
+  code_for_op = {**CStyleLanguage.code_for_op, Ops.TRUNC: _ocml("trunc"), Ops.SIN: _ocml("sin"), Ops.FDIV: lambda a,b,dtype: f"({a}/{b})",
                  Ops.LOG2: _ocml("log2"), Ops.EXP2: _ocml("exp2"), Ops.SQRT: _ocml("sqrt")}
   smem_prefix = "__attribute__((shared, aligned(16)))"
   smem_prefix_for_cast: bool = False

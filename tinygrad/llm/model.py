@@ -115,7 +115,10 @@ class FFNBlock:
           resolve(x.shape[1] == 1, False) and self.config.num_experts == 384 and self.config.num_experts_per_tok == 8 and self.config.norm_topk_prob
         if router_topk and logits.dtype == dtypes.float32 and self.exp_probs_b["bias"].dtype == dtypes.float16:
           if getenv("CUSTOM_KIMI_ROUTER_QUANT_Q8", 0) and kimi_moe_ok:
-            from tinygrad.llm.amd_kimi import kimi_router_quant_q8_0
+            if getenv("CUSTOM_KIMI_ROUTER_QUANT_UOP", 0):
+              from tinygrad.llm.amd_kimi import kimi_router_quant_q8_0_uop as kimi_router_quant_q8_0
+            else:
+              from tinygrad.llm.amd_kimi import kimi_router_quant_q8_0
             sel_probs, h_q8 = kimi_router_quant_q8_0(logits, self.exp_probs_b["bias"], h, self.config.routed_scaling_factor)
           else:
             from tinygrad.llm.amd_kimi import kimi_router_topk
