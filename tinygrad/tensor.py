@@ -20,12 +20,15 @@ from tinygrad.callify import transform_to_call
 # *** all in scope Tensors are here. this gets relevant UOps ***
 
 all_tensors: dict[weakref.ref[Tensor], None] = {}
-def _apply_map_to_tensors(applied_map:dict[UOp, UOp], name:str, walk:bool=False) -> None:
+def _apply_map_to_tensors(applied_map:dict[UOp, UOp], name:str, walk:bool=False, tensors:Sequence[Tensor]|None=None) -> None:
   with cpu_profile(TracingKey(name), "TINY"):
-    # get tensors in scope
-    in_scope: dict[UOp, bool] = {}
-    def visitor(node: UOp) -> bool: return True if node in applied_map else any(in_scope.get(s, False) for s in node.src)
-    scope_tensors: list[Tensor] = [t for tref in list(all_tensors) if (t:=tref()) is not None and t.uop.topovisit(visitor, in_scope)]
+    if tensors is None:
+      # get tensors in scope
+      in_scope: dict[UOp, bool] = {}
+      def visitor(node: UOp) -> bool: return True if node in applied_map else any(in_scope.get(s, False) for s in node.src)
+      scope_tensors: list[Tensor] = [t for tref in list(all_tensors) if (t:=tref()) is not None and t.uop.topovisit(visitor, in_scope)]
+    else:
+      scope_tensors = list(tensors)
 
     # get all Tensors and apply the map
     sink = UOp.sink(*[t.uop for t in scope_tensors])
@@ -223,10 +226,10 @@ class Tensor(OpMixin):
     _apply_map_to_tensors({x:y.after(big_sink) for x,y in buffer_map.items()}, name="callify")
     return self
 
-  def linear_with_vars(self, *lst:Tensor) -> tuple[UOp, dict[str, int]]:
+  def linear_with_vars(self, *lst:Tensor, apply_map_to:Sequence[Tensor]|None=None) -> tuple[UOp, dict[str, int]]:
     """Creates the LINEAR UOp needed to realize these Tensor(s), with Variables."""
     big_sink, becomes_map = transform_to_call(UOp.sink(*[x.uop for x in (self,)+lst]))
-    _apply_map_to_tensors(becomes_map, name="buffers")
+    _apply_map_to_tensors(becomes_map, name="buffers", tensors=apply_map_to)
     return create_linear_with_vars(big_sink)
 
   def schedule_linear(self, *lst:Tensor) -> UOp:

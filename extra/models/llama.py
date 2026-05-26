@@ -204,10 +204,15 @@ class Transformer:
     self.freqs_cis = precompute_freqs_cis(dim // n_heads, self.max_context * 2, rope_theta).contiguous().requires_grad_(False)
     self.forward_jit = TinyJit(self.forward) if jit else None
 
+  def _freqs_cis_for(self, dtype):
+    if self.freqs_cis.dtype != dtype or not self.freqs_cis.uop.has_buffer_identity():
+      self.freqs_cis = self.freqs_cis.cast(dtype).contiguous().realize().requires_grad_(False)
+    return self.freqs_cis
+
   def forward(self, tokens:Tensor, start_pos:Union[Variable,int], temperature:float, top_k:int, top_p:float, alpha_f:float, alpha_p:float):
     _bsz, seqlen = tokens.shape
     h = self.tok_embeddings(tokens).contiguous()
-    freqs_cis = self.freqs_cis.cast(h.dtype)[:, start_pos:start_pos+seqlen, :, :, :]
+    freqs_cis = self._freqs_cis_for(h.dtype)[:, start_pos:start_pos+seqlen, :, :, :]
 
     if self.max_context != 0 and seqlen > 1:
       mask = Tensor.full((1, 1, seqlen, start_pos+seqlen), float("-inf"), dtype=h.dtype, device=h.device).triu(start_pos+1)

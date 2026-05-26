@@ -219,7 +219,8 @@ def _prepare_jit_inputs(args, kwargs):
   for x in args + tuple(kwargs.values()):
     it = x if isinstance(x, (tuple,list)) else x.values() if isinstance(x, dict) else []
     tensors += [t for t in it if t.__class__ is Tensor and not any(t is y for y in tensors)]
-  if len(unrealized_tensors := [x for x in tensors if not x.uop.is_realized]): Tensor.realize(*unrealized_tensors)
+  if len(unrealized_tensors := [x for x in tensors if not x.uop.is_realized]):
+    run_linear(*unrealized_tensors[0].linear_with_vars(*unrealized_tensors[1:], apply_map_to=unrealized_tensors))
   input_uops: list[UOp] = flatten([t.uop.src if t.uop.op is Ops.MULTI else [t.uop] for t in tensors])
   if any(u.base.op is Ops.CONST for u in input_uops):
     raise JitError("JIT inputs cannot be const, create a buffer with .contiguous()")

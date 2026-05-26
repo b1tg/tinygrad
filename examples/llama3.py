@@ -378,12 +378,13 @@ if __name__ == "__main__":
       toks = [tokenizer.bos_id] + tokenizer.encode(rjson.get("prompt", ""), allow_special=True)
 
       start_pos = prefill(model, toks[:-1])
-      last_tok = toks[-1]
+      last_tok = Tensor([[toks[-1]]], device=device).realize()
       while True:
         GlobalCounters.reset()
-        tok = model(Tensor([[last_tok]], device=device), start_pos, TEMPERATURE, TOP_K, TOP_P, ALPHA_F, ALPHA_P).item()
+        tok_tensor = model(last_tok, start_pos, TEMPERATURE, TOP_K, TOP_P, ALPHA_F, ALPHA_P)
+        tok = tok_tensor.item()
         start_pos += 1
-        last_tok = tok
+        last_tok = tok_tensor.reshape(1, 1)
         if tok in tokenizer.stop_tokens: break
 
         res = {
@@ -426,13 +427,14 @@ if __name__ == "__main__":
       random_id = random.randbytes(16).hex()
 
       start_pos = prefill(model, toks[:-1])
-      last_tok = toks[-1]
-      last_seen_toks.append(last_tok)
+      last_tok = Tensor([[toks[-1]]], device=device).realize()
+      last_seen_toks.append(toks[-1])
       while True:
         GlobalCounters.reset()
-        tok = model(Tensor([[last_tok]], device=device), start_pos, TEMPERATURE, TOP_K, TOP_P, ALPHA_F, ALPHA_P).item()
+        tok_tensor = model(last_tok, start_pos, TEMPERATURE, TOP_K, TOP_P, ALPHA_F, ALPHA_P)
+        tok = tok_tensor.item()
         start_pos += 1
-        last_tok = tok
+        last_tok = tok_tensor.reshape(1, 1)
         last_seen_toks.append(tok)
         if tok in tokenizer.stop_tokens: break
 
@@ -470,7 +472,7 @@ if __name__ == "__main__":
     toks = [tokenizer.bos_id] + encode_message("user", "Hello.") + encode_role("assistant")
 
     start_pos = prefill(model, toks[:-1])
-    last_tok = toks[-1]
+    last_tok = Tensor([[toks[-1]]], device=device).realize()
     generated = ""
     for _ in range(20):
       GlobalCounters.reset()
@@ -481,10 +483,10 @@ if __name__ == "__main__":
             with Timing("enqueue in ", on_exit=(lambda et: (f", {(GlobalCounters.time_sum_s-st)*1e3:.2f} ms on {Device.DEFAULT}" if DEBUG>=2 else "")+
                         f", {GlobalCounters.global_ops*1e-9:.2f} GOPS, {GlobalCounters.global_mem*1e-9:.2f} GB"+
                         (f", {GlobalCounters.global_mem*1e-9/(GlobalCounters.time_sum_s-st):.2f} GB/s, param {param_bytes*1e-9/(GlobalCounters.time_sum_s-st):.2f} GB/s" if DEBUG>=2 else "")) if DEBUG else None):
-              tok = model(Tensor([[last_tok]], device=device), start_pos, TEMPERATURE, TOP_K, TOP_P, ALPHA_F, ALPHA_P)
-            tok = tok.item()
+              tok_tensor = model(last_tok, start_pos, TEMPERATURE, TOP_K, TOP_P, ALPHA_F, ALPHA_P)
+            tok = tok_tensor.item()
       start_pos += 1
-      last_tok = tok
+      last_tok = tok_tensor.reshape(1, 1)
       generated += tokenizer.decode([tok])
       print(generated)
     if "LLaMA-3/8B-SF-DPO" in args.model.as_posix() and (TEMPERATURE == 0.85 or TEMPERATURE == 0):
@@ -509,7 +511,7 @@ if __name__ == "__main__":
       toks = encode_message("user", input("Q: ")) + encode_role("assistant")
 
       start_pos = prefill(model, toks[:-1], start_pos=start_pos)
-      last_tok = toks[-1]
+      last_tok = Tensor([[toks[-1]]], device=device).realize()
       while True:
         GlobalCounters.reset()
         if args.timing or args.profile: print("")
@@ -520,10 +522,10 @@ if __name__ == "__main__":
                         f", {GlobalCounters.global_ops*1e-9:.2f} GOPS, {GlobalCounters.global_mem*1e-9:.2f} GB"+
                         (f", {GlobalCounters.global_mem*1e-9/(GlobalCounters.time_sum_s-st):.2f} GB/s, param {param_bytes*1e-9/(GlobalCounters.time_sum_s-st):.2f} GB/s" if DEBUG>=2 else "")) if DEBUG else None, enabled=args.timing):
 
-              tok = model(Tensor([[last_tok]], device=device), start_pos, TEMPERATURE, TOP_K, TOP_P, ALPHA_F, ALPHA_P)
-            tok = tok.item()
+              tok_tensor = model(last_tok, start_pos, TEMPERATURE, TOP_K, TOP_P, ALPHA_F, ALPHA_P)
+            tok = tok_tensor.item()
         start_pos += 1
-        last_tok = tok
+        last_tok = tok_tensor.reshape(1, 1)
         if tok in tokenizer.stop_tokens: break
         print(tokenizer.decode([tok]), end="", flush=True)
       print(flush=True)

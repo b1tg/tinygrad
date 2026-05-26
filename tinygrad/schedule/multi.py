@@ -1,4 +1,4 @@
-from tinygrad.helpers import all_same, prod, getenv, ALLREDUCE_CAST
+from tinygrad.helpers import all_int, all_same, prod, getenv, ALLREDUCE_CAST
 from tinygrad.uop.ops import Ops, UOp, PatternMatcher, UPat, GroupOp, graph_rewrite
 from tinygrad.dtype import dtypes
 from tinygrad.schedule.allreduce import handle_allreduce
@@ -34,10 +34,15 @@ replace_allreduce = PatternMatcher([
    lambda s,v,ms: v.replace(src=(s.mselect(ms.arg),)+v.src[1:])),
 ])
 
+def early_allreduce(buf:UOp, red:UOp):
+  if getenv("LATE_ALLREDUCE", 1):
+    if not all_int(buf.shape) or prod(buf.shape) > getenv("EARLY_ALLREDUCE_THRESHOLD", 16384): return None
+  return handle_allreduce(buf, red)
+
 _early_allreduce = PatternMatcher([
-  (UPat(Ops.ALLREDUCE, src=(UPat.var("buf"), UPat()), name="red"), handle_allreduce),
+  (UPat(Ops.ALLREDUCE, src=(UPat.var("buf"), UPat()), name="red"), early_allreduce),
 ])
-if not getenv("LATE_ALLREDUCE", 1): replace_allreduce = _early_allreduce + replace_allreduce
+replace_allreduce = _early_allreduce + replace_allreduce
 
 # ***** multi functions *****
 
