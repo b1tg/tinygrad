@@ -111,6 +111,18 @@ def split_reduceop(reduce:UOp, x:UOp):
   # reduce original axes, then split
   return splitted._rop(*reduce.arg).contiguous()._rop(reduce.arg[0], (len(reduce.shape),)).reshape(reduce.shape)
 
+def split_independent_reduces(x:UOp):
+  if any(s.op is Ops.CONTIGUOUS for s in x.src): return None
+  reduce_srcs = []
+  for s in x.src:
+    if any(u.op is Ops.REDUCE for u in s.toposort(gate=lambda u: u.op not in {Ops.CONTIGUOUS, Ops.AFTER, Ops.BUFFER, Ops.PARAM})):
+      reduce_srcs.append(s)
+  if len(reduce_srcs) < 2: return None
+  pm_contiguous_reduce = PatternMatcher([
+    (UPat(Ops.REDUCE, name="r"), lambda r: r.contiguous()),
+  ])
+  return x.replace(src=tuple(graph_rewrite(s, pm_contiguous_reduce, bottom_up=True, walk=True) if s in reduce_srcs else s for s in x.src))
+
 mop_cleanup = PatternMatcher([
   # merge adjacent RESHAPES
   (UPat(Ops.RESHAPE, src=(UPat(Ops.RESHAPE, name="x2"), UPat()), name="x"), lambda x,x2: x.replace(src=(x2.src[0], x.src[1]))),
@@ -152,6 +164,7 @@ earliest_rewrites = mop_cleanup+PatternMatcher([
 
   # split_reduceop
   (UPat(Ops.REDUCE, name="reduce", src=(UPat.var("x"),)), split_reduceop),
+  (UPat(GroupOp.ALU, name="x"), split_independent_reduces),
 
   # remove DETACH/CONTIGUOUS_BACKWARD (TODO: this is copied in allocations)
   (UPat((Ops.DETACH, Ops.CONTIGUOUS_BACKWARD), name="x"), lambda x: x.src[0]),

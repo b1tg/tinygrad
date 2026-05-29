@@ -20,12 +20,17 @@ from tinygrad.callify import transform_to_call
 # *** all in scope Tensors are here. this gets relevant UOps ***
 
 all_tensors: dict[weakref.ref[Tensor], None] = {}
-def _apply_map_to_tensors(applied_map:dict[UOp, UOp], name:str, walk:bool=False) -> None:
+def _apply_map_to_tensors(applied_map:dict[UOp, UOp], name:str, walk:bool=False, tensors:Sequence[Tensor]|None=None) -> None:
   with cpu_profile(TracingKey(name), "TINY"):
     # get tensors in scope
     in_scope: dict[UOp, bool] = {}
+    has_buffer_keys = any(u.has_buffer_identity() for u in applied_map)
     def visitor(node: UOp) -> bool: return True if node in applied_map else any(in_scope.get(s, False) for s in node.src)
-    scope_tensors: list[Tensor] = [t for tref in list(all_tensors) if (t:=tref()) is not None and t.uop.topovisit(visitor, in_scope)]
+    scope_tensors: list[Tensor] = []
+    for t in tensors if tensors is not None else (tref() for tref in list(all_tensors)):
+      if t is None: continue
+      if t.uop.has_buffer_identity() and t.uop not in applied_map and (not has_buffer_keys or t.uop.base not in applied_map): continue
+      if t.uop.topovisit(visitor, in_scope): scope_tensors.append(t)
 
     # get all Tensors and apply the map
     sink = UOp.sink(*[t.uop for t in scope_tensors])
@@ -223,10 +228,10 @@ class Tensor(OpMixin):
     _apply_map_to_tensors({x:y.after(big_sink) for x,y in buffer_map.items()}, name="callify")
     return self
 
-  def linear_with_vars(self, *lst:Tensor) -> tuple[UOp, dict[str, int]]:
+  def linear_with_vars(self, *lst:Tensor, _update_tensors:Sequence[Tensor]|None=None) -> tuple[UOp, dict[str, int]]:
     """Creates the LINEAR UOp needed to realize these Tensor(s), with Variables."""
     big_sink, becomes_map = transform_to_call(UOp.sink(*[x.uop for x in (self,)+lst]))
-    _apply_map_to_tensors(becomes_map, name="buffers")
+    _apply_map_to_tensors(becomes_map, name="buffers", tensors=_update_tensors)
     return create_linear_with_vars(big_sink)
 
   def schedule_linear(self, *lst:Tensor) -> UOp:
@@ -239,7 +244,9 @@ class Tensor(OpMixin):
   def realize(self, *lst:Tensor, do_update_stats=True) -> Tensor:
     """Triggers the computation needed to create these Tensor(s)."""
     if len(to_realize:=[x for x in (self,)+lst if not x.uop.has_buffer_identity()]):
-      run_linear(*Tensor.linear_with_vars(*to_realize), update_stats=do_update_stats)
+      # STORE updates can affect aliases/views not present in to_realize, so they still need the global tensor update.
+      update_tensors = None if any(u.op is Ops.STORE for x in to_realize for u in x.uop.toposort()) else to_realize
+      run_linear(*Tensor.linear_with_vars(*to_realize, _update_tensors=update_tensors), update_stats=do_update_stats)
     return self
 
   def replace(self, x:Tensor) -> Tensor:
@@ -260,7 +267,13 @@ class Tensor(OpMixin):
     if self.shape != x.shape: raise RuntimeError(f"assign shape mismatch {self.shape} != {x.shape}")
     if not is_disk and self.device != x.device: raise RuntimeError(f"assign device mismatch {self.device} != {x.device}")
     if not is_disk and self.dtype != x.dtype: raise RuntimeError(f"assign dtype mismatch {self.dtype} != {x.dtype}")
-    if isinstance(self.device, tuple) and self.uop.axis != x.uop.axis: raise RuntimeError(f"multi axis mismatch {self.uop.axis} != {x.uop.axis}")
+    if isinstance(self.device, tuple) and self.uop.axis != x.uop.axis:
+      if self.uop.axis is not None and x.uop.axis is None:
+        x = Tensor(x.uop._shard(self.uop.axis).multi(self.uop.axis))
+      elif self.uop.axis is None and x.uop.axis is not None:
+        x = Tensor(x.uop.src[0]._unshard(x.uop.axis).allreduce(Ops.ADD, self.device))
+      else:
+        raise RuntimeError(f"multi axis mismatch {self.uop.axis} != {x.uop.axis}")
 
     # TODO: this is a hack for writing to DISK. remove with working assign
     if is_disk:

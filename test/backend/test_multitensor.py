@@ -189,12 +189,33 @@ class TestMultiTensor(unittest.TestCase):
     # only shrink on the device that owns the shard, this is enabled by the mselect simplifier
     for i in range(2):
       xt = X[i*2:i*2+2].contiguous()
+      self.assertEqual(xt.uop.device, devices_2[i])
       linear, var_vals = xt.linear_with_vars()
       #kernels = [call for call in linear.src if call.src[0].op is Ops.SINK]
       #self.assertEqual(len(kernels), 1)
       #self.assertEqual(kernels[0].src[1].buffer.device, devices_2[i])
       run_linear(linear, var_vals)
       np.testing.assert_equal(xt.numpy(), X_np[i*2:i*2+2])
+
+  def test_replicated_cast_shrink_copies_slice(self):
+    pos = Variable("pos", 1, 1023).bind(1)
+    freqs = Tensor.empty(1, 1024, 1, 16, 2, dtype=dtypes.float32).realize().to(devices_2)
+    GlobalCounters.reset()
+    freqs.cast(dtypes.float16)[:, pos:pos+1].contiguous().realize()
+    for d in devices_2: Device[d].synchronize()
+    self.assertLess(GlobalCounters.global_mem, 8192)
+
+  def test_assign_replicated_to_sharded_view(self):
+    x = Tensor.zeros(2, 4).realize().shard_(devices_2, axis=1)
+    y = Tensor.arange(8).reshape(2, 4).cast(x.dtype).realize().to(devices_2)
+    x.assign(y).realize()
+    np.testing.assert_equal(x.numpy(), y.numpy())
+
+  def test_assign_sharded_to_replicated_view(self):
+    x = Tensor.zeros(2, 4).realize().to(devices_2)
+    y = Tensor.arange(8).reshape(2, 4).cast(x.dtype).realize().shard(devices_2, axis=1)
+    x.assign(y).realize()
+    np.testing.assert_equal(x.numpy(), y.numpy())
 
   @given(strat.sampled_from((devices_2, devices_3)),
          strat.sampled_from((Ops.ADD, Ops.MUL, Ops.MAX)),

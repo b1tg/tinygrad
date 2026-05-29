@@ -5,17 +5,23 @@ from tinygrad.schedule.allreduce import handle_allreduce
 
 # ***** multi rewrite MSELECT/MSTACK *****
 
+def _movement_before_copy(s:UOp, fxn) -> UOp:
+  if s.op is Ops.COPY: return fxn(s.src[0]).copy_to_device(s.device)
+  if s.op in {Ops.CAST, Ops.BITCAST, Ops.CONTIGUOUS, Ops.DETACH, Ops.CONTIGUOUS_BACKWARD}:
+    return s.replace(src=(_movement_before_copy(s.src[0], fxn),)+s.src[1:])
+  return fxn(s)
+
+def mstack_passthrough(root:UOp, ms:UOp):
+  return ms.replace(dtype=root.dtype, src=tuple(root.replace(src=(x,)+root.src[1:]) for x in ms.src))
+
 def mstack_early_shrink(ms:UOp, shrink:UOp):
   ret:list[UOp] = []
   def apply_shrink(s:UOp, i:int) -> UOp:
     new_arg = [tuple([x.substitute({dvar[0]:dvar[0].const_like(i)}) if isinstance(x, UOp) and
                       (dvar:=[v for v in x.variables() if v.expr=='_device_num']) else x for x in ss]) for ss in shrink.marg]
-    return s.shrink(tuple(new_arg))
+    return _movement_before_copy(s, lambda x: x.shrink(tuple(new_arg)))
   for i, x in enumerate(ms.src):
-    if x.op is Ops.COPY:
-      ret.append(apply_shrink(x.src[0], i).copy_to_device(x.device))
-    else:
-      ret.append(apply_shrink(x, i).contiguous())
+    ret.append(apply_shrink(x, i).contiguous())
   return ms.replace(src=tuple(ret))
 
 replace_allreduce = PatternMatcher([
@@ -29,6 +35,8 @@ replace_allreduce = PatternMatcher([
   (UPat(Ops.MSELECT, src=(UPat(Ops.MSTACK, name="mstack"),), name="ms"), lambda mstack, ms: mstack.src[ms.arg]),
   # move shrink before MSTACK
   (UPat(Ops.SHRINK, src=(UPat(Ops.MSTACK, name="ms"),), allow_any_len=True, name="shrink"), mstack_early_shrink),
+  # move unary movement/casts into MSTACK so later shrink can happen before copies
+  (UPat((Ops.CAST, Ops.BITCAST, Ops.CONTIGUOUS, Ops.DETACH, Ops.CONTIGUOUS_BACKWARD), src=(UPat(Ops.MSTACK, name="ms"),), name="root"), mstack_passthrough),
   # move MSELECT before movement ops
   (UPat(Ops.MSELECT, src=(UPat(GroupOp.Movement, src=(UPat.var("s"),), allow_any_len=True, name="v"),), name="ms"),
    lambda s,v,ms: v.replace(src=(s.mselect(ms.arg),)+v.src[1:])),
@@ -98,9 +106,9 @@ def shrink_multi(root:UOp, multi:UOp):
     f"shrinking not supported for {root.marg=}"
   if multi.axis is not None and root.marg[multi.axis] in multi.bounds and root.marg[multi.axis] != (0, multi.shape[multi.axis]):
     # NOTE: shrink on the shard axis is only allowed when result is a single partition, denoted by the new real
-    # we just copy it to all the devices, no real. this will be optimized out later
+    # keep only the owner shard instead of broadcasting the selected partition back to all devices.
     non_shard_shrink = tuple((0, multi.src[0].shape[i]) if i == multi.axis else s for i, s in enumerate(root.marg))
-    return multi.src[0].copy_to_device(multi.device, arg=multi.bounds.index(root.marg[multi.axis])).shrink(non_shard_shrink)
+    return multi.src[0].mselect(multi.bounds.index(root.marg[multi.axis])).shrink(non_shard_shrink)
   return multi.src[0].shrink(tuple((0, multi.src[0].shape[multi.axis]) if a == multi.axis else s for a,s in enumerate(root.marg))).multi(multi.axis)
 
 def flip_multi(root:UOp, multi:UOp):

@@ -695,6 +695,9 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
       return self.src[0].device[self.arg]
     if self.op is Ops.MSTACK: return tuple(cast(str, x.device) for x in self.src)
     if self.op in {Ops.COPY, Ops.BUFFER, Ops.ALLREDUCE}: return self.src[1].device
+    if self.op is Ops.SHRINK and (axis:=self.src[0].axis) is not None and self.marg[axis] in self.src[0].bounds and \
+       self.marg[axis] != (0, self.src[0].shape[axis]):
+      return self.src[0].device[self.src[0].bounds.index(self.marg[axis])]
     for x in self.src:
       if x._device is not None: return x._device
     return None
