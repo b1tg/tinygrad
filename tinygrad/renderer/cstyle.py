@@ -99,7 +99,8 @@ def uops_to_dtypes(uops:list[UOp]) -> list[DType]: return dedup(u.dtype for u in
 
 # (name, dims, dtype_in, dtype_out, device, threads, upcast_axes, reduce_axes)
 def wmma_args(uops:list[UOp]):
-  return dedup((uop.arg[0], uop.arg[1], uop.arg[2], uop.dtype.scalar(), *(uop.arg[4:8])) for uop in uops if uop.op is Ops.WMMA)
+  return dedup((uop.arg[0], uop.arg[1], uop.arg[2], uop.dtype.scalar(), *(uop.arg[4:8]))
+               for uop in uops if uop.op is Ops.WMMA and uop.arg != SUDOT4_ARG)
 
 class CStyleLanguage(Renderer):
   kernel_typedef: str = "void"
@@ -462,6 +463,64 @@ class NVCCRenderer(CUDARenderer):
 def fp8_index(dtype: DType): return (dtypes.fp8e4m3, dtypes.fp8e5m2).index(dtype.scalar())
 def _ocml(op): return lambda x,dtype: f"__ocml_{op}_f{ {dtypes.half:16, dtypes.double:64}.get(dtype, 32)}({x})"
 
+def _add_terms(x:UOp, limit=5) -> list[UOp]|None:
+  ret, stack = [], [x]
+  while stack:
+    y = stack.pop()
+    if y.op is Ops.ADD: stack.extend(y.src)
+    else: ret.append(y)
+    if len(ret) + len(stack) > limit: return None
+  return ret
+
+def _const_arg(x:UOp) -> int|None: return x.arg if x.op is Ops.CONST and isinstance(x.arg, int) else None
+
+def _dot4_byte(x:UOp) -> tuple[UOp, int]|None:
+  # Match sext_i8((packed >> shift) & 255). This is intentionally strict: it
+  # only recognizes the canonical packed dot expression emitted by quant paths.
+  if x.op is Ops.CAST and x.dtype == dtypes.int32 and x.src[0].op is Ops.CAST and x.src[0].dtype == dtypes.int8: x = x.src[0].src[0]
+  elif x.op is Ops.CAST and x.dtype == dtypes.int32 and x.src[0].dtype == dtypes.int8: x = x.src[0]
+  else: return None
+  if x.op is Ops.CAST and x.dtype == dtypes.int8: x = x.src[0]
+  if x.op is not Ops.AND: return None
+  mask = _const_arg(x.src[1])
+  src = x.src[0]
+  if mask != 255: return None
+  if src.op is Ops.SHR:
+    shift = _const_arg(src.src[1])
+    return (src.src[0], shift) if shift in (0, 8, 16, 24) else None
+  return (src, 0)
+
+def _dot4_mul(x:UOp) -> tuple[UOp, UOp, int]|None:
+  if x.op is not Ops.MUL: return None
+  a, b = _dot4_byte(x.src[0]), _dot4_byte(x.src[1])
+  if a is None or b is None or a[1] != b[1]: return None
+  return a[0], b[0], a[1]
+
+SUDOT4_ARG = ("__builtin_amdgcn_sudot4", (1, 1, 4), None, None, None, 1, None, None)
+
+def _match_sudot4(x:UOp) -> tuple[UOp, UOp, UOp]|None:
+  if x.dtype != dtypes.int32: return None
+  terms = _add_terms(x)
+  if terms is None: return None
+  muls = [_dot4_mul(t) for t in terms]
+  if sum(m is not None for m in muls) != 4 or len(terms) != 5: return None
+  accs = [t for t,m in zip(terms, muls) if m is None]
+  if len(accs) != 1 or accs[0].dtype != dtypes.int32: return None
+  dots = cast(list[tuple[UOp, UOp, int]], [m for m in muls if m is not None])
+  if sorted(d[2] for d in dots) != [0, 8, 16, 24]: return None
+  a, b = dots[0][0], dots[0][1]
+  if any(d[0] is not a or d[1] is not b for d in dots): return None
+  return a, b, accs[0]
+
+def _make_sudot4(x:UOp) -> UOp|None:
+  if (match:=_match_sudot4(x)) is None: return None
+  return UOp(Ops.WMMA, dtypes.int32, match, SUDOT4_ARG)
+
+def _render_sudot4(ctx, x:UOp) -> str|None:
+  if x.op is Ops.WMMA and x.arg == SUDOT4_ARG:
+    return f"__builtin_amdgcn_sudot4(1, {ctx[x.src[0]]}, 1, {ctx[x.src[1]]}, {ctx[x.src[2]]}, 0)"
+  return None
+
 class HIPRenderer(CStyleLanguage):
   shared_max = 65536
   # NOTE: this is only really needed on gfx12, even though gfx11 reports the same limitation
@@ -476,9 +535,12 @@ class HIPRenderer(CStyleLanguage):
     super().__init__(target)
     from tinygrad.runtime.support.compiler_amd import HIPCompiler, HIPCCCompiler
     self.compiler, self.tensor_cores = (HIPCCCompiler if use_hipcc else HIPCompiler)(target.arch), tc.get_amd(target.arch)
+    self.extra_matcher += PatternMatcher([(UPat(Ops.ADD, name="x"), _make_sudot4)])
+    self.string_rewrite = PatternMatcher([(UPat(Ops.WMMA, name="x"), _render_sudot4)]) + base_rewrite
     if not self.is_cdna4(target.arch): self.extra_matcher += pm_manual_bf16_cast + extra_pm
     if self.is_cdna(target.arch):
       self.string_rewrite = PatternMatcher([
+        (UPat(Ops.WMMA, name="x"), _render_sudot4),
         (UPat(Ops.WMMA, name="x"), lambda ctx,x: f"__{x.arg[0]}({ctx[x.src[0]]}, {ctx[x.src[1]]}, {ctx[x.src[2]]},"
           f" {fp8_index(x.src[0].dtype)}, {fp8_index(x.src[0].dtype)}, 0, 0, 0, 0)" if x.arg[1][2] == 128 else None),
         (UPat(Ops.WMMA, name="x"), lambda ctx,x: f"__{x.arg[0]}({ctx[x.src[0]]}, {ctx[x.src[1]]}, {ctx[x.src[2]]}, 0, 0, 0)"),

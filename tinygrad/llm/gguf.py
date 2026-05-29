@@ -130,7 +130,7 @@ readers: dict[int, Callable[[io.BufferedIOBase], Any]] = { 8: read_str, 9: read_
     [ (0,"c",1), (1,"b",1), (2,"H",2), (3,"h",2), (4,"I",4), (5,"i",4), (6,"f",4), (7,"?",1), (10,"Q",8), (11,"q",8), (12,"d",8) ] } }
 read_uint32, read_int32, read_uint64, read_int64 = readers[4], readers[5], readers[10], readers[11]
 
-def _gguf_parse(tensor: Tensor) -> tuple[dict, dict[str, Tensor]]:
+def _gguf_parse(tensor: Tensor, keep_quant=False, skip_dequant:Callable[[str, tuple[int, ...], int], bool]|None=None) -> tuple[dict, dict[str, Tensor], dict[str, Tensor]]:
   # TODO: remove the need for copy to default device
   tensor = tensor.to(None).realize()
   r = io.BufferedReader(TensorIO(tensor), 1_000_000)
@@ -146,8 +146,15 @@ def _gguf_parse(tensor: Tensor) -> tuple[dict, dict[str, Tensor]]:
   alignment, pos = kv_data.get("general.alignment", 32), r.tell()
   data_start = round_up(pos, alignment)
 
-  state_dict = {name: ggml_data_to_tensor(tensor[data_start + off:], prod(dims), typ).reshape(*reversed(dims)) for name, dims, typ, off in t_infos}
-  return kv_data, state_dict
+  state_dict = {name: ggml_data_to_tensor(tensor[data_start + off:], prod(dims), typ).reshape(*reversed(dims))
+                for name, dims, typ, off in t_infos if skip_dequant is None or not skip_dequant(name, dims, typ)}
+  quant_dict = {}
+  if keep_quant:
+    for name, dims, typ, off in t_infos:
+      if typ == 8 and len(dims) == 2:
+        rdims = tuple(reversed(dims))
+        quant_dict[name] = tensor[data_start + off:data_start + off + (prod(dims)//32)*34].reshape(rdims[0], rdims[1]//32, 34)
+  return kv_data, state_dict, quant_dict
 
 def _gguf_split_paths(path: pathlib.Path, kv: dict) -> list[pathlib.Path]:
   if (total := kv.get('split.count', 1)) <= 1: return [path]
@@ -170,8 +177,18 @@ def gguf_load(fn: Tensor|str|pathlib.Path) -> tuple[dict, dict[str, Tensor]]:
 
   NOTE: The provided tensor must be on a device that supports execution.
   """
-  kv, sd = _gguf_parse(fn if isinstance(fn, Tensor) else Tensor(pathlib.Path(fn)))
+  kv, sd, _ = _gguf_parse(fn if isinstance(fn, Tensor) else Tensor(pathlib.Path(fn)))
   if kv.get('split.count', 1) <= 1: return kv, sd
   if isinstance(fn, Tensor): raise ValueError("multi-part GGUF requires a path argument (got Tensor)")
   for pp in _gguf_split_paths(pathlib.Path(fn), kv)[1:]: sd.update(_gguf_parse(Tensor(pp))[1])
   return kv, sd
+
+def gguf_load_with_quant(fn: Tensor|str|pathlib.Path, skip_dequant:Callable[[str, tuple[int, ...], int], bool]|None=None) -> tuple[dict, dict[str, Tensor], dict[str, Tensor]]:
+  kv, sd, qd = _gguf_parse(fn if isinstance(fn, Tensor) else Tensor(pathlib.Path(fn)), keep_quant=True, skip_dequant=skip_dequant)
+  if kv.get('split.count', 1) <= 1: return kv, sd, qd
+  if isinstance(fn, Tensor): raise ValueError("multi-part GGUF requires a path argument (got Tensor)")
+  for pp in _gguf_split_paths(pathlib.Path(fn), kv)[1:]:
+    _, sdi, qdi = _gguf_parse(Tensor(pp), keep_quant=True, skip_dequant=skip_dequant)
+    sd.update(sdi)
+    qd.update(qdi)
+  return kv, sd, qd

@@ -1,5 +1,5 @@
 from __future__ import annotations
-import sys, argparse, codecs, typing, re, unicodedata, json, uuid, time, pathlib
+import sys, argparse, codecs, typing, re, unicodedata, json, uuid, time, pathlib, os
 from tinygrad import nn
 from tinygrad.uop.ops import UOp, Ops
 from tinygrad.helpers import partition, DEBUG, Timing, GlobalCounters, stderr_log, colored, Context, fetch, profile_marker
@@ -188,7 +188,11 @@ def main():
   parser.add_argument("--serve", nargs='?', type=int, const=8000, metavar="PORT", help="Run OpenAI compatible API (optional port, default 8000)")
   parser.add_argument("--warmup", action="store_true", help="warmup the JIT")
   parser.add_argument("--benchmark", nargs='?', type=int, const=20, metavar="COUNT", help="Benchmark tok/s (optional count, default 20)")
+  parser.add_argument("--native_q8", action="store_true", help="Use native packed Q8_0 GGUF Linear path")
+  parser.add_argument("--native_q8_scope", default="attn", choices=("attn", "ffn", "all"), help="Which Q8_0 Linear weights use native packed path")
   args = parser.parse_args()
+  if args.native_q8: os.environ["GGUF_NATIVE_Q8"] = "1"
+  os.environ["GGUF_NATIVE_Q8_SCOPE"] = args.native_q8_scope
 
   # load the model
   model, kv = Transformer.from_gguf(fetch(models.get(args.model, args.model)), args.max_context)

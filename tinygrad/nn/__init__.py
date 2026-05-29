@@ -174,7 +174,12 @@ class Linear:
     self.weight = Tensor.uniform(out_features, in_features, low=-bound, high=bound)
     self.bias = Tensor.uniform(out_features, low=-bound, high=bound) if bias else None
 
-  def __call__(self, x:Tensor) -> Tensor: return x.linear(self.weight.transpose(), self.bias)
+  def __call__(self, x:Tensor) -> Tensor:
+    if hasattr(self, "q8_0_weight"):
+      from tinygrad.llm.quant import q8_0_matvec
+      ret = q8_0_matvec(x.float(), self.q8_0_weight).cast(x.dtype)
+      return ret.add(self.bias) if self.bias is not None else ret
+    return x.linear(self.weight.transpose(), self.bias)
 
 class GroupNorm:
   """

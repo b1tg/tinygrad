@@ -2,7 +2,7 @@ from __future__ import annotations
 import functools, itertools, pathlib
 from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function
-from tinygrad.llm.gguf import gguf_load
+from tinygrad.llm.gguf import gguf_load, gguf_load_with_quant
 from tinygrad.uop.ops import resolve
 
 @functools.cache
@@ -118,6 +118,10 @@ class FFNBlock:
         out = out + shexp
       return out
     # TODO: remove the need for this contiguous
+    if hasattr(self.ffn_gate, "q8_0_weight") and hasattr(self.ffn_up, "q8_0_weight"):
+      from tinygrad.llm.quant import q8_0_matvec_many
+      gate, up = [y.cast(x.dtype) for y in q8_0_matvec_many(x.float(), [self.ffn_gate.q8_0_weight, self.ffn_up.q8_0_weight])]
+      return self.ffn_down(gate.silu().contiguous() * up)
     return self.ffn_down(self.ffn_gate(x).silu().contiguous() * self.ffn_up(x))
 
   # given the token-prefix match, return how much cached state this block can still reuse
@@ -151,7 +155,11 @@ class TransformerBlock(FFNBlock):
     if config.qk_norm: self.attn_q_norm, self.attn_k_norm = nn.RMSNorm(config.qk_norm, config.norm_eps), nn.RMSNorm(config.qk_norm, config.norm_eps)
 
   def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
-    q, k, v = self.attn_q(x), self.attn_k(x), self.attn_v(x)
+    if hasattr(self.attn_q, "q8_0_weight") and hasattr(self.attn_k, "q8_0_weight") and hasattr(self.attn_v, "q8_0_weight"):
+      from tinygrad.llm.quant import q8_0_matvec_many
+      q, k, v = [y.cast(x.dtype) for y in q8_0_matvec_many(x.float(), [self.attn_q.q8_0_weight, self.attn_k.q8_0_weight, self.attn_v.q8_0_weight])]
+    else:
+      q, k, v = self.attn_q(x), self.attn_k(x), self.attn_v(x)
     if self.config.qk_norm and self.config.qk_norm != self.config.head_dim: q, k = self.attn_q_norm(q), self.attn_k_norm(k)
 
     B, T, _ = x.shape
@@ -322,7 +330,21 @@ class Transformer:
   def from_gguf(gguf:Tensor|str|pathlib.Path, max_context:int|None=None,
                 realize=bool(getenv("REALIZE", 0))) -> tuple[Transformer, dict]:
     # TODO: remove the need for copy to default device
-    kv, state_dict = gguf_load(gguf.to(None).realize() if isinstance(gguf, Tensor) else gguf)
+    native_q8, native_q8_scope = bool(getenv("GGUF_NATIVE_Q8", 0)), getenv("GGUF_NATIVE_Q8_SCOPE", "attn")
+    def _native_q8_linear_name(name:str) -> bool:
+      if not name.endswith(".weight"): return False
+      if not any(x in name for x in ("attn_q.", "attn_k.", "attn_v.", "attn_output.", "ffn_gate.", "ffn_up.", "ffn_down.", "output.")): return False
+      if native_q8_scope == "attn": return any(x in name for x in ("attn_q.", "attn_k.", "attn_v.", "attn_output."))
+      if native_q8_scope == "ffn": return any(x in name for x in ("ffn_gate.", "ffn_up.", "ffn_down."))
+      return True
+    def _skip_native_q8_dequant(name:str, dims:tuple[int, ...], typ:int) -> bool:
+      return typ == 8 and len(dims) == 2 and _native_q8_linear_name(name)
+    if native_q8:
+      kv, state_dict, q8_state = gguf_load_with_quant(gguf.to(None).realize() if isinstance(gguf, Tensor) else gguf,
+                                                       skip_dequant=_skip_native_q8_dequant)
+    else:
+      kv, state_dict = gguf_load(gguf.to(None).realize() if isinstance(gguf, Tensor) else gguf)
+      q8_state = {}
 
     # all state items should be float16, not float32
     state_dict = {k:v.cast('float16') if getenv("HALF", 1) else v for k,v in state_dict.items()}
@@ -380,7 +402,30 @@ class Transformer:
       qkv_bias='blk.0.attn_q.bias' in state_dict,
       expert_bias=f"blk.{kv.get(f'{arch}.leading_dense_block_count', 0)}.exp_probs_b.bias" in state_dict)
     model = Transformer(config)
-    nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
+    nn.state.load_state_dict(model, state_dict, strict=not native_q8, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
+    if native_q8:
+      q8_params = []
+      def _lookup(obj, parts):
+        for p in parts:
+          obj = obj[int(p)] if isinstance(obj, list) else obj[p] if isinstance(obj, dict) else getattr(obj, p)
+        return obj
+      native_linear_weights = []
+      for name, q8 in q8_state.items():
+        if not name.endswith(".weight"): continue
+        if not _native_q8_linear_name(name): continue
+        try: parent = _lookup(model, name.split(".")[:-1])
+        except (AttributeError, KeyError, IndexError, ValueError): continue
+        if isinstance(parent, nn.Linear) and parent.weight.shape == (q8.shape[0], q8.shape[1]*32):
+          if getenv("GGUF_NATIVE_Q8_PACK_U32", 0):
+            from tinygrad.llm.quant import q8_0_pack_weight_u32
+            parent.q8_0_weight = q8_0_pack_weight_u32(q8).clone()
+          else:
+            parent.q8_0_weight = q8.clone()
+          q8_params.append(parent.q8_0_weight)
+          native_linear_weights.append(parent)
+      if q8_params: q8_params[0].realize(*q8_params[1:])
+      for parent in native_linear_weights:
+        parent.weight = Tensor.empty(0, dtype=parent.weight.dtype, device=parent.weight.device)
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:
       for s in (params:=nn.state.get_parameters(model)): s.replace(s.contiguous())
