@@ -1,9 +1,9 @@
 from __future__ import annotations
 import functools, itertools, pathlib
 from dataclasses import dataclass, replace
-from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function
+from tinygrad import Device, Tensor, nn, UOp, TinyJit, getenv, function
 from tinygrad.llm.gguf import gguf_load
-from tinygrad.uop.ops import resolve
+from tinygrad.uop.ops import Ops, resolve
 
 @functools.cache
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, device:str|None=None) -> Tensor:
@@ -13,11 +13,27 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, device:str|
 
 class ExpertWeights:
   """Like nn.Linear but with num_experts dimension. Weight shape: (num_experts, out_features, in_features)."""
-  def __init__(self, num_experts:int, in_features:int, out_features:int):
+  def __init__(self, num_experts:int, in_features:int, out_features:int, devices:tuple[str, ...]|None=None):
+    if devices is not None and num_experts % len(devices) != 0:
+      raise RuntimeError(f"expert count {num_experts} does not divide {len(devices)} devices")
     self.weight = Tensor.zeros(num_experts, out_features, in_features)
+    if devices is not None: self.weight = self.weight.shard(devices, axis=0)
   def __call__(self, sel:Tensor, x:Tensor) -> Tensor:
     # sel: (B, T, k), x: (B, T, 1, in) or (B, T, k, in) -> output: (B, T, k, out)
-    return (x.unsqueeze(-2) @ self.weight[sel].transpose(-1, -2)).contiguous().squeeze(-2)
+    if not isinstance(self.weight.device, tuple):
+      return (x.unsqueeze(-2) @ self.weight[sel].transpose(-1, -2)).contiguous().squeeze(-2)
+    per, parts = self.weight.shape[0] // len(self.weight.device), []
+    for rank, device in enumerate(self.weight.device):
+      local = sel.to(device) - rank * per
+      valid = (local >= 0) & (local < per)
+      # GGUF expert shards are loaded as MULTI(MSTACK(rank_weights))
+      weight_uop = self.weight.uop.src[0] if self.weight.uop.op is Ops.CAST else self.weight.uop
+      weight = Tensor(weight_uop.src[0].src[rank].copy_to_device(device))
+      if self.weight.uop.op is Ops.CAST: weight = weight.cast(self.weight.uop.dtype)
+      ids = valid.where(local, 0).cast('int32')
+      part = (x.to(device).unsqueeze(-2) @ weight[ids].transpose(-1, -2)).contiguous().squeeze(-2)
+      parts.append(valid.reshape(valid.shape + (1,) * (part.ndim - valid.ndim)).where(part, 0))
+    return functools.reduce(lambda a,b: a + b.to(a.device), parts)
 
 def apply_rope(x:Tensor, freqs_cis:Tensor) -> Tensor:
   assert x.shape[-1] % 2 == 0
@@ -73,7 +89,7 @@ class TransformerConfig:
   expert_bias: bool = False
 
 class FFNBlock:
-  def __init__(self, config:TransformerConfig):
+  def __init__(self, config:TransformerConfig, devices:tuple[str, ...]|None=None):
     self.config = config
 
     # --- RMSNorms --------------------------------------------------------
@@ -84,9 +100,9 @@ class FFNBlock:
     if config.num_experts > 0:
       self.ffn_gate_inp = nn.Linear(config.dim, config.num_experts, bias=False)  # router
       if config.expert_bias: self.exp_probs_b = {"bias": Tensor.zeros(config.num_experts)}
-      self.ffn_gate_exps = ExpertWeights(config.num_experts, config.dim, config.hidden_dim)
-      self.ffn_up_exps = ExpertWeights(config.num_experts, config.dim, config.hidden_dim)
-      self.ffn_down_exps = ExpertWeights(config.num_experts, config.hidden_dim, config.dim)
+      self.ffn_gate_exps = ExpertWeights(config.num_experts, config.dim, config.hidden_dim, devices)
+      self.ffn_up_exps = ExpertWeights(config.num_experts, config.dim, config.hidden_dim, devices)
+      self.ffn_down_exps = ExpertWeights(config.num_experts, config.hidden_dim, config.dim, devices)
       if config.shared_expert_dim > 0:
         self.ffn_gate_shexp = nn.Linear(config.dim, config.shared_expert_dim, bias=False)
         self.ffn_up_shexp = nn.Linear(config.dim, config.shared_expert_dim, bias=False)
@@ -137,8 +153,8 @@ class FFNBlock:
     return _run(x, start_pos)
 
 class TransformerBlock(FFNBlock):
-  def __init__(self, config:TransformerConfig):
-    super().__init__(config)
+  def __init__(self, config:TransformerConfig, devices:tuple[str, ...]|None=None):
+    super().__init__(config, devices)
     assert config.v_head_dim == config.head_dim, "TransformerBlock requires v_head_dim == head_dim"
 
     # --- attention projections (all linear, bias-free) ------------------
@@ -190,8 +206,8 @@ class TransformerBlock(FFNBlock):
       self.freqs_cis = precompute_freqs_cis(self.config.rope_dim, self.config.max_context, self.config.rope_theta, device=x.device)
 
 class MLATransformerBlock(FFNBlock):
-  def __init__(self, config:TransformerConfig):
-    super().__init__(config)
+  def __init__(self, config:TransformerConfig, devices:tuple[str, ...]|None=None):
+    super().__init__(config, devices)
     qk_nope_head_dim = config.head_dim - config.rope_dim
     if config.q_lora_rank > 0:
       self.attn_q_a = nn.Linear(config.dim, config.q_lora_rank, bias=False)
@@ -294,12 +310,12 @@ class GatedDeltaNetBlock(FFNBlock):
       self.recurrent_state = Tensor.zeros(x.shape[0], self.num_v_heads, self.head_v_dim, self.head_v_dim, device=x.device).clone()
 
 class Transformer:
-  def __init__(self, config:TransformerConfig):
+  def __init__(self, config:TransformerConfig, devices:tuple[str, ...]|None=None):
     dense_config = replace(config, num_experts=0, num_experts_per_tok=0, shared_expert_dim=0, hidden_dim=config.dense_hidden_dim or config.hidden_dim)
     if config.ssm: config = replace(config, qk_norm=config.head_dim)
     block_cls = MLATransformerBlock if config.kv_lora_rank > 0 else TransformerBlock
     self.blk:list[FFNBlock] = [GatedDeltaNetBlock(config, config.ssm) if config.ssm and (i+1) % config.full_attention_interval != 0 else
-                               block_cls(dense_config if i < config.leading_dense_blocks else config) for i in range(config.num_blocks)]
+      block_cls(dense_config if i < config.leading_dense_blocks else config, devices) for i in range(config.num_blocks)]
     self.token_embd  = nn.Embedding(config.vocab_size, config.dim)
     self.output_norm = nn.RMSNorm(config.dim, config.norm_eps)
     self.output = nn.Linear(config.dim, config.vocab_size, bias=False)
@@ -322,9 +338,9 @@ class Transformer:
 
   @staticmethod
   def from_gguf(gguf:Tensor|str|pathlib.Path, max_context:int|None=None,
-                realize=bool(getenv("REALIZE", 0))) -> tuple[Transformer, dict]:
-    # TODO: remove the need for copy to default device
-    kv, state_dict = gguf_load(gguf.to(None).realize() if isinstance(gguf, Tensor) else gguf)
+                realize=bool(getenv("REALIZE", 0)), shard:int=1) -> tuple[Transformer, dict]:
+    devices = tuple(Device.canonicalize(f"{Device.DEFAULT}:{i}") for i in range(shard)) if shard > 1 else None
+    kv, state_dict = gguf_load(gguf, devices=devices)
 
     # all state items should be float16, not float32
     state_dict = {k:v.cast('float16') if getenv("HALF", 1) else v for k,v in state_dict.items()}
@@ -381,7 +397,10 @@ class Transformer:
       full_attention_interval=kv.get(f'{arch}.full_attention_interval', 0),
       qkv_bias='blk.0.attn_q.bias' in state_dict,
       expert_bias=f"blk.{kv.get(f'{arch}.leading_dense_block_count', 0)}.exp_probs_b.bias" in state_dict)
-    model = Transformer(config)
+    model = Transformer(config, devices)
+    if devices:
+      for k,v in nn.state.get_state_dict(model).items():
+        if k in state_dict and isinstance(v.device, str): v.to_(state_dict[k].device)
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:
@@ -398,9 +417,10 @@ class Transformer:
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
     v_toks = UOp.variable("toks", 1, chunk_size)
     # TODO: use UOp.variable for temperature once float variables are supported
-    temp = Tensor([temperature])
+    dev = self.token_embd.weight.device
+    temp = Tensor(temperature, device=dev).contiguous()
     # assign all input tokens once, then slice from start_pos for the model call
-    t = Tensor(tokens + [0] * (self.max_context - len(tokens)), dtype="int32").reshape(1, self.max_context)
+    t = Tensor(tokens + [0] * (self.max_context - len(tokens)), dtype="int32", device=dev).reshape(1, self.max_context)
     # recompute start_pos from what's currently valid in the caches
     start_pos = self.get_start_pos(tokens)
     if start_pos < len(self._cached_tokens) and (resets := [r for b in self.blk for r in b._state_reset_ops()]): Tensor.realize(*resets)

@@ -130,9 +130,10 @@ readers: dict[int, Callable[[io.BufferedIOBase], Any]] = { 8: read_str, 9: read_
     [ (0,"c",1), (1,"b",1), (2,"H",2), (3,"h",2), (4,"I",4), (5,"i",4), (6,"f",4), (7,"?",1), (10,"Q",8), (11,"q",8), (12,"d",8) ] } }
 read_uint32, read_int32, read_uint64, read_int64 = readers[4], readers[5], readers[10], readers[11]
 
-def _gguf_parse(tensor: Tensor) -> tuple[dict, dict[str, Tensor]]:
-  # TODO: remove the need for copy to default device
-  tensor = tensor.to(None).realize()
+def _ggml_nbytes(n:int, typ:int) -> int:
+  return n * _GGML_NATIVE[typ].itemsize if typ in _GGML_NATIVE else (n // _GGML_QUANT[typ][0]) * _GGML_QUANT[typ][1]
+
+def _gguf_parse(tensor: Tensor, devices:tuple[str,...]|None=None) -> tuple[dict, dict[str, Tensor]]:
   r = io.BufferedReader(TensorIO(tensor), 1_000_000)
   magic, version, n_tensors, n_kv = r.read(4), read_int32(r), read_int64(r), read_int64(r)
   if magic != b"GGUF" or version not in [2, 3]: raise ValueError("Invalid GGUF format!")
@@ -146,8 +147,26 @@ def _gguf_parse(tensor: Tensor) -> tuple[dict, dict[str, Tensor]]:
   alignment, pos = kv_data.get("general.alignment", 32), r.tell()
   data_start = round_up(pos, alignment)
 
-  state_dict = {name: ggml_data_to_tensor(tensor[data_start + off:], prod(dims), typ).reshape(*reversed(dims)) for name, dims, typ, off in t_infos}
-  return kv_data, state_dict
+  if devices:
+    state_dict = {}
+    for name, dims, typ, off in t_infos:
+      shape, n = tuple(reversed(dims)), prod(dims)
+      if name.endswith("_exps.weight"):
+        if shape[0] % len(devices) != 0: raise RuntimeError(f"axis size {shape[0]} does not divide {len(devices)} devices")
+        per, parts = prod(shape[1:]), []
+        part_nbytes = _ggml_nbytes(per, typ)
+        for i,d in enumerate(devices):
+          s, e = i * (shape[0] // len(devices)), (i+1) * (shape[0] // len(devices))
+          raw = tensor[data_start + off + s*part_nbytes:data_start + off + e*part_nbytes].to(d).realize()
+          parts.append(ggml_data_to_tensor(raw, (e-s)*per, typ).reshape(e-s, *shape[1:]))
+        state_dict[name] = Tensor(parts[0].uop.mstack(*[p.uop for p in parts[1:]]).multi(0))
+      else:
+        raw = tensor[data_start + off:data_start + off + _ggml_nbytes(n, typ)].to(devices[0]).realize()
+        state_dict[name] = ggml_data_to_tensor(raw, n, typ).reshape(*shape)
+    return kv_data, state_dict
+  # TODO: remove the need for copy to default device
+  tensor = tensor.to(None).realize()
+  return kv_data, {name: ggml_data_to_tensor(tensor[data_start + off:], prod(dims), typ).reshape(*reversed(dims)) for name, dims, typ, off in t_infos}
 
 def _gguf_split_paths(path: pathlib.Path, kv: dict) -> list[pathlib.Path]:
   if (total := kv.get('split.count', 1)) <= 1: return [path]
@@ -155,7 +174,7 @@ def _gguf_split_paths(path: pathlib.Path, kv: dict) -> list[pathlib.Path]:
   if not (m := re.match(r"^(.*)-00001-of-\d{5}\.gguf$", str(path))): raise ValueError(f"first split path must end with -00001-of-NNNNN.gguf: {path}")
   return [pathlib.Path(f"{m.group(1)}-{i:05d}-of-{total:05d}.gguf") for i in range(1, total+1)]
 
-def gguf_load(fn: Tensor|str|pathlib.Path) -> tuple[dict, dict[str, Tensor]]:
+def gguf_load(fn: Tensor|str|pathlib.Path, devices:tuple[str,...]|None=None) -> tuple[dict, dict[str, Tensor]]:
   """
   Loads a .gguf file, returning the `kv_data` and `state_dict`. Multi-part splits are auto-merged when loaded by path.
 
@@ -170,8 +189,8 @@ def gguf_load(fn: Tensor|str|pathlib.Path) -> tuple[dict, dict[str, Tensor]]:
 
   NOTE: The provided tensor must be on a device that supports execution.
   """
-  kv, sd = _gguf_parse(fn if isinstance(fn, Tensor) else Tensor(pathlib.Path(fn)))
+  kv, sd = _gguf_parse(fn if isinstance(fn, Tensor) else Tensor(pathlib.Path(fn)), devices)
   if kv.get('split.count', 1) <= 1: return kv, sd
   if isinstance(fn, Tensor): raise ValueError("multi-part GGUF requires a path argument (got Tensor)")
-  for pp in _gguf_split_paths(pathlib.Path(fn), kv)[1:]: sd.update(_gguf_parse(Tensor(pp))[1])
+  for pp in _gguf_split_paths(pathlib.Path(fn), kv)[1:]: sd.update(_gguf_parse(Tensor(pp), devices)[1])
   return kv, sd
