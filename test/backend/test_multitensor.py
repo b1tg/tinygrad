@@ -200,6 +200,13 @@ class TestMultiTensor(unittest.TestCase):
       run_linear(linear, var_vals)
       np.testing.assert_equal(xt.numpy(), X_np[i*2:i*2+2])
 
+  def test_replicated_cast_shrink_copies_slice(self):
+    x = Tensor.empty(1024, dtype=dtypes.float32).realize().to(devices_2)
+    GlobalCounters.reset()
+    x.cast(dtypes.float16)[1:2].contiguous().realize()
+    for d in devices_2: Device[d].synchronize()
+    self.assertLess(GlobalCounters.global_mem, x.numel() * x.dtype.itemsize)
+
   @given(strat.sampled_from((devices_2, devices_3)),
          strat.sampled_from((Ops.ADD, Ops.MUL, Ops.MAX)),
          strat.sampled_from((None, 0, 1)), strat.sampled_from((None, 0, 1)))

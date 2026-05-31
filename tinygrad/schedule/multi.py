@@ -5,17 +5,24 @@ from tinygrad.schedule.allreduce import handle_allreduce
 
 # ***** multi rewrite MSELECT/MSTACK *****
 
+def _apply_before_copy(s:UOp, fxn) -> UOp:
+  if s.op is Ops.COPY: return fxn(s.src[0]).copy_to_device(s.device)
+  if s.op in {Ops.CAST, Ops.BITCAST, Ops.CONTIGUOUS, Ops.DETACH, Ops.CONTIGUOUS_BACKWARD}:
+    return s.replace(src=(_apply_before_copy(s.src[0], fxn),)+s.src[1:])
+  return fxn(s)
+
+def mstack_passthrough(root:UOp, ms:UOp):
+  return ms.replace(dtype=root.dtype, src=tuple(root.replace(src=(x,)+root.src[1:]) for x in ms.src))
+
 def mstack_early_shrink(ms:UOp, shrink:UOp):
   ret:list[UOp] = []
   def apply_shrink(s:UOp, i:int) -> UOp:
     new_arg = [tuple([x.substitute({dvar[0]:dvar[0].const_like(i)}) if isinstance(x, UOp) and
                       (dvar:=[v for v in x.variables() if v.expr=='_device_num']) else x for x in ss]) for ss in shrink.marg]
-    return s._mop(Ops.SHRINK, tuple(new_arg))
+    def do_shrink(x:UOp, op=Ops.SHRINK): return x._mop(op, tuple(new_arg))
+    return _apply_before_copy(s, do_shrink)
   for i, x in enumerate(ms.src):
-    if x.op is Ops.COPY:
-      ret.append(apply_shrink(x.src[0], i).copy_to_device(x.device))
-    else:
-      ret.append(apply_shrink(x, i).contiguous())
+    ret.append(apply_shrink(x, i).contiguous())
   return ms.replace(src=tuple(ret))
 
 replace_allreduce = PatternMatcher([
@@ -29,6 +36,10 @@ replace_allreduce = PatternMatcher([
   (UPat(Ops.MSELECT, src=(UPat(Ops.MSTACK, name="mstack"),), name="ms"), lambda mstack, ms: mstack.src[ms.arg]),
   # move shrink before MSTACK
   (UPat(Ops.SHRINK, src=(UPat(Ops.MSTACK, name="ms"),), allow_any_len=True, name="shrink"), mstack_early_shrink),
+  # move unary movement/casts into MSTACK only when this exposes shrink-before-copy
+  (UPat(Ops.SHRINK, src=(UPat((Ops.CAST, Ops.BITCAST, Ops.CONTIGUOUS, Ops.DETACH, Ops.CONTIGUOUS_BACKWARD),
+    src=(UPat(Ops.MSTACK, name="ms"),), name="root"),), allow_any_len=True, name="shrink"),
+   lambda root,ms,shrink: mstack_early_shrink(mstack_passthrough(root, ms), shrink)),
   # move MSELECT before movement ops
   (UPat(Ops.MSELECT, src=(UPat(GroupOp.Movement, src=(UPat.var("s"),), allow_any_len=True, name="v"),), name="ms"),
    lambda s,v,ms: v.replace(src=(s.mselect(ms.arg),)+v.src[1:])),
