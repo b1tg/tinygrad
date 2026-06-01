@@ -11,6 +11,13 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, device:str|
   freqs = Tensor.arange(end, device=device).unsqueeze(dim=1) * freqs.unsqueeze(dim=0)
   return freqs.cos().cat(freqs.sin(), dim=-1).contiguous()
 
+def local_shard(t:Tensor, rank:int, device:str) -> Tensor:
+  u, dtype = (t.uop.src[0], t.uop.dtype) if t.uop.op is Ops.CAST else (t.uop, None)
+  local = u.src[0].src[rank].copy_to_device(device) if u.src[0].op is Ops.MSTACK else u.src[0].copy_to_device(device, arg=rank)
+  ret = Tensor(local)
+  return ret.cast(dtype) if dtype is not None else ret
+
+
 class ExpertWeights:
   """Like nn.Linear but with num_experts dimension. Weight shape: (num_experts, out_features, in_features)."""
   def __init__(self, num_experts:int, in_features:int, out_features:int, devices:tuple[str, ...]|None=None):
@@ -26,14 +33,37 @@ class ExpertWeights:
     for rank, device in enumerate(self.weight.device):
       local = sel.to(device) - rank * per
       valid = (local >= 0) & (local < per)
-      # GGUF expert shards are loaded as MULTI(MSTACK(rank_weights))
-      weight_uop = self.weight.uop.src[0] if self.weight.uop.op is Ops.CAST else self.weight.uop
-      weight = Tensor(weight_uop.src[0].src[rank].copy_to_device(device))
-      if self.weight.uop.op is Ops.CAST: weight = weight.cast(self.weight.uop.dtype)
+      weight = local_shard(self.weight, rank, device)
       ids = valid.where(local, 0).cast('int32')
       part = (x.to(device).unsqueeze(-2) @ weight[ids].transpose(-1, -2)).contiguous().squeeze(-2)
       parts.append(valid.reshape(valid.shape + (1,) * (part.ndim - valid.ndim)).where(part, 0))
     return functools.reduce(lambda a,b: a + b.to(a.device), parts)
+
+def _shard_loaded_weight(w:Tensor, devices:tuple[str, ...], axis:int) -> Tensor:
+  assert w.shape[axis] % len(devices) == 0
+  per = w.shape[axis] // len(devices)
+  parts = [(w[i*per:(i+1)*per] if axis == 0 else w[:, i*per:(i+1)*per]).to(d).realize() for i,d in enumerate(devices)]
+  return Tensor(parts[0].uop.mstack(*[p.uop for p in parts[1:]]).multi(axis))
+
+class ShardedLinear:
+  def __init__(self, in_features:int, out_features:int, devices:tuple[str, ...]|None=None, axis:int=0):
+    self.devices = devices if getenv("TP", 0) and devices is not None and (out_features if axis == 0 else in_features) % len(devices) == 0 else None
+    self.axis = axis
+    self.weight = Tensor.zeros(out_features, in_features)
+    if self.devices is not None: self.weight = self.weight.shard(self.devices, axis=axis)
+  def __call__(self, x:Tensor) -> Tensor:
+    if self.devices is None: return x.linear(self.weight.transpose())
+    parts = []
+    for rank, device in enumerate(self.devices):
+      x_i = x
+      if self.axis == 1:
+        per = x.shape[-1] // len(self.devices)
+        x_i = x_i[..., rank*per:(rank+1)*per]
+      parts.append(x_i.to(device).linear(local_shard(self.weight, rank, device).transpose()))
+    if self.axis == 0: return parts[0].cat(*[p.to(parts[0].device) for p in parts[1:]], dim=-1)
+    ret = parts[0]
+    for part in parts[1:]: ret = ret + part.to(ret.device)
+    return ret
 
 def apply_rope(x:Tensor, freqs_cis:Tensor) -> Tensor:
   assert x.shape[-1] % 2 == 0
@@ -104,14 +134,14 @@ class FFNBlock:
       self.ffn_up_exps = ExpertWeights(config.num_experts, config.dim, config.hidden_dim, devices)
       self.ffn_down_exps = ExpertWeights(config.num_experts, config.hidden_dim, config.dim, devices)
       if config.shared_expert_dim > 0:
-        self.ffn_gate_shexp = nn.Linear(config.dim, config.shared_expert_dim, bias=False)
-        self.ffn_up_shexp = nn.Linear(config.dim, config.shared_expert_dim, bias=False)
-        self.ffn_down_shexp = nn.Linear(config.shared_expert_dim, config.dim, bias=False)
+        self.ffn_gate_shexp = ShardedLinear(config.dim, config.shared_expert_dim, devices=devices)
+        self.ffn_up_shexp = ShardedLinear(config.dim, config.shared_expert_dim, devices=devices)
+        self.ffn_down_shexp = ShardedLinear(config.shared_expert_dim, config.dim, devices=devices, axis=1)
         if config.shared_expert_gate: self.ffn_gate_inp_shexp = {"weight": Tensor.zeros(config.dim)}
     else:
-      self.ffn_gate    = nn.Linear(config.dim, config.hidden_dim, bias=False)
-      self.ffn_up      = nn.Linear(config.dim, config.hidden_dim, bias=False)
-      self.ffn_down    = nn.Linear(config.hidden_dim, config.dim, bias=False)
+      self.ffn_gate    = ShardedLinear(config.dim, config.hidden_dim, devices=devices)
+      self.ffn_up      = ShardedLinear(config.dim, config.hidden_dim, devices=devices)
+      self.ffn_down    = ShardedLinear(config.hidden_dim, config.dim, devices=devices, axis=1)
 
   def _feed_forward(self, x:Tensor) -> Tensor:
     if hasattr(self, 'ffn_gate_exps'):
@@ -210,16 +240,16 @@ class MLATransformerBlock(FFNBlock):
     super().__init__(config, devices)
     qk_nope_head_dim = config.head_dim - config.rope_dim
     if config.q_lora_rank > 0:
-      self.attn_q_a = nn.Linear(config.dim, config.q_lora_rank, bias=False)
+      self.attn_q_a = ShardedLinear(config.dim, config.q_lora_rank)
       self.attn_q_a_norm = nn.RMSNorm(config.q_lora_rank, config.norm_eps)
-      self.attn_q_b = nn.Linear(config.q_lora_rank, config.n_heads * config.head_dim, bias=False)
+      self.attn_q_b = ShardedLinear(config.q_lora_rank, config.n_heads * config.head_dim, devices=devices)
     else:
-      self.attn_q = nn.Linear(config.dim, config.n_heads * config.head_dim, bias=False)
-    self.attn_kv_a_mqa = nn.Linear(config.dim, config.kv_lora_rank + config.rope_dim, bias=False)
+      self.attn_q = ShardedLinear(config.dim, config.n_heads * config.head_dim, devices=devices)
+    self.attn_kv_a_mqa = ShardedLinear(config.dim, config.kv_lora_rank + config.rope_dim)
     self.attn_kv_a_norm = nn.RMSNorm(config.kv_lora_rank, config.norm_eps)
     self.attn_k_b = {"weight": Tensor.zeros(config.n_heads, config.kv_lora_rank, qk_nope_head_dim)}
     self.attn_v_b = {"weight": Tensor.zeros(config.n_heads, config.v_head_dim, config.kv_lora_rank)}
-    self.attn_output = nn.Linear(config.n_heads * config.v_head_dim, config.dim, bias=False)
+    self.attn_output = ShardedLinear(config.n_heads * config.v_head_dim, config.dim, devices=devices, axis=1)
 
   def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
     B, T, _ = x.shape
@@ -373,6 +403,10 @@ class Transformer:
         state_dict[name] = w.rearrange("n (h two) d -> n (two h) d", two=2).reshape(-1, w.shape[-1])
       elif kv_lora_rank and 'attn_kv_a_mqa.weight' in name:
         state_dict[name] = state_dict[name][:kv_lora_rank].cat(state_dict[name][kv_lora_rank:].rearrange("(h two) d -> (two h) d", two=2), dim=0)
+    if devices and getenv("TP", 0):
+      for name in state_dict:
+        if any(name.endswith(f".{n}.weight") for n in ("attn_q", "attn_q_b")): state_dict[name] = _shard_loaded_weight(state_dict[name], devices, 0)
+        elif name.endswith(".attn_output.weight"): state_dict[name] = _shard_loaded_weight(state_dict[name], devices, 1)
     config = TransformerConfig(
       num_blocks=kv[f'{arch}.block_count'] - kv.get(f'{arch}.nextn_predict_layers', 0), dim=kv[f'{arch}.embedding_length'],
       hidden_dim=kv.get(f'{arch}.expert_feed_forward_length', kv.get(f'{arch}.feed_forward_length', 0)),

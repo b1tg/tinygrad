@@ -3,7 +3,7 @@ from typing import Any, Callable
 
 from tinygrad.tensor import Tensor
 from tinygrad.dtype import dtypes
-from tinygrad.helpers import prod, round_up
+from tinygrad.helpers import getenv, prod, round_up
 from tinygrad.nn.state import TensorIO
 
 # ggml packs each iq grid entry as N bytes (N=4 for uint32 grids, N=8 for uint64 grids) in a single word. See ggml-common.h.
@@ -133,6 +133,12 @@ read_uint32, read_int32, read_uint64, read_int64 = readers[4], readers[5], reade
 def _ggml_nbytes(n:int, typ:int) -> int:
   return n * _GGML_NATIVE[typ].itemsize if typ in _GGML_NATIVE else (n // _GGML_QUANT[typ][0]) * _GGML_QUANT[typ][1]
 
+def _tp_axis(name:str) -> int|None:
+  if not getenv("TP", 0) or not name.startswith("blk.") or not name.endswith(".weight"): return None
+  if any(name.endswith(f".{n}.weight") for n in ("ffn_gate", "ffn_up", "ffn_gate_shexp", "ffn_up_shexp")): return 0
+  if any(name.endswith(f".{n}.weight") for n in ("ffn_down", "ffn_down_shexp")): return 1
+  return None
+
 def _gguf_parse(tensor: Tensor, devices:tuple[str,...]|None=None) -> tuple[dict, dict[str, Tensor]]:
   r = io.BufferedReader(TensorIO(tensor), 1_000_000)
   magic, version, n_tensors, n_kv = r.read(4), read_int32(r), read_int64(r), read_int64(r)
@@ -151,9 +157,18 @@ def _gguf_parse(tensor: Tensor, devices:tuple[str,...]|None=None) -> tuple[dict,
     state_dict = {}
     for name, dims, typ, off in t_infos:
       shape, n = tuple(reversed(dims)), prod(dims)
-      if name.endswith("_exps.weight"):
-        if shape[0] % len(devices) != 0: raise RuntimeError(f"axis size {shape[0]} does not divide {len(devices)} devices")
-        per, parts = prod(shape[1:]), []
+      axis = 0 if name.endswith("_exps.weight") else _tp_axis(name)
+      if axis is not None:
+        if shape[axis] % len(devices) != 0: raise RuntimeError(f"axis size {shape[axis]} does not divide {len(devices)} devices")
+        parts = []
+        if axis == 1:
+          raw = tensor[data_start + off:data_start + off + _ggml_nbytes(n, typ)].to(devices[0]).realize()
+          t = ggml_data_to_tensor(raw, n, typ).reshape(*shape)
+          per = shape[1] // len(devices)
+          for i,d in enumerate(devices): parts.append(t[:, i*per:(i+1)*per].to(d).realize())
+          state_dict[name] = Tensor(parts[0].uop.mstack(*[p.uop for p in parts[1:]]).multi(1))
+          continue
+        per = prod(shape[1:])
         part_nbytes = _ggml_nbytes(per, typ)
         for i,d in enumerate(devices):
           s, e = i * (shape[0] // len(devices)), (i+1) * (shape[0] // len(devices))
