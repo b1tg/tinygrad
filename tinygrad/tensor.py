@@ -368,6 +368,12 @@ class Tensor(OpMixin):
     """
     if self.uop.device is None: return self
     if (device:=canonicalize_device(device)) == self.device: return self
+    if isinstance(self.device, str) and self.device.startswith("DISK") and self.uop is not self.uop.base and self.uop.contiguous_view_offset() is None:
+      u, mops = self.uop, []
+      while u is not u.base:
+        mops.append(u)
+        u = u.src[0]
+      if u.op is Ops.BUFFER and all(x.op in {Ops.RESHAPE, Ops.SHRINK} for x in mops): return self.contiguous().to(device)
     ret = Tensor(self.uop.copy_to_device(device))
     if self.grad is not None: ret.grad = self.grad.to(device)
     return ret.is_param_(self.is_param)
@@ -1248,6 +1254,25 @@ class Tensor(OpMixin):
     """
     Returns a contiguous tensor.
     """
+    if isinstance(self.device, str) and self.device.startswith("DISK") and self.uop is not self.uop.base and self.uop.contiguous_view_offset() is None:
+      assert all_int(self.shape), f"no data if shape is symbolic, {self.shape=}"
+      u, mops = self.uop, []
+      while u is not u.base:
+        mops.append(u)
+        u = u.src[0]
+      if u.op is Ops.BUFFER and all(x.op in {Ops.RESHAPE, Ops.SHRINK} for x in mops):
+        from tinygrad.helpers import strides_for_shape
+        import numpy as np
+        shape, strides, offset = (u.arg,), (1,), 0
+        for x in reversed(mops):
+          if x.op is Ops.RESHAPE: shape, strides = x.shape, strides_for_shape(x.shape)
+          elif x.op is Ops.SHRINK:
+            offset += sum(s*b for s,(b,_) in zip(strides, x.marg))
+            shape = tuple(e-b for b,e in x.marg)
+        buf = u.buffer.ensure_allocated()
+        ary = np.ndarray(shape, dtype=_to_np_dtype(self.dtype.base), buffer=buf.as_memoryview(), offset=offset*self.dtype.itemsize,
+                         strides=tuple(s*self.dtype.itemsize for s in strides))
+        return Tensor(np.ascontiguousarray(ary), device="CPU")
     return self._apply_uop(UOp.contiguous, extra_args=args, **kwargs)
 
   # ***** broadcasted elementwise ops *****

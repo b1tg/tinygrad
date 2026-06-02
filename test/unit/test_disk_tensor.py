@@ -554,6 +554,16 @@ class TestDiskTensorMovement(TempDirTestCase):
     t = Tensor(self.fn)
     self.assertListEqual(t[16:18].tolist(), [16,17])
 
+  def test_strided_slice_contiguous_read(self):
+    fn = pathlib.Path(self.tmp("dt_strided_slice_contiguous_read"))
+    data = np.arange(4*2*34, dtype=np.uint8)
+    data.tofile(fn)
+    raw = Tensor(fn).reshape(4, 2, 34)
+    expected = data.reshape(4, 2, 34)[:, 0:1, :]
+    np.testing.assert_equal(raw[:, 0:1, :].contiguous().numpy(), expected)
+    np.testing.assert_equal(raw[:, 0:1, :].contiguous().to("CPU").realize().numpy(), expected)
+    np.testing.assert_equal(raw[:, 0:1, :].to("CPU").realize().numpy(), expected)
+
   def test_slice_read_cat(self):
     t = Tensor(self.fn)
     with self.assertRaises(AssertionError):
