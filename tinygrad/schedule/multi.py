@@ -18,7 +18,17 @@ def mstack_early_shrink(ms:UOp, shrink:UOp):
       ret.append(apply_shrink(x, i).contiguous())
   return ms.replace(src=tuple(ret))
 
+def has_allreduce(u:UOp) -> bool: return u.op is Ops.ALLREDUCE or any(has_allreduce(s) for s in u.src)
+
 replace_allreduce = PatternMatcher([
+  # Push copy-to-one through movement wrappers so placement can affect ALLREDUCE lowering.
+  (UPat(Ops.COPY, name="c", src=(
+    UPat((Ops.CAST, Ops.BITCAST, Ops.CONTIGUOUS, Ops.RESHAPE, Ops.PERMUTE), name="m"), UPat(Ops.DEVICE, name="device"))),
+   lambda c,m,device: m.replace(src=(m.src[0].copy_to_device(device),)+m.src[1:])
+   if isinstance(c.device, str) and isinstance(m.device, tuple) and has_allreduce(m) else None),
+  # If the consumer immediately copies an ALLREDUCE to one device, reduce directly to that device instead of allreducing to all devices.
+  (UPat(Ops.COPY, name="c", src=(UPat(Ops.ALLREDUCE, name="red"), UPat(Ops.DEVICE, name="device"))),
+   lambda c,red,device: red.replace(src=(red.src[0], device)) if isinstance(c.device, str) and isinstance(red.device, tuple) else None),
   # BROADCAST: explicitly expand broadcast copies and combine with MSTACK
   (UPat(Ops.COPY, name="c", src=(UPat(GroupOp.All-{Ops.CONST}, name="x"), UPat(Ops.DEVICE))), lambda c,x:
     UOp(Ops.MSTACK, c.dtype, tuple(x.copy_to_device(d) for d in c.device)) if isinstance(c.device, tuple) and isinstance(x.device, str) else None),

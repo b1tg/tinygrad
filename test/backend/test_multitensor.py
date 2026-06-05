@@ -262,6 +262,19 @@ class TestMultiTensor(unittest.TestCase):
         self.assertLess(kernels[0], 2*ndev)
         self.assertLessEqual(mem[0], 4*nbytes)
 
+  def test_reduce_shard_axis_to_single_device(self):
+    with Context(RING=0, SCACHE=0):
+      x = Tensor.arange(1024).reshape(4, 256).clone().shard(devices_4, 0).realize()
+      GlobalCounters.reset()
+      replicated = x.sum(axis=0).realize()
+      replicated_kernels = GlobalCounters.kernel_count
+      GlobalCounters.reset()
+      single = x.sum(axis=0).to(Device.DEFAULT).realize()
+      single_kernels = GlobalCounters.kernel_count
+    self.assertEqual(single.device, Device.DEFAULT)
+    np.testing.assert_equal(single.numpy(), replicated.numpy())
+    self.assertLessEqual(single_kernels, replicated_kernels)
+
   def test_allreduce_all2all(self):
     with Context(ALL2ALL=2):
       a,b = _test_allreduce(Tensor.rand(256, 256))
