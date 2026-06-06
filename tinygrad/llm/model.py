@@ -13,29 +13,33 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, device:str|
 
 class ExpertWeights:
   """Like nn.Linear but with num_experts dimension. Weight shape: (num_experts, out_features, in_features)."""
-  def __init__(self, num_experts:int, in_features:int, out_features:int, devices:tuple[str, ...]|None=None, axis:int|None=None):
-    if devices is None or axis is None: self.weight = Tensor.zeros(num_experts, out_features, in_features)
-    elif axis == 1: self.weights = [Tensor.zeros(num_experts, out_features//len(devices), in_features, device=d) for d in devices]
-    else: self.weights = [Tensor.zeros(num_experts, out_features, in_features//len(devices), device=d) for d in devices]
-  def __call__(self, sel:Tensor, x:Tensor, rank:int|None=None) -> Tensor:
-    # sel: (B, T, k), x: (B, T, 1, in) or (B, T, k, in) -> output: (B, T, k, out)
-    if rank is not None:
-      weight = self.weights[rank]
-      sel = sel.to(weight.device)
-    else:
-      weight = self.weight
+  def __init__(self, num_experts:int, in_features:int, out_features:int):
+    self.weight = Tensor.zeros(num_experts, out_features, in_features)
+  @staticmethod
+  def _linear(sel:Tensor, x:Tensor, weight:Tensor) -> Tensor:
     return (x.unsqueeze(-2) @ weight[sel].transpose(-1, -2)).contiguous().squeeze(-2)
-
-def rank_tensor(x:Tensor, rank:int, device:str) -> Tensor:
-  return Tensor(x.uop.mselect(rank)) if isinstance(x.device, tuple) else x.to(device)
-
-
-def tp_sum(parts:list[Tensor], device:str) -> Tensor:
-  if len(parts) == 1: return parts[0].to(device)
-  return functools.reduce(lambda a,b: a + b.to(a.device), parts).to(device)
+  def _local_weight(self, rank:int) -> Tensor:
+    weight_uop, dtype = self.weight.uop, None
+    if weight_uop.op is Ops.CAST: dtype, weight_uop = weight_uop.dtype, weight_uop.src[0]
+    weight = Tensor(weight_uop.src[0].mselect(rank))
+    return weight.cast(dtype) if dtype is not None else weight
+  def __call__(self, sel:Tensor, x:Tensor) -> Tensor:
+    # sel: (B, T, k), x: (B, T, 1, in) or (B, T, k, in) -> output: (B, T, k, out)
+    return self._linear(sel, x, self.weight)
+  def moe(self, sel:Tensor, x:Tensor, probs:Tensor, gate:ExpertWeights, up:ExpertWeights) -> Tensor:
+    if not isinstance(self.weight.device, tuple):
+      return (self(sel, (gate(sel, x).silu() * up(sel, x)).contiguous()) * probs.unsqueeze(-1)).sum(axis=2)
+    parts = []
+    for i,d in enumerate(self.weight.device):
+      sel_i, x_i, probs_i = sel.to(d), x.to(d), probs.to(d)
+      act_i = gate._linear(sel_i, x_i, gate._local_weight(i)).silu() * up._linear(sel_i, x_i, up._local_weight(i))
+      parts.append(self._linear(sel_i, (act_i * probs_i.unsqueeze(-1)).contiguous(), self._local_weight(i)).sum(axis=2))
+    return functools.reduce(lambda a,b: a + b.to(a.device), parts)
 
 def bound_const(x) -> int|None:
-  return x.src[1].arg if isinstance(x, UOp) and x.op is Ops.BIND and x.src[1].op is Ops.CONST else None
+  if isinstance(x, UOp) and x.op is Ops.BIND and x.src[1].op is Ops.CONST: return x.src[1].arg
+  if isinstance(x, UOp) and x.op is Ops.PARAM and getattr(x.arg, "name", None) == "toks": return 1
+  return None
 
 def bound_token_slice(x:Tensor) -> Tensor:
   # Native tuple-device linear can't currently schedule a symbolic SHRINK input. Decode binds T=1, so rebuild that slice concretely.
@@ -52,22 +56,6 @@ def _prepare_sharded_load(model, state_dict:dict[str, Tensor]):
     if (sd:=state_dict.get(k)) is not None and isinstance(sd.device, tuple) and not isinstance(v.device, tuple):
       v.replace(Tensor.zeros(*v.shape, device=sd.device[0]).shard(sd.device, axis=sd.uop.axis))
 
-  for k in state_dict:
-    if not k.endswith(".weights.0"): continue
-    obj = model
-    for part in k[:-len(".weights.0")].split("."): obj = obj[int(part)] if isinstance(obj, list) else getattr(obj, part)
-    if isinstance(obj, dict):
-      obj.pop("weight", None)
-      obj["weights"], i = [], 0
-      while (wk:=f"{k[:-1]}{i}") in state_dict:
-        obj["weights"].append(state_dict[wk].zeros_like())
-        i += 1
-      continue
-    if hasattr(obj, "weight"): del obj.weight
-    obj.weights, i = [], 0
-    while (wk:=f"{k[:-1]}{i}") in state_dict:
-      obj.weights.append(state_dict[wk].zeros_like())
-      i += 1
 
 def pairwise_topk(x: Tensor, k: int) -> tuple[Tensor, Tensor]:
   n = x.shape[-1]
@@ -128,9 +116,9 @@ class FFNBlock:
     if config.num_experts > 0:
       self.ffn_gate_inp = nn.Linear(config.dim, config.num_experts, bias=False)  # router
       if config.expert_bias: self.exp_probs_b = {"bias": Tensor.zeros(config.num_experts)}
-      self.ffn_gate_exps = ExpertWeights(config.num_experts, config.dim, config.hidden_dim, devices, axis=1)
-      self.ffn_up_exps = ExpertWeights(config.num_experts, config.dim, config.hidden_dim, devices, axis=1)
-      self.ffn_down_exps = ExpertWeights(config.num_experts, config.hidden_dim, config.dim, devices, axis=2)
+      self.ffn_gate_exps = ExpertWeights(config.num_experts, config.dim, config.hidden_dim)
+      self.ffn_up_exps = ExpertWeights(config.num_experts, config.dim, config.hidden_dim)
+      self.ffn_down_exps = ExpertWeights(config.num_experts, config.hidden_dim, config.dim)
       if config.shared_expert_dim > 0:
         self.ffn_gate_shexp = nn.Linear(config.dim, config.shared_expert_dim, bias=False)
         self.ffn_up_shexp = nn.Linear(config.dim, config.shared_expert_dim, bias=False)
@@ -154,18 +142,10 @@ class FFNBlock:
         vals, sel = pairwise_topk(logits, self.config.num_experts_per_tok)
         probs = vals.softmax(-1) if self.config.norm_topk_prob else logits.softmax(-1).gather(-1, sel)
       probs = probs * self.config.routed_scaling_factor
-      if hasattr(self.ffn_gate_exps, "weights"):
-        parts = []
-        for i,weight in enumerate(self.ffn_gate_exps.weights):
-          x_i = rank_tensor(x, i, weight.device).contiguous()
-          h_i = x_i.unsqueeze(2)
-          act_i = self.ffn_gate_exps(sel, h_i, i).silu() * self.ffn_up_exps(sel, h_i, i)
-          x_down_i = self.ffn_down_exps(sel, (act_i * probs.to(weight.device).unsqueeze(-1)).contiguous(), i)
-          parts.append(x_down_i.sum(axis=2))
-        out = tp_sum(parts, x.device)
-      else:
-        x_down = self.ffn_down_exps(sel, (self.ffn_gate_exps(sel, h).silu() * self.ffn_up_exps(sel, h)).contiguous())  # (B, T, k, D)
-        out = (x_down * probs.unsqueeze(-1)).sum(axis=2)  # (B, T, D)
+      devices = self.ffn_gate_exps.weight.device if isinstance(self.ffn_gate_exps.weight.device, tuple) else None
+      h = (bound_token_slice(x) if devices is not None else x).unsqueeze(2)
+      sel, probs = (bound_token_slice(sel), bound_token_slice(probs)) if devices is not None else (sel, probs)
+      out = self.ffn_down_exps.moe(sel, h, probs, self.ffn_gate_exps, self.ffn_up_exps).to(x.device).contiguous()
       if hasattr(self, 'ffn_gate_shexp'):
         h = bound_token_slice(x)
         h = h.to(self.ffn_gate_shexp.weight.device) if isinstance(self.ffn_gate_shexp.weight.device, tuple) else h

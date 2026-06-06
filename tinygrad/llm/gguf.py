@@ -138,7 +138,6 @@ def _shard_tensor(tensor:Tensor, data_start:int, name:str, dims:tuple[int, ...],
   shape = tuple(reversed(dims))
   if shape[axis] % len(devices) != 0: raise RuntimeError(f"axis size {shape[axis]} does not divide {len(devices)} devices")
   parts, per = [], shape[axis] // len(devices)
-  returns_local_weights = name.endswith("_exps.weight")
   if axis == 0:
     row_elems = prod(shape[1:])
     if typ in _GGML_QUANT and row_elems % _GGML_QUANT[typ][0] != 0:
@@ -146,12 +145,7 @@ def _shard_tensor(tensor:Tensor, data_start:int, name:str, dims:tuple[int, ...],
     part_nbytes = _ggml_nbytes(row_elems, typ)
     raws = [tensor[data_start + off + i*per*part_nbytes:data_start + off + (i+1)*per*part_nbytes].to(d) for i,d in enumerate(devices)]
     Tensor.realize(*raws)
-    if returns_local_weights or typ not in _GGML_QUANT:
-      parts = [ggml_data_to_tensor(raw, per*row_elems, typ).reshape(per, *shape[1:]) for raw in raws]
-    else:
-      raw = Tensor(raws[0].uop.mstack(*[r.uop for r in raws[1:]]))
-      t = ggml_data_to_tensor(raw, per*row_elems, typ).reshape(per, *shape[1:])
-      return {name: Tensor(t.uop.multi(axis))}
+    parts = [ggml_data_to_tensor(raw, per*row_elems, typ).reshape(per, *shape[1:]) for raw in raws]
   elif typ in _GGML_QUANT:
     qblock, block_bytes = _GGML_QUANT[typ]
     if shape[-1] % qblock != 0: raise RuntimeError(f"quantized tensor {name} last dim {shape[-1]} does not divide {qblock}")
@@ -167,16 +161,10 @@ def _shard_tensor(tensor:Tensor, data_start:int, name:str, dims:tuple[int, ...],
       raws.append(raw_view[tuple(slc)].contiguous().reshape(-1).to(d))
       part_shapes.append(part_shape)
     Tensor.realize(*raws)
-    if returns_local_weights:
-      parts = [ggml_data_to_tensor(raw, prod(part_shape), typ).reshape(*part_shape) for raw,part_shape in zip(raws, part_shapes)]
-    else:
-      assert all(s == part_shapes[0] for s in part_shapes)
-      raw = Tensor(raws[0].uop.mstack(*[r.uop for r in raws[1:]]))
-      t = ggml_data_to_tensor(raw, prod(part_shapes[0]), typ).reshape(*part_shapes[0])
-      return {name: Tensor(t.uop.multi(axis))}
+    assert all(s == part_shapes[0] for s in part_shapes)
+    parts = [ggml_data_to_tensor(raw, prod(part_shape), typ).reshape(*part_shape) for raw,part_shape in zip(raws, part_shapes)]
   elif axis != 0: raise RuntimeError(f"native tensor {name} only supports axis0 shard")
-  if not name.endswith("_exps.weight"): return {name: Tensor(parts[0].uop.mstack(*[p.uop for p in parts[1:]]).multi(axis))}
-  return {f"{name[:-6]}weights.{i}":p for i,p in enumerate(parts)}
+  return {name: Tensor(parts[0].uop.mstack(*[p.uop for p in parts[1:]]).multi(axis))}
 
 def _tp_axis(name:str) -> int|None:
   key = name.split(".", 2)[-1] if name.startswith("blk.") else name
