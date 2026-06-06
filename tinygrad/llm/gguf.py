@@ -130,9 +130,75 @@ readers: dict[int, Callable[[io.BufferedIOBase], Any]] = { 8: read_str, 9: read_
     [ (0,"c",1), (1,"b",1), (2,"H",2), (3,"h",2), (4,"I",4), (5,"i",4), (6,"f",4), (7,"?",1), (10,"Q",8), (11,"q",8), (12,"d",8) ] } }
 read_uint32, read_int32, read_uint64, read_int64 = readers[4], readers[5], readers[10], readers[11]
 
-def _gguf_parse(tensor: Tensor) -> tuple[dict, dict[str, Tensor]]:
+def _ggml_nbytes(n:int, typ:int) -> int:
+  return n * _GGML_NATIVE[typ].itemsize if typ in _GGML_NATIVE else (n // _GGML_QUANT[typ][0]) * _GGML_QUANT[typ][1]
+
+def _shard_tensor(tensor:Tensor, data_start:int, name:str, dims:tuple[int, ...], typ:int, off:int,
+                  devices:tuple[str, ...], axis:int) -> dict[str, Tensor]:
+  shape = tuple(reversed(dims))
+  if shape[axis] % len(devices) != 0: raise RuntimeError(f"axis size {shape[axis]} does not divide {len(devices)} devices")
+  parts, per = [], shape[axis] // len(devices)
+  returns_local_weights = name.endswith("_exps.weight")
+  if axis == 0:
+    row_elems = prod(shape[1:])
+    if typ in _GGML_QUANT and row_elems % _GGML_QUANT[typ][0] != 0:
+      raise RuntimeError(f"quantized tensor {name} row size {row_elems} does not divide {_GGML_QUANT[typ][0]}")
+    part_nbytes = _ggml_nbytes(row_elems, typ)
+    raws = [tensor[data_start + off + i*per*part_nbytes:data_start + off + (i+1)*per*part_nbytes].to(d) for i,d in enumerate(devices)]
+    Tensor.realize(*raws)
+    if returns_local_weights or typ not in _GGML_QUANT:
+      parts = [ggml_data_to_tensor(raw, per*row_elems, typ).reshape(per, *shape[1:]) for raw in raws]
+    else:
+      raw = Tensor(raws[0].uop.mstack(*[r.uop for r in raws[1:]]))
+      t = ggml_data_to_tensor(raw, per*row_elems, typ).reshape(per, *shape[1:])
+      return {name: Tensor(t.uop.multi(axis))}
+  elif typ in _GGML_QUANT:
+    qblock, block_bytes = _GGML_QUANT[typ]
+    if shape[-1] % qblock != 0: raise RuntimeError(f"quantized tensor {name} last dim {shape[-1]} does not divide {qblock}")
+    raw_shape = (*shape[:-1], shape[-1] // qblock, block_bytes)
+    raw_view = tensor[data_start + off:data_start + off + _ggml_nbytes(prod(shape), typ)].to("CPU").realize().reshape(*raw_shape)
+    raws, part_shapes = [], []
+    for i,d in enumerate(devices):
+      if axis == len(shape) - 1 and per % qblock != 0: raise RuntimeError(f"quantized shard axis size {per} does not divide {qblock}")
+      part_shape = (*shape[:axis], per, *shape[axis+1:])
+      raw_axis, raw_per = (len(shape)-1, per // qblock) if axis == len(shape)-1 else (axis, per)
+      slc = [slice(None)] * len(raw_shape)
+      slc[raw_axis] = slice(i*raw_per, (i+1)*raw_per)
+      raws.append(raw_view[tuple(slc)].contiguous().reshape(-1).to(d))
+      part_shapes.append(part_shape)
+    Tensor.realize(*raws)
+    if returns_local_weights:
+      parts = [ggml_data_to_tensor(raw, prod(part_shape), typ).reshape(*part_shape) for raw,part_shape in zip(raws, part_shapes)]
+    else:
+      assert all(s == part_shapes[0] for s in part_shapes)
+      raw = Tensor(raws[0].uop.mstack(*[r.uop for r in raws[1:]]))
+      t = ggml_data_to_tensor(raw, prod(part_shapes[0]), typ).reshape(*part_shapes[0])
+      return {name: Tensor(t.uop.multi(axis))}
+  elif axis != 0: raise RuntimeError(f"native tensor {name} only supports axis0 shard")
+  if not name.endswith("_exps.weight"): return {name: Tensor(parts[0].uop.mstack(*[p.uop for p in parts[1:]]).multi(axis))}
+  return {f"{name[:-6]}weights.{i}":p for i,p in enumerate(parts)}
+
+def _tp_axis(name:str) -> int|None:
+  key = name.split(".", 2)[-1] if name.startswith("blk.") else name
+  if key in ("attn_k.weight", "attn_v.weight", "attn_k.bias", "attn_v.bias"): return 0
+  if key in ("attn_q.weight", "attn_q_b.weight", "attn_k_b.weight", "attn_v_b.weight"): return 0
+  if key == "attn_output.weight": return 1
+  if key in ("ffn_gate.weight", "ffn_up.weight"): return 0
+  if key == "ffn_down.weight": return 1
+  if key in ("ffn_gate_shexp.weight", "ffn_up_shexp.weight"): return 0
+  if key == "ffn_down_shexp.weight": return 1
+  if key in ("ffn_gate_exps.weight", "ffn_up_exps.weight"): return 1
+  if key == "ffn_down_exps.weight": return 2
+  return None
+
+def _replicated_weight(name:str) -> str|None:
+  key = name.split(".", 2)[-1] if name.startswith("blk.") else name
+  return key if key in ("attn_norm.weight", "attn_q_a.weight", "attn_q_a_norm.weight",
+                        "attn_kv_a_mqa.weight", "attn_kv_a_norm.weight") else None
+
+def _gguf_parse(tensor: Tensor, devices:tuple[str, ...]|None=None) -> tuple[dict, dict[str, Tensor]]:
   # TODO: remove the need for copy to default device
-  tensor = tensor.to(None).realize()
+  if devices is None: tensor = tensor.to(None).realize()
   r = io.BufferedReader(TensorIO(tensor), 1_000_000)
   magic, version, n_tensors, n_kv = r.read(4), read_int32(r), read_int64(r), read_int64(r)
   if magic != b"GGUF" or version not in [2, 3]: raise ValueError("Invalid GGUF format!")
@@ -146,7 +212,19 @@ def _gguf_parse(tensor: Tensor) -> tuple[dict, dict[str, Tensor]]:
   alignment, pos = kv_data.get("general.alignment", 32), r.tell()
   data_start = round_up(pos, alignment)
 
-  state_dict = {name: ggml_data_to_tensor(tensor[data_start + off:], prod(dims), typ).reshape(*reversed(dims)) for name, dims, typ, off in t_infos}
+  state_dict = {}
+  for name, dims, typ, off in t_infos:
+    if devices is not None and _replicated_weight(name) is not None:
+      n = prod(dims)
+      raw = tensor[data_start + off:data_start + off + _ggml_nbytes(n, typ)].to("CPU").realize()
+      weight = ggml_data_to_tensor(raw, n, typ).reshape(*reversed(dims))
+      state_dict[name] = weight.to(devices).realize()
+    elif devices is not None and (axis := _tp_axis(name)) is not None:
+      state_dict.update(_shard_tensor(tensor, data_start, name, dims, typ, off, devices, axis))
+    else:
+      n = prod(dims)
+      raw = tensor[data_start + off:data_start + off + _ggml_nbytes(n, typ)].to(devices[0] if devices is not None else None).realize()
+      state_dict[name] = ggml_data_to_tensor(raw, n, typ).reshape(*reversed(dims))
   return kv_data, state_dict
 
 def _gguf_split_paths(path: pathlib.Path, kv: dict) -> list[pathlib.Path]:
@@ -155,7 +233,7 @@ def _gguf_split_paths(path: pathlib.Path, kv: dict) -> list[pathlib.Path]:
   if not (m := re.match(r"^(.*)-00001-of-\d{5}\.gguf$", str(path))): raise ValueError(f"first split path must end with -00001-of-NNNNN.gguf: {path}")
   return [pathlib.Path(f"{m.group(1)}-{i:05d}-of-{total:05d}.gguf") for i in range(1, total+1)]
 
-def gguf_load(fn: Tensor|str|pathlib.Path) -> tuple[dict, dict[str, Tensor]]:
+def gguf_load(fn: Tensor|str|pathlib.Path, devices:tuple[str, ...]|None=None) -> tuple[dict, dict[str, Tensor]]:
   """
   Loads a .gguf file, returning the `kv_data` and `state_dict`. Multi-part splits are auto-merged when loaded by path.
 
@@ -170,8 +248,8 @@ def gguf_load(fn: Tensor|str|pathlib.Path) -> tuple[dict, dict[str, Tensor]]:
 
   NOTE: The provided tensor must be on a device that supports execution.
   """
-  kv, sd = _gguf_parse(fn if isinstance(fn, Tensor) else Tensor(pathlib.Path(fn)))
+  kv, sd = _gguf_parse(fn if isinstance(fn, Tensor) else Tensor(pathlib.Path(fn)), devices)
   if kv.get('split.count', 1) <= 1: return kv, sd
   if isinstance(fn, Tensor): raise ValueError("multi-part GGUF requires a path argument (got Tensor)")
-  for pp in _gguf_split_paths(pathlib.Path(fn), kv)[1:]: sd.update(_gguf_parse(Tensor(pp))[1])
+  for pp in _gguf_split_paths(pathlib.Path(fn), kv)[1:]: sd.update(_gguf_parse(Tensor(pp), devices)[1])
   return kv, sd

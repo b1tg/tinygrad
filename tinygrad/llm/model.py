@@ -1,23 +1,45 @@
 from __future__ import annotations
 import functools, itertools, pathlib
 from dataclasses import dataclass, replace
-from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function
+from tinygrad import Device, Tensor, nn, UOp, TinyJit, getenv, function
 from tinygrad.llm.gguf import gguf_load
-from tinygrad.uop.ops import resolve
+from tinygrad.uop.ops import Ops, resolve
 
 @functools.cache
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, device:str|None=None) -> Tensor:
-  freqs = 1.0 / (theta ** (Tensor.arange(0, dim, 2)[:(dim // 2)] / dim))
-  freqs = Tensor.arange(end).unsqueeze(dim=1) * freqs.unsqueeze(dim=0)
-  return freqs.cos().cat(freqs.sin(), dim=-1).clone(device)
+  freqs = 1.0 / (theta ** (Tensor.arange(0, dim, 2, device=device)[:(dim // 2)] / dim))
+  freqs = Tensor.arange(end, device=device).unsqueeze(dim=1) * freqs.unsqueeze(dim=0)
+  return freqs.cos().cat(freqs.sin(), dim=-1).contiguous()
 
 class ExpertWeights:
   """Like nn.Linear but with num_experts dimension. Weight shape: (num_experts, out_features, in_features)."""
-  def __init__(self, num_experts:int, in_features:int, out_features:int):
-    self.weight = Tensor.zeros(num_experts, out_features, in_features)
-  def __call__(self, sel:Tensor, x:Tensor) -> Tensor:
+  def __init__(self, num_experts:int, in_features:int, out_features:int, devices:tuple[str, ...]|None=None, axis:int|None=None):
+    if devices is None or axis is None: self.weight = Tensor.zeros(num_experts, out_features, in_features)
+    elif axis == 1: self.weights = [Tensor.zeros(num_experts, out_features//len(devices), in_features, device=d) for d in devices]
+    else: self.weights = [Tensor.zeros(num_experts, out_features, in_features//len(devices), device=d) for d in devices]
+  def __call__(self, sel:Tensor, x:Tensor, rank:int|None=None) -> Tensor:
     # sel: (B, T, k), x: (B, T, 1, in) or (B, T, k, in) -> output: (B, T, k, out)
-    return (x.unsqueeze(-2) @ self.weight[sel].transpose(-1, -2)).contiguous().squeeze(-2)
+    if rank is not None:
+      weight = self.weights[rank]
+      sel = sel.to(weight.device)
+    else:
+      weight = self.weight
+    return (x.unsqueeze(-2) @ weight[sel].transpose(-1, -2)).contiguous().squeeze(-2)
+
+def rank_tensor(x:Tensor, rank:int, device:str) -> Tensor:
+  return Tensor(x.uop.mselect(rank)) if isinstance(x.device, tuple) else x.to(device)
+
+
+def tp_sum(parts:list[Tensor], device:str) -> Tensor:
+  if len(parts) == 1: return parts[0].to(device)
+  return functools.reduce(lambda a,b: a + b.to(a.device), parts).to(device)
+
+def bound_const(x) -> int|None:
+  return x.src[1].arg if isinstance(x, UOp) and x.op is Ops.BIND and x.src[1].op is Ops.CONST else None
+
+def bound_token_slice(x:Tensor) -> Tensor:
+  # Native tuple-device linear can't currently schedule a symbolic SHRINK input. Decode binds T=1, so rebuild that slice concretely.
+  return x[:, :toks] if x.ndim >= 2 and (toks:=bound_const(x.shape[1])) is not None else x
 
 def apply_rope(x:Tensor, freqs_cis:Tensor) -> Tensor:
   assert x.shape[-1] % 2 == 0
@@ -25,11 +47,33 @@ def apply_rope(x:Tensor, freqs_cis:Tensor) -> Tensor:
   x1, x2 = x.chunk(2, dim=-1)
   return (x1 * cos - x2 * sin).cat(x2 * cos + x1 * sin, dim=-1)
 
+def _prepare_sharded_load(model, state_dict:dict[str, Tensor]):
+  for k,v in nn.state.get_state_dict(model).items():
+    if (sd:=state_dict.get(k)) is not None and isinstance(sd.device, tuple) and not isinstance(v.device, tuple):
+      v.replace(Tensor.zeros(*v.shape, device=sd.device[0]).shard(sd.device, axis=sd.uop.axis))
+
+  for k in state_dict:
+    if not k.endswith(".weights.0"): continue
+    obj = model
+    for part in k[:-len(".weights.0")].split("."): obj = obj[int(part)] if isinstance(obj, list) else getattr(obj, part)
+    if isinstance(obj, dict):
+      obj.pop("weight", None)
+      obj["weights"], i = [], 0
+      while (wk:=f"{k[:-1]}{i}") in state_dict:
+        obj["weights"].append(state_dict[wk].zeros_like())
+        i += 1
+      continue
+    if hasattr(obj, "weight"): del obj.weight
+    obj.weights, i = [], 0
+    while (wk:=f"{k[:-1]}{i}") in state_dict:
+      obj.weights.append(state_dict[wk].zeros_like())
+      i += 1
+
 def pairwise_topk(x: Tensor, k: int) -> tuple[Tensor, Tensor]:
   n = x.shape[-1]
-  vals = Tensor.arange(n).reshape(1,1,n).cast(x.dtype).expand(x.shape)
+  vals = Tensor.arange(n, device=x.device).reshape(1,1,n).cast(x.dtype).expand(x.shape)
   cmp = (x.unsqueeze(-1) > x.unsqueeze(-2)) | ((x.unsqueeze(-1) == x.unsqueeze(-2)) & \
-    (Tensor.arange(n).reshape(1,1,n,1) < Tensor.arange(n).reshape(1,1,1,n)))
+    (Tensor.arange(n, device=x.device).reshape(1,1,n,1) < Tensor.arange(n, device=x.device).reshape(1,1,1,n)))
   sel = x.const_like(0).scatter(-1, cmp.sum(axis=-1).cast('int32'), vals)[:,:,n-k:].cast('int32')
   return x.gather(-1, sel), sel
 
@@ -73,7 +117,7 @@ class TransformerConfig:
   expert_bias: bool = False
 
 class FFNBlock:
-  def __init__(self, config:TransformerConfig):
+  def __init__(self, config:TransformerConfig, devices:tuple[str, ...]|None=None):
     self.config = config
 
     # --- RMSNorms --------------------------------------------------------
@@ -84,9 +128,9 @@ class FFNBlock:
     if config.num_experts > 0:
       self.ffn_gate_inp = nn.Linear(config.dim, config.num_experts, bias=False)  # router
       if config.expert_bias: self.exp_probs_b = {"bias": Tensor.zeros(config.num_experts)}
-      self.ffn_gate_exps = ExpertWeights(config.num_experts, config.dim, config.hidden_dim)
-      self.ffn_up_exps = ExpertWeights(config.num_experts, config.dim, config.hidden_dim)
-      self.ffn_down_exps = ExpertWeights(config.num_experts, config.hidden_dim, config.dim)
+      self.ffn_gate_exps = ExpertWeights(config.num_experts, config.dim, config.hidden_dim, devices, axis=1)
+      self.ffn_up_exps = ExpertWeights(config.num_experts, config.dim, config.hidden_dim, devices, axis=1)
+      self.ffn_down_exps = ExpertWeights(config.num_experts, config.hidden_dim, config.dim, devices, axis=2)
       if config.shared_expert_dim > 0:
         self.ffn_gate_shexp = nn.Linear(config.dim, config.shared_expert_dim, bias=False)
         self.ffn_up_shexp = nn.Linear(config.dim, config.shared_expert_dim, bias=False)
@@ -110,15 +154,29 @@ class FFNBlock:
         vals, sel = pairwise_topk(logits, self.config.num_experts_per_tok)
         probs = vals.softmax(-1) if self.config.norm_topk_prob else logits.softmax(-1).gather(-1, sel)
       probs = probs * self.config.routed_scaling_factor
-      x_down = self.ffn_down_exps(sel, (self.ffn_gate_exps(sel, h).silu() * self.ffn_up_exps(sel, h)).contiguous())  # (B, T, k, D)
-      out = (x_down * probs.unsqueeze(-1)).sum(axis=2)  # (B, T, D)
+      if hasattr(self.ffn_gate_exps, "weights"):
+        parts = []
+        for i,weight in enumerate(self.ffn_gate_exps.weights):
+          x_i = rank_tensor(x, i, weight.device).contiguous()
+          h_i = x_i.unsqueeze(2)
+          act_i = self.ffn_gate_exps(sel, h_i, i).silu() * self.ffn_up_exps(sel, h_i, i)
+          x_down_i = self.ffn_down_exps(sel, (act_i * probs.to(weight.device).unsqueeze(-1)).contiguous(), i)
+          parts.append(x_down_i.sum(axis=2))
+        out = tp_sum(parts, x.device)
+      else:
+        x_down = self.ffn_down_exps(sel, (self.ffn_gate_exps(sel, h).silu() * self.ffn_up_exps(sel, h)).contiguous())  # (B, T, k, D)
+        out = (x_down * probs.unsqueeze(-1)).sum(axis=2)  # (B, T, D)
       if hasattr(self, 'ffn_gate_shexp'):
-        shexp = self.ffn_down_shexp(self.ffn_gate_shexp(x).silu().contiguous() * self.ffn_up_shexp(x))
-        if hasattr(self, 'ffn_gate_inp_shexp'): shexp = shexp * (x * self.ffn_gate_inp_shexp["weight"]).sum(axis=-1, keepdim=True).sigmoid()
+        h = bound_token_slice(x)
+        h = h.to(self.ffn_gate_shexp.weight.device) if isinstance(self.ffn_gate_shexp.weight.device, tuple) else h
+        shexp = self.ffn_down_shexp(self.ffn_gate_shexp(h).silu().contiguous() * self.ffn_up_shexp(h)).to(x.device).contiguous()
+        if hasattr(self, 'ffn_gate_inp_shexp'):
+          shexp = shexp * (x * self.ffn_gate_inp_shexp["weight"]).sum(axis=-1, keepdim=True).sigmoid()
         out = out + shexp
       return out
     # TODO: remove the need for this contiguous
-    return self.ffn_down(self.ffn_gate(x).silu().contiguous() * self.ffn_up(x))
+    h = x if not isinstance(self.ffn_gate.weight.device, tuple) else bound_token_slice(x).to(self.ffn_gate.weight.device)
+    return self.ffn_down(self.ffn_gate(h).silu().contiguous() * self.ffn_up(h)).to(x.device).contiguous()
 
   # given the token-prefix match, return how much cached state this block can still reuse
   def _reusable_prefix_len(self, prefix_len:int, cached_len:int) -> int: return prefix_len
@@ -129,16 +187,20 @@ class FFNBlock:
 
   def __call__(self, x: Tensor, start_pos: int|UOp):
     self._init_state(x)
+    attn_output = getattr(self, "attn_output", None)
+    attn_devices = attn_output.weight.device if attn_output is not None and hasattr(self, "attn_k_b") else None
+    sharded_attn = isinstance(attn_devices, tuple)
     # we pass in the weights implicitly so we unpack the GGUF on the fly
     @function(precompile=True, allow_implicit=True)
     def _run(x:Tensor, start_pos:int|UOp):
-      h =     x + self._attention(self.attn_norm(x), start_pos)
+      attn_in = self.attn_norm(bound_token_slice(x).to(attn_devices)) if sharded_attn else self.attn_norm(x)
+      h = x + self._attention(attn_in, start_pos).to(x.device).contiguous()
       return (h + self._feed_forward(self.ffn_norm(h))).contiguous()
     return _run(x, start_pos)
 
 class TransformerBlock(FFNBlock):
-  def __init__(self, config:TransformerConfig):
-    super().__init__(config)
+  def __init__(self, config:TransformerConfig, devices:tuple[str, ...]|None=None):
+    super().__init__(config, devices)
     assert config.v_head_dim == config.head_dim, "TransformerBlock requires v_head_dim == head_dim"
 
     # --- attention projections (all linear, bias-free) ------------------
@@ -190,8 +252,8 @@ class TransformerBlock(FFNBlock):
       self.freqs_cis = precompute_freqs_cis(self.config.rope_dim, self.config.max_context, self.config.rope_theta, device=x.device)
 
 class MLATransformerBlock(FFNBlock):
-  def __init__(self, config:TransformerConfig):
-    super().__init__(config)
+  def __init__(self, config:TransformerConfig, devices:tuple[str, ...]|None=None):
+    super().__init__(config, devices)
     qk_nope_head_dim = config.head_dim - config.rope_dim
     if config.q_lora_rank > 0:
       self.attn_q_a = nn.Linear(config.dim, config.q_lora_rank, bias=False)
@@ -220,7 +282,7 @@ class MLATransformerBlock(FFNBlock):
       self.freqs_cis[start_pos:start_pos+T])
 
     k_store = c_kv.reshape(B, 1, T, self.config.kv_lora_rank).cat(k_rope.reshape(B, 1, T, self.config.rope_dim), dim=-1)
-    k = Tensor(self.cache_k.uop.after(self.cache_k[:, :, start_pos:start_pos+T, :].uop.store(k_store.uop)))[:, :, 0:start_pos+T, :]
+    k = Tensor(self.cache_k[:, :, 0:start_pos+T, :].uop.after(self.cache_k[:, :, start_pos:start_pos+T, :].uop.store(k_store.uop)))
     v = k[..., :self.config.kv_lora_rank]
 
     mask = Tensor.full((1, 1, T, start_pos+T), float("-inf"), dtype=x.dtype, buffer=False).triu(start_pos+1) \
@@ -233,12 +295,16 @@ class MLATransformerBlock(FFNBlock):
 
   def _init_state(self, x:Tensor):
     if not hasattr(self, "cache_k"):
-      self.cache_k = Tensor.empty(x.shape[0], 1, self.config.max_context, self.config.kv_lora_rank + self.config.rope_dim, device=x.device)
-      self.freqs_cis = precompute_freqs_cis(self.config.rope_dim, self.config.max_context, self.config.rope_theta, device=x.device)
+      if isinstance(devices:=self.attn_output.weight.device, tuple):
+        self.cache_k = Tensor.empty(x.shape[0], 1, self.config.max_context, self.config.kv_lora_rank + self.config.rope_dim, device=devices)
+        self.freqs_cis = precompute_freqs_cis(self.config.rope_dim, self.config.max_context, self.config.rope_theta, device=devices[0]).to(devices)
+      else:
+        self.cache_k = Tensor.empty(x.shape[0], 1, self.config.max_context, self.config.kv_lora_rank + self.config.rope_dim, device=x.device)
+        self.freqs_cis = precompute_freqs_cis(self.config.rope_dim, self.config.max_context, self.config.rope_theta, device=x.device)
 
 class GatedDeltaNetBlock(FFNBlock):
-  def __init__(self, config:TransformerConfig, ssm:SSMConfig):
-    super().__init__(config)
+  def __init__(self, config:TransformerConfig, ssm:SSMConfig, devices:tuple[str, ...]|None=None):
+    super().__init__(config, devices)
     self.head_k_dim, self.num_k_heads, self.num_v_heads = ssm.state_size, ssm.group_count, ssm.time_step_rank
     assert self.num_v_heads % self.num_k_heads == 0
     self.head_v_dim, self.ssm_conv_kernel = ssm.inner_size // ssm.time_step_rank, ssm.conv_kernel
@@ -294,12 +360,12 @@ class GatedDeltaNetBlock(FFNBlock):
       self.recurrent_state = Tensor.zeros(x.shape[0], self.num_v_heads, self.head_v_dim, self.head_v_dim, device=x.device).clone()
 
 class Transformer:
-  def __init__(self, config:TransformerConfig):
+  def __init__(self, config:TransformerConfig, devices:tuple[str, ...]|None=None):
     dense_config = replace(config, num_experts=0, num_experts_per_tok=0, shared_expert_dim=0, hidden_dim=config.dense_hidden_dim or config.hidden_dim)
     if config.ssm: config = replace(config, qk_norm=config.head_dim)
     block_cls = MLATransformerBlock if config.kv_lora_rank > 0 else TransformerBlock
-    self.blk:list[FFNBlock] = [GatedDeltaNetBlock(config, config.ssm) if config.ssm and (i+1) % config.full_attention_interval != 0 else
-                               block_cls(dense_config if i < config.leading_dense_blocks else config) for i in range(config.num_blocks)]
+    self.blk:list[FFNBlock] = [GatedDeltaNetBlock(config, config.ssm, devices) if config.ssm and (i+1) % config.full_attention_interval != 0 else
+                               block_cls(dense_config if i < config.leading_dense_blocks else config, devices) for i in range(config.num_blocks)]
     self.token_embd  = nn.Embedding(config.vocab_size, config.dim)
     self.output_norm = nn.RMSNorm(config.dim, config.norm_eps)
     self.output = nn.Linear(config.dim, config.vocab_size, bias=False)
@@ -322,9 +388,10 @@ class Transformer:
 
   @staticmethod
   def from_gguf(gguf:Tensor|str|pathlib.Path, max_context:int|None=None,
-                realize=bool(getenv("REALIZE", 0))) -> tuple[Transformer, dict]:
+                realize=bool(getenv("REALIZE", 0)), shard:int=1) -> tuple[Transformer, dict]:
     # TODO: remove the need for copy to default device
-    kv, state_dict = gguf_load(gguf.to(None).realize() if isinstance(gguf, Tensor) else gguf)
+    devices = tuple(Device.canonicalize(f"{Device.DEFAULT}:{i}") for i in range(shard)) if shard > 1 else None
+    kv, state_dict = gguf_load(gguf.to(None).realize() if isinstance(gguf, Tensor) else gguf, devices)
 
     # all state items should be float16, not float32
     state_dict = {k:v.cast('float16') if getenv("HALF", 1) else v for k,v in state_dict.items()}
@@ -348,8 +415,8 @@ class Transformer:
 
     # Permute RoPE weights from interleaved to half-split layout.
     for name in state_dict:
-      if ('attn_q.weight' in name or 'attn_q_b.weight' in name) and (arch == 'llama' or kv_lora_rank):
-        w = state_dict[name].reshape(n_heads, state_dict[name].shape[0]//n_heads, -1)
+      if ('.attn_q.weight' in name or '.attn_q_b.weight' in name) and (arch == 'llama' or kv_lora_rank):
+        w = state_dict[name].reshape(state_dict[name].shape[0]//head_dim, head_dim, -1)
         prefix = head_dim-rope_dim
         state_dict[name] = w[:, :prefix].cat(w[:, prefix:].rearrange("n (h two) d -> n (two h) d", two=2), dim=1).reshape(-1, w.shape[-1])
       elif arch == 'llama' and 'attn_k.weight' in name:
@@ -381,7 +448,8 @@ class Transformer:
       full_attention_interval=kv.get(f'{arch}.full_attention_interval', 0),
       qkv_bias='blk.0.attn_q.bias' in state_dict,
       expert_bias=f"blk.{kv.get(f'{arch}.leading_dense_block_count', 0)}.exp_probs_b.bias" in state_dict)
-    model = Transformer(config)
+    model = Transformer(config, devices)
+    _prepare_sharded_load(model, state_dict)
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:
