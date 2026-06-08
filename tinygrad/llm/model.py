@@ -36,26 +36,16 @@ class ExpertWeights:
       parts.append(self._linear(sel_i, (act_i * probs_i.unsqueeze(-1)).contiguous(), self._local_weight(i)).sum(axis=2))
     return functools.reduce(lambda a,b: a + b.to(a.device), parts)
 
-def bound_const(x) -> int|None:
-  if isinstance(x, UOp) and x.op is Ops.BIND and x.src[1].op is Ops.CONST: return x.src[1].arg
-  if isinstance(x, UOp) and x.op is Ops.PARAM and getattr(x.arg, "name", None) == "toks": return 1
-  return None
-
 def bound_token_slice(x:Tensor) -> Tensor:
-  # Native tuple-device linear can't currently schedule a symbolic SHRINK input. Decode binds T=1, so rebuild that slice concretely.
-  return x[:, :toks] if x.ndim >= 2 and (toks:=bound_const(x.shape[1])) is not None else x
+  # Native tuple-device linear can't currently schedule a symbolic SHRINK input. If T is already bound, rebuild that slice concretely.
+  t = x.shape[1] if x.ndim >= 2 else None
+  return x[:, :t.src[1].arg] if isinstance(t, UOp) and t.op is Ops.BIND and t.src[1].op is Ops.CONST else x
 
 def apply_rope(x:Tensor, freqs_cis:Tensor) -> Tensor:
   assert x.shape[-1] % 2 == 0
   cos, sin = freqs_cis.reshape(1, 1, x.shape[2], -1).chunk(2, dim=-1)
   x1, x2 = x.chunk(2, dim=-1)
   return (x1 * cos - x2 * sin).cat(x2 * cos + x1 * sin, dim=-1)
-
-def _prepare_sharded_load(model, state_dict:dict[str, Tensor]):
-  for k,v in nn.state.get_state_dict(model).items():
-    if (sd:=state_dict.get(k)) is not None and isinstance(sd.device, tuple) and not isinstance(v.device, tuple):
-      v.replace(Tensor.zeros(*v.shape, device=sd.device[0]).shard(sd.device, axis=sd.uop.axis))
-
 
 def pairwise_topk(x: Tensor, k: int) -> tuple[Tensor, Tensor]:
   n = x.shape[-1]
@@ -275,12 +265,10 @@ class MLATransformerBlock(FFNBlock):
 
   def _init_state(self, x:Tensor):
     if not hasattr(self, "cache_k"):
-      if isinstance(devices:=self.attn_output.weight.device, tuple):
-        self.cache_k = Tensor.empty(x.shape[0], 1, self.config.max_context, self.config.kv_lora_rank + self.config.rope_dim, device=devices)
-        self.freqs_cis = precompute_freqs_cis(self.config.rope_dim, self.config.max_context, self.config.rope_theta, device=devices[0]).to(devices)
-      else:
-        self.cache_k = Tensor.empty(x.shape[0], 1, self.config.max_context, self.config.kv_lora_rank + self.config.rope_dim, device=x.device)
-        self.freqs_cis = precompute_freqs_cis(self.config.rope_dim, self.config.max_context, self.config.rope_theta, device=x.device)
+      cache_device = self.attn_output.weight.device
+      freqs_device = cache_device[0] if isinstance(cache_device, tuple) else cache_device
+      self.cache_k = Tensor.empty(x.shape[0], 1, self.config.max_context, self.config.kv_lora_rank + self.config.rope_dim, device=cache_device)
+      self.freqs_cis = precompute_freqs_cis(self.config.rope_dim, self.config.max_context, self.config.rope_theta, device=freqs_device).to(cache_device)
 
 class GatedDeltaNetBlock(FFNBlock):
   def __init__(self, config:TransformerConfig, ssm:SSMConfig, devices:tuple[str, ...]|None=None):
@@ -429,7 +417,9 @@ class Transformer:
       qkv_bias='blk.0.attn_q.bias' in state_dict,
       expert_bias=f"blk.{kv.get(f'{arch}.leading_dense_block_count', 0)}.exp_probs_b.bias" in state_dict)
     model = Transformer(config, devices)
-    _prepare_sharded_load(model, state_dict)
+    for k,v in nn.state.get_state_dict(model).items():
+      if (sd:=state_dict.get(k)) is not None and isinstance(sd.device, tuple) and not isinstance(v.device, tuple):
+        v.replace(Tensor.zeros(*v.shape, device=sd.device[0]).shard(sd.device, axis=sd.uop.axis))
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:
