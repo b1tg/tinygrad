@@ -27,6 +27,9 @@ replace_allreduce = PatternMatcher([
     x.mselect(0).copy_to_device(c.device) if isinstance(c.device, str) and isinstance(x.device, tuple) else None),
   # MSELECT on MSTACK is replaced with nothing
   (UPat(Ops.MSELECT, src=(UPat(Ops.MSTACK, name="mstack"),), name="ms"), lambda mstack, ms: mstack.src[ms.arg]),
+  # MSELECT resolves through the MULTI view and dtype conversions down to the per-device data
+  (UPat(Ops.MSELECT, src=(UPat(Ops.MULTI, name="m"),), name="ms"), lambda m,ms: m.src[0].mselect(ms.arg)),
+  (UPat(Ops.MSELECT, src=(UPat((Ops.CAST, Ops.BITCAST), name="c"),), name="ms"), lambda c,ms: c.replace(src=(c.src[0].mselect(ms.arg),))),
   # move shrink before MSTACK
   (UPat(Ops.SHRINK, src=(UPat(Ops.MSTACK, name="ms"),), allow_any_len=True, name="shrink"), mstack_early_shrink),
   # move MSELECT before movement ops

@@ -15,26 +15,9 @@ class ExpertWeights:
   """Like nn.Linear but with num_experts dimension. Weight shape: (num_experts, out_features, in_features)."""
   def __init__(self, num_experts:int, in_features:int, out_features:int):
     self.weight = Tensor.zeros(num_experts, out_features, in_features)
-  @staticmethod
-  def _linear(sel:Tensor, x:Tensor, weight:Tensor) -> Tensor:
-    return (x.unsqueeze(-2) @ weight[sel].transpose(-1, -2)).contiguous().squeeze(-2)
-  def _local_weight(self, rank:int) -> Tensor:
-    weight_uop, dtype = self.weight.uop, None
-    if weight_uop.op is Ops.CAST: dtype, weight_uop = weight_uop.dtype, weight_uop.src[0]
-    weight = Tensor(weight_uop.src[0].mselect(rank))
-    return weight.cast(dtype) if dtype is not None else weight
   def __call__(self, sel:Tensor, x:Tensor) -> Tensor:
     # sel: (B, T, k), x: (B, T, 1, in) or (B, T, k, in) -> output: (B, T, k, out)
-    return self._linear(sel, x, self.weight)
-  def moe(self, sel:Tensor, x:Tensor, probs:Tensor, gate:ExpertWeights, up:ExpertWeights) -> Tensor:
-    if not isinstance(self.weight.device, tuple):
-      return (self(sel, (gate(sel, x).silu() * up(sel, x)).contiguous()) * probs.unsqueeze(-1)).sum(axis=2)
-    parts = []
-    for i,d in enumerate(self.weight.device):
-      sel_i, x_i, probs_i = sel.to(d), x.to(d), probs.to(d)
-      act_i = gate._linear(sel_i, x_i, gate._local_weight(i)).silu() * up._linear(sel_i, x_i, up._local_weight(i))
-      parts.append(self._linear(sel_i, (act_i * probs_i.unsqueeze(-1)).contiguous(), self._local_weight(i)).sum(axis=2))
-    return functools.reduce(lambda a,b: a + b.to(a.device), parts)
+    return (x.unsqueeze(-2) @ self.weight[sel].transpose(-1, -2)).contiguous().squeeze(-2)
 
 def bound_token_slice(x:Tensor) -> Tensor:
   # Native tuple-device linear can't currently schedule a symbolic SHRINK input. If T is already bound, rebuild that slice concretely.
@@ -143,7 +126,9 @@ class FFNBlock:
       devices = self.ffn_gate_exps.weight.device if isinstance(self.ffn_gate_exps.weight.device, tuple) else None
       h = (bound_token_slice(x) if devices is not None else x).unsqueeze(2)
       sel, probs = (bound_token_slice(sel), bound_token_slice(probs)) if devices is not None else (sel, probs)
-      out = self.ffn_down_exps.moe(sel, h, probs, self.ffn_gate_exps, self.ffn_up_exps).to(x.device).contiguous()
+      if devices is not None: h, probs = h.to(devices), probs.to(devices)
+      act = (self.ffn_gate_exps(sel, h).silu() * self.ffn_up_exps(sel, h)).contiguous()
+      out = (self.ffn_down_exps(sel, act) * probs.unsqueeze(-1)).sum(axis=2).to(x.device).contiguous()
       if hasattr(self, 'ffn_gate_shexp'):
         h = bound_token_slice(x) if devices is not None else x
         h = h.to(self.ffn_gate_shexp.weight.device) if isinstance(self.ffn_gate_shexp.weight.device, tuple) else h

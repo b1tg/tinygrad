@@ -303,8 +303,15 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
       # wmma output shape = accumulator shape (src[2])
       case Ops.WMMA | Ops.SHAPED_WMMA: return self.src[2]._shape
 
+      # MSELECT picks one device's data: its shape is the per-device (sharded) shape, i.e. the source's shape with the
+      # shard axis divided by the device count (the inverse of MULTI multiplying that axis).
+      case Ops.MSELECT:
+        if (ps:=self.src[0]._shape) is None: return None
+        if (a:=self.src[0].axis) is not None and isinstance(self.src[0].device, tuple):
+          return tuple(s//len(self.src[0].device) if i==a else s for i,s in enumerate(ps))
+        return ps
       # passthrough ops
-      case Ops.MSTACK | Ops.MSELECT | Ops.DETACH | Ops.CONTIGUOUS | Ops.CONTIGUOUS_BACKWARD | Ops.AFTER | Ops.LOAD | \
+      case Ops.MSTACK | Ops.DETACH | Ops.CONTIGUOUS | Ops.CONTIGUOUS_BACKWARD | Ops.AFTER | Ops.LOAD | \
            Ops.COPY | Ops.ALLREDUCE | Ops.STORE:
         return self.src[0]._shape
       # REDUCE with empty axis is passthrough (lowered form)
