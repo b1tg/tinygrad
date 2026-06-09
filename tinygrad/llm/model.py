@@ -7,9 +7,9 @@ from tinygrad.uop.ops import Ops, resolve
 
 @functools.cache
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, device:str|None=None) -> Tensor:
-  freqs = 1.0 / (theta ** (Tensor.arange(0, dim, 2, device=device)[:(dim // 2)] / dim))
-  freqs = Tensor.arange(end, device=device).unsqueeze(dim=1) * freqs.unsqueeze(dim=0)
-  return freqs.cos().cat(freqs.sin(), dim=-1).contiguous()
+  freqs = 1.0 / (theta ** (Tensor.arange(0, dim, 2)[:(dim // 2)] / dim))
+  freqs = Tensor.arange(end).unsqueeze(dim=1) * freqs.unsqueeze(dim=0)
+  return freqs.cos().cat(freqs.sin(), dim=-1).clone(device)
 
 class ExpertWeights:
   """Like nn.Linear but with num_experts dimension. Weight shape: (num_experts, out_features, in_features)."""
@@ -40,9 +40,9 @@ def apply_rope(x:Tensor, freqs_cis:Tensor) -> Tensor:
 
 def pairwise_topk(x: Tensor, k: int) -> tuple[Tensor, Tensor]:
   n = x.shape[-1]
-  vals = Tensor.arange(n, device=x.device).reshape(1,1,n).cast(x.dtype).expand(x.shape)
+  vals = Tensor.arange(n).reshape(1,1,n).cast(x.dtype).expand(x.shape)
   cmp = (x.unsqueeze(-1) > x.unsqueeze(-2)) | ((x.unsqueeze(-1) == x.unsqueeze(-2)) & \
-    (Tensor.arange(n, device=x.device).reshape(1,1,n,1) < Tensor.arange(n, device=x.device).reshape(1,1,1,n)))
+    (Tensor.arange(n).reshape(1,1,n,1) < Tensor.arange(n).reshape(1,1,1,n)))
   sel = x.const_like(0).scatter(-1, cmp.sum(axis=-1).cast('int32'), vals)[:,:,n-k:].cast('int32')
   return x.gather(-1, sel), sel
 
@@ -158,7 +158,7 @@ class FFNBlock:
     def _run(x:Tensor, start_pos:int|UOp):
       if sharded_attn: x = bound_token_slice(x)  # concretize T once so the residual matches the sharded (concrete-T) sub-kernels
       attn_in = self.attn_norm(x.to(attn_devices)) if sharded_attn else self.attn_norm(x)
-      h = x + self._attention(attn_in, start_pos).to(x.device).contiguous()
+      h =     x + self._attention(attn_in, start_pos).to(x.device).contiguous()
       return (h + self._feed_forward(self.ffn_norm(h))).contiguous()
     return _run(x, start_pos)
 
@@ -245,7 +245,7 @@ class MLATransformerBlock(FFNBlock):
       self.freqs_cis[start_pos:start_pos+T])
 
     k_store = c_kv.reshape(B, 1, T, self.config.kv_lora_rank).cat(k_rope.reshape(B, 1, T, self.config.rope_dim), dim=-1)
-    k = Tensor(self.cache_k[:, :, 0:start_pos+T, :].uop.after(self.cache_k[:, :, start_pos:start_pos+T, :].uop.store(k_store.uop)))
+    k = Tensor(self.cache_k.uop.after(self.cache_k[:, :, start_pos:start_pos+T, :].uop.store(k_store.uop)))[:, :, 0:start_pos+T, :]
     v = k[..., :self.config.kv_lora_rank]
 
     mask = causal_mask(T, start_pos, x.dtype, q.device) if resolve(T != 1) else None
@@ -375,7 +375,7 @@ class Transformer:
 
     # Permute RoPE weights from interleaved to half-split layout.
     for name in state_dict:
-      if ('.attn_q.weight' in name or '.attn_q_b.weight' in name) and (arch == 'llama' or kv_lora_rank):
+      if ('attn_q.weight' in name or 'attn_q_b.weight' in name) and (arch == 'llama' or kv_lora_rank):
         w = state_dict[name].reshape(state_dict[name].shape[0]//head_dim, head_dim, -1)
         prefix = head_dim-rope_dim
         state_dict[name] = w[:, :prefix].cat(w[:, prefix:].rearrange("n (h two) d -> n (two h) d", two=2), dim=1).reshape(-1, w.shape[-1])
