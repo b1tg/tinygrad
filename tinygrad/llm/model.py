@@ -5,6 +5,25 @@ from tinygrad import Device, Tensor, nn, UOp, TinyJit, getenv, function
 from tinygrad.llm.gguf import gguf_load
 from tinygrad.uop.ops import Ops, resolve
 
+# tensor-parallel sharding policy (vLLM-style column/row parallel), passed into gguf_load so the format loader stays generic
+def _blk_key(name:str) -> str: return name.split(".", 2)[-1] if name.startswith("blk.") else name
+
+def _tp_axis(name:str) -> int|None:
+  key = _blk_key(name)
+  if key in ("attn_k.weight", "attn_v.weight", "attn_k.bias", "attn_v.bias"): return 0
+  if key in ("attn_q.weight", "attn_q_b.weight", "attn_k_b.weight", "attn_v_b.weight"): return 0
+  if key == "attn_output.weight": return 1
+  if key in ("ffn_gate.weight", "ffn_up.weight"): return 0
+  if key == "ffn_down.weight": return 1
+  if key in ("ffn_gate_shexp.weight", "ffn_up_shexp.weight"): return 0
+  if key == "ffn_down_shexp.weight": return 1
+  if key in ("ffn_gate_exps.weight", "ffn_up_exps.weight"): return 1
+  if key == "ffn_down_exps.weight": return 2
+  return None
+
+def _replicated_weight(name:str) -> bool:
+  return _blk_key(name) in ("attn_norm.weight", "attn_q_a.weight", "attn_q_a_norm.weight", "attn_kv_a_mqa.weight", "attn_kv_a_norm.weight")
+
 @functools.cache
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, device:str|None=None) -> Tensor:
   freqs = 1.0 / (theta ** (Tensor.arange(0, dim, 2)[:(dim // 2)] / dim))
@@ -352,7 +371,8 @@ class Transformer:
                 realize=bool(getenv("REALIZE", 0)), shard:int=1) -> tuple[Transformer, dict]:
     # TODO: remove the need for copy to default device
     devices = tuple(Device.canonicalize(f"{Device.DEFAULT}:{i}") for i in range(shard)) if shard > 1 else None
-    kv, state_dict = gguf_load(gguf.to(None).realize() if isinstance(gguf, Tensor) else gguf, devices)
+    kv, state_dict = gguf_load(gguf.to(None).realize() if isinstance(gguf, Tensor) else gguf, devices,
+                               shard_axis=_tp_axis, replicated=_replicated_weight)
 
     # all state items should be float16, not float32
     state_dict = {k:v.cast('float16') if getenv("HALF", 1) else v for k,v in state_dict.items()}
