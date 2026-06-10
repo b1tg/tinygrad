@@ -24,7 +24,7 @@ def bound_token_slice(x:Tensor) -> Tensor:
   t = x.shape[1] if x.ndim >= 2 else None
   return x[:, :t.src[1].arg] if isinstance(t, UOp) and t.op is Ops.BIND and t.src[1].op is Ops.CONST else x
 
-def causal_mask(T:int, start_pos:int|UOp, dtype, device) -> Tensor:
+def causal_mask(T:int|UOp, start_pos:int|UOp, dtype, device) -> Tensor:
   # concrete TxT causal block built on `device` (a sharded tuple in TP mode), then the all-visible [0,start_pos) keys padded with 0.
   # Tensor.arange uses full(buffer=False) which drops the device and materializes a single-device buffer -> breaks sharded kernels;
   # full(buffer=True)+cumsum keeps the device, but only for a concrete length, hence the pad instead of a symbolic-length arange.
@@ -260,7 +260,8 @@ class MLATransformerBlock(FFNBlock):
       cache_device = self.attn_output.weight.device
       freqs_device = cache_device[0] if isinstance(cache_device, tuple) else cache_device
       self.cache_k = Tensor.empty(x.shape[0], 1, self.config.max_context, self.config.kv_lora_rank + self.config.rope_dim, device=cache_device)
-      self.freqs_cis = precompute_freqs_cis(self.config.rope_dim, self.config.max_context, self.config.rope_theta, device=freqs_device).to(cache_device)
+      fc = precompute_freqs_cis(self.config.rope_dim, self.config.max_context, self.config.rope_theta, device=freqs_device)
+      self.freqs_cis = fc.to(cache_device)
 
 class GatedDeltaNetBlock(FFNBlock):
   def __init__(self, config:TransformerConfig, ssm:SSMConfig, devices:tuple[str, ...]|None=None):
