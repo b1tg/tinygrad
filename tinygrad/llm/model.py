@@ -145,7 +145,7 @@ class FFNBlock:
       devices = self.ffn_gate_exps.weight.device if isinstance(self.ffn_gate_exps.weight.device, tuple) else None
       h = (bound_token_slice(x) if devices is not None else x).unsqueeze(2)
       sel, probs = (bound_token_slice(sel), bound_token_slice(probs)) if devices is not None else (sel, probs)
-      if devices is not None: h, probs = h.to(devices), probs.to(devices)
+      if devices is not None: h, sel, probs = h.to(devices), sel.to(devices), probs.to(devices)
       act = (self.ffn_gate_exps(sel, h).silu() * self.ffn_up_exps(sel, h)).contiguous()
       out = (self.ffn_down_exps(sel, act) * probs.unsqueeze(-1)).sum(axis=2).to(x.device).contiguous()
       if hasattr(self, 'ffn_gate_shexp'):

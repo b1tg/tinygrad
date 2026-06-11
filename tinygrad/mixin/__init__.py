@@ -59,12 +59,6 @@ class OpMixin(ElementwiseMixin, ReduceMixin):
     # view-only indexing (no Tensor/list indices, no setitem) is handled by MovementMixin.__getitem__
     if v is None and not any(is_adv(i) for i in (indices if isinstance(indices,tuple) else (indices,))):
       return super().__getitem__(indices)
-    # multi-device advanced index on a non-shard axis (e.g. MoE expert weights sharded on the feature axis):
-    # gather each device's local shard fresh, so single-device gather folds to reading only the selected rows.
-    if v is None and isinstance(indices, type(self)) and isinstance(self.device, tuple) and (sax:=self._uop.axis) is not None and sax != 0:
-      branches = tuple(self._wrap_uop(self._uop.mselect(i))[self._wrap_uop(indices._uop.copy_to_device(d))]._uop
-                       for i,d in enumerate(self.device))
-      return self._wrap_uop(UOp(Ops.MSTACK, self.dtype, branches).multi(sax - 1 + len(indices.shape)))
     # wrap single index into a list
     if (isinstance(indices, list) and all_int(indices)) or not isinstance(indices, (tuple, list)): indices = [indices]
     indices_parsed, dim = [], 0
