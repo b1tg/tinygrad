@@ -3,7 +3,7 @@ import functools, itertools, pathlib
 from dataclasses import dataclass, replace
 from tinygrad import Device, Tensor, nn, UOp, TinyJit, getenv, function
 from tinygrad.llm.gguf import gguf_load
-from tinygrad.uop.ops import Ops, resolve
+from tinygrad.uop.ops import resolve
 
 # tensor-parallel sharding policy (vLLM-style column/row parallel), passed into gguf_load so the format loader stays generic
 def _blk_key(name:str) -> str: return name.split(".", 2)[-1] if name.startswith("blk.") else name
@@ -38,18 +38,11 @@ class ExpertWeights:
     # sel: (B, T, k), x: (B, T, 1, in) or (B, T, k, in) -> output: (B, T, k, out)
     return (x.unsqueeze(-2) @ self.weight[sel].transpose(-1, -2)).contiguous().squeeze(-2)
 
-def bound_token_slice(x:Tensor) -> Tensor:
-  # Native tuple-device linear can't currently schedule a symbolic SHRINK input. If T is already bound, rebuild that slice concretely.
-  t = x.shape[1] if x.ndim >= 2 else None
-  return x[:, :t.src[1].arg] if isinstance(t, UOp) and t.op is Ops.BIND and t.src[1].op is Ops.CONST else x
-
 def causal_mask(T:int|UOp, start_pos:int|UOp, dtype, device) -> Tensor:
-  # concrete TxT causal block built on `device` (a sharded tuple in TP mode), then the all-visible [0,start_pos) keys padded with 0.
-  # Tensor.arange uses full(buffer=False) which drops the device and materializes a single-device buffer -> breaks sharded kernels;
-  # full(buffer=True)+cumsum keeps the device, but only for a concrete length, hence the pad instead of a symbolic-length arange.
-  r = Tensor.full((T,), 1, dtype="int32", device=device)._cumalu(0, Ops.ADD) - 1
-  block = (r.reshape(1, 1, 1, T) > r.reshape(1, 1, T, 1)).where(Tensor.full((), float("-inf"), dtype=dtype, device=device), 0)
-  return block.pad((None, None, None, (start_pos, 0)))
+  # causal_lower_right: query i (position start_pos+i) sees keys [0, start_pos+i]
+  q = Tensor.arange(T, device=device).reshape(1, 1, T, 1) + start_pos
+  k = Tensor.arange(start_pos+T, device=device).reshape(1, 1, 1, start_pos+T)
+  return (k > q).where(Tensor.full((), float("-inf"), dtype=dtype, device=device), 0)
 
 def apply_rope(x:Tensor, freqs_cis:Tensor) -> Tensor:
   assert x.shape[-1] % 2 == 0
@@ -143,21 +136,19 @@ class FFNBlock:
         probs = vals.softmax(-1) if self.config.norm_topk_prob else logits.softmax(-1).gather(-1, sel)
       probs = probs * self.config.routed_scaling_factor
       devices = self.ffn_gate_exps.weight.device if isinstance(self.ffn_gate_exps.weight.device, tuple) else None
-      h = (bound_token_slice(x) if devices is not None else x).unsqueeze(2)
-      sel, probs = (bound_token_slice(sel), bound_token_slice(probs)) if devices is not None else (sel, probs)
+      h = x.unsqueeze(2)
       if devices is not None: h, sel, probs = h.to(devices), sel.to(devices), probs.to(devices)
       act = (self.ffn_gate_exps(sel, h).silu() * self.ffn_up_exps(sel, h)).contiguous()
       out = (self.ffn_down_exps(sel, act) * probs.unsqueeze(-1)).sum(axis=2).to(x.device).contiguous()
       if hasattr(self, 'ffn_gate_shexp'):
-        h = bound_token_slice(x) if devices is not None else x
-        h = h.to(self.ffn_gate_shexp.weight.device) if isinstance(self.ffn_gate_shexp.weight.device, tuple) else h
+        h = x.to(self.ffn_gate_shexp.weight.device) if isinstance(self.ffn_gate_shexp.weight.device, tuple) else x
         shexp = self.ffn_down_shexp(self.ffn_gate_shexp(h).silu().contiguous() * self.ffn_up_shexp(h)).to(x.device).contiguous()
         if hasattr(self, 'ffn_gate_inp_shexp'):
           shexp = shexp * (x * self.ffn_gate_inp_shexp["weight"]).sum(axis=-1, keepdim=True).sigmoid()
         out = out + shexp
       return out
     # TODO: remove the need for this contiguous
-    h = x if not isinstance(self.ffn_gate.weight.device, tuple) else bound_token_slice(x).to(self.ffn_gate.weight.device)
+    h = x if not isinstance(self.ffn_gate.weight.device, tuple) else x.to(self.ffn_gate.weight.device)
     return self.ffn_down(self.ffn_gate(h).silu().contiguous() * self.ffn_up(h)).to(x.device).contiguous()
 
   # given the token-prefix match, return how much cached state this block can still reuse
@@ -175,7 +166,6 @@ class FFNBlock:
     # we pass in the weights implicitly so we unpack the GGUF on the fly
     @function(precompile=True, allow_implicit=True)
     def _run(x:Tensor, start_pos:int|UOp):
-      if sharded_attn: x = bound_token_slice(x)  # concretize T once so the residual matches the sharded (concrete-T) sub-kernels
       attn_in = self.attn_norm(x.to(attn_devices)) if sharded_attn else self.attn_norm(x)
       h =     x + self._attention(attn_in, start_pos).to(x.device).contiguous()
       return (h + self._feed_forward(self.ffn_norm(h))).contiguous()

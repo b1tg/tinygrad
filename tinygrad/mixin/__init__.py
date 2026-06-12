@@ -194,7 +194,7 @@ class OpMixin(ElementwiseMixin, ReduceMixin):
     return cls.full(argfix(*shape), 1.0, **kwargs)
 
   @classmethod
-  def arange(cls, start, stop=None, step=1, dtype:DTypeLike|None=None) -> Self:
+  def arange(cls, start, stop=None, step=1, dtype:DTypeLike|None=None, device:str|tuple[str, ...]|None=None) -> Self:
     """
     Returns a 1-D tensor of size `ceil((stop - start) / step)` with values from `[start, stop)`, with spacing between values given by `step`.
 
@@ -220,8 +220,10 @@ class OpMixin(ElementwiseMixin, ReduceMixin):
     lo, hi = (start, stop-step) if step > 0 else (stop-step, start)
     if lo < (dt:=to_dtype(dtype)).min or dt.max < hi: raise OverflowError(f"arange [{start}, {stop}) is not representable in dtype {dtype}")
     # NOTE: this matches numpy, torch raises RuntimeError if stop-start and step have different signs
-    if (output_len:=ceildiv(stop-start, step)) <= 0: return cls.full((0,), 0, dtype=dtype, buffer=False)
-    return (cls.full((output_len,), step, dtype=dtype, buffer=False)._cumalu(0, Ops.ADD) + (start - step)).cast(dtype)
+    # device=None keeps the buffer=False broadcast-const (foldable) path; an explicit device builds the range on that device
+    # (buffer=True keeps the device, which buffer=False drops) so it works on a sharded tuple without a default-device copy
+    if (output_len:=ceildiv(stop-start, step)) <= 0: return cls.full((0,), 0, dtype=dtype, device=device, buffer=False)
+    return (cls.full((output_len,), step, dtype=dtype, device=device, buffer=device is not None)._cumalu(0, Ops.ADD) + (start-step)).cast(dtype)
 
   @classmethod
   def linspace(cls, start:int|float, stop:int|float, steps:int, dtype:DTypeLike|None=None) -> Self:

@@ -9,7 +9,7 @@ from tinygrad.helpers import PCONTIG, FLOAT16, OPENPILOT_HACKS, argsort, partiti
 from tinygrad.codegen.simplify import pm_flatten_range, pm_reduce_simplify
 from tinygrad.codegen.opt import Opt
 from tinygrad.schedule.indexing import run_rangeify, BufferizeOpts, IndexingContext, apply_movement_op
-from tinygrad.schedule.multi import multi_pm
+from tinygrad.schedule.multi import multi_pm, mstack_common_op
 from tinygrad.schedule.allreduce import create_allreduce_function
 
 # creation can recurse a lot
@@ -35,6 +35,14 @@ def lower_shaped_wmma(ctx, x):
 
 pm_store_ranges = PatternMatcher([
   (UPat(Ops.STORE, name="x"), add_ranges_to_store),
+])
+
+pm_lift_multi_views = PatternMatcher([
+  # MSTACK(mov(b_i)) -> mov(MSTACK(b_i)): lift identical per-device movement above MSTACK
+  (UPat(Ops.MSTACK, name="ms"), mstack_common_op),
+  # MSELECT(mov(s)) -> mov(MSELECT(s)): lift movement above MSELECT
+  (UPat(Ops.MSELECT, src=(UPat(GroupOp.Movement, src=(UPat.var("s"),), allow_any_len=True, name="v"),), name="ms"),
+   lambda s,v,ms: v.replace(src=(s.mselect(ms.arg),)+v.src[1:])),
 ])
 
 pm_syntactic_sugar = PatternMatcher([
@@ -592,6 +600,9 @@ def get_kernel_graph(sink:UOp) -> UOp:
   # bufferize -> store
   lunique_start: int = max([-1]+[x.arg for x in tsink.toposort() if x.op is Ops.LUNIQUE]) + 1
   tsink = graph_rewrite(tsink, pm_add_buffers+pm_add_range_tags, ctx=itertools.count(lunique_start), bottom_up=True, name="stage to store")
+  # lift per-device movement views above MSTACK/MSELECT so symbolic (non-foldable) views sit on the multi result and fold
+  # into consuming kernels, instead of surviving as bare SHRINK/RESHAPE on a branch (which can't be a kernel input)
+  tsink = graph_rewrite(tsink, pm_lift_multi_views, name="lift multi views")
   tsink = graph_rewrite(tsink, split_kernels, bottom_up=True, name="split kernels")
 
   # WAR deps: if kernel U reads buffer S, and S is also written by another kernel, S's write must wait for U to finish

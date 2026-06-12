@@ -2,6 +2,7 @@ import gc, unittest
 from tinygrad import Tensor, GlobalCounters, dtypes, Device
 from tinygrad.engine.jit import TinyJit
 from tinygrad.helpers import Context
+from tinygrad.uop.ops import UOp
 
 class TestMultiRamUsage(unittest.TestCase):
   def setUp(self):
@@ -244,6 +245,38 @@ class TestMstackCommonLift(unittest.TestCase):
     sel = Tensor([1, 4, 7], dtype=dtypes.int32)
     ref = (q.cast(dtypes.float32) * s)[sel]
     self.assertLess((w[sel.to(devs)].to(Device.DEFAULT) - ref).abs().max().item(), 1e-4)
+
+class TestSymbolicShard(unittest.TestCase):
+  """A symbolic-length view (e.g. x[:, :T]) on the broadcast/sharded path schedules: the view is lifted above
+  MSTACK/MSELECT and folds into per-device kernel indexing, instead of surviving as a bare SHRINK on a branch."""
+  def test_symbolic_broadcast_schedules(self):
+    v = UOp.variable("T", 1, 8).bind(4)
+    (Tensor.empty(1, 8, 32)[:, :v].to(("NULL:1", "NULL:2")) + 1).realize()
+
+  def test_symbolic_sharded_matmul_schedules(self):
+    devs = ("NULL:1", "NULL:2")
+    v = UOp.variable("T", 1, 8).bind(4)
+    x = Tensor.empty(1, 8, 32)[:, :v].to(devs)
+    w = Tensor.empty(32, 64).shard(devs, axis=1)
+    (x @ w).to(devs[0]).realize()  # matmul contracts the shard axis -> allreduce with symbolic shape
+
+  @unittest.skipIf(Device.DEFAULT == "NULL", "numerics need a real backend")
+  def test_symbolic_matches_concrete(self):
+    Tensor.manual_seed(0)
+    devs = tuple(f"{Device.DEFAULT}:{i}" for i in range(2))
+    a, w = Tensor.rand(1, 8, 32), Tensor.rand(32, 64)
+    wm = w.shard(devs, axis=1)
+    def run(stop): return (a[:, :stop].to(devs) @ wm).to(Device.DEFAULT).sum()
+    self.assertLess(abs(run(UOp.variable("T", 1, 8).bind(4)).item() - run(4).item()), 1e-3)
+
+  def test_arange_on_sharded_device(self):
+    # arange builds directly on the (sharded tuple) device, not on the default device then copied
+    devs = ("NULL:1", "NULL:2")
+    t = Tensor.arange(6, device=devs)
+    self.assertEqual(t.device, devs)
+    t.realize()
+    # symbolic length on a sharded device also schedules
+    Tensor.arange(UOp.variable("T", 1, 8).bind(4), device=devs).realize()
 
 if __name__ == '__main__':
   unittest.main()
