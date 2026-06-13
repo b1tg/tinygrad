@@ -7,8 +7,6 @@ def handle_allreduce(buf:UOp, red:UOp) -> UOp|None:
   if not isinstance(buf.device, tuple): return None
   ndev, shape, numel = len(buf.device), buf.shape, prod(buf.shape)
 
-  # ring/all2all chunk by numel, so they need a concrete shape; symbolic shapes fall back to naive allreduce.
-  # naive also wins when there are only 2 nodes or <256k elements (empirically) — saves chunking/reassembly kernels.
   concrete = all_int(shape)
   use_all2all = concrete and (ALL2ALL >= 2 or (ndev > 2 and numel > getenv("RING_ALLREDUCE_THRESHOLD", 256_000) and ALL2ALL >= 1))
   use_ring = concrete and not use_all2all and (RING >= 2 or (ndev > 2 and numel > getenv("RING_ALLREDUCE_THRESHOLD", 256_000) and RING >= 1))

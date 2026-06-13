@@ -166,8 +166,8 @@ def _shard_tensor(tensor:Tensor, data_start:int, name:str, dims:tuple[int, ...],
   elif axis != 0: raise RuntimeError(f"native tensor {name} only supports axis0 shard")
   return {name: Tensor(parts[0].uop.mstack(*[p.uop for p in parts[1:]]).multi(axis))}
 
-def _gguf_parse(tensor: Tensor, devices:tuple[str, ...]|None=None, shard_axis:Callable[[str], int|None]|None=None,
-                replicated:Callable[[str], bool]|None=None) -> tuple[dict, dict[str, Tensor]]:
+def _gguf_parse(tensor: Tensor, devices:tuple[str, ...]|None=None,
+                shard:Callable[[str], int|str|None]|None=None) -> tuple[dict, dict[str, Tensor]]:
   # TODO: remove the need for copy to default device
   if devices is None: tensor = tensor.to(None).realize()
   r = io.BufferedReader(TensorIO(tensor), 1_000_000)
@@ -186,19 +186,16 @@ def _gguf_parse(tensor: Tensor, devices:tuple[str, ...]|None=None, shard_axis:Ca
   if devices is None:
     state_dict = {name: ggml_data_to_tensor(tensor[data_start + off:], prod(dims), typ).reshape(*reversed(dims)) for name, dims, typ, off in t_infos}
     return kv_data, state_dict
-  # tensor-parallel load: shard/replicate/place per the injected policy (avoids materializing the full weight to reshard)
   state_dict = {}
   for name, dims, typ, off in t_infos:
-    if replicated is not None and replicated(name):
-      n = prod(dims)
-      raw = tensor[data_start + off:data_start + off + _ggml_nbytes(n, typ)].to("CPU").realize()
-      state_dict[name] = ggml_data_to_tensor(raw, n, typ).reshape(*reversed(dims)).to(devices).realize()
-    elif shard_axis is not None and (axis := shard_axis(name)) is not None:
-      state_dict.update(_shard_tensor(tensor, data_start, name, dims, typ, off, devices, axis))
-    else:
-      n = prod(dims)
-      raw = tensor[data_start + off:data_start + off + _ggml_nbytes(n, typ)].to(devices[0]).realize()
-      state_dict[name] = ggml_data_to_tensor(raw, n, typ).reshape(*reversed(dims))
+    spec = shard(name) if shard is not None else None
+    if isinstance(spec, int):
+      state_dict.update(_shard_tensor(tensor, data_start, name, dims, typ, off, devices, spec))
+      continue
+    n = prod(dims)
+    raw = tensor[data_start + off:data_start + off + _ggml_nbytes(n, typ)].to("CPU" if spec == "replicate" else devices[0]).realize()
+    t = ggml_data_to_tensor(raw, n, typ).reshape(*reversed(dims))
+    state_dict[name] = t.to(devices).realize() if spec == "replicate" else t
   return kv_data, state_dict
 
 def _gguf_split_paths(path: pathlib.Path, kv: dict) -> list[pathlib.Path]:
@@ -207,8 +204,8 @@ def _gguf_split_paths(path: pathlib.Path, kv: dict) -> list[pathlib.Path]:
   if not (m := re.match(r"^(.*)-00001-of-\d{5}\.gguf$", str(path))): raise ValueError(f"first split path must end with -00001-of-NNNNN.gguf: {path}")
   return [pathlib.Path(f"{m.group(1)}-{i:05d}-of-{total:05d}.gguf") for i in range(1, total+1)]
 
-def gguf_load(fn: Tensor|str|pathlib.Path, devices:tuple[str, ...]|None=None, shard_axis:Callable[[str], int|None]|None=None,
-              replicated:Callable[[str], bool]|None=None) -> tuple[dict, dict[str, Tensor]]:
+def gguf_load(fn: Tensor|str|pathlib.Path, devices:tuple[str, ...]|None=None,
+              shard:Callable[[str], int|str|None]|None=None) -> tuple[dict, dict[str, Tensor]]:
   """
   Loads a .gguf file, returning the `kv_data` and `state_dict`. Multi-part splits are auto-merged when loaded by path.
 
@@ -223,8 +220,8 @@ def gguf_load(fn: Tensor|str|pathlib.Path, devices:tuple[str, ...]|None=None, sh
 
   NOTE: The provided tensor must be on a device that supports execution.
   """
-  kv, sd = _gguf_parse(fn if isinstance(fn, Tensor) else Tensor(pathlib.Path(fn)), devices, shard_axis, replicated)
+  kv, sd = _gguf_parse(fn if isinstance(fn, Tensor) else Tensor(pathlib.Path(fn)), devices, shard)
   if kv.get('split.count', 1) <= 1: return kv, sd
   if isinstance(fn, Tensor): raise ValueError("multi-part GGUF requires a path argument (got Tensor)")
-  for pp in _gguf_split_paths(pathlib.Path(fn), kv)[1:]: sd.update(_gguf_parse(Tensor(pp), devices, shard_axis, replicated)[1])
+  for pp in _gguf_split_paths(pathlib.Path(fn), kv)[1:]: sd.update(_gguf_parse(Tensor(pp), devices, shard)[1])
   return kv, sd

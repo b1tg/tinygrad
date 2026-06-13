@@ -3,26 +3,18 @@ import functools, itertools, pathlib
 from dataclasses import dataclass, replace
 from tinygrad import Device, Tensor, nn, UOp, TinyJit, getenv, function
 from tinygrad.llm.gguf import gguf_load
-from tinygrad.uop.ops import resolve
+from tinygrad.uop.ops import Ops, resolve
 
-# tensor-parallel sharding policy (vLLM-style column/row parallel), passed into gguf_load so the format loader stays generic
-def _blk_key(name:str) -> str: return name.split(".", 2)[-1] if name.startswith("blk.") else name
-
-def _tp_axis(name:str) -> int|None:
-  key = _blk_key(name)
-  if key in ("attn_k.weight", "attn_v.weight", "attn_k.bias", "attn_v.bias"): return 0
-  if key in ("attn_q.weight", "attn_q_b.weight", "attn_k_b.weight", "attn_v_b.weight"): return 0
-  if key == "attn_output.weight": return 1
-  if key in ("ffn_gate.weight", "ffn_up.weight"): return 0
-  if key == "ffn_down.weight": return 1
-  if key in ("ffn_gate_shexp.weight", "ffn_up_shexp.weight"): return 0
-  if key == "ffn_down_shexp.weight": return 1
-  if key in ("ffn_gate_exps.weight", "ffn_up_exps.weight"): return 1
-  if key == "ffn_down_exps.weight": return 2
-  return None
-
-def _replicated_weight(name:str) -> bool:
-  return _blk_key(name) in ("attn_norm.weight", "attn_q_a.weight", "attn_q_a_norm.weight", "attn_kv_a_mqa.weight", "attn_kv_a_norm.weight")
+_TP_LAYOUT: dict[str, int|str] = {
+  "attn_q.weight":0, "attn_q_b.weight":0, "attn_k.weight":0, "attn_k.bias":0, "attn_v.weight":0, "attn_v.bias":0,
+  "attn_k_b.weight":0, "attn_v_b.weight":0, "attn_output.weight":1,
+  "ffn_gate.weight":0, "ffn_up.weight":0, "ffn_down.weight":1,
+  "ffn_gate_shexp.weight":0, "ffn_up_shexp.weight":0, "ffn_down_shexp.weight":1,
+  "ffn_gate_exps.weight":1, "ffn_up_exps.weight":1, "ffn_down_exps.weight":2,
+  "attn_norm.weight":"replicate", "attn_q_a.weight":"replicate", "attn_q_a_norm.weight":"replicate",
+  "attn_kv_a_mqa.weight":"replicate", "attn_kv_a_norm.weight":"replicate",
+}
+def _shard_policy(name:str) -> int|str|None: return _TP_LAYOUT.get(name.split(".", 2)[-1] if name.startswith("blk.") else name)
 
 @functools.cache
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, device:str|None=None) -> Tensor:
@@ -39,10 +31,9 @@ class ExpertWeights:
     return (x.unsqueeze(-2) @ self.weight[sel].transpose(-1, -2)).contiguous().squeeze(-2)
 
 def causal_mask(T:int|UOp, start_pos:int|UOp, dtype, device) -> Tensor:
-  # causal_lower_right: query i (position start_pos+i) sees keys [0, start_pos+i]
-  q = Tensor.arange(T, device=device).reshape(1, 1, T, 1) + start_pos
-  k = Tensor.arange(start_pos+T, device=device).reshape(1, 1, 1, start_pos+T)
-  return (k > q).where(Tensor.full((), float("-inf"), dtype=dtype, device=device), 0)
+  r = Tensor.full((T,), 1, dtype="int32", device=device)._cumalu(0, Ops.ADD) - 1
+  block = (r.reshape(1, 1, 1, T) > r.reshape(1, 1, T, 1)).where(Tensor.full((), float("-inf"), dtype=dtype, device=device), 0)
+  return block.pad((None, None, None, (start_pos, 0)))
 
 def apply_rope(x:Tensor, freqs_cis:Tensor) -> Tensor:
   assert x.shape[-1] % 2 == 0
@@ -98,7 +89,7 @@ class TransformerConfig:
   expert_bias: bool = False
 
 class FFNBlock:
-  def __init__(self, config:TransformerConfig, devices:tuple[str, ...]|None=None):
+  def __init__(self, config:TransformerConfig):
     self.config = config
 
     # --- RMSNorms --------------------------------------------------------
@@ -124,7 +115,6 @@ class FFNBlock:
 
   def _feed_forward(self, x:Tensor) -> Tensor:
     if hasattr(self, 'ffn_gate_exps'):
-      h = x.unsqueeze(2)  # (B, T, 1, D) - add expert dim for broadcasting
       logits = self.ffn_gate_inp(x)
       if hasattr(self, 'exp_probs_b'):
         probs = logits.sigmoid()
@@ -172,8 +162,8 @@ class FFNBlock:
     return _run(x, start_pos)
 
 class TransformerBlock(FFNBlock):
-  def __init__(self, config:TransformerConfig, devices:tuple[str, ...]|None=None):
-    super().__init__(config, devices)
+  def __init__(self, config:TransformerConfig):
+    super().__init__(config)
     assert config.v_head_dim == config.head_dim, "TransformerBlock requires v_head_dim == head_dim"
 
     # --- attention projections (all linear, bias-free) ------------------
@@ -224,8 +214,8 @@ class TransformerBlock(FFNBlock):
       self.freqs_cis = precompute_freqs_cis(self.config.rope_dim, self.config.max_context, self.config.rope_theta, device=x.device)
 
 class MLATransformerBlock(FFNBlock):
-  def __init__(self, config:TransformerConfig, devices:tuple[str, ...]|None=None):
-    super().__init__(config, devices)
+  def __init__(self, config:TransformerConfig):
+    super().__init__(config)
     qk_nope_head_dim = config.head_dim - config.rope_dim
     if config.q_lora_rank > 0:
       self.attn_q_a = nn.Linear(config.dim, config.q_lora_rank, bias=False)
@@ -273,8 +263,8 @@ class MLATransformerBlock(FFNBlock):
       self.freqs_cis = fc.to(cache_device)
 
 class GatedDeltaNetBlock(FFNBlock):
-  def __init__(self, config:TransformerConfig, ssm:SSMConfig, devices:tuple[str, ...]|None=None):
-    super().__init__(config, devices)
+  def __init__(self, config:TransformerConfig, ssm:SSMConfig):
+    super().__init__(config)
     self.head_k_dim, self.num_k_heads, self.num_v_heads = ssm.state_size, ssm.group_count, ssm.time_step_rank
     assert self.num_v_heads % self.num_k_heads == 0
     self.head_v_dim, self.ssm_conv_kernel = ssm.inner_size // ssm.time_step_rank, ssm.conv_kernel
@@ -330,12 +320,12 @@ class GatedDeltaNetBlock(FFNBlock):
       self.recurrent_state = Tensor.zeros(x.shape[0], self.num_v_heads, self.head_v_dim, self.head_v_dim, device=x.device).clone()
 
 class Transformer:
-  def __init__(self, config:TransformerConfig, devices:tuple[str, ...]|None=None):
+  def __init__(self, config:TransformerConfig):
     dense_config = replace(config, num_experts=0, num_experts_per_tok=0, shared_expert_dim=0, hidden_dim=config.dense_hidden_dim or config.hidden_dim)
     if config.ssm: config = replace(config, qk_norm=config.head_dim)
     block_cls = MLATransformerBlock if config.kv_lora_rank > 0 else TransformerBlock
-    self.blk:list[FFNBlock] = [GatedDeltaNetBlock(config, config.ssm, devices) if config.ssm and (i+1) % config.full_attention_interval != 0 else
-                               block_cls(dense_config if i < config.leading_dense_blocks else config, devices) for i in range(config.num_blocks)]
+    self.blk:list[FFNBlock] = [GatedDeltaNetBlock(config, config.ssm) if config.ssm and (i+1) % config.full_attention_interval != 0 else
+                               block_cls(dense_config if i < config.leading_dense_blocks else config) for i in range(config.num_blocks)]
     self.token_embd  = nn.Embedding(config.vocab_size, config.dim)
     self.output_norm = nn.RMSNorm(config.dim, config.norm_eps)
     self.output = nn.Linear(config.dim, config.vocab_size, bias=False)
@@ -361,8 +351,7 @@ class Transformer:
                 realize=bool(getenv("REALIZE", 0)), shard:int=1) -> tuple[Transformer, dict]:
     # TODO: remove the need for copy to default device
     devices = tuple(Device.canonicalize(f"{Device.DEFAULT}:{i}") for i in range(shard)) if shard > 1 else None
-    kv, state_dict = gguf_load(gguf.to(None).realize() if isinstance(gguf, Tensor) else gguf, devices,
-                               shard_axis=_tp_axis, replicated=_replicated_weight)
+    kv, state_dict = gguf_load(gguf.to(None).realize() if isinstance(gguf, Tensor) else gguf, devices, shard=_shard_policy)
 
     # all state items should be float16, not float32
     state_dict = {k:v.cast('float16') if getenv("HALF", 1) else v for k,v in state_dict.items()}
@@ -387,7 +376,7 @@ class Transformer:
     # Permute RoPE weights from interleaved to half-split layout.
     for name in state_dict:
       if ('attn_q.weight' in name or 'attn_q_b.weight' in name) and (arch == 'llama' or kv_lora_rank):
-        w = state_dict[name].reshape(state_dict[name].shape[0]//head_dim, head_dim, -1)
+        w = state_dict[name].reshape(n_heads, state_dict[name].shape[0]//n_heads, -1)
         prefix = head_dim-rope_dim
         state_dict[name] = w[:, :prefix].cat(w[:, prefix:].rearrange("n (h two) d -> n (two h) d", two=2), dim=1).reshape(-1, w.shape[-1])
       elif arch == 'llama' and 'attn_k.weight' in name:
@@ -419,7 +408,7 @@ class Transformer:
       full_attention_interval=kv.get(f'{arch}.full_attention_interval', 0),
       qkv_bias='blk.0.attn_q.bias' in state_dict,
       expert_bias=f"blk.{kv.get(f'{arch}.leading_dense_block_count', 0)}.exp_probs_b.bias" in state_dict)
-    model = Transformer(config, devices)
+    model = Transformer(config)
     for k,v in nn.state.get_state_dict(model).items():
       if (sd:=state_dict.get(k)) is not None and isinstance(sd.device, tuple) and not isinstance(v.device, tuple):
         v.replace(Tensor.zeros(*v.shape, device=sd.device[0]).shard(sd.device, axis=sd.uop.axis))

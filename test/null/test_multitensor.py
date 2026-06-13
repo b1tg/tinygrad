@@ -223,7 +223,6 @@ class TestMstackCommonLift(unittest.TestCase):
   """Identical per-device compute under MSTACK (lazy dequant of sharded weight shards) lifts above the MSTACK, so an
   advanced index folds to computing only the selected rows instead of every row on every device."""
   def test_lazy_dequant_gather_fused(self):
-    # gguf-style sharded weight: MSTACK of per-device cast(int8 shard) * scale, then gather 4 of 64 rows
     devs, (E, O, I, k) = ("NULL:1", "NULL:2"), (64, 32, 32, 4)
     parts = [(Tensor.empty(E, O//2, I, dtype=dtypes.int8, device=d).cast(dtypes.float32) *
               Tensor.empty(E, 1, 1, device=d)).uop for d in devs]
@@ -269,14 +268,12 @@ class TestSymbolicShard(unittest.TestCase):
     def run(stop): return (a[:, :stop].to(devs) @ wm).to(Device.DEFAULT).sum()
     self.assertLess(abs(run(UOp.variable("T", 1, 8).bind(4)).item() - run(4).item()), 1e-3)
 
-  def test_arange_on_sharded_device(self):
-    # arange builds directly on the (sharded tuple) device, not on the default device then copied
+  def test_symbolic_causal_mask_sharded(self):
     devs = ("NULL:1", "NULL:2")
-    t = Tensor.arange(6, device=devs)
-    self.assertEqual(t.device, devs)
-    t.realize()
-    # symbolic length on a sharded device also schedules
-    Tensor.arange(UOp.variable("T", 1, 8).bind(4), device=devs).realize()
+    v = UOp.variable("T", 1, 8).bind(4)
+    q = Tensor.empty(1, 8, 8, 16).shard(devs, axis=1)[:, :, :v]
+    mask = Tensor.full((1, 1, v, v), float("-inf"), device=q.device).triu(1)
+    q.scaled_dot_product_attention(q, q, attn_mask=mask).to(devs[0]).realize()
 
 if __name__ == '__main__':
   unittest.main()
