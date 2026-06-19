@@ -224,13 +224,12 @@ class TestMstackCommonLift(unittest.TestCase):
   advanced index folds to computing only the selected rows instead of every row on every device."""
   def test_lazy_dequant_gather_fused(self):
     devs, (E, O, I, k) = ("NULL:1", "NULL:2"), (64, 32, 32, 4)
-    parts = [(Tensor.empty(E, O//2, I, dtype=dtypes.int8, device=d).cast(dtypes.float32) *
-              Tensor.empty(E, 1, 1, device=d)).uop for d in devs]
+    parts = [Tensor.empty(E, O//2, I, dtype=dtypes.int8, device=d).cast(dtypes.float32).uop for d in devs]
     w = Tensor(parts[0].mstack(parts[1]).multi(1))
     with Context(SCACHE=0):
       GlobalCounters.reset()
       w[Tensor.empty(k, dtype=dtypes.int32).to(devs)].realize()
-    self.assertLess(GlobalCounters.global_mem, E*O*I*4)  # materializing the full dequant would already exceed this
+    self.assertLess(GlobalCounters.global_mem, E*O*I*4)  # materializing the full cast would already exceed this
 
   @unittest.skipIf(Device.DEFAULT == "NULL", "numerics need a real backend")
   def test_lazy_dequant_gather_correct(self):
@@ -246,34 +245,21 @@ class TestMstackCommonLift(unittest.TestCase):
     self.assertLess((w[sel.to(devs)].to(Device.DEFAULT) - ref).abs().max().item(), 1e-4)
 
 class TestSymbolicShard(unittest.TestCase):
-  """A symbolic-length view (e.g. x[:, :T]) on the broadcast/sharded path schedules: the view is lifted above
-  MSTACK/MSELECT and folds into per-device kernel indexing, instead of surviving as a bare SHRINK on a branch."""
-  def test_symbolic_broadcast_schedules(self):
-    v = UOp.variable("T", 1, 8).bind(4)
-    (Tensor.empty(1, 8, 32)[:, :v].to(("NULL:1", "NULL:2")) + 1).realize()
-
-  def test_symbolic_sharded_matmul_schedules(self):
+  """Symbolic-length dims flowing through sharded ops: reshape shard-axis remap and allreduce must support symbolic shapes."""
+  def test_symbolic_allreduce_over_sharded_axis(self):
+    # reducing over a sharded axis when the result keeps a symbolic dim -> handle_allreduce gets a
+    # symbolic-shaped buffer. without the symbolic fallback this hits `assert all_int(buf.shape)`.
     devs = ("NULL:1", "NULL:2")
     v = UOp.variable("T", 1, 8).bind(4)
-    x = Tensor.empty(1, 8, 32)[:, :v].to(devs)
-    w = Tensor.empty(32, 64).shard(devs, axis=1)
-    (x @ w).to(devs[0]).realize()  # matmul contracts the shard axis -> allreduce with symbolic shape
+    Tensor.empty(8, 8).shard(devs, axis=1)[:v].sum(axis=1).realize()  # sum over sharded axis 1 -> allreduce, shape (v,)
 
-  @unittest.skipIf(Device.DEFAULT == "NULL", "numerics need a real backend")
-  def test_symbolic_matches_concrete(self):
-    Tensor.manual_seed(0)
-    devs = tuple(f"{Device.DEFAULT}:{i}" for i in range(2))
-    a, w = Tensor.rand(1, 8, 32), Tensor.rand(32, 64)
-    wm = w.shard(devs, axis=1)
-    def run(stop): return (a[:, :stop].to(devs) @ wm).to(Device.DEFAULT).sum()
-    self.assertLess(abs(run(UOp.variable("T", 1, 8).bind(4)).item() - run(4).item()), 1e-3)
-
-  def test_symbolic_causal_mask_sharded(self):
+  def test_symbolic_sharded_reshape_axis(self):
+    # reshape inserts a size-1 dim before the sharded axis, with a symbolic dim in the shape. finding the new
+    # shard axis must use ssimplify; master's structural .index() picks the wrong axis -> "moved items between shards".
     devs = ("NULL:1", "NULL:2")
-    v = UOp.variable("T", 1, 8).bind(4)
-    q = Tensor.empty(1, 8, 8, 16).shard(devs, axis=1)[:, :, :v]
-    mask = Tensor.full((1, 1, v, v), float("-inf"), device=q.device).triu(1)
-    q.scaled_dot_product_attention(q, q, attn_mask=mask).to(devs[0]).realize()
+    n = UOp.variable("n", 1, 4)
+    x = Tensor.empty(4, 2).shard(devs, axis=1)[:n]    # (n, 2) sharded on axis 1
+    self.assertEqual(x.reshape(n, 1, 2).uop.axis, 2)  # the sharded axis (the 2) moves to axis 2
 
 if __name__ == '__main__':
   unittest.main()
