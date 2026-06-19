@@ -10,10 +10,11 @@ def handle_allreduce(buf:UOp, red:UOp) -> UOp|None:
   # ring allreduce doesn't provide a benefit with only 2 nodes or where number of elements is less than 256k (empirically)
   # fallback to naive allreduce to save on kernel dispatch, chunking and reassembling chunks.
   # symbolic shapes can't be chunked into ring/all2all pieces, so they also fall back to naive
-  use_all2all = use_ring = False
   if all_int(shape):
     use_all2all = (ALL2ALL >= 2 or (ndev > 2 and numel > getenv("RING_ALLREDUCE_THRESHOLD", 256_000) and ALL2ALL >= 1))
     use_ring = not use_all2all and (RING >= 2 or (ndev > 2 and numel > getenv("RING_ALLREDUCE_THRESHOLD", 256_000) and RING >= 1))
+  else:
+    use_all2all = use_ring = False
   if DEBUG >= 2: print(f"{'ALL2ALL' if use_all2all else 'RING' if use_ring else 'NAIVE'} ALLREDUCE {ndev}x{numel} | {buf.dtype}")
 
   # contiguous before we copy it
@@ -23,7 +24,8 @@ def handle_allreduce(buf:UOp, red:UOp) -> UOp|None:
   if not use_ring and not use_all2all:
     return functools.reduce(lambda x,y: x.alu(red.arg, y), [buf.mselect(i).copy_to_device(red.src[1]) for i in range(ndev)])
 
-  # chunk data into ndev pieces
+  # chunk data into ndev pieces (only concrete shapes reach here; symbolic returned naive above)
+  assert isinstance(numel, int)
   factor = next((f for f in [32, 16, 8, 4, 2] if numel % f == 0), 1)
   base, left = divmod(numel // factor,  ndev)
   chunks = list(itertools.pairwise(itertools.accumulate([(base + 1) * factor] * left + [base * factor] * (ndev - left), initial=0)))

@@ -316,6 +316,7 @@ class Transformer:
     self.output_norm = nn.RMSNorm(config.dim, config.norm_eps)
     self.output = nn.Linear(config.dim, config.vocab_size, bias=False)
     self.max_context = config.max_context
+    self.devices: tuple[str, ...]|None = None  # set by from_gguf when sharding (tensor-parallel)
     self.has_recurrent_block = any(isinstance(b, GatedDeltaNetBlock) for b in self.blk)
     self._cached_tokens: list[int] = []
     # we specialize the JIT for prefill and rollout
@@ -324,9 +325,9 @@ class Transformer:
 
   def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
     x = self.token_embd(tokens).float()                   # (B, T, D)
-    if isinstance(sd:=self.blk[0].attn_norm.weight.device, tuple): x = x.to(sd)  # replicate residual once; blocks keep it replicated (no device0 hub)
+    if self.devices is not None: x = x.to(self.devices)   # replicate residual once; blocks keep it replicated (no device0 hub)
     for block in self.blk: x = block(x, start_pos)
-    x = x.to(self.output_norm.weight.device)              # gather once for lm_head
+    if self.devices is not None: x = x.to(self.devices[0])  # gather once for lm_head
     logits = self.output(self.output_norm(x))[:, -1, :]
     # Gumbel-max trick: argmax(logits/temp - log(-log(uniform))) is equivalent to sampling from softmax(logits/temp)
     return (logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1, keepdim=True)
@@ -397,6 +398,7 @@ class Transformer:
       qkv_bias='blk.0.attn_q.bias' in state_dict,
       expert_bias=f"blk.{kv.get(f'{arch}.leading_dense_block_count', 0)}.exp_probs_b.bias" in state_dict)
     model = Transformer(config)
+    model.devices = devices
     for k,v in nn.state.get_state_dict(model).items():
       if (sd:=state_dict.get(k)) is not None and isinstance(sd.device, tuple) and not isinstance(v.device, tuple):
         v.replace(Tensor.zeros(*v.shape, device=sd.device[0]).shard(sd.device, axis=sd.uop.axis))
