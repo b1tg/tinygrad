@@ -20,8 +20,7 @@ def mstack_early_shrink(ms:UOp, shrink:UOp):
 
 def mstack_common_op(ms:UOp):
   s0 = ms.src[0]
-  if s0.op not in GroupOp.Elementwise and s0.op not in GroupOp.Movement and s0.op not in {Ops.CAST, Ops.BITCAST}:
-    return None
+  if s0.op not in GroupOp.Elementwise and s0.op not in GroupOp.Movement: return None
   if not all(s.op is s0.op and s.arg == s0.arg and s.dtype == s0.dtype and len(s.src) == len(s0.src) for s in ms.src[1:]): return None
   all_kids = [[s.src[i] for s in ms.src] for i in range(len(s0.src))]
   if not all(all_same(kids) or all(isinstance(k.device, str) for k in kids) for kids in all_kids): return None
