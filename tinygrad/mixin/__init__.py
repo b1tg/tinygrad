@@ -6,7 +6,7 @@ from tinygrad.mixin.movement import MovementMixin
 from tinygrad.mixin.reduce import ReduceMixin
 from tinygrad.uop import Ops
 from tinygrad.uop.ops import _broadcast_shape, resolve, smax, smin, identity_element
-from tinygrad.dtype import ConstType, DTypeLike, Invalid, InvalidType, PtrDType, PyConst, dtypes, least_upper_dtype, sum_acc_dtype, to_dtype
+from tinygrad.dtype import ConstType, DTypeLike, PtrDType, PyConst, dtypes, least_upper_dtype, sum_acc_dtype, to_dtype
 from tinygrad.helpers import all_int, argfix, ceildiv, flatten, flat_to_grouped, fully_flatten, get_shape, make_tuple, prod
 from tinygrad.helpers import resolve_pool_pads, round_up
 
@@ -18,12 +18,7 @@ ReductionStr = Literal["mean", "sum", "none"]
 
 class OpMixin(ElementwiseMixin, ReduceMixin):
   @staticmethod
-  def unique_const(fill_value:ConstType, **kwargs): raise NotImplementedError
-  @staticmethod
   def const(dtype, b): raise NotImplementedError
-  @property
-  def _uop(self) -> UOp: raise NotImplementedError
-  def _wrap_uop(self, u:UOp) -> Self: raise NotImplementedError
 
   @classmethod
   def full(cls, shape:tuple[sint, ...], fill_value:ConstType|UOp, dtype:DTypeLike|None=None,
@@ -46,8 +41,7 @@ class OpMixin(ElementwiseMixin, ReduceMixin):
     from tinygrad.uop.ops import UOp
     new_shape = argfix(shape)
     dt = to_dtype(dtype) if dtype is not None else None
-    if isinstance(fill_value, UOp): val = cls.const(dt or fill_value.dtype, fill_value)
-    else: val = cls.const(dt or dtypes.from_py(fill_value), fill_value)
+    val = cls.const(dt or (fill_value.dtype if isinstance(fill_value, UOp) else dtypes.from_py(fill_value)), fill_value)
     val = val.reshape((1,)*len(new_shape)).expand(new_shape)
     return val.clone(device=device) if buffer else val
 
@@ -56,9 +50,6 @@ class OpMixin(ElementwiseMixin, ReduceMixin):
   def _getitem(self, indices, v=None) -> Self:
     from tinygrad.uop.ops import UOp
     def is_adv(i): return isinstance(i,(list,tuple)) or (isinstance(i,type(self)) and (not isinstance(i,UOp) or i.shape != ()))
-    # view-only indexing (no Tensor/list indices, no setitem) is handled by MovementMixin.__getitem__
-    if v is None and not any(is_adv(i) for i in (indices if isinstance(indices,tuple) else (indices,))):
-      return super().__getitem__(indices)
     # wrap single index into a list
     if (isinstance(indices, list) and all_int(indices)) or not isinstance(indices, (tuple, list)): indices = [indices]
     indices_parsed, dim = [], 0
@@ -146,18 +137,6 @@ class OpMixin(ElementwiseMixin, ReduceMixin):
     vb = vb.flip(tuple(d for d, m in enumerate(mops) if m['stride'] < 0))
     vb = vb.pad(tuple((m['boundary'][0], self.shape[d] - m['boundary'][1]) for d, m in enumerate(mops)))
     return (type(self).uprod(*per_dim) if per_dim else type(self).const(dtypes.bool, True)).where(vb, self)
-
-  @classmethod
-  def invalids(cls, *shape, **kwargs) -> Self:
-    """
-    Creates a tensor with the given shape, filled with Invalid.
-
-    This is an alternative to Tensor.empty when you want an "anonymous" buffer.
-
-    Eventually Tensor.empty will be replaced by this.
-    """
-    new_shape = argfix(*shape)
-    return cls.unique_const(Invalid, **kwargs).reshape((1,)*len(new_shape)).expand(new_shape)
 
   @classmethod
   def zeros(cls, *shape, **kwargs) -> Self:
@@ -388,10 +367,6 @@ class OpMixin(ElementwiseMixin, ReduceMixin):
     if mode in {"reflect", "replicate"}: return self._pad_reflect_replicate(pX, mode)
     raise NotImplementedError(f"{mode=} is not supported")
 
-  def _ufix_keep_dtype(self, x) -> bool:
-    # matches Tensor scalar-wrapping behavior: keep self.dtype for float self, or for int self with int/Invalid scalar
-    return dtypes.is_float(self.dtype) or (dtypes.is_int(self.dtype) and isinstance(x, (int, InvalidType)))
-
   def _broadcasted(self, y, reverse=False) -> tuple[Self, Self]:
     if not isinstance(y, type(self)): y = self.ufix(y)
     x, y = (self, y) if not reverse else (y, self)
@@ -403,10 +378,6 @@ class OpMixin(ElementwiseMixin, ReduceMixin):
     # ptr dtypes aren't in the promo lattice
     if x.dtype == y.dtype or any(isinstance(d, PtrDType) for d in (x.dtype, y.dtype)): return x, y
     return x.cast(out_dtype := least_upper_dtype(x.dtype, y.dtype)), y.cast(out_dtype)
-
-  def _binop(self, op:Ops, x, reverse:bool) -> Self:
-    lhs, rhs = self._broadcasted(x, reverse)
-    return lhs.alu(op, rhs)
 
   def dot(self, w:Self, dtype:DTypeLike|None=None) -> Self:
     """
@@ -468,7 +439,7 @@ class OpMixin(ElementwiseMixin, ReduceMixin):
     """
     assert gradient is not None or self.shape == tuple(), "when no gradient is provided, backward must be called on a scalar tensor"
     if not (self.is_floating_point() and all(t.is_floating_point() for t in targets)): raise RuntimeError("only float Tensors have gradient")
-    from tinygrad.gradient import compute_gradient
+    from tinygrad.mixin.gradient import compute_gradient
     if gradient is None: gradient = self.const_like(1.0)
     target_uops = [t._uop for t in targets]
     grads = compute_gradient(self._uop, gradient._uop, set(target_uops))
@@ -765,7 +736,7 @@ class OpMixin(ElementwiseMixin, ReduceMixin):
     base = ret[..., -1]._cumalu(-1, op)._pad_constant((None,)*(ret.ndim-2) + ((1, -1),), value)
     base = base.unsqueeze(-1).expand(*base.shape, ret.shape[-1])
     def fix(x: Self) -> Self: return x.flatten(start_dim=-2)[..., -s:].transpose(axis,-1)
-    return getattr(fix(ret), {Ops.ADD: "add", Ops.MAX: "maximum", Ops.MUL: "mul"}[op])(fix(base))
+    return fix(ret).alu(op, fix(base))
 
   def cumsum(self, axis:int=0) -> Self:
     """
@@ -1304,9 +1275,9 @@ class OpMixin(ElementwiseMixin, ReduceMixin):
     ```
     """
     axis = tuple(range(-len(k_ := make_tuple(kernel_size, 2)), 0))
-    pads = resolve_pool_pads(padding, len(k_))
-    if ceil_mode: pads = self._apply_ceil_mode(pads, k_, stride if stride is not None else k_, dilation)
     s_ = stride if stride is not None else k_
+    pads = resolve_pool_pads(padding, len(k_))
+    if ceil_mode: pads = self._apply_ceil_mode(pads, k_, s_, dilation)
     pooled = self._pad_constant(((0,0),)*(self.ndim-len(k_)) + flat_to_grouped(pads), self.dtype.min)._pool(k_, s_, dilation)
     if not return_indices: return pooled.max(axis)
     spatial_sz = int(prod(spatial_shape := self.shape[-len(k_):]))
@@ -1644,7 +1615,7 @@ class OpMixin(ElementwiseMixin, ReduceMixin):
     if self.shape[-2] > self.shape[-1]: return self.transpose(-2, -1).newton_schulz(steps, params, eps).transpose(-2, -1)
     G = self / (self.square().sum(axis=(-2, -1), keepdim=True).sqrt() + eps)
     for _ in range(steps):
-      G = functools.reduce(lambda a, b: a + b, (p * functools.reduce(lambda x, y: (y @ y.transpose(-2, -1)) @ x, [G]*i, G)  # type: ignore[operator]
+      G = functools.reduce(lambda a, b: a + b, (p * functools.reduce(lambda x, y: (y @ y.transpose(-2, -1)) @ x, [G]*i, G)
                                                  for i,p in enumerate(params)))
     return G
 

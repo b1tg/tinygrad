@@ -13,14 +13,17 @@ class FastEnum(IntEnum):
 class Ops(FastEnum):
   # ** 1 -- defines/special **
 
-  # define GLOBAL/VAR are ptrs to outside the Kernel
-  DEFINE_VAR = auto(); BIND = auto()
+  # BIND pairs a symbolic PARAM with a concrete value
+  BIND = auto()
 
   # this is a RANGE for GPU dimensions, similar to symbolic shapes but not exactly
   SPECIAL = auto()
 
   # define LOCAL/REG allocate things
   DEFINE_LOCAL = auto(); DEFINE_REG = auto()
+
+  # BUFFER is the new LOCAL/REG
+  BUFFER = auto()
 
   # ** 2 -- non op uops **
 
@@ -49,7 +52,7 @@ class Ops(FastEnum):
   # ** 3 -- load/store **
 
   # INDEX is a BinaryOp similar to ADD, but it operates on pointers
-  INDEX = auto()
+  INDEX = auto(); SHRINK = auto()
 
   # load/store before math
   LOAD = auto(); STORE = auto()
@@ -99,10 +102,10 @@ class Ops(FastEnum):
   CONTIGUOUS = auto(); CONTIGUOUS_BACKWARD = auto(); DETACH = auto()
 
   # buffer ops
-  STAGE = auto(); COPY = auto(); BUFFER = auto(); SLICE = auto(); MSELECT = auto(); MSTACK = auto(); CUSTOM_FUNCTION = auto()
+  STAGE = auto(); COPY = auto(); SLICE = auto(); MSELECT = auto(); MSTACK = auto(); CUSTOM_FUNCTION = auto()
 
   # the core 6 movement ops! these only exist in the tensor graph
-  RESHAPE = auto(); PERMUTE = auto(); EXPAND = auto(); PAD = auto(); SHRINK = auto(); FLIP = auto()
+  RESHAPE = auto(); PERMUTE = auto(); EXPAND = auto(); PAD = auto(); FLIP = auto()
   MULTI = auto()  # MULTI is really a movement op
 
   # reduce
@@ -124,7 +127,7 @@ class GroupOp:
 
   Defines = {Ops.PARAM, Ops.DEFINE_LOCAL, Ops.DEFINE_REG}
 
-  Irreducible = {Ops.CONST, Ops.DEFINE_VAR, Ops.SPECIAL, Ops.RANGE}
+  Irreducible = {Ops.CONST, Ops.SPECIAL, Ops.RANGE, Ops.PARAM}
   Movement = {Ops.RESHAPE, Ops.EXPAND, Ops.PERMUTE, Ops.PAD, Ops.SHRINK, Ops.FLIP}
 
   # BinaryOps that can be flipped
@@ -138,8 +141,5 @@ class GroupOp:
 
   # These can change the dtype to bool
   Comparison = {Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ}
-
-  # do not preserve f(0) = 0
-  UnsafePad = {Ops.RECIPROCAL, Ops.LOG2, Ops.EXP2, Ops.CDIV, Ops.POW, Ops.FLOORDIV}
 
   All = set(Ops)
