@@ -13,6 +13,7 @@ _TP_LAYOUT: dict[str, int|str] = {
   "ffn_gate_exps.weight":1, "ffn_up_exps.weight":1, "ffn_down_exps.weight":2,
   "attn_norm.weight":"replicate", "attn_q_a.weight":"replicate", "attn_q_a_norm.weight":"replicate",
   "attn_kv_a_mqa.weight":"replicate", "attn_kv_a_norm.weight":"replicate",
+  "ffn_norm.weight":"replicate", "ffn_gate_inp.weight":"replicate", "exp_probs_b.bias":"replicate",
 }
 def _shard_policy(name:str) -> int|str|None: return _TP_LAYOUT.get(name.split(".", 2)[-1] if name.startswith("blk.") else name)
 
@@ -338,7 +339,9 @@ class Transformer:
 
   def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
     x = self.token_embd(tokens).float()                   # (B, T, D)
+    if isinstance(sd:=self.blk[0].attn_norm.weight.device, tuple): x = x.to(sd)  # replicate residual once; blocks keep it replicated (no device0 hub)
     for block in self.blk: x = block(x, start_pos)
+    x = x.to(self.output_norm.weight.device)              # gather once for lm_head
     logits = self.output(self.output_norm(x))[:, -1, :]
     # Gumbel-max trick: argmax(logits/temp - log(-log(uniform))) is equivalent to sampling from softmax(logits/temp)
     return (logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1, keepdim=True)
