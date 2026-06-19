@@ -68,7 +68,9 @@ class SimpleTokenizer:
     if self.preset == 'olmo': return self.encode("<|" + role + "|>\n")  # OLMoE Instruct format
     if self.preset == 'kimi-k2': return self.encode("<|im_" + role + "|>" + role + "<|im_middle|>")
     if self.preset == 'qwen2': return self.encode("<|im_start|>" + role + "\n")
-    if self.preset == 'glm4': return self.encode("<|" + role + "|>")
+    if self.preset == 'glm4':
+      if role == 'assistant' and '<think>' in self._special_tokens: return self.encode("<|assistant|><think></think>")
+      return self.encode("<|" + role + "|>")
     if self.preset == 'tekken':
       if role == 'user': return self.encode("[INST]")
       if role == 'assistant': return []
