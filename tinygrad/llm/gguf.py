@@ -48,7 +48,9 @@ def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
     blocks = t.reshape(*t.shape[:-1], -1, bb).contiguous()
     B = blocks.shape[:-1]  # (*leading, nblk)
     # all quant branches use ... indexing + B-relative reshapes so a sharded block-view dequants per-shard (gather folds, no multi rewrite)
-    if ggml_type == 2: return ((q_to_uint8(blocks[...,2:], 4).bitcast(dtypes.int8) - 8) * blocks[...,:2].bitcast(dtypes.float16).cast(dtypes.float32)).flatten(-2)
+    if ggml_type == 2:
+      d = blocks[...,:2].bitcast(dtypes.float16).cast(dtypes.float32)
+      return ((q_to_uint8(blocks[...,2:], 4).bitcast(dtypes.int8) - 8) * d).flatten(-2)
     if ggml_type == 3:
       d, m = (blocks[...,s:s+2].bitcast(dtypes.float16).cast(dtypes.float32) for s in [ 0, 2 ])
       return (q_to_uint8(blocks[...,4:], 4).bitcast(dtypes.int8) * d + m).flatten(-2)
@@ -140,7 +142,8 @@ def _ggml_nbytes(n:int, typ:int) -> int:
 
 def _shard_tensor(tensor:Tensor, data_start:int, t_info:tuple[str, tuple[int, ...], int, int], devices:tuple[str, ...], axis:int) -> Tensor:
   name, dims, typ, off = t_info
-  shape = tuple(reversed(dims)); ndev, last, off0 = len(devices), len(dims)-1, data_start + off
+  shape = tuple(reversed(dims))
+  ndev, last, off0 = len(devices), len(dims)-1, data_start + off
   if shape[axis] % ndev != 0: raise RuntimeError(f"{name}: axis {axis} size {shape[axis]} does not divide {ndev} devices")
   if typ in _GGML_QUANT:
     if typ not in (2, 3, 6, 7, 8, 12, 13, 14): raise RuntimeError(f"{name}: sharding not implemented for quantized type {typ}")
@@ -150,7 +153,7 @@ def _shard_tensor(tensor:Tensor, data_start:int, t_info:tuple[str, tuple[int, ..
     qb, bb = _GGML_QUANT[typ]
     if shape[-1] % qb != 0: raise RuntimeError(f"{name}: quantized last dim {shape[-1]} does not divide {qb}")
     S = shape[-1] // qb
-    bv = tensor[off0:off0 + (prod(shape)//qb)*bb].to("CPU").realize().reshape(*shape[:-1], S*bb)  # (*shape[:-1], S*bb); realize so strided shard slices read correctly
+    bv = tensor[off0:off0 + (prod(shape)//qb)*bb].to("CPU").realize().reshape(*shape[:-1], S*bb)  # realize so strided shard slices read correctly
     if axis == last and S % ndev != 0: raise RuntimeError(f"{name}: quantized shard axis size {shape[-1]//ndev} does not divide {qb}")
     aax, cnt = (last, (S//ndev)*bb) if axis == last else (axis, shape[axis]//ndev)  # axis to slice in bv, count per device
     parts = [bv[tuple(slice(i*cnt, (i+1)*cnt) if a==aax else slice(None) for a in range(len(shape)))].contiguous().to(d)
@@ -159,7 +162,8 @@ def _shard_tensor(tensor:Tensor, data_start:int, t_info:tuple[str, tuple[int, ..
     return ggml_data_to_tensor(Tensor(parts[0].uop.mstack(*[p.uop for p in parts[1:]]).multi(axis)), prod(shape), typ).reshape(*shape)
   # native (non-quantized) values: only the contiguous axis-0 row split
   if axis != 0: raise RuntimeError(f"{name}: native tensor only supports axis0 shard, got axis {axis}")
-  per, row = shape[0]//ndev, prod(shape[1:]); pnb = _ggml_nbytes(row, typ)
+  per, row = shape[0]//ndev, prod(shape[1:])
+  pnb = _ggml_nbytes(row, typ)
   raws = [tensor[off0+i*per*pnb:off0+(i+1)*per*pnb].to(d) for i,d in enumerate(devices)]
   Tensor.realize(*raws)
   parts = [ggml_data_to_tensor(r, per*row, typ).reshape(per, *shape[1:]) for r in raws]
