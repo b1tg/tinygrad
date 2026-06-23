@@ -42,27 +42,23 @@ def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
 
   if (nelements_nbytes := _GGML_QUANT.get(ggml_type)) is not None:
     from tinygrad.runtime.autogen import ggml_common as _ggml
-    qb, bb = nelements_nbytes
-    if t.ndim == 1: t = t[:(n//qb)*bb]
-    # keep any leading (non-block) dims: flat input (non-sharded) -> (nblk, bb); a sharded block-view -> (*shard_dims, nblk, bb)
-    blocks = t.reshape(*t.shape[:-1], -1, bb).contiguous()
-    B = blocks.shape[:-1]  # (*leading, nblk)
-    # all quant branches use ... indexing + B-relative reshapes so a sharded block-view dequants per-shard (gather folds, no multi rewrite)
-    if ggml_type == 2:
-      d = blocks[...,:2].bitcast(dtypes.float16).cast(dtypes.float32)
-      return ((q_to_uint8(blocks[...,2:], 4).bitcast(dtypes.int8) - 8) * d).flatten(-2)
+    if t.ndim == 1: t = t[:(n//nelements_nbytes[0])*nelements_nbytes[1]]
+    blocks = t.reshape(*t.shape[:-1], -1, nelements_nbytes[1]).contiguous()  # keep leading dims so a sharded block-view dequants per-shard
+    if ggml_type == 2: return (q_to_uint8(blocks[:,2:], 4).bitcast(dtypes.int8) - 8) * blocks[:,:2].bitcast(dtypes.float16).cast(dtypes.float32)
     if ggml_type == 3:
-      d, m = (blocks[...,s:s+2].bitcast(dtypes.float16).cast(dtypes.float32) for s in [ 0, 2 ])
-      return (q_to_uint8(blocks[...,4:], 4).bitcast(dtypes.int8) * d + m).flatten(-2)
+      d, m = (blocks[:,s:s+2].bitcast(dtypes.float16).cast(dtypes.float32) for s in [ 0, 2 ])
+      return q_to_uint8(blocks[:,4:], 4).bitcast(dtypes.int8) * d + m
     if ggml_type in (6, 7):
-      d = blocks[...,:2].bitcast(dtypes.float16).cast(dtypes.float32)
+      d = blocks[:,:2].bitcast(dtypes.float16).cast(dtypes.float32)
       qh_off = 2 if ggml_type == 6 else 4
-      qh = q_to_uint8(blocks[...,qh_off:qh_off+4], 1).reshape(*B, 8, 4).transpose(-1, -2).flatten(-2).bitcast(dtypes.int8)
-      q = q_to_uint8(blocks[...,qh_off+4:], 4).bitcast(dtypes.int8) + qh * 16
-      return (q * d + (blocks[...,2:4].bitcast(dtypes.float16).cast(dtypes.float32) if ggml_type == 7 else -16 * d)).flatten(-2)
+      qh = q_to_uint8(blocks[:,qh_off:qh_off+4], 1).reshape((-1, 8, 4)).transpose(-1, -2).flatten(-2).bitcast(dtypes.int8)
+      q = q_to_uint8(blocks[:,qh_off+4:], 4).bitcast(dtypes.int8) + qh * 16
+      return q * d + (blocks[:,2:4].bitcast(dtypes.float16).cast(dtypes.float32) if ggml_type == 7 else -16 * d)
+    # Q8_0/Q4_K/Q5_K/Q6_K (the gathered expert types) keep leading dims via ... + B reshapes, so a sharded gather folds (no multi rewrite)
+    B = blocks.shape[:-1]  # (*leading, nblk)
     if ggml_type == 8: return (blocks[...,:2].bitcast(dtypes.float16).cast(dtypes.float32) * blocks[...,2:].bitcast(dtypes.int8)).flatten(-2)
-    # Q4_K: 256 elements per 144-byte block (d:2, dmin:2, scales:12, qs:128)
-    # Q5_K: 256 elements per 176-byte block (d:2, dmin:2, scales:12, qh:32, qs:128)
+     # Q4_K: 256 elements per 144-byte block (d:2, dmin:2, scales:12, qs:128)
+     # Q5_K: 256 elements per 176-byte block (d:2, dmin:2, scales:12, qh:32, qs:128)
     if ggml_type in (12, 13):
       d, dmin = (blocks[...,i:i+2].bitcast(dtypes.float16).cast(dtypes.float32).unsqueeze(-1) for i in [0, 2])
       s = blocks[...,4:16]  # 12 bytes: 6-bit scales[0-3], 6-bit mins[0-3], high bits[4-7]
@@ -145,11 +141,10 @@ def _shard_tensor(tensor:Tensor, data_start:int, t_info:tuple[str, tuple[int, ..
   shape = tuple(reversed(dims))
   ndev, last, off0 = len(devices), len(dims)-1, data_start + off
   if shape[axis] % ndev != 0: raise RuntimeError(f"{name}: axis {axis} size {shape[axis]} does not divide {ndev} devices")
-  if typ in _GGML_QUANT:
-    if typ not in (2, 3, 6, 7, 8, 12, 13, 14): raise RuntimeError(f"{name}: sharding not implemented for quantized type {typ}")
-    # MSTACK the raw quantized bytes (per-shard block-view, leading dims intact) and dequant the MULTI. keeping MSTACK at the
-    # leaves lets an expert gather fold to "dequant only the selected rows" with no scheduler rewrite (ggml_data_to_tensor
-    # preserves leading dims). blocks are packed along the last dim, so the shard must land on whole super-blocks.
+  if typ in (8, 12, 13, 14):
+    # gathered expert types: MSTACK the raw quantized bytes (per-shard block-view, leading dims intact) and dequant the MULTI. with
+    # MSTACK at the leaves the expert gather folds to "dequant only the selected rows", no scheduler rewrite (ggml_data_to_tensor
+    # keeps leading dims). blocks are packed along the last dim, so the shard must land on whole super-blocks.
     qb, bb = _GGML_QUANT[typ]
     if shape[-1] % qb != 0: raise RuntimeError(f"{name}: quantized last dim {shape[-1]} does not divide {qb}")
     S = shape[-1] // qb
@@ -160,8 +155,8 @@ def _shard_tensor(tensor:Tensor, data_start:int, t_info:tuple[str, tuple[int, ..
              for i,d in enumerate(devices)]
     Tensor.realize(*parts)  # raw quantized bytes resident per device; the dequant above stays lazy so the gather folds
     return ggml_data_to_tensor(Tensor(parts[0].uop.mstack(*[p.uop for p in parts[1:]]).multi(axis)), prod(shape), typ).reshape(*shape)
-  # native (non-quantized) values: only the contiguous axis-0 row split
-  if axis != 0: raise RuntimeError(f"{name}: native tensor only supports axis0 shard, got axis {axis}")
+  # everything else (Q5_0 attn_k_b, native biases): not gathered, so just dequant each shard and MSTACK. contiguous axis-0 rows only
+  if axis != 0: raise RuntimeError(f"{name}: shard axis {axis} not supported for type {typ}")
   per, row = shape[0]//ndev, prod(shape[1:])
   pnb = _ggml_nbytes(row, typ)
   raws = [tensor[off0+i*per*pnb:off0+(i+1)*per*pnb].to(d) for i,d in enumerate(devices)]
