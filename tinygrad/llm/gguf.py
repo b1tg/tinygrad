@@ -42,7 +42,11 @@ def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
 
   if (nelements_nbytes := _GGML_QUANT.get(ggml_type)) is not None:
     from tinygrad.runtime.autogen import ggml_common as _ggml
-    blocks = t[:(n//nelements_nbytes[0])*nelements_nbytes[1]].reshape((-1, nelements_nbytes[1])).contiguous()
+    qb, bb = nelements_nbytes
+    if t.ndim == 1: t = t[:(n//qb)*bb]
+    # keep any leading (non-block) dims: flat input (non-sharded) -> (nblk, bb); a sharded block-view -> (*shard_dims, nblk, bb)
+    blocks = t.reshape(*t.shape[:-1], -1, bb).contiguous()
+    B = blocks.shape[:-1]  # (*leading, nblk)
     if ggml_type == 2: return (q_to_uint8(blocks[:,2:], 4).bitcast(dtypes.int8) - 8) * blocks[:,:2].bitcast(dtypes.float16).cast(dtypes.float32)
     if ggml_type == 3:
       d, m = (blocks[:,s:s+2].bitcast(dtypes.float16).cast(dtypes.float32) for s in [ 0, 2 ])
@@ -53,23 +57,24 @@ def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
       qh = q_to_uint8(blocks[:,qh_off:qh_off+4], 1).reshape((-1, 8, 4)).transpose(-1, -2).flatten(-2).bitcast(dtypes.int8)
       q = q_to_uint8(blocks[:,qh_off+4:], 4).bitcast(dtypes.int8) + qh * 16
       return q * d + (blocks[:,2:4].bitcast(dtypes.float16).cast(dtypes.float32) if ggml_type == 7 else -16 * d)
-    if ggml_type == 8: return blocks[:,:2].bitcast(dtypes.float16).cast(dtypes.float32) * blocks[:,2:].bitcast(dtypes.int8)
-     # Q4_K: 256 elements per 144-byte block (d:2, dmin:2, scales:12, qs:128)
-     # Q5_K: 256 elements per 176-byte block (d:2, dmin:2, scales:12, qh:32, qs:128)
+    # Q8_0/Q4_K/Q5_K/Q6_K written with ... indexing + B-relative reshapes so a sharded block-view dequants per-shard (gather folds, no multi rewrite)
+    if ggml_type == 8: return (blocks[...,:2].bitcast(dtypes.float16).cast(dtypes.float32) * blocks[...,2:].bitcast(dtypes.int8)).flatten(-2)
+    # Q4_K: 256 elements per 144-byte block (d:2, dmin:2, scales:12, qs:128)
+    # Q5_K: 256 elements per 176-byte block (d:2, dmin:2, scales:12, qh:32, qs:128)
     if ggml_type in (12, 13):
-      d, dmin = (blocks[:,i:i+2].bitcast(dtypes.float16).cast(dtypes.float32).unsqueeze(-1) for i in [0, 2])
-      s = blocks[:,4:16]  # 12 bytes: 6-bit scales[0-3], 6-bit mins[0-3], high bits[4-7]
-      sc = s[:,0:4].bitwise_and(63).cat(s[:,8:12].bitwise_and(0xF).bitwise_or(s[:,0:4].rshift(6).lshift(4)), dim=-1)
-      mn = s[:,4:8].bitwise_and(63).cat(s[:,8:12].rshift(4).bitwise_or(s[:,4:8].rshift(6).lshift(4)), dim=-1)
+      d, dmin = (blocks[...,i:i+2].bitcast(dtypes.float16).cast(dtypes.float32).unsqueeze(-1) for i in [0, 2])
+      s = blocks[...,4:16]  # 12 bytes: 6-bit scales[0-3], 6-bit mins[0-3], high bits[4-7]
+      sc = s[...,0:4].bitwise_and(63).cat(s[...,8:12].bitwise_and(0xF).bitwise_or(s[...,0:4].rshift(6).lshift(4)), dim=-1)
+      mn = s[...,4:8].bitwise_and(63).cat(s[...,8:12].rshift(4).bitwise_or(s[...,4:8].rshift(6).lshift(4)), dim=-1)
       qs_off = 48 if ggml_type == 13 else 16
-      q = Tensor.stack((qs:=blocks[:,qs_off:qs_off+128].reshape(-1,4,32)).bitwise_and(0xF), qs.rshift(4), dim=2).reshape(-1,8,32)
-      if ggml_type == 13: q = q + q_to_uint8(blocks[:,16:48], 1).reshape(-1, 8, 32) * 16
-      return (d * sc.unsqueeze(-1) * q - dmin * mn.unsqueeze(-1)).flatten(-2)
+      q = Tensor.stack((qs:=blocks[...,qs_off:qs_off+128].reshape(*B,4,32)).bitwise_and(0xF), qs.rshift(4), dim=-2).reshape(*B,8,32)
+      if ggml_type == 13: q = q + q_to_uint8(blocks[...,16:48], 1).reshape(*B, 8, 32) * 16
+      return (d * sc.unsqueeze(-1) * q - dmin * mn.unsqueeze(-1)).flatten(-3)
     if ggml_type == 14:
-      xl, xh = q_to_uint8(blocks[:,:128].reshape((-1, 2, 64)), 4), q_to_uint8(blocks[:,128:192].reshape((-1, 2, 32)), 2).lshift(4)
-      scales = blocks[:,192:208].bitcast(dtypes.int8).unsqueeze(-1).expand((-1, 16, 16)).reshape((-1, 256))
-      d = blocks[:,-2:].bitcast(dtypes.float16).cast(dtypes.float32).expand((-1, 256))
-      return d * (xl.bitwise_or(xh).bitcast(dtypes.int8) - 32).flatten(-2) * scales
+      xl, xh = q_to_uint8(blocks[...,:128].reshape(*B, 2, 64), 4), q_to_uint8(blocks[...,128:192].reshape(*B, 2, 32), 2).lshift(4)
+      scales = blocks[...,192:208].bitcast(dtypes.int8).unsqueeze(-1).expand(*B, 16, 16).reshape(*B, 256)
+      d = blocks[...,-2:].bitcast(dtypes.float16).cast(dtypes.float32).expand(*B, 256)
+      return (d * (xl.bitwise_or(xh).bitcast(dtypes.int8) - 32).flatten(-2) * scales).flatten(-2)
     if ggml_type == 18:
       d = blocks[:, :2].bitcast(dtypes.float16).cast(dtypes.float32).reshape((-1, 1, 1, 1))
       scale_words = blocks[:, 66:98].bitcast(dtypes.uint32)
@@ -133,38 +138,32 @@ read_uint32, read_int32, read_uint64, read_int64 = readers[4], readers[5], reade
 def _ggml_nbytes(n:int, typ:int) -> int:
   return n * _GGML_NATIVE[typ].itemsize if typ in _GGML_NATIVE else (n // _GGML_QUANT[typ][0]) * _GGML_QUANT[typ][1]
 
-def _shard_tensor(tensor:Tensor, data_start:int, name:str, dims:tuple[int, ...], typ:int, off:int,
-                  devices:tuple[str, ...], axis:int) -> dict[str, Tensor]:
-  shape = tuple(reversed(dims))
-  if shape[axis] % len(devices) != 0: raise RuntimeError(f"axis size {shape[axis]} does not divide {len(devices)} devices")
-  parts, per = [], shape[axis] // len(devices)
-  if axis == 0:
-    row_elems = prod(shape[1:])
-    if typ in _GGML_QUANT and row_elems % _GGML_QUANT[typ][0] != 0:
-      raise RuntimeError(f"quantized tensor {name} row size {row_elems} does not divide {_GGML_QUANT[typ][0]}")
-    part_nbytes = _ggml_nbytes(row_elems, typ)
-    raws = [tensor[data_start + off + i*per*part_nbytes:data_start + off + (i+1)*per*part_nbytes].to(d) for i,d in enumerate(devices)]
-    Tensor.realize(*raws)
-    parts = [ggml_data_to_tensor(raw, per*row_elems, typ).reshape(per, *shape[1:]) for raw in raws]
-  elif typ in _GGML_QUANT:
-    qblock, block_bytes = _GGML_QUANT[typ]
-    if shape[-1] % qblock != 0: raise RuntimeError(f"quantized tensor {name} last dim {shape[-1]} does not divide {qblock}")
-    raw_shape = (*shape[:-1], shape[-1] // qblock, block_bytes)
-    raw_view = tensor[data_start + off:data_start + off + _ggml_nbytes(prod(shape), typ)].to("CPU").realize().reshape(*raw_shape)
-    raws, part_shapes = [], []
-    for i,d in enumerate(devices):
-      if axis == len(shape) - 1 and per % qblock != 0: raise RuntimeError(f"quantized shard axis size {per} does not divide {qblock}")
-      part_shape = (*shape[:axis], per, *shape[axis+1:])
-      raw_axis, raw_per = (len(shape)-1, per // qblock) if axis == len(shape)-1 else (axis, per)
-      slc = [slice(None)] * len(raw_shape)
-      slc[raw_axis] = slice(i*raw_per, (i+1)*raw_per)
-      raws.append(raw_view[tuple(slc)].contiguous().reshape(-1).to(d))
-      part_shapes.append(part_shape)
-    Tensor.realize(*raws)
-    assert all(s == part_shapes[0] for s in part_shapes)
-    parts = [ggml_data_to_tensor(raw, prod(part_shape), typ).reshape(*part_shape) for raw,part_shape in zip(raws, part_shapes)]
-  elif axis != 0: raise RuntimeError(f"native tensor {name} only supports axis0 shard")
-  return {name: Tensor(parts[0].uop.mstack(*[p.uop for p in parts[1:]]).multi(axis))}
+def _shard_tensor(tensor:Tensor, data_start:int, t_info:tuple[str, tuple[int, ...], int, int], devices:tuple[str, ...], axis:int) -> Tensor:
+  name, dims, typ, off = t_info
+  shape = tuple(reversed(dims)); ndev, last, off0 = len(devices), len(dims)-1, data_start + off
+  if shape[axis] % ndev != 0: raise RuntimeError(f"{name}: axis {axis} size {shape[axis]} does not divide {ndev} devices")
+  if typ in _GGML_QUANT:
+    if typ not in (8, 12, 13, 14): raise RuntimeError(f"{name}: sharding not implemented for quantized type {typ} (only Q8_0/Q4_K/Q5_K/Q6_K)")
+    # MSTACK the raw quantized bytes (per-shard block-view, leading dims intact) and dequant the MULTI. keeping MSTACK at the
+    # leaves lets an expert gather fold to "dequant only the selected rows" with no scheduler rewrite (ggml_data_to_tensor
+    # preserves leading dims). blocks are packed along the last dim, so the shard must land on whole super-blocks.
+    qb, bb = _GGML_QUANT[typ]
+    if shape[-1] % qb != 0: raise RuntimeError(f"{name}: quantized last dim {shape[-1]} does not divide {qb}")
+    S = shape[-1] // qb
+    bv = tensor[off0:off0 + (prod(shape)//qb)*bb].to("CPU").realize().reshape(*shape[:-1], S*bb)  # (*shape[:-1], S*bb); realize so strided shard slices read correctly
+    if axis == last and S % ndev != 0: raise RuntimeError(f"{name}: quantized shard axis size {shape[-1]//ndev} does not divide {qb}")
+    aax, cnt = (last, (S//ndev)*bb) if axis == last else (axis, shape[axis]//ndev)  # axis to slice in bv, count per device
+    parts = [bv[tuple(slice(i*cnt, (i+1)*cnt) if a==aax else slice(None) for a in range(len(shape)))].contiguous().to(d)
+             for i,d in enumerate(devices)]
+    Tensor.realize(*parts)  # raw quantized bytes resident per device; the dequant above stays lazy so the gather folds
+    return ggml_data_to_tensor(Tensor(parts[0].uop.mstack(*[p.uop for p in parts[1:]]).multi(axis)), prod(shape), typ).reshape(*shape)
+  # native (non-quantized) values: only the contiguous axis-0 row split
+  if axis != 0: raise RuntimeError(f"{name}: native tensor only supports axis0 shard, got axis {axis}")
+  per, row = shape[0]//ndev, prod(shape[1:]); pnb = _ggml_nbytes(row, typ)
+  raws = [tensor[off0+i*per*pnb:off0+(i+1)*per*pnb].to(d) for i,d in enumerate(devices)]
+  Tensor.realize(*raws)
+  parts = [ggml_data_to_tensor(r, per*row, typ).reshape(per, *shape[1:]) for r in raws]
+  return Tensor(parts[0].uop.mstack(*[p.uop for p in parts[1:]]).multi(0))
 
 def _gguf_parse(tensor: Tensor, devices:tuple[str, ...]|None=None,
                 shard:Callable[[str], int|str|None]|None=None) -> tuple[dict, dict[str, Tensor]]:
@@ -187,10 +186,11 @@ def _gguf_parse(tensor: Tensor, devices:tuple[str, ...]|None=None,
     state_dict = {name: ggml_data_to_tensor(tensor[data_start + off:], prod(dims), typ).reshape(*reversed(dims)) for name, dims, typ, off in t_infos}
     return kv_data, state_dict
   state_dict = {}
-  for name, dims, typ, off in t_infos:
+  for t_info in t_infos:
+    name, dims, typ, off = t_info
     spec = shard(name) if shard is not None else None
     if isinstance(spec, int):
-      state_dict.update(_shard_tensor(tensor, data_start, name, dims, typ, off, devices, spec))
+      state_dict[name] = _shard_tensor(tensor, data_start, t_info, devices, spec)
       continue
     n = prod(dims)
     raw = tensor[data_start + off:data_start + off + _ggml_nbytes(n, typ)].to("CPU" if spec == "replicate" else devices[0]).realize()

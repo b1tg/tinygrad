@@ -219,13 +219,13 @@ class TestMultiAxis(unittest.TestCase):
     self.assertEqual(e.uop.axis, 0)
     self.assertTrue(e.uop.has_buffer_identity())
 
-class TestMstackCommonLift(unittest.TestCase):
-  """Identical per-device compute under MSTACK (lazy dequant of sharded weight shards) lifts above the MSTACK, so an
-  advanced index folds to computing only the selected rows instead of every row on every device."""
+class TestShardedDequantGatherFold(unittest.TestCase):
+  """A sharded quantized weight is built as dequant(MSTACK(raw shards)) — MSTACK at the leaves, dequant above. An advanced
+  index then folds through the dequant and the MSTACK to compute only the selected rows, not every row on every device."""
   def test_lazy_dequant_gather_fused(self):
     devs, (E, O, I, k) = ("NULL:1", "NULL:2"), (64, 32, 32, 4)
-    parts = [Tensor.empty(E, O//2, I, dtype=dtypes.int8, device=d).cast(dtypes.float32).uop for d in devs]
-    w = Tensor(parts[0].mstack(parts[1]).multi(1))
+    raw = [Tensor.empty(E, O//2, I, dtype=dtypes.int8, device=d).uop for d in devs]
+    w = Tensor(raw[0].mstack(raw[1]).multi(1)).cast(dtypes.float32)  # dequant (cast) above the MSTACK of raw shards
     with Context(SCACHE=0):
       GlobalCounters.reset()
       w[Tensor.empty(k, dtype=dtypes.int32).to(devs)].realize()
@@ -238,8 +238,8 @@ class TestMstackCommonLift(unittest.TestCase):
     E, O, I = 16, 8, 6
     q = (Tensor.rand(E, O, I)*200 - 100).cast(dtypes.int8).realize()
     s = (Tensor.rand(E, 1, 1) + 0.5).realize()
-    parts = [(q[:, i*(O//2):(i+1)*(O//2)].contiguous().to(d).cast(dtypes.float32) * s.to(d)).uop for i, d in enumerate(devs)]
-    w = Tensor(parts[0].mstack(parts[1]).multi(1))
+    raw = [q[:, i*(O//2):(i+1)*(O//2)].contiguous().to(d).uop for i, d in enumerate(devs)]
+    w = Tensor(raw[0].mstack(raw[1]).multi(1)).cast(dtypes.float32) * s.to(devs)  # dequant above the MSTACK
     sel = Tensor([1, 4, 7], dtype=dtypes.int32)
     ref = (q.cast(dtypes.float32) * s)[sel]
     self.assertLess((w[sel.to(devs)].to(Device.DEFAULT) - ref).abs().max().item(), 1e-4)
