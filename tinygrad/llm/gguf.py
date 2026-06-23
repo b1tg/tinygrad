@@ -184,11 +184,10 @@ def _gguf_parse(tensor: Tensor, devices:tuple[str, ...]|None=None,
     spec = shard(name) if shard is not None else None
     if isinstance(spec, int):
       state_dict[name] = _shard_tensor(tensor, data_start, t_info, devices, spec)
-      continue
-    n = prod(dims)
-    raw = tensor[data_start + off:data_start + off + _ggml_nbytes(n, typ)].to("CPU" if spec == "replicate" else devices[0]).realize()
-    t = ggml_data_to_tensor(raw, n, typ).reshape(*reversed(dims))
-    state_dict[name] = t.to(devices).realize() if spec == "replicate" else t
+    else:
+      n = prod(dims)
+      raw = tensor[data_start + off:data_start + off + _ggml_nbytes(n, typ)].to(devices if spec == "replicate" else devices[0]).realize()
+      state_dict[name] = ggml_data_to_tensor(raw, n, typ).reshape(*reversed(dims))
   return kv_data, state_dict
 
 def _gguf_split_paths(path: pathlib.Path, kv: dict) -> list[pathlib.Path]:

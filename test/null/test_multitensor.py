@@ -220,8 +220,6 @@ class TestMultiAxis(unittest.TestCase):
     self.assertTrue(e.uop.has_buffer_identity())
 
 class TestShardedDequantGatherFold(unittest.TestCase):
-  """A sharded quantized weight is built as dequant(MSTACK(raw shards)) — MSTACK at the leaves, dequant above. An advanced
-  index then folds through the dequant and the MSTACK to compute only the selected rows, not every row on every device."""
   def test_lazy_dequant_gather_fused(self):
     devs, (E, O, I, k) = ("NULL:1", "NULL:2"), (64, 32, 32, 4)
     raw = [Tensor.empty(E, O//2, I, dtype=dtypes.int8, device=d).uop for d in devs]
@@ -245,21 +243,16 @@ class TestShardedDequantGatherFold(unittest.TestCase):
     self.assertLess((w[sel.to(devs)].to(Device.DEFAULT) - ref).abs().max().item(), 1e-4)
 
 class TestSymbolicShard(unittest.TestCase):
-  """Symbolic-length dims flowing through sharded ops: reshape shard-axis remap and allreduce must support symbolic shapes."""
   def test_symbolic_allreduce_over_sharded_axis(self):
-    # reducing over a sharded axis when the result keeps a symbolic dim -> handle_allreduce gets a
-    # symbolic-shaped buffer. without the symbolic fallback this hits `assert all_int(buf.shape)`.
     devs = ("NULL:1", "NULL:2")
     v = UOp.variable("T", 1, 8).bind(4)
-    Tensor.empty(8, 8).shard(devs, axis=1)[:v].sum(axis=1).realize()  # sum over sharded axis 1 -> allreduce, shape (v,)
+    Tensor.empty(8, 8).shard(devs, axis=1)[:v].sum(axis=1).realize()
 
   def test_symbolic_sharded_reshape_axis(self):
-    # reshape inserts a size-1 dim before the sharded axis, with a symbolic dim in the shape. finding the new
-    # shard axis must use ssimplify; master's structural .index() picks the wrong axis -> "moved items between shards".
     devs = ("NULL:1", "NULL:2")
     n = UOp.variable("n", 1, 4)
-    x = Tensor.empty(4, 2).shard(devs, axis=1)[:n]    # (n, 2) sharded on axis 1
-    self.assertEqual(x.reshape(n, 1, 2).uop.axis, 2)  # the sharded axis (the 2) moves to axis 2
+    x = Tensor.empty(4, 2).shard(devs, axis=1)[:n]
+    self.assertEqual(x.reshape(n, 1, 2).uop.axis, 2)
 
 if __name__ == '__main__':
   unittest.main()
