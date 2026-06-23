@@ -169,6 +169,21 @@ class TestGGUF(unittest.TestCase):
 
     np.testing.assert_equal(dq_tensor.numpy(), ref)
 
+  def _test_dequantization_keeps_leading_dims(self, qtype: GGMLQuantizationType):
+    # a sharded weight is dequantized as a multi-dim block-view; ggml_data_to_tensor must keep the leading dim, not flatten across it
+    block_size, type_size = GGML_QUANT_SIZES[qtype]
+    n_el, n_bytes, L = ggml_test_block_count * block_size, ggml_test_block_count * type_size, 2
+    try: q_data = quantize((np.random.random((n_el,)).astype(np.float32) * 100 - 50), qtype)
+    except NotImplementedError: q_data = np.random.default_rng(42).integers(0, 256, size=n_bytes, dtype=np.uint8)
+    ref = ggml_data_to_tensor(Tensor(q_data), n_el, qtype.value).reshape(L, n_el // L).numpy()
+    bv = Tensor(q_data).reshape(L, n_bytes // L)  # raw bytes with a leading dim, like one expert/shard's block-view
+    np.testing.assert_equal(ggml_data_to_tensor(bv, n_el, qtype.value).numpy(), ref)
+
+  def test_dequantization_leading_dims_q8_0(self): self._test_dequantization_keeps_leading_dims(GGMLQuantizationType.Q8_0)
+  def test_dequantization_leading_dims_q4_k(self): self._test_dequantization_keeps_leading_dims(GGMLQuantizationType.Q4_K)
+  def test_dequantization_leading_dims_q5_k(self): self._test_dequantization_keeps_leading_dims(GGMLQuantizationType.Q5_K)
+  def test_dequantization_leading_dims_q6_k(self): self._test_dequantization_keeps_leading_dims(GGMLQuantizationType.Q6_K)
+
   def _test_gguf_load(self, url: str):
     fp = fetch(url)
     model_size = os.stat(fp).st_size
