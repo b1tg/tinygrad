@@ -43,7 +43,7 @@ def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
   if (nelements_nbytes := _GGML_QUANT.get(ggml_type)) is not None:
     from tinygrad.runtime.autogen import ggml_common as _ggml
     if t.ndim == 1: t = t[:(n//nelements_nbytes[0])*nelements_nbytes[1]]
-    blocks = t.reshape(*t.shape[:-1], -1, nelements_nbytes[1]).contiguous()  # keep leading dims so a sharded block-view dequants per-shard
+    blocks = t.reshape(*t.shape[:-1], -1, nelements_nbytes[1]).contiguous()
     if ggml_type == 2: return (q_to_uint8(blocks[:,2:], 4).bitcast(dtypes.int8) - 8) * blocks[:,:2].bitcast(dtypes.float16).cast(dtypes.float32)
     if ggml_type == 3:
       d, m = (blocks[:,s:s+2].bitcast(dtypes.float16).cast(dtypes.float32) for s in [ 0, 2 ])
@@ -54,8 +54,7 @@ def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
       qh = q_to_uint8(blocks[:,qh_off:qh_off+4], 1).reshape((-1, 8, 4)).transpose(-1, -2).flatten(-2).bitcast(dtypes.int8)
       q = q_to_uint8(blocks[:,qh_off+4:], 4).bitcast(dtypes.int8) + qh * 16
       return q * d + (blocks[:,2:4].bitcast(dtypes.float16).cast(dtypes.float32) if ggml_type == 7 else -16 * d)
-    # Q8_0/Q4_K/Q5_K/Q6_K (the gathered expert types) keep leading dims via ... + B reshapes, so a sharded gather folds (no multi rewrite)
-    B = blocks.shape[:-1]  # (*leading, nblk)
+    B = blocks.shape[:-1]
     if ggml_type == 8: return (blocks[...,:2].bitcast(dtypes.float16).cast(dtypes.float32) * blocks[...,2:].bitcast(dtypes.int8)).flatten(-2)
      # Q4_K: 256 elements per 144-byte block (d:2, dmin:2, scales:12, qs:128)
      # Q5_K: 256 elements per 176-byte block (d:2, dmin:2, scales:12, qh:32, qs:128)
@@ -140,29 +139,24 @@ def _shard_tensor(tensor:Tensor, data_start:int, t_info:tuple[str, tuple[int, ..
   name, dims, typ, off = t_info
   shape = tuple(reversed(dims))
   ndev, last, off0 = len(devices), len(dims)-1, data_start + off
-  if shape[axis] % ndev != 0: raise RuntimeError(f"{name}: axis {axis} size {shape[axis]} does not divide {ndev} devices")
-  if typ in (8, 12, 13, 14):
-    # gathered expert types: MSTACK the raw quantized bytes (per-shard block-view, leading dims intact) and dequant the MULTI. with
-    # MSTACK at the leaves the expert gather folds to "dequant only the selected rows", no scheduler rewrite (ggml_data_to_tensor
-    # keeps leading dims). blocks are packed along the last dim, so the shard must land on whole super-blocks.
-    qb, bb = _GGML_QUANT[typ]
-    if shape[-1] % qb != 0: raise RuntimeError(f"{name}: quantized last dim {shape[-1]} does not divide {qb}")
-    S = shape[-1] // qb
-    bv = tensor[off0:off0 + (prod(shape)//qb)*bb].to("CPU").realize().reshape(*shape[:-1], S*bb)  # realize so strided shard slices read correctly
-    if axis == last and S % ndev != 0: raise RuntimeError(f"{name}: quantized shard axis size {shape[-1]//ndev} does not divide {qb}")
-    aax, cnt = (last, (S//ndev)*bb) if axis == last else (axis, shape[axis]//ndev)  # axis to slice in bv, count per device
-    parts = [bv[tuple(slice(i*cnt, (i+1)*cnt) if a==aax else slice(None) for a in range(len(shape)))].contiguous().to(d)
-             for i,d in enumerate(devices)]
-    Tensor.realize(*parts)  # raw quantized bytes resident per device; the dequant above stays lazy so the gather folds
-    return ggml_data_to_tensor(Tensor(parts[0].uop.mstack(*[p.uop for p in parts[1:]]).multi(axis)), prod(shape), typ).reshape(*shape)
-  # everything else (Q5_0 attn_k_b, native biases): not gathered, so just dequant each shard and MSTACK. contiguous axis-0 rows only
-  if axis != 0: raise RuntimeError(f"{name}: shard axis {axis} not supported for type {typ}")
-  per, row = shape[0]//ndev, prod(shape[1:])
-  pnb = _ggml_nbytes(row, typ)
-  raws = [tensor[off0+i*per*pnb:off0+(i+1)*per*pnb].to(d) for i,d in enumerate(devices)]
-  Tensor.realize(*raws)
-  parts = [ggml_data_to_tensor(r, per*row, typ).reshape(per, *shape[1:]) for r in raws]
-  return Tensor(parts[0].uop.mstack(*[p.uop for p in parts[1:]]).multi(0))
+  assert shape[axis] % ndev == 0, f"{name}: axis {axis} size {shape[axis]} does not divide {ndev} devices"
+  if axis == 0:
+    per, row = shape[0]//ndev, prod(shape[1:])
+    pnb = _ggml_nbytes(row, typ)
+    raws = [tensor[off0+i*per*pnb:off0+(i+1)*per*pnb].to(d) for i,d in enumerate(devices)]
+    Tensor.realize(*raws)
+    parts = [ggml_data_to_tensor(r, per*row, typ).reshape(per, *shape[1:]) for r in raws]
+    return Tensor(parts[0].uop.mstack(*[p.uop for p in parts[1:]]).multi(0))
+  assert typ in (8, 12, 13, 14), f"{name}: shard axis {axis} unsupported for quant type {typ} (needs a leading-dim dequant)"
+  qb, bb = _GGML_QUANT[typ]
+  assert shape[-1] % qb == 0, f"{name}: quantized last dim {shape[-1]} does not divide {qb}"
+  S = shape[-1] // qb
+  bv = tensor[off0:off0 + (prod(shape)//qb)*bb].to("CPU").realize().reshape(*shape[:-1], S*bb)
+  assert axis != last or S % ndev == 0, f"{name}: quantized shard axis size {shape[-1]//ndev} does not divide {qb}"
+  aax, cnt = (last, (S//ndev)*bb) if axis == last else (axis, shape[axis]//ndev)
+  parts = [bv[tuple(slice(i*cnt, (i+1)*cnt) if a==aax else slice(None) for a in range(len(shape)))].contiguous().to(d) for i,d in enumerate(devices)]
+  Tensor.realize(*parts)
+  return ggml_data_to_tensor(Tensor(parts[0].uop.mstack(*[p.uop for p in parts[1:]]).multi(axis)), prod(shape), typ).reshape(*shape)
 
 def _gguf_parse(tensor: Tensor, devices:tuple[str, ...]|None=None,
                 shard:Callable[[str], int|str|None]|None=None) -> tuple[dict, dict[str, Tensor]]:

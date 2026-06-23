@@ -225,11 +225,11 @@ class TestShardedDequantGatherFold(unittest.TestCase):
   def test_lazy_dequant_gather_fused(self):
     devs, (E, O, I, k) = ("NULL:1", "NULL:2"), (64, 32, 32, 4)
     raw = [Tensor.empty(E, O//2, I, dtype=dtypes.int8, device=d).uop for d in devs]
-    w = Tensor(raw[0].mstack(raw[1]).multi(1)).cast(dtypes.float32)  # dequant (cast) above the MSTACK of raw shards
+    w = Tensor(raw[0].mstack(raw[1]).multi(1)).cast(dtypes.float32)
     with Context(SCACHE=0):
       GlobalCounters.reset()
       w[Tensor.empty(k, dtype=dtypes.int32).to(devs)].realize()
-    self.assertLess(GlobalCounters.global_mem, E*O*I*4)  # materializing the full cast would already exceed this
+    self.assertLess(GlobalCounters.global_mem, E*O*I*4)
 
   @unittest.skipIf(Device.DEFAULT == "NULL", "numerics need a real backend")
   def test_lazy_dequant_gather_correct(self):
@@ -239,7 +239,7 @@ class TestShardedDequantGatherFold(unittest.TestCase):
     q = (Tensor.rand(E, O, I)*200 - 100).cast(dtypes.int8).realize()
     s = (Tensor.rand(E, 1, 1) + 0.5).realize()
     raw = [q[:, i*(O//2):(i+1)*(O//2)].contiguous().to(d).uop for i, d in enumerate(devs)]
-    w = Tensor(raw[0].mstack(raw[1]).multi(1)).cast(dtypes.float32) * s.to(devs)  # dequant above the MSTACK
+    w = Tensor(raw[0].mstack(raw[1]).multi(1)).cast(dtypes.float32) * s.to(devs)
     sel = Tensor([1, 4, 7], dtype=dtypes.int32)
     ref = (q.cast(dtypes.float32) * s)[sel]
     self.assertLess((w[sel.to(devs)].to(Device.DEFAULT) - ref).abs().max().item(), 1e-4)
