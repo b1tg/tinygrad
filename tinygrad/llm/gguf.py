@@ -138,23 +138,23 @@ def _ggml_nbytes(n:int, typ:int) -> int:
 def _shard_tensor(tensor:Tensor, data_start:int, t_info:tuple[str, tuple[int, ...], int, int], devices:tuple[str, ...], axis:int) -> Tensor:
   name, dims, typ, off = t_info
   shape = tuple(reversed(dims))
-  ndev, last, off0 = len(devices), len(dims)-1, data_start + off
+  ndev, off0 = len(devices), data_start + off
   assert shape[axis] % ndev == 0, f"{name}: axis {axis} size {shape[axis]} does not divide {ndev} devices"
   if axis == 0:
-    per, row = shape[0]//ndev, prod(shape[1:])
-    pnb = _ggml_nbytes(row, typ)
-    raws = [tensor[off0+i*per*pnb:off0+(i+1)*per*pnb].to(d) for i,d in enumerate(devices)]
+    row_count, row_elems = shape[0]//ndev, prod(shape[1:])
+    pnb = _ggml_nbytes(row_elems, typ)
+    raws = [tensor[off0+i*row_count*pnb:off0+(i+1)*row_count*pnb].to(d) for i,d in enumerate(devices)]
     Tensor.realize(*raws)
-    parts = [ggml_data_to_tensor(r, per*row, typ).reshape(per, *shape[1:]) for r in raws]
+    parts = [ggml_data_to_tensor(r, row_count*row_elems, typ).reshape(row_count, *shape[1:]) for r in raws]
     return Tensor(parts[0].uop.mstack(*[p.uop for p in parts[1:]]).multi(0))
   assert typ in (8, 12, 13, 14), f"{name}: shard axis {axis} unsupported for quant type {typ} (needs a leading-dim dequant)"
-  qb, bb = _GGML_QUANT[typ]
-  assert shape[-1] % qb == 0, f"{name}: quantized last dim {shape[-1]} does not divide {qb}"
-  S = shape[-1] // qb
-  bv = tensor[off0:off0 + (prod(shape)//qb)*bb].to("CPU").realize().reshape(*shape[:-1], S*bb)
-  assert axis != last or S % ndev == 0, f"{name}: quantized shard axis size {shape[-1]//ndev} does not divide {qb}"
-  aax, cnt = (last, (S//ndev)*bb) if axis == last else (axis, shape[axis]//ndev)
-  parts = [bv[tuple(slice(i*cnt, (i+1)*cnt) if a==aax else slice(None) for a in range(len(shape)))].contiguous().to(d) for i,d in enumerate(devices)]
+  ne, nb = _GGML_QUANT[typ]
+  assert shape[-1] % ne == 0, f"{name}: quantized last dim {shape[-1]} does not divide {ne}"
+  S = shape[-1] // ne
+  bv = tensor[off0:off0 + (prod(shape)//ne)*nb].to("CPU").realize().reshape(*shape[:-1], S*nb)
+  assert axis != len(dims)-1 or S % ndev == 0, f"{name}: quantized shard axis size {shape[-1]//ndev} does not divide {ne}"
+  cnt = bv.shape[axis] // ndev
+  parts = [bv[tuple(slice(i*cnt, (i+1)*cnt) if a==axis else slice(None) for a in range(len(shape)))].contiguous().to(d) for i,d in enumerate(devices)]
   Tensor.realize(*parts)
   return ggml_data_to_tensor(Tensor(parts[0].uop.mstack(*[p.uop for p in parts[1:]]).multi(axis)), prod(shape), typ).reshape(*shape)
 
