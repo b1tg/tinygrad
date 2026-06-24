@@ -1,7 +1,7 @@
 import os, struct, unittest, tempfile, pathlib, sys
 from tinygrad import dtypes, Tensor, fetch, Device
 from tinygrad.helpers import disable_gc
-from tinygrad.llm.gguf import _ggml_iq_grid, ggml_data_to_tensor, gguf_load
+from tinygrad.llm.gguf import _ggml_iq_grid, ggml_data_to_tensor, gguf_load, _GGML_QUANT
 from tinygrad.runtime.autogen import ggml_common as _ggml
 import numpy as np
 from gguf import GGUFReader, GGUFValueType, GGMLQuantizationType, GGML_QUANT_SIZES, dequantize, quantize
@@ -169,19 +169,13 @@ class TestGGUF(unittest.TestCase):
 
     np.testing.assert_equal(dq_tensor.numpy(), ref)
 
-  def _test_dequantization_keeps_leading_dims(self, qtype: GGMLQuantizationType):
-    block_size, type_size = GGML_QUANT_SIZES[qtype]
-    n_el, n_bytes, L = ggml_test_block_count * block_size, ggml_test_block_count * type_size, 2
-    try: q_data = quantize((np.random.random((n_el,)).astype(np.float32) * 100 - 50), qtype)
-    except NotImplementedError: q_data = np.random.default_rng(42).integers(0, 256, size=n_bytes, dtype=np.uint8)
-    ref = ggml_data_to_tensor(Tensor(q_data), n_el, qtype.value).reshape(L, n_el // L).numpy()
-    bv = Tensor(q_data).reshape(L, n_bytes // L)
-    np.testing.assert_equal(ggml_data_to_tensor(bv, n_el, qtype.value).numpy(), ref)
-
-  def test_dequantization_leading_dims_q8_0(self): self._test_dequantization_keeps_leading_dims(GGMLQuantizationType.Q8_0)
-  def test_dequantization_leading_dims_q4_k(self): self._test_dequantization_keeps_leading_dims(GGMLQuantizationType.Q4_K)
-  def test_dequantization_leading_dims_q5_k(self): self._test_dequantization_keeps_leading_dims(GGMLQuantizationType.Q5_K)
-  def test_dequantization_leading_dims_q6_k(self): self._test_dequantization_keeps_leading_dims(GGMLQuantizationType.Q6_K)
+  def test_dequantization_keeps_leading_dims(self):
+    for typ, (ne, nb) in _GGML_QUANT.items():
+      q_data = np.random.default_rng(typ).integers(0, 256, size=ggml_test_block_count*nb, dtype=np.uint8)
+      n_el, L = ggml_test_block_count*ne, 2
+      ref = ggml_data_to_tensor(Tensor(q_data), n_el, typ).reshape(L, n_el//L).numpy()
+      got = ggml_data_to_tensor(Tensor(q_data).reshape(L, ggml_test_block_count*nb//L), n_el, typ).numpy()
+      np.testing.assert_equal(got, ref, err_msg=f"ggml type {typ}")
 
   def _test_gguf_load(self, url: str):
     fp = fetch(url)
