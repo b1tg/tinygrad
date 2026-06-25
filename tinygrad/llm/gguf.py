@@ -4,6 +4,7 @@ from typing import Any, Callable
 from tinygrad.tensor import Tensor
 from tinygrad.dtype import dtypes
 from tinygrad.helpers import prod, round_up
+from tinygrad.uop.ops import sint
 from tinygrad.nn.state import TensorIO
 
 # ggml packs each iq grid entry as N bytes (N=4 for uint32 grids, N=8 for uint64 grids) in a single word. See ggml-common.h.
@@ -20,7 +21,7 @@ _GGML_NATIVE = {0: dtypes.float32, 1: dtypes.float16, 24: dtypes.int8, 25: dtype
 _GGML_QUANT = {2:(32,18), 3:(32,20), 6:(32,22), 7:(32,24), 8:(32,34),
                12:(256,144), 13:(256,176), 14:(256,210), 18:(256,98), 21:(256,110), 22:(256,82), 23:(256,136), 39:(32,17), 41:(128,18)}
 
-def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
+def ggml_data_to_tensor(t: Tensor, n: sint, ggml_type: int) -> Tensor:
   """
   Converts ggml tensor data to a tinygrad tensor.
 
@@ -136,7 +137,8 @@ read_uint32, read_int32, read_uint64, read_int64 = readers[4], readers[5], reade
 def _ggml_nbytes(n:int, typ:int) -> int:
   return n * _GGML_NATIVE[typ].itemsize if typ in _GGML_NATIVE else (n // _GGML_QUANT[typ][0]) * _GGML_QUANT[typ][1]
 
-def _shard_tensor(tensor:Tensor, data_start:int, t_info:tuple[str, tuple[int, ...], int, int], devices:tuple[str, ...], axis:int) -> Tensor:
+def _shard_tensor(tensor:Tensor, data_start:int, t_info:tuple[str, tuple[int, ...], int, int], devices:tuple[str, ...],
+                  axis:int, raw:bool=False) -> Tensor:
   name, dims, typ, off = t_info
   shape = tuple(reversed(dims))
   ndev, off0 = len(devices), data_start + off
@@ -157,10 +159,11 @@ def _shard_tensor(tensor:Tensor, data_start:int, t_info:tuple[str, tuple[int, ..
   cnt = bv.shape[axis] // ndev
   parts = [bv[tuple(slice(i*cnt, (i+1)*cnt) if a==axis else slice(None) for a in range(len(shape)))].contiguous().to(d) for i,d in enumerate(devices)]
   Tensor.realize(*parts)
-  return ggml_data_to_tensor(Tensor(parts[0].uop.mstack(*[p.uop for p in parts[1:]]).multi(axis)), prod(shape), typ).reshape(*shape)
+  m = Tensor(parts[0].uop.mstack(*[p.uop for p in parts[1:]]).multi(axis))
+  return m if raw else ggml_data_to_tensor(m, prod(shape), typ).reshape(*shape)
 
 def _gguf_parse(tensor: Tensor, devices:tuple[str, ...]|None=None,
-                shard:Callable[[str], int|str|None]|None=None) -> tuple[dict, dict[str, Tensor]]:
+                shard:Callable[[str], int|str|None]|None=None) -> tuple[dict, dict[str, Tensor], dict[str, int]]:
   # TODO: remove the need for copy to default device
   if devices is None: tensor = tensor.to(None).realize()
   r = io.BufferedReader(TensorIO(tensor), 1_000_000)
@@ -178,18 +181,20 @@ def _gguf_parse(tensor: Tensor, devices:tuple[str, ...]|None=None,
 
   if devices is None:
     state_dict = {name: ggml_data_to_tensor(tensor[data_start + off:], prod(dims), typ).reshape(*reversed(dims)) for name, dims, typ, off in t_infos}
-    return kv_data, state_dict
-  state_dict = {}
+    return kv_data, state_dict, {}
+  state_dict, types = {}, {}  # types: ggml type of the tensors kept raw (3D experts), so the consumer can dequant after the gather
   for t_info in t_infos:
     name, dims, typ, off = t_info
     spec = shard(name) if shard is not None else None
     if isinstance(spec, int):
-      state_dict[name] = _shard_tensor(tensor, data_start, t_info, devices, spec)
+      keep = len(dims) == 3
+      state_dict[name] = _shard_tensor(tensor, data_start, t_info, devices, spec, raw=keep)
+      if keep: types[name] = typ
     else:
       n = prod(dims)
       raw = tensor[data_start + off:data_start + off + _ggml_nbytes(n, typ)].to(devices if spec == "replicate" else devices[0]).realize()
       state_dict[name] = ggml_data_to_tensor(raw, n, typ).reshape(*reversed(dims))
-  return kv_data, state_dict
+  return kv_data, state_dict, types
 
 def _gguf_split_paths(path: pathlib.Path, kv: dict) -> list[pathlib.Path]:
   if (total := kv.get('split.count', 1)) <= 1: return [path]
@@ -198,9 +203,9 @@ def _gguf_split_paths(path: pathlib.Path, kv: dict) -> list[pathlib.Path]:
   return [pathlib.Path(f"{m.group(1)}-{i:05d}-of-{total:05d}.gguf") for i in range(1, total+1)]
 
 def gguf_load(fn: Tensor|str|pathlib.Path, devices:tuple[str, ...]|None=None,
-              shard:Callable[[str], int|str|None]|None=None) -> tuple[dict, dict[str, Tensor]]:
+              shard:Callable[[str], int|str|None]|None=None) -> tuple[dict, dict[str, Tensor], dict[str, int]]:
   """
-  Loads a .gguf file, returning the `kv_data` and `state_dict`. Multi-part splits are auto-merged when loaded by path.
+  Loads a .gguf file, returning `kv_data`, `state_dict`, and `types` (ggml type of any tensors left raw). Splits are auto-merged by path.
 
   ```python
   import pathlib
@@ -208,13 +213,16 @@ def gguf_load(fn: Tensor|str|pathlib.Path, devices:tuple[str, ...]|None=None,
   from tinygrad.llm.gguf import gguf_load
 
   gguf_tensor = Tensor(pathlib.Path("Meta-Llama-3-8B-Instruct.Q4_0.gguf")).to(Device.DEFAULT)
-  kv_data, state_dict = gguf_load(gguf_tensor)
+  kv_data, state_dict, _ = gguf_load(gguf_tensor)
   ```
 
   NOTE: The provided tensor must be on a device that supports execution.
   """
-  kv, sd = _gguf_parse(fn if isinstance(fn, Tensor) else Tensor(pathlib.Path(fn)), devices, shard)
-  if kv.get('split.count', 1) <= 1: return kv, sd
+  kv, sd, types = _gguf_parse(fn if isinstance(fn, Tensor) else Tensor(pathlib.Path(fn)), devices, shard)
+  if kv.get('split.count', 1) <= 1: return kv, sd, types
   if isinstance(fn, Tensor): raise ValueError("multi-part GGUF requires a path argument (got Tensor)")
-  for pp in _gguf_split_paths(pathlib.Path(fn), kv)[1:]: sd.update(_gguf_parse(Tensor(pp), devices, shard)[1])
-  return kv, sd
+  for pp in _gguf_split_paths(pathlib.Path(fn), kv)[1:]:
+    _, psd, pt = _gguf_parse(Tensor(pp), devices, shard)
+    sd.update(psd)
+    types.update(pt)
+  return kv, sd, types
