@@ -144,7 +144,7 @@ class TestGGUF(unittest.TestCase):
       a, b = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32), np.array([5.0, 6.0], dtype=np.float32)
       (d / "test-00001-of-00002.gguf").write_bytes(self._build_gguf([("a", (4,), 0, a.tobytes())], [("split.count", 2), ("split.no", 0)]))
       (d / "test-00002-of-00002.gguf").write_bytes(self._build_gguf([("b", (2,), 0, b.tobytes())], [("split.count", 2), ("split.no", 1)]))
-      kv, ts, _ = gguf_load(d / "test-00001-of-00002.gguf")
+      kv, ts = gguf_load(d / "test-00001-of-00002.gguf")
       self.assertEqual(kv["split.count"], 2)
       np.testing.assert_equal(ts["a"].numpy(), a)
       np.testing.assert_equal(ts["b"].numpy(), b)
@@ -181,7 +181,7 @@ class TestGGUF(unittest.TestCase):
     fp = fetch(url)
     model_size = os.stat(fp).st_size
     gguf_tensor = Tensor.empty(model_size, dtype=dtypes.uint8, device=f"disk:{fp}").to(Device.DEFAULT)
-    kv_data, tensors, _ = gguf_load(gguf_tensor)
+    kv_data, tensors = gguf_load(gguf_tensor)
 
     reader = GGUFReader(fp)
 
@@ -232,7 +232,7 @@ class TestGGUFGEMV(unittest.TestCase):
     buf += b"\x00" * ((32 - len(buf) % 32) % 32)                # pad to alignment=32
     buf += q_data.tobytes()
 
-    _, tensors, _ = gguf_load(Tensor(np.frombuffer(buf, dtype=np.uint8)).to(None))
+    _, tensors = gguf_load(Tensor(np.frombuffer(buf, dtype=np.uint8)).to(None))
 
     x = rng.standard_normal(cols).astype(np.float32)
     with np.errstate(all='ignore'):
@@ -261,7 +261,7 @@ class TestGGUFGC(unittest.TestCase):
     t = Tensor.empty(os.stat(fp).st_size, dtype=dtypes.uint8, device=f"disk:{fp}").to(Device.DEFAULT).realize()
     with disable_gc():
       ref_before = sys.getrefcount(t)
-      kv_data, tensors, _ = gguf_load(t)
+      kv_data, tensors = gguf_load(t)
       self.assertEqual(sys.getrefcount(t), ref_before, "gguf_load leaked a reference to the input tensor")
 
 if __name__ == '__main__':

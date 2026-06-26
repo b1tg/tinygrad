@@ -162,8 +162,19 @@ def _shard_tensor(tensor:Tensor, data_start:int, t_info:tuple[str, tuple[int, ..
   m = Tensor(parts[0].uop.mstack(*[p.uop for p in parts[1:]]).multi(axis))
   return m if raw else ggml_data_to_tensor(m, prod(shape), typ).reshape(*shape)
 
+class LazyQuantTensor:
+  """Sharded quantized weights kept as raw ggml bytes; indexing gathers the selected rows and dequants ONLY those (never the
+  whole tensor). __slots__ keeps it opaque to nn.state.get_state_dict, so it is placed directly, not loaded like a Tensor."""
+  __slots__ = ("raw", "ggml_type", "in_features")
+  def __init__(self, raw:Tensor, ggml_type:int, in_features:int): self.raw, self.ggml_type, self.in_features = raw, ggml_type, in_features
+  @property
+  def shape(self) -> tuple[sint, ...]: return (*self.raw.shape[:-1], self.in_features)
+  def __getitem__(self, sel:Tensor) -> Tensor:
+    w = self.raw[sel]
+    return ggml_data_to_tensor(w, prod(w.shape[:-1])*self.in_features, self.ggml_type).reshape(*w.shape[:-1], self.in_features).cast(dtypes.float16)
+
 def _gguf_parse(tensor: Tensor, devices:tuple[str, ...]|None=None,
-                shard:Callable[[str], int|str|None]|None=None) -> tuple[dict, dict[str, Tensor], dict[str, int]]:
+                shard:Callable[[str], int|str|None]|None=None) -> tuple[dict, dict]:
   # TODO: remove the need for copy to default device
   if devices is None: tensor = tensor.to(None).realize()
   r = io.BufferedReader(TensorIO(tensor), 1_000_000)
@@ -181,20 +192,21 @@ def _gguf_parse(tensor: Tensor, devices:tuple[str, ...]|None=None,
 
   if devices is None:
     state_dict = {name: ggml_data_to_tensor(tensor[data_start + off:], prod(dims), typ).reshape(*reversed(dims)) for name, dims, typ, off in t_infos}
-    return kv_data, state_dict, {}
-  state_dict, types = {}, {}  # types: ggml type of the tensors kept raw (3D experts), so the consumer can dequant after the gather
+    return kv_data, state_dict
+  sharded: dict[str, Tensor|LazyQuantTensor] = {}
   for t_info in t_infos:
     name, dims, typ, off = t_info
     spec = shard(name) if shard is not None else None
     if isinstance(spec, int):
-      keep = len(dims) == 3
-      state_dict[name] = _shard_tensor(tensor, data_start, t_info, devices, spec, raw=keep)
-      if keep: types[name] = typ
+      if name.endswith("_exps.weight"):  # stacked MoE experts: keep raw, dequant lazily on the gather (carries its own type)
+        sharded[name] = LazyQuantTensor(_shard_tensor(tensor, data_start, t_info, devices, spec, raw=True), typ, dims[0])
+      else:
+        sharded[name] = _shard_tensor(tensor, data_start, t_info, devices, spec)
     else:
       n = prod(dims)
       raw = tensor[data_start + off:data_start + off + _ggml_nbytes(n, typ)].to(devices if spec == "replicate" else devices[0]).realize()
-      state_dict[name] = ggml_data_to_tensor(raw, n, typ).reshape(*reversed(dims))
-  return kv_data, state_dict, types
+      sharded[name] = ggml_data_to_tensor(raw, n, typ).reshape(*reversed(dims))
+  return kv_data, sharded
 
 def _gguf_split_paths(path: pathlib.Path, kv: dict) -> list[pathlib.Path]:
   if (total := kv.get('split.count', 1)) <= 1: return [path]
@@ -203,9 +215,9 @@ def _gguf_split_paths(path: pathlib.Path, kv: dict) -> list[pathlib.Path]:
   return [pathlib.Path(f"{m.group(1)}-{i:05d}-of-{total:05d}.gguf") for i in range(1, total+1)]
 
 def gguf_load(fn: Tensor|str|pathlib.Path, devices:tuple[str, ...]|None=None,
-              shard:Callable[[str], int|str|None]|None=None) -> tuple[dict, dict[str, Tensor], dict[str, int]]:
+              shard:Callable[[str], int|str|None]|None=None) -> tuple[dict, dict[str, Tensor|LazyQuantTensor]]:
   """
-  Loads a .gguf file, returning `kv_data`, `state_dict`, and `types` (ggml type of any tensors left raw). Splits are auto-merged by path.
+  Loads a .gguf file, returning the `kv_data` and `state_dict`. Multi-part splits are auto-merged when loaded by path.
 
   ```python
   import pathlib
@@ -213,16 +225,13 @@ def gguf_load(fn: Tensor|str|pathlib.Path, devices:tuple[str, ...]|None=None,
   from tinygrad.llm.gguf import gguf_load
 
   gguf_tensor = Tensor(pathlib.Path("Meta-Llama-3-8B-Instruct.Q4_0.gguf")).to(Device.DEFAULT)
-  kv_data, state_dict, _ = gguf_load(gguf_tensor)
+  kv_data, state_dict = gguf_load(gguf_tensor)
   ```
 
   NOTE: The provided tensor must be on a device that supports execution.
   """
-  kv, sd, types = _gguf_parse(fn if isinstance(fn, Tensor) else Tensor(pathlib.Path(fn)), devices, shard)
-  if kv.get('split.count', 1) <= 1: return kv, sd, types
+  kv, sd = _gguf_parse(fn if isinstance(fn, Tensor) else Tensor(pathlib.Path(fn)), devices, shard)
+  if kv.get('split.count', 1) <= 1: return kv, sd
   if isinstance(fn, Tensor): raise ValueError("multi-part GGUF requires a path argument (got Tensor)")
-  for pp in _gguf_split_paths(pathlib.Path(fn), kv)[1:]:
-    _, psd, pt = _gguf_parse(Tensor(pp), devices, shard)
-    sd.update(psd)
-    types.update(pt)
-  return kv, sd, types
+  for pp in _gguf_split_paths(pathlib.Path(fn), kv)[1:]: sd.update(_gguf_parse(Tensor(pp), devices, shard)[1])
+  return kv, sd

@@ -1,9 +1,8 @@
 from __future__ import annotations
 import functools, itertools, pathlib
 from dataclasses import dataclass, replace
-from tinygrad import Device, Tensor, nn, UOp, TinyJit, getenv, function, dtypes
-from tinygrad.helpers import prod
-from tinygrad.llm.gguf import gguf_load, ggml_data_to_tensor
+from tinygrad import Device, Tensor, nn, UOp, TinyJit, getenv, function
+from tinygrad.llm.gguf import gguf_load, LazyQuantTensor
 from tinygrad.uop.ops import resolve
 
 _TP_LAYOUT: dict[str, int|str] = {
@@ -27,13 +26,11 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, device:str|
 class ExpertWeights:
   """Like nn.Linear but with num_experts dimension. Weight shape: (num_experts, out_features, in_features)."""
   def __init__(self, num_experts:int, in_features:int, out_features:int):
-    self.weight, self.in_features, self.ggml_type = Tensor.zeros(num_experts, out_features, in_features), in_features, 0
+    self.weight: Tensor|LazyQuantTensor = Tensor.zeros(num_experts, out_features, in_features)
   def __call__(self, sel:Tensor, x:Tensor) -> Tensor:
     # sel: (B, T, k), x: (B, T, 1, in) or (B, T, k, in) -> output: (B, T, k, out)
-    w = self.weight[sel]
-    if self.ggml_type:  # raw quant bytes: dequant only the gathered experts, not all of them
-      w = ggml_data_to_tensor(w, prod(w.shape[:-1])*self.in_features, self.ggml_type).reshape(*w.shape[:-1], self.in_features).cast(dtypes.float16)
-    return (x.unsqueeze(-2) @ w.transpose(-1, -2)).contiguous().squeeze(-2)
+    # self.weight is a Tensor (dense) or a LazyQuantTensor (sharded quant); both gather then matmul the selected experts
+    return (x.unsqueeze(-2) @ self.weight[sel].transpose(-1, -2)).contiguous().squeeze(-2)
 
 def apply_rope(x:Tensor, freqs_cis:Tensor) -> Tensor:
   assert x.shape[-1] % 2 == 0
@@ -344,10 +341,11 @@ class Transformer:
                 realize=bool(getenv("REALIZE", 0)), shard:int=1) -> tuple[Transformer, dict]:
     # TODO: remove the need for copy to default device
     devices = tuple(Device.canonicalize(f"{Device.DEFAULT}:{i}") for i in range(shard)) if shard > 1 else None
-    kv, state_dict, types = gguf_load(gguf.to(None).realize() if isinstance(gguf, Tensor) else gguf, devices, shard=_shard_policy)
+    kv, loaded = gguf_load(gguf.to(None).realize() if isinstance(gguf, Tensor) else gguf, devices, shard=_shard_policy)
 
-    # all state items should be float16, not float32 (raw quant experts stay uint8)
-    state_dict = {k:v.cast('float16') if getenv("HALF", 1) and v.dtype != dtypes.uint8 else v for k,v in state_dict.items()}
+    # split off the lazily-dequanted sharded experts so the rest stays a plain {name: Tensor} and casts to float16
+    experts = {k:v for k,v in loaded.items() if isinstance(v, LazyQuantTensor)}
+    state_dict: dict[str, Tensor] = {k:(v.cast('float16') if getenv("HALF", 1) else v) for k,v in loaded.items() if isinstance(v, Tensor)}
 
     # some models like Llama 3.2 don't have an output.weight, they just tie to the token_embd.weight
     if 'output.weight' not in state_dict: state_dict['output.weight'] = state_dict['token_embd.weight']
@@ -405,8 +403,8 @@ class Transformer:
     model.devices = devices
     for i, block in enumerate(model.blk):
       for attr, ew in vars(block).items():
-        if isinstance(ew, ExpertWeights) and (sd := state_dict.get(name := f'blk.{i}.{attr}.weight')) is not None and sd.dtype == dtypes.uint8:
-          ew.weight, ew.ggml_type = sd, types[name]
+        if isinstance(ew, ExpertWeights) and (lqt := experts.get(f'blk.{i}.{attr}.weight')) is not None:
+          ew.weight = lqt  # placed directly (opaque to get_state_dict); its ggml_type rides along
     for k,v in nn.state.get_state_dict(model).items():
       if (sd:=state_dict.get(k)) is not None and isinstance(sd.device, tuple) and not isinstance(v.device, tuple):
         v.replace(Tensor.zeros(*v.shape, device=sd.device[0]).shard(sd.device, axis=sd.uop.axis))
