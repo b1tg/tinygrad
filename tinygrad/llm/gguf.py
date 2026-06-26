@@ -4,7 +4,6 @@ from typing import Any, Callable
 from tinygrad.tensor import Tensor
 from tinygrad.dtype import dtypes
 from tinygrad.helpers import prod, round_up
-from tinygrad.uop.ops import sint
 from tinygrad.nn.state import TensorIO
 
 # ggml packs each iq grid entry as N bytes (N=4 for uint32 grids, N=8 for uint64 grids) in a single word. See ggml-common.h.
@@ -21,7 +20,7 @@ _GGML_NATIVE = {0: dtypes.float32, 1: dtypes.float16, 24: dtypes.int8, 25: dtype
 _GGML_QUANT = {2:(32,18), 3:(32,20), 6:(32,22), 7:(32,24), 8:(32,34),
                12:(256,144), 13:(256,176), 14:(256,210), 18:(256,98), 21:(256,110), 22:(256,82), 23:(256,136), 39:(32,17), 41:(128,18)}
 
-def ggml_data_to_tensor(t: Tensor, n: sint, ggml_type: int) -> Tensor:
+def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
   """
   Converts ggml tensor data to a tinygrad tensor.
 
@@ -43,84 +42,81 @@ def ggml_data_to_tensor(t: Tensor, n: sint, ggml_type: int) -> Tensor:
 
   if (nelements_nbytes := _GGML_QUANT.get(ggml_type)) is not None:
     from tinygrad.runtime.autogen import ggml_common as _ggml
-    if t.ndim == 1: t = t[:(n//nelements_nbytes[0])*nelements_nbytes[1]]
-    blocks = t.reshape(*t.shape[:-1], -1, nelements_nbytes[1]).contiguous()
-    B = blocks.shape[:-1]
-    if ggml_type == 2:
-      return ((q_to_uint8(blocks[...,2:], 4).bitcast(dtypes.int8) - 8) * blocks[...,:2].bitcast(dtypes.float16).cast(dtypes.float32)).flatten(-2)
+    blocks = t[:(n//nelements_nbytes[0])*nelements_nbytes[1]].reshape((-1, nelements_nbytes[1])).contiguous()
+    if ggml_type == 2: return (q_to_uint8(blocks[:,2:], 4).bitcast(dtypes.int8) - 8) * blocks[:,:2].bitcast(dtypes.float16).cast(dtypes.float32)
     if ggml_type == 3:
-      d, m = (blocks[...,s:s+2].bitcast(dtypes.float16).cast(dtypes.float32) for s in [ 0, 2 ])
-      return (q_to_uint8(blocks[...,4:], 4).bitcast(dtypes.int8) * d + m).flatten(-2)
+      d, m = (blocks[:,s:s+2].bitcast(dtypes.float16).cast(dtypes.float32) for s in [ 0, 2 ])
+      return q_to_uint8(blocks[:,4:], 4).bitcast(dtypes.int8) * d + m
     if ggml_type in (6, 7):
-      d = blocks[...,:2].bitcast(dtypes.float16).cast(dtypes.float32)
+      d = blocks[:,:2].bitcast(dtypes.float16).cast(dtypes.float32)
       qh_off = 2 if ggml_type == 6 else 4
-      qh = q_to_uint8(blocks[...,qh_off:qh_off+4], 1).reshape(*B, 8, 4).transpose(-1, -2).flatten(-2).bitcast(dtypes.int8)
-      q = q_to_uint8(blocks[...,qh_off+4:], 4).bitcast(dtypes.int8) + qh * 16
-      return (q * d + (blocks[...,2:4].bitcast(dtypes.float16).cast(dtypes.float32) if ggml_type == 7 else -16 * d)).flatten(-2)
-    if ggml_type == 8: return (blocks[...,:2].bitcast(dtypes.float16).cast(dtypes.float32) * blocks[...,2:].bitcast(dtypes.int8)).flatten(-2)
+      qh = q_to_uint8(blocks[:,qh_off:qh_off+4], 1).reshape((-1, 8, 4)).transpose(-1, -2).flatten(-2).bitcast(dtypes.int8)
+      q = q_to_uint8(blocks[:,qh_off+4:], 4).bitcast(dtypes.int8) + qh * 16
+      return q * d + (blocks[:,2:4].bitcast(dtypes.float16).cast(dtypes.float32) if ggml_type == 7 else -16 * d)
+    if ggml_type == 8: return blocks[:,:2].bitcast(dtypes.float16).cast(dtypes.float32) * blocks[:,2:].bitcast(dtypes.int8)
      # Q4_K: 256 elements per 144-byte block (d:2, dmin:2, scales:12, qs:128)
      # Q5_K: 256 elements per 176-byte block (d:2, dmin:2, scales:12, qh:32, qs:128)
     if ggml_type in (12, 13):
-      d, dmin = (blocks[...,i:i+2].bitcast(dtypes.float16).cast(dtypes.float32).unsqueeze(-1) for i in [0, 2])
-      s = blocks[...,4:16]  # 12 bytes: 6-bit scales[0-3], 6-bit mins[0-3], high bits[4-7]
-      sc = s[...,0:4].bitwise_and(63).cat(s[...,8:12].bitwise_and(0xF).bitwise_or(s[...,0:4].rshift(6).lshift(4)), dim=-1)
-      mn = s[...,4:8].bitwise_and(63).cat(s[...,8:12].rshift(4).bitwise_or(s[...,4:8].rshift(6).lshift(4)), dim=-1)
+      d, dmin = (blocks[:,i:i+2].bitcast(dtypes.float16).cast(dtypes.float32).unsqueeze(-1) for i in [0, 2])
+      s = blocks[:,4:16]  # 12 bytes: 6-bit scales[0-3], 6-bit mins[0-3], high bits[4-7]
+      sc = s[:,0:4].bitwise_and(63).cat(s[:,8:12].bitwise_and(0xF).bitwise_or(s[:,0:4].rshift(6).lshift(4)), dim=-1)
+      mn = s[:,4:8].bitwise_and(63).cat(s[:,8:12].rshift(4).bitwise_or(s[:,4:8].rshift(6).lshift(4)), dim=-1)
       qs_off = 48 if ggml_type == 13 else 16
-      q = Tensor.stack((qs:=blocks[...,qs_off:qs_off+128].reshape(*B,4,32)).bitwise_and(0xF), qs.rshift(4), dim=-2).reshape(*B,8,32)
-      if ggml_type == 13: q = q + q_to_uint8(blocks[...,16:48], 1).reshape(*B, 8, 32) * 16
-      return (d * sc.unsqueeze(-1) * q - dmin * mn.unsqueeze(-1)).flatten(-3)
+      q = Tensor.stack((qs:=blocks[:,qs_off:qs_off+128].reshape(-1,4,32)).bitwise_and(0xF), qs.rshift(4), dim=2).reshape(-1,8,32)
+      if ggml_type == 13: q = q + q_to_uint8(blocks[:,16:48], 1).reshape(-1, 8, 32) * 16
+      return (d * sc.unsqueeze(-1) * q - dmin * mn.unsqueeze(-1)).flatten(-2)
     if ggml_type == 14:
-      xl, xh = q_to_uint8(blocks[...,:128].reshape(*B, 2, 64), 4), q_to_uint8(blocks[...,128:192].reshape(*B, 2, 32), 2).lshift(4)
-      scales = blocks[...,192:208].bitcast(dtypes.int8).unsqueeze(-1).expand(*B, 16, 16).reshape(*B, 256)
-      d = blocks[...,-2:].bitcast(dtypes.float16).cast(dtypes.float32).expand(*B, 256)
-      return (d * (xl.bitwise_or(xh).bitcast(dtypes.int8) - 32).flatten(-2) * scales).flatten(-2)
+      xl, xh = q_to_uint8(blocks[:,:128].reshape((-1, 2, 64)), 4), q_to_uint8(blocks[:,128:192].reshape((-1, 2, 32)), 2).lshift(4)
+      scales = blocks[:,192:208].bitcast(dtypes.int8).unsqueeze(-1).expand((-1, 16, 16)).reshape((-1, 256))
+      d = blocks[:,-2:].bitcast(dtypes.float16).cast(dtypes.float32).expand((-1, 256))
+      return d * (xl.bitwise_or(xh).bitcast(dtypes.int8) - 32).flatten(-2) * scales
     if ggml_type == 18:
-      d = blocks[...,:2].bitcast(dtypes.float16).cast(dtypes.float32).reshape(*B, 1, 1, 1)
-      scale_words = blocks[...,66:98].bitcast(dtypes.uint32)
-      db = d * (scale_words.rshift(28).cast(dtypes.float32) + 0.5).reshape(*B, 8, 1, 1) * 0.5
+      d = blocks[:, :2].bitcast(dtypes.float16).cast(dtypes.float32).reshape((-1, 1, 1, 1))
+      scale_words = blocks[:, 66:98].bitcast(dtypes.uint32)
+      db = d * (scale_words.rshift(28).cast(dtypes.float32) + 0.5).reshape((-1, 8, 1, 1)) * 0.5
       sign_idx = scale_words.unsqueeze(-1).rshift(
-        Tensor([0, 7, 14, 21], device=t.device, dtype=dtypes.uint32)).bitwise_and(0x7F).reshape(*B, 32).cast(dtypes.int32)
+        Tensor([0, 7, 14, 21], device=t.device, dtype=dtypes.uint32)).bitwise_and(0x7F).reshape((-1, 32)).cast(dtypes.int32)
       even_signs = Tensor([i | (0x80 if i.bit_count() % 2 else 0) for i in range(128)], dtype=dtypes.uint8, device=t.device)
-      signs = (q_to_uint8(even_signs[sign_idx].reshape(*B, 32, 1), 1) == 0).where(1.0, -1.0).reshape(*B, 8, 4, 8)
-      grid = _ggml_iq_grid(t.device, _ggml.iq3xxs_grid, (256, 4))[blocks[...,2:66]].reshape(*B, 8, 4, 8)
-      return (db * grid * signs).flatten(-4)
+      signs = (q_to_uint8(even_signs[sign_idx].reshape((-1, 32, 1)), 1) == 0).where(1.0, -1.0).reshape((-1, 8, 4, 8))
+      grid = _ggml_iq_grid(t.device, _ggml.iq3xxs_grid, (256, 4))[blocks[:, 2:66]].reshape((-1, 8, 4, 8))
+      return (db * grid * signs).flatten(-3)
     if ggml_type == 21:
-      d = blocks[...,:2].bitcast(dtypes.float16).cast(dtypes.float32).reshape(*B, 1, 1, 1)
-      scales = (1 + 2 * q_to_uint8(blocks[...,106:110].reshape(*B, 4, 1), 4).reshape(*B, 8)).cast(dtypes.float32).reshape(*B, 8, 1, 1)
-      qh = q_to_uint8(blocks[...,66:74].reshape(*B, 8, 1), 1).reshape(*B, 64).cast(dtypes.uint16)
-      signs = (q_to_uint8(blocks[...,74:106].reshape(*B, 32, 1), 1).reshape(*B, 256) == 0).where(1.0, -1.0).reshape(*B, 8, 4, 8)
-      q = blocks[...,2:66].cast(dtypes.uint16) + qh.lshift(8)
-      return (d * scales * _ggml_iq_grid(t.device, _ggml.iq3s_grid, (512, 4))[q].reshape(*B, 8, 4, 8) * signs).flatten(-4)
+      d = blocks[:, :2].bitcast(dtypes.float16).cast(dtypes.float32).reshape((-1, 1, 1, 1))
+      scales = (1 + 2 * q_to_uint8(blocks[:, 106:110].reshape((-1, 4, 1)), 4).reshape((-1, 8))).cast(dtypes.float32).reshape((-1, 8, 1, 1))
+      qh = q_to_uint8(blocks[:, 66:74].reshape((-1, 8, 1)), 1).reshape((-1, 64)).cast(dtypes.uint16)
+      signs = (q_to_uint8(blocks[:, 74:106].reshape((-1, 32, 1)), 1).reshape((-1, 256)) == 0).where(1.0, -1.0).reshape((-1, 8, 4, 8))
+      q = blocks[:, 2:66].cast(dtypes.uint16) + qh.lshift(8)
+      return (d * scales * _ggml_iq_grid(t.device, _ggml.iq3s_grid, (512, 4))[q].reshape((-1, 8, 4, 8)) * signs).flatten(-3)
     if ggml_type == 22:
-      d = blocks[...,:2].bitcast(dtypes.float16).cast(dtypes.float32).reshape(*B, 1, 1, 1)
-      db = d * (q_to_uint8(blocks[...,74:82].reshape(*B, 8, 1), 4).reshape(*B, 16).cast(dtypes.float32) + 0.5).reshape(*B, 16, 1, 1) * 0.25
-      signs = (q_to_uint8(blocks[...,34:66].reshape(*B, 32, 1), 1) == 0).where(1.0, -1.0).reshape(*B, 16, 2, 8)
-      qh = q_to_uint8(blocks[...,66:74].reshape(*B, 8, 1), 2).reshape(*B, 32).cast(dtypes.uint16)
-      q = blocks[...,2:34].cast(dtypes.uint16) + qh.lshift(8)
-      return (db * _ggml_iq_grid(t.device, _ggml.iq2s_grid, (1024, 8))[q].reshape(*B, 16, 2, 8) * signs).flatten(-4)
+      d = blocks[:, :2].bitcast(dtypes.float16).cast(dtypes.float32).reshape((-1, 1, 1, 1))
+      db = d * (q_to_uint8(blocks[:, 74:82].reshape((-1, 8, 1)), 4).reshape((-1, 16)).cast(dtypes.float32) + 0.5).reshape((-1, 16, 1, 1)) * 0.25
+      signs = (q_to_uint8(blocks[:, 34:66].reshape((-1, 32, 1)), 1) == 0).where(1.0, -1.0).reshape((-1, 16, 2, 8))
+      qh = q_to_uint8(blocks[:, 66:74].reshape((-1, 8, 1)), 2).reshape((-1, 32)).cast(dtypes.uint16)
+      q = blocks[:, 2:34].cast(dtypes.uint16) + qh.lshift(8)
+      return (db * _ggml_iq_grid(t.device, _ggml.iq2s_grid, (1024, 8))[q].reshape((-1, 16, 2, 8)) * signs).flatten(-3)
     if ggml_type == 23:
-      d = blocks[...,:2].bitcast(dtypes.float16).cast(dtypes.float32).reshape(*B, 1, 1)
+      d = blocks[:, :2].bitcast(dtypes.float16).cast(dtypes.float32).reshape((-1, 1, 1))
       scale_shifts = Tensor([0, 2, 4, 6, 8, 10, 12, 14], device=t.device, dtype=dtypes.uint16)
       iq4_xs_lut = Tensor(list(_ggml.kvalues_iq4nl), dtype=dtypes.float32, device=t.device)
-      scales_l = Tensor.stack((sl:=blocks[...,4:8]).bitwise_and(0xF), sl.rshift(4), dim=-1).reshape(*B, 8)
-      scales_h = blocks[...,2:4].bitcast(dtypes.uint16).unsqueeze(-1).rshift(scale_shifts).bitwise_and(0x03).reshape(*B, 8).cast(dtypes.uint8)
-      scales = (scales_l.bitwise_or(scales_h.lshift(4)).bitcast(dtypes.int8) - 32).cast(dtypes.float32).reshape(*B, 8, 1)
-      q = (qs:=blocks[...,8:].reshape(*B, 8, 16)).bitwise_and(0xF).cat(qs.rshift(4), dim=-1)
-      return (d * scales * iq4_xs_lut[q]).flatten(-3)
+      scales_l = Tensor.stack((sl:=blocks[:, 4:8]).bitwise_and(0xF), sl.rshift(4), dim=2).reshape((-1, 8))
+      scales_h = blocks[:, 2:4].bitcast(dtypes.uint16).unsqueeze(-1).rshift(scale_shifts).bitwise_and(0x03).reshape((-1, 8)).cast(dtypes.uint8)
+      scales = (scales_l.bitwise_or(scales_h.lshift(4)).bitcast(dtypes.int8) - 32).cast(dtypes.float32).reshape((-1, 8, 1))
+      q = (qs:=blocks[:, 8:].reshape((-1, 8, 16))).bitwise_and(0xF).cat(qs.rshift(4), dim=2)
+      return (d * scales * iq4_xs_lut[q]).flatten(-2)
     if ggml_type == 39:
-      e = blocks[...,0].cast(dtypes.uint32)
+      e = blocks[:, 0].cast(dtypes.uint32)
       small_bits = Tensor([0x00200000, 0x00400000], dtype=dtypes.uint32, device=t.device)[e.clip(0, 1).cast(dtypes.int32)] # e = 0 or e = 1 case
       d = (e < 2).where(small_bits, ((e - 1) * 0x00800000).cast(dtypes.uint32)).bitcast(dtypes.float32).unsqueeze(-1)
-      codes = q_to_uint8(blocks[...,1:17], 4)
+      codes = q_to_uint8(blocks[:, 1:17], 4)
       fp4_lut = Tensor([0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0,
                        -0.0,-1.0,-2.0,-3.0,-4.0,-6.0,-8.0,-12.0],
                       dtype=dtypes.float32, device=t.device)
       fp4_val = fp4_lut[codes]
-      return (fp4_val * d).flatten(-2)
+      return (fp4_val * d).flatten(-2)[:n]
     if ggml_type == 41:
-      d = blocks[...,:2].bitcast(dtypes.float16)
-      bits = q_to_uint8(blocks[...,2:], 1).reshape(*B, 8, 16).transpose(-1, -2).flatten(-2).bitcast(dtypes.int8)
-      return (d * (bits * 2 - 1)).flatten(-2)
+      d = blocks[:,:2].bitcast(dtypes.float16)
+      bits = q_to_uint8(blocks[:,2:], 1).reshape(-1, 8, 16).transpose(-1, -2).flatten(-2).bitcast(dtypes.int8)
+      return d * (bits * 2 - 1)
   raise ValueError(f"GGML type '{ggml_type}' is not supported!")
 
 def _read_unpack(fmt: str, n: int, r:io.BufferedIOBase): return struct.unpack(fmt, r.read(n))[0]
@@ -138,7 +134,7 @@ def _ggml_nbytes(n:int, typ:int) -> int:
   return n * _GGML_NATIVE[typ].itemsize if typ in _GGML_NATIVE else (n // _GGML_QUANT[typ][0]) * _GGML_QUANT[typ][1]
 
 def _shard_tensor(tensor:Tensor, data_start:int, t_info:tuple[str, tuple[int, ...], int, int], devices:tuple[str, ...],
-                  axis:int, raw:bool=False) -> Tensor:
+                  axis:int) -> Tensor:
   name, dims, typ, off = t_info
   shape = tuple(reversed(dims))
   ndev, off0 = len(devices), data_start + off
@@ -153,17 +149,18 @@ def _shard_tensor(tensor:Tensor, data_start:int, t_info:tuple[str, tuple[int, ..
   assert typ in _GGML_QUANT, f"{name}: native type {typ} only supports axis-0 shard"
   ne, nb = _GGML_QUANT[typ]
   assert shape[-1] % ne == 0, f"{name}: quantized last dim {shape[-1]} does not divide {ne}"
-  S = shape[-1] // ne
+  S, per = shape[-1] // ne, shape[axis] // ndev
   bv = tensor[off0:off0 + (prod(shape)//ne)*nb].to("CPU").realize().reshape(*shape[:-1], S*nb)
   assert axis != len(dims)-1 or S % ndev == 0, f"{name}: quantized shard axis size {shape[-1]//ndev} does not divide {ne}"
-  cnt = bv.shape[axis] // ndev
-  parts = [bv[tuple(slice(i*cnt, (i+1)*cnt) if a==axis else slice(None) for a in range(len(shape)))].contiguous().to(d) for i,d in enumerate(devices)]
-  Tensor.realize(*parts)
-  m = Tensor(parts[0].uop.mstack(*[p.uop for p in parts[1:]]).multi(axis))
-  return m if raw else ggml_data_to_tensor(m, prod(shape), typ).reshape(*shape)
+  cnt, part_shape = bv.shape[axis] // ndev, (*shape[:axis], per, *shape[axis+1:])
+  raws = [bv[tuple(slice(i*cnt, (i+1)*cnt) if a==axis else slice(None) for a in range(len(shape)))].contiguous().to(d) for i,d in enumerate(devices)]
+  Tensor.realize(*raws)
+  # dequant per shard then mstack -> mstack_common_op lifts dequant above MSTACK so an expert gather folds to selected rows
+  parts = [ggml_data_to_tensor(r.reshape(-1), prod(part_shape), typ).reshape(*part_shape) for r in raws]
+  return Tensor(parts[0].uop.mstack(*[p.uop for p in parts[1:]]).multi(axis))
 
 def _gguf_parse(tensor: Tensor, devices:tuple[str, ...]|None=None,
-                shard:Callable[[str], int|str|None]|None=None) -> tuple[dict, dict[str, Tensor], dict[str, int]]:
+                shard:Callable[[str], int|str|None]|None=None) -> tuple[dict, dict[str, Tensor]]:
   # TODO: remove the need for copy to default device
   if devices is None: tensor = tensor.to(None).realize()
   r = io.BufferedReader(TensorIO(tensor), 1_000_000)
@@ -181,20 +178,18 @@ def _gguf_parse(tensor: Tensor, devices:tuple[str, ...]|None=None,
 
   if devices is None:
     state_dict = {name: ggml_data_to_tensor(tensor[data_start + off:], prod(dims), typ).reshape(*reversed(dims)) for name, dims, typ, off in t_infos}
-    return kv_data, state_dict, {}
-  state_dict, types = {}, {}  # types: ggml type of the tensors kept raw (3D experts), so the consumer can dequant after the gather
+    return kv_data, state_dict
+  state_dict = {}
   for t_info in t_infos:
     name, dims, typ, off = t_info
     spec = shard(name) if shard is not None else None
     if isinstance(spec, int):
-      keep = len(dims) == 3
-      state_dict[name] = _shard_tensor(tensor, data_start, t_info, devices, spec, raw=keep)
-      if keep: types[name] = typ
+      state_dict[name] = _shard_tensor(tensor, data_start, t_info, devices, spec)
     else:
       n = prod(dims)
       raw = tensor[data_start + off:data_start + off + _ggml_nbytes(n, typ)].to(devices if spec == "replicate" else devices[0]).realize()
       state_dict[name] = ggml_data_to_tensor(raw, n, typ).reshape(*reversed(dims))
-  return kv_data, state_dict, types
+  return kv_data, state_dict
 
 def _gguf_split_paths(path: pathlib.Path, kv: dict) -> list[pathlib.Path]:
   if (total := kv.get('split.count', 1)) <= 1: return [path]
@@ -203,9 +198,9 @@ def _gguf_split_paths(path: pathlib.Path, kv: dict) -> list[pathlib.Path]:
   return [pathlib.Path(f"{m.group(1)}-{i:05d}-of-{total:05d}.gguf") for i in range(1, total+1)]
 
 def gguf_load(fn: Tensor|str|pathlib.Path, devices:tuple[str, ...]|None=None,
-              shard:Callable[[str], int|str|None]|None=None) -> tuple[dict, dict[str, Tensor], dict[str, int]]:
+              shard:Callable[[str], int|str|None]|None=None) -> tuple[dict, dict[str, Tensor]]:
   """
-  Loads a .gguf file, returning `kv_data`, `state_dict`, and `types` (ggml type of any tensors left raw). Splits are auto-merged by path.
+  Loads a .gguf file, returning the `kv_data` and `state_dict`. Multi-part splits are auto-merged when loaded by path.
 
   ```python
   import pathlib
@@ -213,16 +208,13 @@ def gguf_load(fn: Tensor|str|pathlib.Path, devices:tuple[str, ...]|None=None,
   from tinygrad.llm.gguf import gguf_load
 
   gguf_tensor = Tensor(pathlib.Path("Meta-Llama-3-8B-Instruct.Q4_0.gguf")).to(Device.DEFAULT)
-  kv_data, state_dict, _ = gguf_load(gguf_tensor)
+  kv_data, state_dict = gguf_load(gguf_tensor)
   ```
 
   NOTE: The provided tensor must be on a device that supports execution.
   """
-  kv, sd, types = _gguf_parse(fn if isinstance(fn, Tensor) else Tensor(pathlib.Path(fn)), devices, shard)
-  if kv.get('split.count', 1) <= 1: return kv, sd, types
+  kv, sd = _gguf_parse(fn if isinstance(fn, Tensor) else Tensor(pathlib.Path(fn)), devices, shard)
+  if kv.get('split.count', 1) <= 1: return kv, sd
   if isinstance(fn, Tensor): raise ValueError("multi-part GGUF requires a path argument (got Tensor)")
-  for pp in _gguf_split_paths(pathlib.Path(fn), kv)[1:]:
-    _, psd, pt = _gguf_parse(Tensor(pp), devices, shard)
-    sd.update(psd)
-    types.update(pt)
-  return kv, sd, types
+  for pp in _gguf_split_paths(pathlib.Path(fn), kv)[1:]: sd.update(_gguf_parse(Tensor(pp), devices, shard)[1])
+  return kv, sd
