@@ -242,6 +242,31 @@ class TestShardedDequantGatherFold(unittest.TestCase):
     ref = (q.cast(dtypes.float32) * s)[sel]
     self.assertLess((w[sel.to(devs)].to(Device.DEFAULT) - ref).abs().max().item(), 1e-4)
 
+class TestMstackCommonLift(unittest.TestCase):
+  """Identical per-shard compute under MSTACK (lazy dequant of sharded weight shards) lifts above the MSTACK, so an
+  advanced index folds to computing only the selected rows instead of every row on every device."""
+  def test_lazy_dequant_gather_fused(self):
+    devs, (E, O, I, k) = ("NULL:1", "NULL:2"), (64, 32, 32, 4)
+    parts = [Tensor.empty(E, O//2, I, dtype=dtypes.int8, device=d).cast(dtypes.float32).uop for d in devs]
+    w = Tensor(parts[0].mstack(parts[1]).multi(1))
+    with Context(SCACHE=0):
+      GlobalCounters.reset()
+      w[Tensor.empty(k, dtype=dtypes.int32).to(devs)].realize()
+    self.assertLess(GlobalCounters.global_mem, E*O*I*4)  # materializing the full cast would already exceed this
+
+  @unittest.skipIf(Device.DEFAULT == "NULL", "numerics need a real backend")
+  def test_lazy_dequant_gather_correct(self):
+    Tensor.manual_seed(0)
+    devs = tuple(f"{Device.DEFAULT}:{i}" for i in range(2))
+    E, O, I = 16, 8, 6
+    q = (Tensor.rand(E, O, I)*200 - 100).cast(dtypes.int8).realize()
+    s = (Tensor.rand(E, 1, 1) + 0.5).realize()
+    parts = [(q[:, i*(O//2):(i+1)*(O//2)].contiguous().to(d).cast(dtypes.float32) * s.to(d)).uop for i, d in enumerate(devs)]
+    w = Tensor(parts[0].mstack(parts[1]).multi(1))
+    sel = Tensor([1, 4, 7], dtype=dtypes.int32)
+    ref = (q.cast(dtypes.float32) * s)[sel]
+    self.assertLess((w[sel.to(devs)].to(Device.DEFAULT) - ref).abs().max().item(), 1e-4)
+
 class TestSymbolicShard(unittest.TestCase):
   def test_symbolic_allreduce_over_sharded_axis(self):
     devs = ("NULL:1", "NULL:2")
