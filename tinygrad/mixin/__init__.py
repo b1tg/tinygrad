@@ -8,7 +8,7 @@ from tinygrad.uop import Ops
 from tinygrad.uop.ops import _broadcast_shape, resolve, smax, smin, identity_element
 from tinygrad.dtype import ConstType, DTypeLike, Invalid, PtrDType, PyConst, dtypes, least_upper_dtype, sum_acc_dtype, to_dtype
 from tinygrad.helpers import all_int, argfix, argsort, ceildiv, flatten, flat_to_grouped, fully_flatten, get_shape, make_tuple, merge_dicts, prod
-from tinygrad.helpers import resolve_pool_pads, round_up
+from tinygrad.helpers import resolve_pool_pads
 
 if TYPE_CHECKING:
   from tinygrad.uop.ops import sint, UOp
@@ -190,7 +190,9 @@ class OpMixin(ElementwiseMixin, ReduceMixin):
     if lo < (dt:=to_dtype(dtype)).min or dt.max < hi: raise OverflowError(f"arange [{start}, {stop}) is not representable in dtype {dtype}")
     # NOTE: this matches numpy, torch raises RuntimeError if stop-start and step have different signs
     if (output_len:=ceildiv(stop-start, step)) <= 0: return cls.full((0,), 0, dtype=dtype, buffer=False)
-    return (cls.full((output_len,), step, dtype=dtype, buffer=False)._cumalu(0, Ops.ADD) + (start - step)).cast(dtype)
+    full = cls.full((output_len,), step, dtype=dtype, buffer=False)
+    cumulative = full._cumalu(0, Ops.ADD) if isinstance(output_len, int) else full._split_cumalu(0, Ops.ADD)
+    return (cumulative + (start - step)).cast(dtype)
 
   @classmethod
   def linspace(cls, start:int|float, stop:int|float, steps:int, dtype:DTypeLike|None=None) -> Self:
@@ -762,11 +764,11 @@ class OpMixin(ElementwiseMixin, ReduceMixin):
     # for now this is a two stage cumsum
     SPLIT = 256
     value = identity_element(op, self.dtype)
-    if not isinstance(s:=self.shape[axis], int) or s <= SPLIT*2: return self._cumalu(axis, op)
-    ret = self.transpose(axis,-1)._pad_constant((None,)*(self.ndim-1)+((round_up(s,SPLIT)-s,0),), value).unflatten(-1,(-1,SPLIT))._cumalu(-1, op)
+    if isinstance(s:=self.shape[axis], int) and s <= SPLIT*2: return self._cumalu(axis, op)
+    ret = self.transpose(axis,-1)._pad_constant((None,)*(self.ndim-1)+((0,ceildiv(s,SPLIT)*SPLIT-s),), value).unflatten(-1,(-1,SPLIT))._cumalu(-1, op)
     base = ret[..., -1]._cumalu(-1, op)._pad_constant((None,)*(ret.ndim-2) + ((1, -1),), value)
     base = base.unsqueeze(-1).expand(*base.shape, ret.shape[-1])
-    def fix(x: Self) -> Self: return x.flatten(start_dim=-2)[..., -s:].transpose(axis,-1)
+    def fix(x: Self) -> Self: return x.flatten(start_dim=-2)[..., :s].transpose(axis,-1)
     return fix(ret).alu(op, fix(base))
 
   def cumsum(self, axis:int=0) -> Self:

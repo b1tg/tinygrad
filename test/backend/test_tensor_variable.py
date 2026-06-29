@@ -1,6 +1,6 @@
 import unittest
 import numpy as np
-from tinygrad import Tensor, Variable
+from tinygrad import Tensor, Variable, GlobalCounters
 
 class TestTensorVariable(unittest.TestCase):
   def test_add_tvar(self):
@@ -160,6 +160,29 @@ class TestTensorVariable(unittest.TestCase):
       out = mask.shrink(((0, 1), (0, 1), (0, 4), (0, start_pos+4))).numpy()
       expected = np.tril(np.full((1, 1, 4, start_pos+4), float("-inf")), k=start_pos+1)
       np.testing.assert_equal(out, expected)
+
+class TestSymbolicCumsum(unittest.TestCase):
+  def test_symbolic_cumsum(self):
+    for n in (5, 256, 513, 600, 1000):
+      v = Variable("n", 1, 2000).bind(n)
+      got = Tensor.arange(2000).float().contiguous()[:v].cumsum().pad(((0, 2000-v),)).numpy()
+      np.testing.assert_allclose(got[:n], np.cumsum(np.arange(n)), rtol=1e-4)
+
+  def test_symbolic_arange(self):
+    for n in (5, 256, 600):
+      v = Variable("n", 1, 2000).bind(n)
+      np.testing.assert_equal(Tensor.arange(v).pad(((0, 2000-v),)).numpy()[:n], np.arange(n))
+
+  def test_symbolic_cumsum_is_linear(self):
+    def ops(n):
+      v = Variable("n", 1, 16384).bind(n)
+      base = Tensor.ones(16384).contiguous().realize()
+      GlobalCounters.reset()
+      base[:v].cumsum().realize()
+      return GlobalCounters.global_ops
+    o1, o8 = ops(1024), ops(8192)
+    if o1 == 0: self.skipTest("backend doesn't report op estimates (e.g. CPU:X86 asm)")
+    self.assertLess(o8/o1, 16, f"symbolic cumsum ops grew {o8/o1:.1f}x for 8x length (quadratic?)")
 
 if __name__ == '__main__':
   unittest.main()
