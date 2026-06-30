@@ -2,7 +2,7 @@ from __future__ import annotations
 import math, itertools
 from collections import defaultdict
 from typing import cast, Final
-from tinygrad.uop.ops import Ops, UOp, KernelInfo, graph_rewrite, AxisType, ssimplify, remove_all_tags, identity_element, PatternMatcher, UPat
+from tinygrad.uop.ops import Ops, UOp, KernelInfo, graph_rewrite, AxisType, ssimplify, remove_all_tags
 from tinygrad.uop.ops import axis_letters, axis_colors, axis_to_pos
 from tinygrad.helpers import ceildiv
 from tinygrad.device import Buffer
@@ -10,19 +10,8 @@ from tinygrad.dtype import dtypes, Invalid
 from tinygrad.helpers import colored, getenv, DEBUG, to_function_name, NOOPT, argsort, round_up, prod, merge_dicts, get_single_element, flatten
 from tinygrad.helpers import ALLOW_TF32, count, Context
 from tinygrad.codegen.opt import Opt, OptOps, KernelOptError, check
-from tinygrad.codegen.simplify import pm_flatten_range
+from tinygrad.codegen.simplify import pm_flatten_range, pm_gate_reduce_tail
 from tinygrad.renderer import Renderer
-
-# when a symbolic reduce axis is rounded up to parallelize, gate the overshoot: reduce value->identity, load index->Invalid (OOB safe)
-def _gate_reduce_tail(r:UOp, ctx):
-  sub_axis, cond, new_rng = ctx
-  if sub_axis not in r.src[1:] or (r.src[0].op is Ops.WHERE and r.src[0].src[0] is cond): return None
-  return r.replace(src=(cond.where(r.src[0], r.src[0].const_like(identity_element(r.arg[0], r.src[0].dtype))),)+r.src[1:])
-def _gate_index_oob(ix:UOp, ctx):
-  sub_axis, cond, new_rng = ctx
-  if new_rng not in ix.src[1].backward_slice or (ix.src[1].op is Ops.WHERE and ix.src[1].src[2].arg is Invalid): return None
-  return ix.replace(src=(ix.src[0], ix.src[1].valid(cond)) + ix.src[2:])
-pm_gate_reduce_tail = PatternMatcher([(UPat(Ops.REDUCE, name="r"), _gate_reduce_tail), (UPat(Ops.INDEX, name="ix"), _gate_index_oob)])
 
 class Scheduler:
   def __init__(self, ast:UOp, ren:Renderer):

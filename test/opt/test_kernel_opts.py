@@ -1,11 +1,19 @@
 import unittest
-from tinygrad import Device, Tensor, dtypes
+from tinygrad import Device, Tensor, dtypes, Variable
 from tinygrad.codegen.opt import Opt, OptOps, KernelOptError
 
 # TODO: write a clean version of this
-from test.backend.test_linearizer import helper_linearizer_opt
+from test.backend.test_linearizer import helper_linearizer_opt, replace_opts, to_program
 
 class TestKernelOpts(unittest.TestCase):
+  @unittest.skipUnless(Device[Device.DEFAULT].renderer.has_local, "test requires locals")
+  def test_group_symbolic_reduce(self):
+    # GROUP a symbolic reduce axis by a non-dividing amount: rounds up + gates the tail (master raises KernelOptError)
+    A, B = Tensor.rand(8, 512).realize(), Tensor.rand(512, 8).realize()
+    vi = Variable("i", 1, 512).bind(333)
+    ast = (A[:, :vi] @ B[:vi, :]).linear_with_vars()[0].src[-1].src[0]
+    to_program(replace_opts(ast, [Opt(OptOps.GROUP, 0, 3)]), renderer=Device[Device.DEFAULT].renderer)
+
   @unittest.skipUnless(Device[Device.DEFAULT].renderer.has_local, "test requires locals")
   @unittest.skipUnless(Device[Device.DEFAULT].renderer.has_shared, "test requires shared")
   def test_local_and_grouped_reduce(self):
