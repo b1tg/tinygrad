@@ -92,6 +92,8 @@ def get_kernel_actions(s:Scheduler, include_0=True, max_up:int|None=None) -> dic
   kernel_actions = actions.copy()
 
   for i,a in enumerate(kernel_actions):
+    # skip GROUP/GROUPTOP on symbolic output grids (batched prefill: reduce split is redundant + mis-behaves)
+    if a.op in {OptOps.GROUP, OptOps.GROUPTOP} and any(not isinstance(s.full_shape[j], int) for j in s.axes_of(AxisType.GLOBAL)): continue
     if a.axis is not None and a.op is not OptOps.TC:
       try: ax = s.real_axis(a.op, a.axis)
       except KernelOptError: continue

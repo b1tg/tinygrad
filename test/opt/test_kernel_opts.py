@@ -1,6 +1,8 @@
 import unittest
 from tinygrad import Device, Tensor, dtypes, Variable
 from tinygrad.codegen.opt import Opt, OptOps, KernelOptError
+from tinygrad.codegen.opt.search import get_kernel_actions
+from tinygrad.codegen.opt.postrange import Scheduler
 
 # TODO: write a clean version of this
 from test.backend.test_linearizer import helper_linearizer_opt, replace_opts, to_program
@@ -13,6 +15,24 @@ class TestKernelOpts(unittest.TestCase):
     vi = Variable("i", 1, 512).bind(333)
     ast = (A[:, :vi] @ B[:vi, :]).linear_with_vars()[0].src[-1].src[0]
     to_program(replace_opts(ast, [Opt(OptOps.GROUP, 0, 3)]), renderer=Device[Device.DEFAULT].renderer)
+
+  @unittest.skipUnless(Device[Device.DEFAULT].renderer.has_local, "test requires locals")
+  def test_no_group_on_symbolic_output(self):
+    # GROUP/GROUPTOP split a reduce for parallelism; a symbolic output grid (batched prefill) already saturates the GPU, so BEAM must not offer it
+    ren = Device[Device.DEFAULT].renderer
+    def groups(ast):
+      s = Scheduler(ast, ren); s.convert_loop_to_global()  # BEAM globalizes output loops before enumerating actions
+      return [o for sc in get_kernel_actions(s, include_0=False).values() for o in sc.applied_opts if o.op in (OptOps.GROUP, OptOps.GROUPTOP)]
+    kv, toks = Variable("kv", 1, 1024).bind(1000), Variable("toks", 1, 512).bind(32)
+    v = Tensor.rand(8, 1, 1024, 128, dtype=dtypes.half).realize()
+    # prefill: symbolic query dim in the output -> no GROUP candidates
+    wp = Tensor.rand(8, 2, 512, 1024, dtype=dtypes.half).realize()
+    pre = (wp[:, :, :toks, :kv].unsqueeze(-1) * v[:, :, None, :kv, :]).sum(3).linear_with_vars()[0].src[-1].src[0]
+    self.assertEqual(groups(pre), [])
+    # decode: fixed-size output -> GROUP still offered
+    wd = Tensor.rand(8, 2, 1024, dtype=dtypes.half).realize()
+    dec = (wd[:, :, :kv].unsqueeze(-1) * v[:, :, :kv, :]).sum(2).linear_with_vars()[0].src[-1].src[0]
+    self.assertNotEqual(groups(dec), [])
 
   @unittest.skipUnless(Device[Device.DEFAULT].renderer.has_local, "test requires locals")
   @unittest.skipUnless(Device[Device.DEFAULT].renderer.has_shared, "test requires shared")
