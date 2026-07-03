@@ -17,7 +17,9 @@ def linearize(sink:UOp) -> list[UOp]:
     for s in u.src: out_degree[s] += 1
 
     # we place UOps with higher run_counts later
-    run_count = prod([int(r.vmax)+1 for r in u.ranges])
+    # NOTE: a symbolic range can have vmax 0 (e.g. a padded small variable), it still must order like a loop,
+    # otherwise loop-independent UOps (like the acc init STORE) can get placed inside of it
+    run_count = prod([max(int(r.vmax)+1, 2) for r in u.ranges])
 
     # simple priority override. this is all bottom up now, smaller numbers will be closer to the top
     extra = None

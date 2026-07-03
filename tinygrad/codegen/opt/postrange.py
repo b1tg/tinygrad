@@ -2,7 +2,7 @@ from __future__ import annotations
 import math, itertools
 from collections import defaultdict
 from typing import cast, Final
-from tinygrad.uop.ops import Ops, UOp, KernelInfo, graph_rewrite, AxisType, ssimplify, remove_all_tags
+from tinygrad.uop.ops import Ops, UOp, KernelInfo, graph_rewrite, AxisType, sint, ssimplify, remove_all_tags
 from tinygrad.uop.ops import axis_letters, axis_colors, axis_to_pos
 from tinygrad.device import Buffer
 from tinygrad.dtype import dtypes, Invalid
@@ -141,6 +141,12 @@ class Scheduler:
 
     ret = None
     if opt.op in opt_to_at:
+      # symbolic sized ranges can't be split directly. pad them to a multiple of the split amount first (the tail is masked off)
+      if not isinstance(ssimplify(rng.src[0]), int):
+        check(isinstance(opt.arg, int) and opt.arg > 1, "symbolic axis needs an explicit split amount")
+        if rng.src[0].divides(cast(int, opt.arg)) is None:
+          self.apply_opt(Opt(OptOps.PADTO, real_axis, opt.arg), append_opt=False)
+          rng = self.rngs[real_axis]
       amt:int = int(rng.vmax+1) if opt.arg == 0 else cast(int, opt.arg)
 
       # copied from kernel.py. prevents METAL compiler hangs
@@ -185,14 +191,27 @@ class Scheduler:
       except ValueError as e: raise KernelOptError(str(e))
       check(ret is not None, "no tensor core available")
     elif opt.op is OptOps.PADTO:
-      check(rng.src[0].op is Ops.CONST, "only pad const axes")
       check(rng.arg[-1] not in {AxisType.UPCAST, AxisType.UNROLL}, "cannot pad upcasted") # TODO: why is this wrong?
       check(rng.arg[-1] is not AxisType.THREAD, "cannot pad thread")
-      new_sz = round_up(int(rng.vmax+1), cast(int, opt.arg))
-      check(rng.vmax+1 > new_sz//4, "pad adds more than quadruple the work")
+      # padding a reduce range is only correct if the range enters the reduce through (masked) INDEX loads
+      if rng.arg[-1] in {AxisType.REDUCE, AxisType.GROUP_REDUCE}:
+        for r in [u for u in self.ast.backward_slice if u.op is Ops.REDUCE and rng in u.src[1:]]:
+          check(rng in r.src[0].ranges, "can't pad a reduce range the reduce input doesn't use")
+          seen, stack = set(), [r.src[0]]
+          while stack:
+            if (u:=stack.pop()) in seen or u.op is Ops.INDEX: continue
+            check(u is not rng, "can't pad a reduce range that computes values")
+            seen.add(u)
+            stack.extend(u.src)
+      if isinstance(sz:=ssimplify(rng.src[0]), int):
+        new_sz:sint = round_up(sz, cast(int, opt.arg))
+        check(sz > new_sz//4, "pad adds more than quadruple the work")
+      else:
+        # pad a symbolic range to the next multiple of amt. the (x//amt)*amt form keeps it divisible by amt for later splits
+        new_sz = (sz + (cast(int, opt.arg)-1)) // cast(int, opt.arg) * cast(int, opt.arg)
       replaced_rng = UOp.range(new_sz, *rng.arg)
       replaces = {rng:replaced_rng}
-      valid = replaced_rng < rng.vmax+1
+      valid = replaced_rng < sz
       store_targets = {s.src[0] for s in self.ast.backward_slice_with_self if s.op is Ops.STORE}
       for b in self.bufs:
         if rng in (i:=b.src[1].get_idx()).backward_slice_with_self:
@@ -251,7 +270,7 @@ class Scheduler:
           try:
             for i,a in enumerate(axes):
               idx = self.rngs.index(a)
-              if (a.vmax+1) % tc.dims[i] != 0:
+              if a.src[0].divides(tc.dims[i]) is None:
                 if opt_level < 2: raise KernelOptError("tc padding requires opt_level >= 2")
                 # apply_opt should return the updated range?
                 self.apply_opt(Opt(OptOps.PADTO, idx, tc.dims[i]), append_opt=False) # PADTO might fail

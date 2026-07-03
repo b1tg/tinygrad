@@ -132,8 +132,9 @@ class FFNBlock:
     # we pass in the weights implicitly so we unpack the GGUF on the fly
     @function(precompile=True, allow_implicit=True)
     def _run(x:Tensor, start_pos:int|UOp):
-      h =     x + self._attention(self.attn_norm(x), start_pos)
-      return (h + self._feed_forward(self.ffn_norm(h))).contiguous()
+      # feed the norm output to the projections in half so matmuls hit tensor cores (half in, float acc); the residual stays float
+      h =     x + self._attention(self.attn_norm(x).half(), start_pos)
+      return (h + self._feed_forward(self.ffn_norm(h).half())).contiguous()
     return _run(x, start_pos)
 
 class TransformerBlock(FFNBlock):

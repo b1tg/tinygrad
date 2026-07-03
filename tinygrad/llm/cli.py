@@ -210,6 +210,13 @@ def main():
 
   # do benchmark
   if args.benchmark is not None:
+    # prefill: time to first token on a fresh prompt, same as serve mode. first rounds include JIT capture, the last one is warm
+    n = min(512, model.max_context-1)
+    for i in range(3):
+      profile_marker(f"prefill @ {i}")
+      GlobalCounters.reset()
+      with Timing("prefill ", on_exit=lambda x: f", {n*1e9/x:6.2f} tok/s, {GlobalCounters.global_mem/x:7.2f} GB/s"):
+        next(model.generate([i+1] + [0]*(n-1)))
     gen = model.generate(toks:=[tok.bos_id or 0])
     for i in range(args.benchmark):
       profile_marker(f"decode @ {i}")

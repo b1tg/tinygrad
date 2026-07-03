@@ -214,10 +214,18 @@ def merge_reduce_ends(ctx:ReduceContext, sink:UOp):
       for e in group: subs[e] = merged
   return sink.substitute(subs) if subs else None
 
+# after the expander, a vectorized Invalid is a STACK of scalar Invalid CONSTs
+invalid_gate_vec = UPat.var("cond").where(UPat.var("x"), UPat(Ops.STACK, src=UPat(Ops.CONST, arg=Invalid), name="i"))
+def _reduce_invalid_to_identity(red:UOp, cond:UOp, x:UOp, i:UOp) -> UOp|None:
+  # only for data dtypes. a weakint Invalid is an invalid index and keeps its poison semantics
+  if x.dtype.scalar() is dtypes.weakint and i.op is Ops.STACK: return None
+  return red.replace(src=(cond.where(x, identity_element(red.arg[0], x.dtype.scalar())),)+red.src[1:])
+
 pm_reduce = PatternMatcher([
-  # invalid -> identity element
-  (UPat(Ops.REDUCE, src=(invalid_gate,), allow_any_len=True, name="red"), lambda red,cond,x,i:
-    red.replace(src=(cond.where(x, identity_element(red.arg[0], x.dtype.scalar())),)+red.src[1:])),
+  # invalid -> identity element. each masked lane must contribute the identity individually, if the Invalid survives
+  # into the accumulator, invalid-propagation merges the lane gates with AND and drops valid lanes of the unroll
+  (UPat(Ops.REDUCE, src=(invalid_gate,), allow_any_len=True, name="red"), _reduce_invalid_to_identity),
+  (UPat(Ops.REDUCE, src=(invalid_gate_vec,), allow_any_len=True, name="red"), _reduce_invalid_to_identity),
   # REDUCE -> DEFINE_ACC+ASSIGN, then merge ENDs with same range
   (UPat(Ops.REDUCE, name="red"), reduce_to_acc),
   (UPat(Ops.SINK, name="sink"), merge_reduce_ends),
