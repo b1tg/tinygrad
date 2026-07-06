@@ -11,11 +11,20 @@ _TP_LAYOUT: dict[str, int|str] = {
   "ffn_gate.weight":0, "ffn_up.weight":0, "ffn_down.weight":1,
   "ffn_gate_shexp.weight":"replicate", "ffn_up_shexp.weight":"replicate", "ffn_down_shexp.weight":"replicate",
   "ffn_gate_exps.weight":1, "ffn_up_exps.weight":1, "ffn_down_exps.weight":2,
-  "attn_norm.weight":"replicate", "attn_q_a.weight":"replicate", "attn_q_a_norm.weight":"replicate",
+  "attn_norm.weight":"replicate", "attn_q_norm.weight":"replicate", "attn_k_norm.weight":"replicate",
+  "attn_q_a.weight":"replicate", "attn_q_a_norm.weight":"replicate",
   "attn_kv_a_mqa.weight":"replicate", "attn_kv_a_norm.weight":"replicate",
   "ffn_norm.weight":"replicate", "ffn_gate_inp.weight":"replicate", "exp_probs_b.bias":"replicate",
+  "output.weight":0, "output_norm.weight":"replicate",
 }
 def _shard_policy(name:str) -> int|str|None: return _TP_LAYOUT.get(name.split(".", 2)[-1] if name.startswith("blk.") else name)
+# under hidden-split sharding the per-device gate/up GEMVs are narrow; loading them as one byte-concatenated tensor
+# (per device: gate rows then up rows, exact quant bytes) halves the kernel count and widens the GEMV
+def _fuse_policy(name:str) -> tuple[str, str]|None:
+  # return None
+  if name.startswith("blk.") and name.endswith(".ffn_gate_exps.weight"):
+    return (name.replace("ffn_gate_exps", "ffn_up_exps"), name.replace("ffn_gate_exps", "ffn_gateup_exps"))
+  return None
 
 @functools.cache
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, device:str|None=None) -> Tensor:
@@ -110,7 +119,7 @@ class FFNBlock:
       self.ffn_down    = nn.Linear(config.hidden_dim, config.dim, bias=False)
 
   def _feed_forward(self, x:Tensor) -> Tensor:
-    if hasattr(self, 'ffn_gate_exps'):
+    if hasattr(self, 'ffn_gate_exps') or hasattr(self, 'ffn_gateup_exps'):
       h = x.unsqueeze(2)  # (B, T, 1, D) - add expert dim for broadcasting
       logits = self.ffn_gate_inp(x)
       if hasattr(self, 'exp_probs_b'):
@@ -122,7 +131,17 @@ class FFNBlock:
         vals, sel = pairwise_topk(logits, self.config.num_experts_per_tok)
         probs = vals.softmax(-1) if self.config.norm_topk_prob else logits.softmax(-1).gather(-1, sel)
       probs = probs * self.config.routed_scaling_factor
-      x_down = self.ffn_down_exps(sel, (self.ffn_gate_exps(sel, h).silu() * self.ffn_up_exps(sel, h)).contiguous())  # (B, T, k, D)
+      if hasattr(self, 'ffn_gateup_exps'):
+        # fused gate+up: each device's slice is [gate_local, up_local], so the logical layout along the last
+        # axis is (ndev, 2, hidden//ndev); split it there and fold back to the same layout ffn_down_exps expects
+        ndev = len(self.ffn_gateup_exps.weight.device)
+        gu = self.ffn_gateup_exps(sel, h)  # (B, T, k, 2*hidden)
+        gu = gu.reshape(*gu.shape[:-1], ndev, 2, gu.shape[-1]//(2*ndev))
+        hmid = gu[..., 0, :].silu() * gu[..., 1, :]  # (B, T, k, ndev, hidden//ndev)
+        hmid = hmid.reshape(*hmid.shape[:3], hmid.shape[3]*hmid.shape[4])
+        x_down = self.ffn_down_exps(sel, hmid.contiguous())  # (B, T, k, D)
+      else:
+        x_down = self.ffn_down_exps(sel, (self.ffn_gate_exps(sel, h).silu() * self.ffn_up_exps(sel, h)).contiguous())  # (B, T, k, D)
       out = (x_down * probs.unsqueeze(-1)).sum(axis=2)  # (B, T, D)
       if hasattr(self, 'ffn_gate_shexp'):
         shexp = self.ffn_down_shexp(self.ffn_gate_shexp(x).silu().contiguous() * self.ffn_up_shexp(x))
@@ -198,7 +217,10 @@ class TransformerBlock(FFNBlock):
   def _init_state(self, x:Tensor):
     if not hasattr(self, "cache_kv"):
       # TODO: how is the dtype of this determined?
-      self.cache_kv = Tensor.empty(2, x.shape[0], self.config.n_kv_heads, self.config.max_context, self.config.head_dim, device=x.device)
+      shape = (2, x.shape[0], self.config.n_kv_heads, self.config.max_context, self.config.head_dim)
+      # sharded cache buffers must be realized: store+after on an unrealized multi-device buffer compiles wrong
+      self.cache_kv = Tensor.zeros(*shape, device=x.device[0]).contiguous().shard(x.device, axis=2).realize() if isinstance(x.device, tuple) \
+        else Tensor.empty(*shape, device=x.device)
       self.freqs_cis = precompute_freqs_cis(self.config.rope_dim, self.config.max_context, self.config.rope_theta, device=x.device)
 
 class MLATransformerBlock(FFNBlock):
@@ -245,7 +267,10 @@ class MLATransformerBlock(FFNBlock):
 
   def _init_state(self, x:Tensor):
     if not hasattr(self, "cache_k"):
-      self.cache_k = Tensor.empty(x.shape[0], 1, self.config.max_context, self.config.kv_lora_rank + self.config.rope_dim, device=x.device)
+      shape = (x.shape[0], 1, self.config.max_context, self.config.kv_lora_rank + self.config.rope_dim)
+      # sharded cache buffers must be realized: store+after on an unrealized multi-device buffer compiles wrong
+      self.cache_k = Tensor.zeros(*shape, device=x.device[0]).contiguous().shard(x.device).realize() if isinstance(x.device, tuple) \
+        else Tensor.empty(*shape, device=x.device)
       self.freqs_cis = precompute_freqs_cis(self.config.rope_dim, self.config.max_context, self.config.rope_theta, device=x.device)
 
 class GatedDeltaNetBlock(FFNBlock):
@@ -327,10 +352,15 @@ class Transformer:
     x = self.token_embd(tokens).float()                   # (B, T, D)
     if self.devices is not None: x = x.to(self.devices)
     for block in self.blk: x = block(x, start_pos)
-    if self.devices is not None: x = x.to(self.devices[0])
-    logits = self.output(self.output_norm(x))[:, -1, :]
+    # vocab-sharded lm_head: keep x replicated so every device computes its slice of the logits
+    sharded_head = self.devices is not None and isinstance(self.output.weight.device, tuple)
+    x = self.output_norm(x)
+    if self.devices is not None and not sharded_head: x = x.to(self.devices[0])  # e.g. tied output.weight stays whole
+    logits = self.output(x)[:, -1, :]
+    if sharded_head: temperature = temperature.to(self.devices)
     # Gumbel-max trick: argmax(logits/temp - log(-log(uniform))) is equivalent to sampling from softmax(logits/temp)
-    return (logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1, keepdim=True)
+    out = (logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1, keepdim=True)
+    return out.to(self.devices[0]) if sharded_head else out
 
   def __call__(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
     return (self.prefill_jit if resolve(tokens.shape[1] != 1) else self.rollout_jit)(tokens.contiguous(), start_pos, temperature)
@@ -340,10 +370,15 @@ class Transformer:
                 realize=bool(getenv("REALIZE", 0)), shard:int=1) -> tuple[Transformer, dict]:
     # TODO: remove the need for copy to default device
     devices = tuple(Device.canonicalize(f"{Device.DEFAULT}:{i}") for i in range(shard)) if shard > 1 else None
-    kv, state_dict = gguf_load(gguf.to(None).realize() if isinstance(gguf, Tensor) else gguf, devices, shard_policy=_shard_policy)
+    kv, state_dict = gguf_load(gguf.to(None).realize() if isinstance(gguf, Tensor) else gguf, devices, shard_policy=_shard_policy,
+                               fuse_policy=_fuse_policy if devices is not None else None)
 
     # all state items should be float16, not float32
     state_dict = {k:v.cast('float16') if getenv("HALF", 1) else v for k,v in state_dict.items()}
+    # routers are stored fp32 and read every decode step: materialize the fp16 cast once instead of re-reading 2x bytes
+    if getenv("HALF", 1) and (routers := {k: v.contiguous() for k, v in state_dict.items() if k.endswith("ffn_gate_inp.weight")}):
+      Tensor.realize(*routers.values())
+      state_dict.update(routers)
 
     # some models like Llama 3.2 don't have an output.weight, they just tie to the token_embd.weight
     if 'output.weight' not in state_dict: state_dict['output.weight'] = state_dict['token_embd.weight']
@@ -399,6 +434,11 @@ class Transformer:
       expert_bias=f"blk.{kv.get(f'{arch}.leading_dense_block_count', 0)}.exp_probs_b.bias" in state_dict)
     model = Transformer(config)
     model.devices = devices
+    # restructure blocks whose gate/up expert weights were loaded as one fused tensor
+    for i, b in enumerate(model.blk):
+      if f"blk.{i}.ffn_gateup_exps.weight" in state_dict:
+        b.ffn_gateup_exps = ExpertWeights(config.num_experts, config.dim, 2*config.hidden_dim)
+        del b.ffn_gate_exps, b.ffn_up_exps
     for k,v in nn.state.get_state_dict(model).items():
       if (sd:=state_dict.get(k)) is not None and isinstance(sd.device, tuple) and not isinstance(v.device, tuple):
         v.replace(Tensor.empty(*v.shape, device=sd.device[0]).shard(sd.device, axis=sd.uop.axis))

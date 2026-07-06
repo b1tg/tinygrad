@@ -1,7 +1,7 @@
 import os, struct, unittest, tempfile, pathlib, sys
 from tinygrad import dtypes, Tensor, fetch, Device
 from tinygrad.helpers import disable_gc, prod
-from tinygrad.llm.gguf import _ggml_iq_grid, ggml_data_to_tensor, gguf_load, _shard_tensor
+from tinygrad.llm.gguf import _ggml_iq_grid, ggml_data_to_tensor, gguf_load, _shard_tensor, _shard_tensor_fused
 from test.helpers import not_support_multi_device
 from tinygrad.runtime.autogen import ggml_common as _ggml
 import numpy as np
@@ -62,22 +62,45 @@ class TestGGUF(unittest.TestCase):
   def test_dequantization_iq4_xs(self): self._test_dequantization(GGMLQuantizationType.IQ4_XS)
   def test_dequantization_mxfp4(self): self._test_dequantization(GGMLQuantizationType.MXFP4)
 
+  @staticmethod
+  def _test_bytes(ggml_type, shape, seed=0):
+    if ggml_type == GGMLQuantizationType.F16.value:
+      return Tensor([(i + seed) % 64 for i in range(prod(shape))], dtype=dtypes.float16).bitcast(dtypes.uint8)
+    nelems, nbytes = (32, 34) if ggml_type == GGMLQuantizationType.Q8_0.value else (32, 18)
+    nblk = prod(shape)//nelems
+    scale = Tensor.ones(nblk, 1, dtype=dtypes.float16).bitcast(dtypes.uint8)
+    quants = ((Tensor.arange(nblk*(nbytes-2)) + seed) % 256).cast(dtypes.uint8).reshape(nblk, nbytes-2)
+    return scale.cat(quants, dim=1).flatten()
+
+  _SHARD_TYPES = (GGMLQuantizationType.Q8_0.value, GGMLQuantizationType.Q4_0.value, GGMLQuantizationType.F16.value)
+
   @unittest.skipIf(not_support_multi_device(), "no multi device")
   def test_shard_tensor(self):
     devices = tuple(f"{Device.DEFAULT}:{i}" for i in range(2))
-    def q8_0_bytes(shape):
-      nblk = prod(shape)//32
-      scale = Tensor.ones(nblk, 1, dtype=dtypes.float16).bitcast(dtypes.uint8)
-      quants = (Tensor.arange(nblk*32) % 256).cast(dtypes.uint8).reshape(nblk, 32)
-      return scale.cat(quants, dim=1).flatten()
-    def f16_bytes(shape): return Tensor([i % 64 for i in range(prod(shape))], dtype=dtypes.float16).bitcast(dtypes.uint8)
-    for ggml_type, mkbytes in ((GGMLQuantizationType.Q8_0.value, q8_0_bytes), (GGMLQuantizationType.F16.value, f16_bytes)):
+    for ggml_type in self._SHARD_TYPES:
       for shape, shard_axis in (((64,128),0), ((4,32,64),1), ((4,32,64),2)):
-        data = mkbytes(shape)
+        data = self._test_bytes(ggml_type, shape)
         unsharded = ggml_data_to_tensor(data, prod(shape), ggml_type).reshape(shape)
         sharded = _shard_tensor(data, 0, ("w", tuple(reversed(shape)), ggml_type, 0), devices, shard_axis)
         self.assertEqual(sharded.uop.axis, shard_axis)
         self.assertEqual(sharded.tolist(), unsharded.tolist())
+
+  @unittest.skipIf(not_support_multi_device(), "no multi device")
+  def test_shard_tensor_fused(self):
+    devices = tuple(f"{Device.DEFAULT}:{i}" for i in range(2))
+    shape, cnt = (4, 32, 64), 32 // len(devices)
+    for ggml_type in self._SHARD_TYPES:
+      da, db = self._test_bytes(ggml_type, shape), self._test_bytes(ggml_type, shape, seed=7)
+      a = ggml_data_to_tensor(da, prod(shape), ggml_type).reshape(shape)
+      b = ggml_data_to_tensor(db, prod(shape), ggml_type).reshape(shape)
+      # logical layout: per-device [a_local, b_local] concatenated along axis 1
+      ref = Tensor.cat(*[t[:, i*cnt:(i+1)*cnt] for i in range(len(devices)) for t in (a, b)], dim=1)
+      data = da.cat(db)
+      fused = _shard_tensor_fused(data, 0, ("a", tuple(reversed(shape)), ggml_type, 0),
+                                  ("b", tuple(reversed(shape)), ggml_type, da.shape[0]), devices)
+      self.assertEqual(fused.uop.axis, 1)
+      self.assertEqual(fused.shape, (shape[0], 2*shape[1], shape[2]))
+      self.assertEqual(fused.tolist(), ref.tolist())
 
   @unittest.skipUnless(dtypes.bfloat16 in supported_dtypes, "Backend must support bfloat16")
   def test_dequantization_bf16(self): self._test_dequantization(GGMLQuantizationType.BF16)

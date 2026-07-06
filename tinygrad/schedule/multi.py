@@ -130,7 +130,10 @@ def copy_multi(multi:UOp, device:str | tuple[str, ...]):
     return pieces[0].cat(*pieces[1:], dim=multi.axis)
   return multi.src[0]._unshard(multi.axis).allreduce(Ops.ADD, device)
 
-def store_after_multi(dest:UOp, src:UOp): return dest.after(dest.store(src.src[0])).multi(src.axis)
+def store_after_multi(full:UOp, dest:UOp, src:UOp):
+  # the AFTER's value is the full buffer, the STORE targets the (possibly sliced) dest view. all per-shard, then re-MULTI
+  if not (full.axis == dest.axis == src.axis): return None
+  return full.src[0].after(dest.src[0].store(src.src[0])).multi(full.axis)
 
 def passthrough_multi(root:UOp, multi:UOp):
   return UOp(root.op, root.dtype, (multi.src[0],)+tuple(x.src[0] if x.op is Ops.MULTI else x for x in root.src[1:]), root.arg).multi(multi.axis)
@@ -161,7 +164,8 @@ multi_pm = PatternMatcher([
   (UPat(Ops.SHRINK, src=(UPat(Ops.MULTI, name="multi"), UPat(), UPat()), name="root"), shrink_multi),
   (UPat(Ops.PERMUTE, src=(UPat(Ops.MULTI, name="multi"), ), name="root"), permute_multi),
   (UPat(Ops.FLIP, src=(UPat(Ops.MULTI, name="multi"), ), name="root"), flip_multi),
-  (UPat(Ops.AFTER, src=(UPat(Ops.MULTI), UPat(Ops.STORE, src=(UPat(Ops.MULTI, name="dest"), UPat(Ops.MULTI, name="src"))))), store_after_multi),
+  (UPat(Ops.AFTER, src=(UPat(Ops.MULTI, name="full"), UPat(Ops.STORE, src=(UPat(Ops.MULTI, name="dest"), UPat(Ops.MULTI, name="src"))))),
+   store_after_multi),
   (UPat(Ops.COPY, src=(UPat(Ops.MULTI, name="multi"),), name="copy"), lambda multi,copy: copy_multi(multi, copy.arg)),
   (UPat(Ops.ALLREDUCE, src=(UPat(Ops.MULTI, name="multi"),), name="red"),
     lambda multi,red: multi.src[0].allreduce(*red.arg).multi(axis=multi.axis)),
