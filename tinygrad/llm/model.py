@@ -163,8 +163,9 @@ class FFNBlock:
     # we pass in the weights implicitly so we unpack the GGUF on the fly
     @function(precompile=True, allow_implicit=True)
     def _run(x:Tensor, start_pos:int|UOp):
-      h =     x + self._attention(self.attn_norm(x), start_pos)
-      return (h + self._feed_forward(self.ffn_norm(h))).contiguous()
+      # norm outputs are materialized: fusing the norm tail into the following GEMVs makes BEAM land on ~2x slower schedules
+      h =     x + self._attention(self.attn_norm(x).contiguous(), start_pos)
+      return (h + self._feed_forward(self.ffn_norm(h).contiguous())).contiguous()
     return _run(x, start_pos)
 
 class TransformerBlock(FFNBlock):
@@ -354,7 +355,7 @@ class Transformer:
     for block in self.blk: x = block(x, start_pos)
     # vocab-sharded lm_head: keep x replicated so every device computes its slice of the logits
     sharded_head = self.devices is not None and isinstance(self.output.weight.device, tuple)
-    x = self.output_norm(x)
+    x = self.output_norm(x).contiguous()  # see FFNBlock._run: don't fuse the norm tail into the lm head GEMV
     if self.devices is not None and not sharded_head: x = x.to(self.devices[0])  # e.g. tied output.weight stays whole
     logits = self.output(x)[:, -1, :]
     if sharded_head: temperature = temperature.to(self.devices)
