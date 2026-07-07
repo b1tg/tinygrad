@@ -36,9 +36,12 @@ class ExpertWeights:
   """Like nn.Linear but with num_experts dimension. Weight shape: (num_experts, out_features, in_features)."""
   def __init__(self, num_experts:int, in_features:int, out_features:int):
     self.weight = Tensor.zeros(num_experts, out_features, in_features)
+  def raw(self, sel:Tensor, x:Tensor) -> Tensor:
+    # the pre-contiguous matmul: under sharding this is the allreduce itself, usable as a scheduling pin target
+    return x.unsqueeze(-2) @ self.weight[sel].transpose(-1, -2)
   def __call__(self, sel:Tensor, x:Tensor) -> Tensor:
     # sel: (B, T, k), x: (B, T, 1, in) or (B, T, k, in) -> output: (B, T, k, out)
-    return (x.unsqueeze(-2) @ self.weight[sel].transpose(-1, -2)).contiguous().squeeze(-2)
+    return self.raw(sel, x).contiguous().squeeze(-2)
 
 def apply_rope(x:Tensor, freqs_cis:Tensor) -> Tensor:
   assert x.shape[-1] % 2 == 0
@@ -139,15 +142,27 @@ class FFNBlock:
         gu = gu.reshape(*gu.shape[:-1], ndev, 2, gu.shape[-1]//(2*ndev))
         hmid = gu[..., 0, :].silu() * gu[..., 1, :]  # (B, T, k, ndev, hidden//ndev)
         hmid = hmid.reshape(*hmid.shape[:3], hmid.shape[3]*hmid.shape[4])
-        x_down = self.ffn_down_exps(sel, hmid.contiguous())  # (B, T, k, D)
+        x_down_raw = self.ffn_down_exps.raw(sel, hmid.contiguous())
       else:
-        x_down = self.ffn_down_exps(sel, (self.ffn_gate_exps(sel, h).silu() * self.ffn_up_exps(sel, h)).contiguous())  # (B, T, k, D)
-      out = (x_down * probs.unsqueeze(-1)).sum(axis=2)  # (B, T, D)
+        x_down_raw = self.ffn_down_exps.raw(sel, (self.ffn_gate_exps(sel, h).silu() * self.ffn_up_exps(sel, h)).contiguous())
       if hasattr(self, 'ffn_gate_shexp'):
-        shexp = self.ffn_down_shexp(self.ffn_gate_shexp(x).silu().contiguous() * self.ffn_up_shexp(x))
+        s1 = self.ffn_gate_shexp(x).silu().contiguous()
+        if isinstance(x.device, tuple):
+          # pin2: shexp's first materialization goes after the routed local partial. the dep must be the
+          # pre-contiguous matmul (the allreduce itself) so the scheduler can retarget it to the local input;
+          # the rest of the shexp chain data-deps on s1
+          s1 = Tensor(s1.uop.after(x_down_raw.uop))
+        shexp = self.ffn_down_shexp(s1 * self.ffn_up_shexp(x))
         if hasattr(self, 'ffn_gate_inp_shexp'): shexp = shexp * (x * self.ffn_gate_inp_shexp["weight"]).sum(axis=-1, keepdim=True).sigmoid()
-        out = out + shexp
-      return out
+        if isinstance(x.device, tuple):
+          # pin1: the allreduce (copy enqueue + combine) goes after the shexp tail, so the device-local shexp
+          # GEMVs occupy the compute queue while the partial sums cross devices. must pin the raw allreduce,
+          # not the contiguous after it — the dep has to land on the collective CALL, not a downstream copy
+          shexp = shexp.contiguous()
+          x_down_raw = Tensor(x_down_raw.uop.after(shexp.uop))
+        x_down = x_down_raw.contiguous().squeeze(-2)  # (B, T, k, D)
+        return (x_down * probs.unsqueeze(-1)).sum(axis=2) + shexp
+      return (x_down_raw.contiguous().squeeze(-2) * probs.unsqueeze(-1)).sum(axis=2)  # (B, T, D)
     # TODO: remove the need for this contiguous
     return self.ffn_down(self.ffn_gate(x).silu().contiguous() * self.ffn_up(x))
 

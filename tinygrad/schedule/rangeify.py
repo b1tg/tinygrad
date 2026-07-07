@@ -151,6 +151,20 @@ earliest_rewrites = mop_cleanup+PatternMatcher([
   # resolve FUNCTION calls (inline the body)
   (UPat(Ops.FUNCTION, name="c"), resolve_function),
 
+  # AFTER src[1:] are scheduling deps, not data: strip movement wrappers (e.g. left by the pm_mops AFTER mover)
+  (UPat(Ops.AFTER, name="a"), lambda a: a.replace(src=(a.src[0],)+tuple(s.base for s in a.src[1:]))
+   if any(s.op in GroupOp.Movement for s in a.src[1:]) else None),
+  # an explicit .after() pin on an unrealized value: force a buffer boundary so the deps land on its kernel
+  (UPat(Ops.AFTER, name="a"), lambda a: a.replace(src=(a.src[0].contiguous(),)+a.src[1:])
+   if len(a.src) > 1 and a.src[0].op not in {Ops.AFTER, Ops.CONTIGUOUS, Ops.BUFFER, Ops.PARAM, Ops.MSTACK, Ops.MSELECT,
+                                             Ops.COPY, Ops.MULTI, Ops.ALLREDUCE, Ops.STORE, *GroupOp.Movement} else None),
+  # fold nested AFTER when the outer only adds scheduling deps (all AFTER) and the inner holds no store chain
+  # (CALL-only, e.g. an allreduce output): merging a dep next to a STORE breaks store lowering, keep those nested
+  (UPat(Ops.AFTER, src=(UPat(Ops.AFTER, name="inner"),), allow_any_len=True, name="outer"),
+   lambda inner, outer: inner.replace(src=inner.src + outer.src[1:])
+   if len(outer.src) > 1 and all(s.op is Ops.AFTER for s in outer.src[1:])
+   and all(s.op in {Ops.CALL, Ops.END} for s in inner.src[1:]) else None),
+
   # resolve TUPLE+GETTUPLE
   (UPat(Ops.GETTUPLE, src=(UPat(Ops.TUPLE, name="t"),), name="g"), lambda g,t: t.src[g.arg]),
 

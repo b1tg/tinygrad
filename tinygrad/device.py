@@ -2,7 +2,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from collections import defaultdict
 from typing import Any, Generic, TypeVar, Iterator, Generator, TYPE_CHECKING
-import importlib, inspect, functools, pathlib, os, contextlib, re, atexit, pickle, decimal
+import importlib, inspect, functools, pathlib, os, sys, contextlib, re, atexit, pickle, decimal
 from tinygrad.helpers import LRU, getenv, diskcache_get, diskcache_put, DEBUG, GlobalCounters, flat_mv, PROFILE, temp, colored
 from tinygrad.helpers import Context, CCACHE, ALLOW_DEVICE_USAGE, MAX_BUFFER_SIZE, cpu_events, ProfileEvent, ProfilePointEvent, suppress_finalizing
 from tinygrad.helpers import select_by_name, select_first_inited, DEV, TracingKey, size_to_str, pluralize
@@ -26,6 +26,11 @@ class _Device:
     return self.__get_canonicalized_item(ix)
   @functools.cache  # this class is a singleton, pylint: disable=method-cache-max-size-none
   def __get_canonicalized_item(self, ix:str) -> Compiled:
+    # a device open while a spawn child is importing __main__ means the script isn't guarded by `if __name__ == "__main__"`,
+    # so every pool worker (and every respawn of one) would rerun the whole script. refuse before any hardware is touched.
+    if (mp:=sys.modules.get("multiprocessing")) is not None and getattr(mp.current_process(), "_inheriting", False):
+      raise RuntimeError(f"can't open device {ix} while a multiprocessing spawn child is importing __main__. "
+                         'wrap your script entry point in `if __name__ == "__main__":`')
     base = (__package__ or __name__).split('.')[0]  # tinygrad
     x = ix.split(":")[0].lower()
     ret = [cls for cname, cls in inspect.getmembers(importlib.import_module(f'{base}.runtime.ops_{x}')) \
