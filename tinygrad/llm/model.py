@@ -146,15 +146,19 @@ class FFNBlock:
       else:
         x_down_raw = self.ffn_down_exps.raw(sel, (self.ffn_gate_exps(sel, h).silu() * self.ffn_up_exps(sel, h)).contiguous())
       if hasattr(self, 'ffn_gate_shexp'):
+        # the pins trade a defused shexp (extra kernel boundary, slower standalone schedule) for overlap with the
+        # allreduce window. at 2 devices the window is ~zero (one inbound copy) and the trade is a guaranteed loss,
+        # so default on only for >2 devices. PIN_SHEXP=0/1 overrides.
+        pin_shexp = isinstance(x.device, tuple) and bool(getenv("PIN_SHEXP", 1 if len(x.device) > 2 else 0))
         s1 = self.ffn_gate_shexp(x).silu().contiguous()
-        if isinstance(x.device, tuple):
+        if pin_shexp:
           # pin2: shexp's first materialization goes after the routed local partial. the dep must be the
           # pre-contiguous matmul (the allreduce itself) so the scheduler can retarget it to the local input;
           # the rest of the shexp chain data-deps on s1
           s1 = Tensor(s1.uop.after(x_down_raw.uop))
         shexp = self.ffn_down_shexp(s1 * self.ffn_up_shexp(x))
         if hasattr(self, 'ffn_gate_inp_shexp'): shexp = shexp * (x * self.ffn_gate_inp_shexp["weight"]).sum(axis=-1, keepdim=True).sigmoid()
-        if isinstance(x.device, tuple):
+        if pin_shexp:
           # pin1: the allreduce (copy enqueue + combine) goes after the shexp tail, so the device-local shexp
           # GEMVs occupy the compute queue while the partial sums cross devices. must pin the raw allreduce,
           # not the contiguous after it — the dep has to land on the collective CALL, not a downstream copy
