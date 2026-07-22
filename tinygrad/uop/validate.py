@@ -25,7 +25,7 @@ def create_bounded(name:str, vmin:int, vmax:int, z3ctx:z3.Context) -> tuple[z3.A
   return (s:=z3.Int(name, ctx=z3ctx)), (vmin <= s)&(s <= vmax)
 
 z3_renderer = PatternMatcher([
-  (UPat.var("cond").where(UPat.var("x"), UPat.const(dtypes.weakint, Invalid)), lambda x,cond,ctx: (ctx[1][x], ctx[1][cond])),
+  (UPat.var("cond").where(UPat.var("x"), UPat(Ops.CONST, arg=Invalid)), lambda x,cond,ctx: (ctx[1][x], ctx[1][cond])),
   # variables
   (UPat(Ops.SPECIAL, name="x"), lambda x,ctx: create_bounded(x.arg, 0, ctx[1][x.src[0]]-1, ctx[0])),
   (UPat(Ops.PARAM, name="x"), lambda x,ctx: create_bounded(x.arg.name, x.vmin, x.vmax, ctx[0])),
@@ -51,9 +51,9 @@ z3_renderer = PatternMatcher([
 ])
 
 def uops_to_z3(solver:z3.Solver, *uops: UOp) -> list[z3.ExprRef]:
-  # gate on upstream AFTER/BUFFER as a replacement for PtrDType, but keep INDEX as an unknown LOAD
+  # gate on upstream AFTER/BUFFER, but keep INDEX as an unknown LOAD
   lst = list(UOp.sink(*uops).toposort(gate=lambda x: x.op not in {Ops.AFTER, Ops.BUFFER} and \
-                                      (x.dtype.scalar() in dtypes.ints+(dtypes.bool, dtypes.weakint) or x.op is Ops.SINK)))[:-1]
+                                      (x.dtype in dtypes.ints+(dtypes.bool, dtypes.weakint) or x.op is Ops.SINK)))[:-1]
   z3map: dict[UOp, z3.ExprRef] = {}
   for u in lst:
     # NOTE: we skip STACK here, it can't actually be accessed
