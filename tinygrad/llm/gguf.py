@@ -20,7 +20,7 @@ _GGML_NATIVE = {0: dtypes.float32, 1: dtypes.float16, 24: dtypes.int8, 25: dtype
 _GGML_QUANT = {2:(32,18), 3:(32,20), 6:(32,22), 7:(32,24), 8:(32,34),
                12:(256,144), 13:(256,176), 14:(256,210), 18:(256,98), 21:(256,110), 22:(256,82), 23:(256,136), 39:(32,17), 41:(128,18)}
 
-def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
+def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int, block_contiguous:bool=True) -> Tensor:
   """
   Converts ggml tensor data to a tinygrad tensor.
 
@@ -33,7 +33,8 @@ def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
   # https://github.com/ggerganov/ggml/blob/323951f1bdcdfbd5b5ff3a9a7c3770e63b1a560e/include/ggml.h#L356
 
   if (dtype := _GGML_NATIVE.get(ggml_type)) is not None:
-    return t[:dtype.itemsize * n].contiguous().bitcast(dtype)
+    raw = t[:dtype.itemsize * n]
+    return (raw.contiguous() if block_contiguous else raw).bitcast(dtype)
 
   def q_to_uint8(t: Tensor, b: int) -> Tensor:
     # TODO: rewrite with arange?
@@ -42,7 +43,8 @@ def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
 
   if (nelements_nbytes := _GGML_QUANT.get(ggml_type)) is not None:
     from tinygrad.runtime.autogen import ggml_common as _ggml
-    blocks = t[:(n//nelements_nbytes[0])*nelements_nbytes[1]].reshape((-1, nelements_nbytes[1])).contiguous()
+    blocks = t[:(n//nelements_nbytes[0])*nelements_nbytes[1]].reshape((-1, nelements_nbytes[1]))
+    if block_contiguous: blocks = blocks.contiguous()
     if ggml_type == 2: return (q_to_uint8(blocks[:,2:], 4).bitcast(dtypes.int8) - 8) * blocks[:,:2].bitcast(dtypes.float16).cast(dtypes.float32)
     if ggml_type == 3:
       d, m = (blocks[:,s:s+2].bitcast(dtypes.float16).cast(dtypes.float32) for s in [ 0, 2 ])
@@ -141,10 +143,11 @@ def _shard_tensor(tensor:Tensor, data_start:int, t_info:tuple[str, tuple[int, ..
   if axis == 0:
     row_count, row_elems = shape[0]//ndev, prod(shape[1:])
     row_nbytes = _ggml_nbytes(row_elems, typ)
-    raws = [tensor[start+i*row_count*row_nbytes:start+(i+1)*row_count*row_nbytes].to(d) for i,d in enumerate(devices)]
+    raws = [tensor[start+i*row_count*row_nbytes:start+(i+1)*row_count*row_nbytes].to(d).contiguous() for i,d in enumerate(devices)]
     Tensor.realize(*raws)
-    parts = [ggml_data_to_tensor(r, row_count*row_elems, typ).reshape(row_count, *shape[1:]) for r in raws]
-    return Tensor(parts[0].uop.mstack(*[p.uop for p in parts[1:]]).multi(0))
+    packed = Tensor(raws[0].uop.mstack(*[r.uop for r in raws[1:]]))
+    decoded = ggml_data_to_tensor(packed, row_count*row_elems, typ, block_contiguous=False).reshape(row_count, *shape[1:])
+    return Tensor(decoded.uop.multi(0))
   nelems, nbytes = _GGML_QUANT[typ] if typ in _GGML_QUANT else (1, _GGML_NATIVE[typ].itemsize)
   assert shape[-1] % nelems == 0, f"{name}: last dim {shape[-1]} does not divide block size {nelems}"
   nblk, per_dev = shape[-1] // nelems, shape[axis] // ndev
@@ -153,8 +156,9 @@ def _shard_tensor(tensor:Tensor, data_start:int, t_info:tuple[str, tuple[int, ..
   cnt, shard_shape = blk.shape[axis] // ndev, (*shape[:axis], per_dev, *shape[axis+1:])
   raws = [blk[tuple(slice(i*cnt, (i+1)*cnt) if a==axis else slice(None) for a in range(len(shape)))].contiguous().to(d) for i,d in enumerate(devices)]
   Tensor.realize(*raws)
-  parts = [ggml_data_to_tensor(r.reshape(-1), prod(shard_shape), typ).reshape(*shard_shape) for r in raws]
-  return Tensor(parts[0].uop.mstack(*[p.uop for p in parts[1:]]).multi(axis))
+  packed = Tensor(raws[0].uop.mstack(*[r.uop for r in raws[1:]]))
+  decoded = ggml_data_to_tensor(packed, prod(shard_shape), typ, block_contiguous=False).reshape(*shard_shape)
+  return Tensor(decoded.uop.multi(axis))
 
 def _shard_tensor_fused(tensor:Tensor, data_start:int, t_a:tuple, t_b:tuple, devices:tuple[str, ...]) -> Tensor:
   """Shard two equal-shape quant tensors on axis 1 and concat them per device (a's rows then b's rows), preserving exact bytes.
@@ -172,8 +176,9 @@ def _shard_tensor_fused(tensor:Tensor, data_start:int, t_a:tuple, t_b:tuple, dev
   raws = [blks[0][:, i*cnt:(i+1)*cnt].cat(blks[1][:, i*cnt:(i+1)*cnt], dim=1).contiguous().to(d) for i, d in enumerate(devices)]
   Tensor.realize(*raws)
   shard_shape = (shape[0], 2*cnt, *shape[2:])
-  parts = [ggml_data_to_tensor(r.reshape(-1), prod(shard_shape), typ).reshape(*shard_shape) for r in raws]
-  return Tensor(parts[0].uop.mstack(*[p.uop for p in parts[1:]]).multi(1))
+  packed = Tensor(raws[0].uop.mstack(*[r.uop for r in raws[1:]]))
+  decoded = ggml_data_to_tensor(packed, prod(shard_shape), typ, block_contiguous=False).reshape(*shard_shape)
+  return Tensor(decoded.uop.multi(1))
 
 def _gguf_parse(tensor: Tensor, devices:tuple[str, ...]|None=None,
                 shard_policy:Callable[[str], int|str|None]|None=None,
