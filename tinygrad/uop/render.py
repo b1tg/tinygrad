@@ -4,35 +4,14 @@ from tinygrad.uop.ops import ParamArg, UOp, PatternMatcher, UPat, multirange_str
 from tinygrad.helpers import strip_parens
 
 def pretty_print(x:UOp, cache=None, d=0)->str:
-  # NOTE: iterative implementation, graphs can be too deep for recursion
-  if cache is None:
-    cache = {}
-    dfs_stack = [iter(x.src)]
-    while dfs_stack:
-      if (s:=next(dfs_stack[-1], None)) is None: dfs_stack.pop(); continue
+  def dfs(x:UOp, cache:dict):
+    for s in x.src:
       cache.setdefault(s, [len(cache), 0, False])[1] += 1
-      if cache[s][1] == 1: dfs_stack.append(iter(s.src))
+      if cache[s][1] == 1: dfs(s, cache)
+  if cache is None: dfs(x, cache:={})
   if (cx:=cache.setdefault(x, [0,0,False]))[2]: return f"{' '*d}x{cx[0]}"
-  cx[2] = True
-  frames:list[list] = [[x, d, 0, []]]
-  res = ""
-  while frames:
-    node, dd, idx, parts = f = frames[-1]
-    if idx < len(node.src):
-      f[2] += 1
-      cs = cache.setdefault(s:=node.src[idx], [0,0,False])
-      if cs[2]: parts.append(f"\n{' '*(dd+2)}x{cs[0]},")
-      else:
-        cs[2] = True
-        frames.append([s, dd+2, 0, []])
-    else:
-      cn = cache[node]
-      rendered = f"{' '*dd}{f'x{cn[0]}:=' * (cn[1]>1)}{type(node).__name__}({node.op}, {node.dtype}, "\
-                 f"arg={node.argstr()}{node.tagstr()}, src=({''.join(parts)}))"
-      frames.pop()
-      if frames: frames[-1][3].append(f"\n{rendered},")
-      else: res = rendered
-  return res
+  cx[2], srcs = True, (''.join(f'\n{pretty_print(s, cache, d+2)},' for s in x.src))
+  return f"{' '*d}{f'x{cx[0]}:=' * (cx[1]>1)}{type(x).__name__}({x.op}, {x.dtype}, arg={x.argstr()}{x.tagstr()}, src=({srcs}))"
 
 # ***** uop helpers *****
 
