@@ -331,12 +331,8 @@ class KimiDeltaAttentionBlock(DeltaNetBlock):
     self.num_heads = self.num_k_heads = self.num_v_heads = config.n_heads
     self.inner_size, self.ssm_conv_kernel = self.num_heads * self.head_dim, kda.conv_kernel
     self.conv_channels = 3 * self.inner_size
-    self.attn_q = nn.Linear(config.dim, self.inner_size, bias=False)
-    self.attn_k = nn.Linear(config.dim, self.inner_size, bias=False)
-    self.attn_v = nn.Linear(config.dim, self.inner_size, bias=False)
-    self.ssm_conv1d_q = {"weight": Tensor.zeros(self.inner_size, 1, self.ssm_conv_kernel)}
-    self.ssm_conv1d_k = {"weight": Tensor.zeros(self.inner_size, 1, self.ssm_conv_kernel)}
-    self.ssm_conv1d_v = {"weight": Tensor.zeros(self.inner_size, 1, self.ssm_conv_kernel)}
+    self.attn_qkv = nn.Linear(config.dim, self.conv_channels, bias=False)
+    self.ssm_conv1d = {"weight": Tensor.zeros(self.conv_channels, self.ssm_conv_kernel)}
     self.ssm_f_a = nn.Linear(config.dim, self.head_dim, bias=False)
     self.ssm_f_b = nn.Linear(self.head_dim, self.inner_size, bias=False)
     self.ssm_beta = nn.Linear(config.dim, self.num_heads, bias=False)
@@ -348,10 +344,7 @@ class KimiDeltaAttentionBlock(DeltaNetBlock):
     self.attn_output = nn.Linear(self.inner_size, config.dim, bias=False)
 
   def _project(self, x:Tensor):
-    projected = self.attn_q(x).cat(self.attn_k(x), self.attn_v(x), dim=-1)
-    conv_weight = self.ssm_conv1d_q["weight"].squeeze(1).cat(self.ssm_conv1d_k["weight"].squeeze(1),
-                                                              self.ssm_conv1d_v["weight"].squeeze(1), dim=0)
-    conv_out, conv_state = self._short_conv(projected, conv_weight)
+    conv_out, conv_state = self._short_conv(self.attn_qkv(x), self.ssm_conv1d["weight"])
     q, k, v = conv_out.split([self.inner_size]*3, dim=-1)
     B = x.shape[0]
     g = (self.ssm_f_b(self.ssm_f_a(x)).float() + self.ssm_dt["bias"]).softplus()
@@ -366,11 +359,8 @@ class KimiDeltaAttentionBlock(DeltaNetBlock):
     assert resolve(T <= self.CHUNK_SIZE, False), f"KDA chunk size must be <= {self.CHUNK_SIZE}"
     x = x.half()
 
-    projected = self.attn_q(x).cat(self.attn_k(x), self.attn_v(x), dim=-1)
-    conv_weight = self.ssm_conv1d_q["weight"].squeeze(1).cat(self.ssm_conv1d_k["weight"].squeeze(1),
-                                                              self.ssm_conv1d_v["weight"].squeeze(1), dim=0)
-    window = self.conv_state.cat(projected, dim=1)
-    conv_out = (window.unfold(1, self.ssm_conv_kernel, 1) * conv_weight).sum(-1).silu()
+    window = self.conv_state.cat(self.attn_qkv(x), dim=1)
+    conv_out = (window.unfold(1, self.ssm_conv_kernel, 1) * self.ssm_conv1d["weight"]).sum(-1).silu()
     q, k, v = (t.reshape(B, T, self.num_heads, self.head_dim).transpose(1, 2).float()
                for t in conv_out.split([self.inner_size]*3, dim=-1))
     q, k = q.normalize(dim=-1) * self.head_dim**-0.5, k.normalize(dim=-1)
@@ -456,6 +446,13 @@ class Transformer:
     n_heads, n_kv_heads_meta = kv[f'{arch}.attention.head_count'], kv[f'{arch}.attention.head_count_kv']
     n_kv_heads = max(n_kv_heads_meta) if arch == 'kimi-linear' else n_kv_heads_meta
     kda_layers = tuple(x == 0 for x in n_kv_heads_meta) if arch == 'kimi-linear' else ()
+    for i, is_kda in enumerate(kda_layers):
+      if not is_kda: continue
+      prefix = f"blk.{i}."
+      state_dict[prefix+"attn_qkv.weight"] = state_dict.pop(prefix+"attn_q.weight").cat(
+        state_dict.pop(prefix+"attn_k.weight"), state_dict.pop(prefix+"attn_v.weight"), dim=0).contiguous()
+      state_dict[prefix+"ssm_conv1d.weight"] = state_dict.pop(prefix+"ssm_conv1d_q.weight").cat(
+        state_dict.pop(prefix+"ssm_conv1d_k.weight"), state_dict.pop(prefix+"ssm_conv1d_v.weight"), dim=0).squeeze(1).contiguous()
 
     ssm = None
     if arch in ('qwen35', 'qwen35moe'):
@@ -517,8 +514,9 @@ class Transformer:
     return min(block._reusable_prefix_len(prefix_len, len(self._cached_tokens)) for block in self.blk)
 
   def generate(self, tokens:list[int], chunk_size:int=32, temperature:float=0.0):
+    kda_chunk = any(isinstance(b, KimiDeltaAttentionBlock) for b in self.blk)
     if any(isinstance(b, GatedDeltaNetBlock) for b in self.blk): chunk_size = 1
-    elif any(isinstance(b, KimiDeltaAttentionBlock) for b in self.blk):
+    elif kda_chunk:
       chunk_size = min(chunk_size, KimiDeltaAttentionBlock.CHUNK_SIZE)
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
     v_toks = UOp.variable("toks", 1, chunk_size)
@@ -531,10 +529,12 @@ class Transformer:
     if start_pos < len(self._cached_tokens) and (resets := [r for b in self.blk for r in b._state_reset_ops()]): Tensor.realize(*resets)
     out, prompt_len = None, len(tokens)
     while len(tokens) < self.max_context:
-      sp, nt = v_start_pos.bind(start_pos), v_toks.bind(min(chunk_size, len(tokens) - start_pos))
-      model_input = t[:, sp:sp+(1 if nt.val == 1 else nt)] if start_pos < prompt_len or out is None else out
+      nt = min(chunk_size, len(tokens) - start_pos)
+      if kda_chunk and nt != chunk_size: nt = 1
+      sp, model_nt = v_start_pos.bind(start_pos), nt if kda_chunk else v_toks.bind(nt)
+      model_input = t[:, sp:sp+model_nt] if start_pos < prompt_len or out is None else out
       out = self(model_input, sp, temp).realize()
-      start_pos += nt.val
+      start_pos += nt
       # chunked prefill: keep processing until all prompt tokens are consumed
       if start_pos < len(tokens): continue
       tokens.append(int(out.item()))

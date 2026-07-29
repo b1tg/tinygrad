@@ -185,10 +185,11 @@ class TestKimiDeltaAttentionBlock(unittest.TestCase):
       norm_eps=1e-5, vocab_size=16, head_dim=2, rope_theta=10000.0, rope_dim=1, v_head_dim=2, max_context=4,
       kda=KDAConfig(conv_kernel=2, head_dim=2, layers=(True,)))
     block = KimiDeltaAttentionBlock(config, config.kda)
-    for i, proj in enumerate((block.attn_q, block.attn_k, block.attn_v)):
-      proj.weight = self._linspace(-0.2 + i*0.03, 0.18 + i*0.03, proj.weight.shape)
-    for i, conv in enumerate((block.ssm_conv1d_q, block.ssm_conv1d_k, block.ssm_conv1d_v)):
-      conv["weight"] = self._linspace(-0.1 + i*0.02, 0.09 + i*0.02, conv["weight"].shape)
+    proj_shape, conv_shape = (block.inner_size, config.dim), (block.inner_size, block.ssm_conv_kernel)
+    block.attn_qkv.weight = self._linspace(-0.2, 0.18, proj_shape).cat(
+      self._linspace(-0.17, 0.21, proj_shape), self._linspace(-0.14, 0.24, proj_shape), dim=0)
+    block.ssm_conv1d["weight"] = self._linspace(-0.1, 0.09, conv_shape).cat(
+      self._linspace(-0.08, 0.11, conv_shape), self._linspace(-0.06, 0.13, conv_shape), dim=0)
     block.ssm_f_a.weight = self._linspace(-0.12, 0.11, block.ssm_f_a.weight.shape)
     block.ssm_f_b.weight = self._linspace(-0.08, 0.1, block.ssm_f_b.weight.shape)
     block.ssm_beta.weight = self._linspace(-0.15, 0.12, block.ssm_beta.weight.shape)
@@ -215,9 +216,7 @@ class TestKimiDeltaAttentionBlock(unittest.TestCase):
     initial_state = np.linspace(-0.05, 0.06, 8, dtype=np.float32).reshape(1, block.num_heads, block.head_dim, block.head_dim)
     initial_conv = np.linspace(-0.03, 0.04, 12, dtype=np.float32).reshape(1, block.ssm_conv_kernel-1, block.conv_channels)
     state, conv_state = initial_state.copy(), initial_conv.copy()
-    proj_weights = [p.weight.numpy() for p in (block.attn_q, block.attn_k, block.attn_v)]
-    conv_weights = np.concatenate([c["weight"].numpy().squeeze(1) for c in
-                                   (block.ssm_conv1d_q, block.ssm_conv1d_k, block.ssm_conv1d_v)], axis=0).T
+    proj_weights, conv_weights = np.split(block.attn_qkv.weight.numpy(), 3, axis=0), block.ssm_conv1d["weight"].numpy().T
 
     expected_outputs = []
     block._init_state(Tensor(x[:, :1]))
@@ -278,6 +277,8 @@ class TestKimiDeltaAttentionBlock(unittest.TestCase):
       norm_eps=1e-5, vocab_size=16, head_dim=2, rope_theta=10000.0, rope_dim=1, v_head_dim=2, max_context=6,
       kda=KDAConfig(conv_kernel=2, head_dim=2, layers=(True,)))
     model = Transformer(config)
+    for _ in range(3): next(model.generate([1, 2, 3], chunk_size=3))
+    self.assertEqual(model.prefill_jit.cnt, 3)
     tokens = [1, 2, 3]
     gen = model.generate(tokens, chunk_size=3)
     next(gen)

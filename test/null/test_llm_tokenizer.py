@@ -95,6 +95,17 @@ class TestLLMTokenizer(unittest.TestCase):
     self.assertEqual(template.end_turn(), "[/INST]")
     self.assertEqual(template.role("assistant"), "")
 
+  def test_im_end_from_gguf_kv(self):
+    kv = {
+      "tokenizer.ggml.tokens": ["<unk>", "[EOS]", "<|im_end|>"],
+      "tokenizer.ggml.token_type": [3, 3, 3],
+      "tokenizer.ggml.pre": "kimi-k2",
+      "tokenizer.ggml.eos_token_id": 1,
+    }
+    tok = SimpleTokenizer.from_gguf_kv(kv)
+    self.assertTrue(tok.is_end(1))
+    self.assertTrue(tok.is_end(2))
+
   def test_stream_decoder(self):
     """stream_decoder buffers incomplete UTF-8: token 25677 has 3/4 of emoji, token 138 completes it."""
     bs = [*range(33, 127), *range(161, 173), *range(174, 256)]

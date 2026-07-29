@@ -1,10 +1,10 @@
 from __future__ import annotations
 import sys, argparse, codecs, itertools, typing, re, unicodedata, json, time
 from typing import TYPE_CHECKING
-from tinygrad import nn
+from tinygrad import nn, Tensor
 from tinygrad.uop.ops import UOp, Ops
 from tinygrad.helpers import partition, DEBUG, Timing, GlobalCounters, Context, fetch, profile_marker, getenv
-from tinygrad.llm.model import Transformer
+from tinygrad.llm.model import Transformer, KimiDeltaAttentionBlock
 if TYPE_CHECKING:
   import jinja2
 
@@ -41,9 +41,10 @@ class SimpleTokenizer:
     # https://github.com/ggml-org/llama.cpp/blob/94933c8c2eeaa9a7983e3f6c08af76bd86724094/src/llama-vocab.cpp#L1818-L1820
     vocab: typing.Iterable[tuple[str, int]] = ((tok, idx) for idx, tok in enumerate(kv["tokenizer.ggml.tokens"]))
     normal_tokens, special_tokens = partition(vocab, lambda e: kv["tokenizer.ggml.token_type"][e[1]] == 1)
-    return SimpleTokenizer(dict(normal_tokens), dict(special_tokens), kv["tokenizer.ggml.pre"],
+    special_tokens = dict(special_tokens)
+    return SimpleTokenizer(dict(normal_tokens), special_tokens, kv["tokenizer.ggml.pre"],
       bos_id=kv.get('tokenizer.ggml.bos_token_id') if kv.get('tokenizer.ggml.add_bos_token', True) else None,
-      eos_id=kv.get('tokenizer.ggml.eos_token_id', 0), eot_id=kv.get('tokenizer.ggml.eot_token_id'))
+      eos_id=kv.get('tokenizer.ggml.eos_token_id', 0), eot_id=kv.get('tokenizer.ggml.eot_token_id', special_tokens.get('<|im_end|>')))
 
   def _encode_word(self, word:bytes) -> list[int]:
     if (early_token:=self._normal_tokens.get(word)) is not None: return [early_token]
@@ -163,9 +164,13 @@ def main():
 
   # warmup the JIT
   if args.warmup or args.serve:
-    # run 2 tokens through the model twice to capture the JIT before serving
     with Context(DEBUG=max(DEBUG.value, 1)):
       for _ in range(2): list(zip(range(2), model.generate([0])))
+      chunk_size = 32
+      if model.max_context > chunk_size and any(isinstance(b, KimiDeltaAttentionBlock) for b in model.blk):
+        for _ in range(3): next(model.generate([0] * chunk_size))
+      if resets := [r for b in model.blk for r in b._state_reset_ops()]: Tensor.realize(*resets)
+      model._cached_tokens.clear()
 
   # start server
   if args.serve: LLMServer(('', args.serve), model, model_name, tok, template).serve_forever()
