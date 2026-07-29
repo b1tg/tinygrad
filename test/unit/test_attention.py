@@ -183,7 +183,7 @@ class TestKimiDeltaAttentionBlock(unittest.TestCase):
   def _make_block(self) -> KimiDeltaAttentionBlock:
     config = TransformerConfig(num_blocks=1, dim=4, hidden_dim=8, n_heads=2, n_kv_heads=1,
       norm_eps=1e-5, vocab_size=16, head_dim=2, rope_theta=10000.0, rope_dim=1, v_head_dim=2, max_context=4,
-      kda=KDAConfig(conv_kernel=2, head_dim=2), recurrent_layers=(True,), use_rope=False)
+      kda=KDAConfig(conv_kernel=2, head_dim=2, layers=(True,)), use_rope=False)
     block = KimiDeltaAttentionBlock(config, config.kda)
     for i, proj in enumerate((block.attn_q, block.attn_k, block.attn_v)):
       proj.weight = self._linspace(-0.2 + i*0.03, 0.18 + i*0.03, proj.weight.shape)
@@ -213,7 +213,7 @@ class TestKimiDeltaAttentionBlock(unittest.TestCase):
     block = self._make_block()
     x = np.linspace(-0.8, 0.9, 12, dtype=np.float32).reshape(1, 3, 4)
     state = np.zeros((1, block.num_heads, block.head_dim, block.head_dim), dtype=np.float32)
-    conv_state = np.zeros((1, block.conv_kernel-1, block.conv_channels), dtype=np.float32)
+    conv_state = np.zeros((1, block.ssm_conv_kernel-1, block.conv_channels), dtype=np.float32)
     proj_weights = [p.weight.numpy() for p in (block.attn_q, block.attn_k, block.attn_v)]
     conv_weights = np.concatenate([c["weight"].numpy().squeeze(1) for c in
                                    (block.ssm_conv1d_q, block.ssm_conv1d_k, block.ssm_conv1d_v)], axis=0).T
@@ -253,7 +253,7 @@ class TestKimiDeltaAttentionBlock(unittest.TestCase):
   def test_transformer_mixed_layout(self):
     config = TransformerConfig(num_blocks=2, dim=4, hidden_dim=8, n_heads=2, n_kv_heads=1,
       norm_eps=1e-5, vocab_size=16, head_dim=2, rope_theta=10000.0, rope_dim=1, v_head_dim=2, max_context=4,
-      kv_lora_rank=2, kda=KDAConfig(conv_kernel=2, head_dim=2), recurrent_layers=(True, False), use_rope=False)
+      kv_lora_rank=2, kda=KDAConfig(conv_kernel=2, head_dim=2, layers=(True, False)), use_rope=False)
     model = Transformer(config)
     self.assertIsInstance(model.blk[0], KimiDeltaAttentionBlock)
     self.assertIsInstance(model.blk[1], MLATransformerBlock)
