@@ -183,7 +183,7 @@ class TestKimiDeltaAttentionBlock(unittest.TestCase):
   def _make_block(self) -> KimiDeltaAttentionBlock:
     config = TransformerConfig(num_blocks=1, dim=4, hidden_dim=8, n_heads=2, n_kv_heads=1,
       norm_eps=1e-5, vocab_size=16, head_dim=2, rope_theta=10000.0, rope_dim=1, v_head_dim=2, max_context=4,
-      kda=KDAConfig(conv_kernel=2, head_dim=2, layers=(True,)), use_rope=False)
+      kda=KDAConfig(conv_kernel=2, head_dim=2, layers=(True,)))
     block = KimiDeltaAttentionBlock(config, config.kda)
     for i, proj in enumerate((block.attn_q, block.attn_k, block.attn_v)):
       proj.weight = self._linspace(-0.2 + i*0.03, 0.18 + i*0.03, proj.weight.shape)
@@ -211,14 +211,18 @@ class TestKimiDeltaAttentionBlock(unittest.TestCase):
 
   def test_recurrent_reference_and_reset(self):
     block = self._make_block()
-    x = np.linspace(-0.8, 0.9, 12, dtype=np.float32).reshape(1, 3, 4)
-    state = np.zeros((1, block.num_heads, block.head_dim, block.head_dim), dtype=np.float32)
-    conv_state = np.zeros((1, block.ssm_conv_kernel-1, block.conv_channels), dtype=np.float32)
+    x = np.linspace(-0.8, 0.9, 32, dtype=np.float32).reshape(1, 8, 4)
+    initial_state = np.linspace(-0.05, 0.06, 8, dtype=np.float32).reshape(1, block.num_heads, block.head_dim, block.head_dim)
+    initial_conv = np.linspace(-0.03, 0.04, 12, dtype=np.float32).reshape(1, block.ssm_conv_kernel-1, block.conv_channels)
+    state, conv_state = initial_state.copy(), initial_conv.copy()
     proj_weights = [p.weight.numpy() for p in (block.attn_q, block.attn_k, block.attn_v)]
     conv_weights = np.concatenate([c["weight"].numpy().squeeze(1) for c in
                                    (block.ssm_conv1d_q, block.ssm_conv1d_k, block.ssm_conv1d_v)], axis=0).T
 
+    expected_outputs = []
     block._init_state(Tensor(x[:, :1]))
+    Tensor.realize(block.conv_state.assign(Tensor(initial_conv)),
+                   block.recurrent_state.assign(Tensor(initial_state)))
     for step in range(x.shape[1]):
       xh = x[:, step:step+1].astype(np.float16)
       projected = np.concatenate([self._linear(xh, w) for w in proj_weights], axis=-1)
@@ -239,6 +243,7 @@ class TestKimiDeltaAttentionBlock(unittest.TestCase):
       core = core / np.sqrt((core*core).mean(axis=-1, keepdims=True) + block.ssm_norm.eps) * block.ssm_norm.weight.numpy()
       gate = self._linear(self._linear(xh, block.ssm_g_a.weight.numpy()), block.ssm_g_b.weight.numpy())
       expected = self._linear((core * self._sigmoid(gate.reshape(core.shape))).reshape(1, 1, -1), block.attn_output.weight.numpy())
+      expected_outputs.append(expected)
       conv_state = conv_window[:, 1:, :]
 
       actual = block._attention(Tensor(x[:, step:step+1]), step).realize().numpy()
@@ -250,15 +255,35 @@ class TestKimiDeltaAttentionBlock(unittest.TestCase):
     np.testing.assert_equal(block.conv_state.numpy(), 0)
     np.testing.assert_equal(block.recurrent_state.numpy(), 0)
 
+    Tensor.realize(block.conv_state.assign(Tensor(initial_conv)),
+                   block.recurrent_state.assign(Tensor(initial_state)))
+
+    actual = block._attention(Tensor(x), 0).realize().numpy()
+    np.testing.assert_allclose(actual, np.concatenate(expected_outputs, axis=1), rtol=2e-3, atol=2e-3)
+    np.testing.assert_allclose(block.conv_state.numpy(), conv_state, rtol=2e-3, atol=2e-3)
+    np.testing.assert_allclose(block.recurrent_state.numpy(), state, rtol=2e-3, atol=2e-3)
+
   def test_transformer_mixed_layout(self):
     config = TransformerConfig(num_blocks=2, dim=4, hidden_dim=8, n_heads=2, n_kv_heads=1,
       norm_eps=1e-5, vocab_size=16, head_dim=2, rope_theta=10000.0, rope_dim=1, v_head_dim=2, max_context=4,
-      kv_lora_rank=2, kda=KDAConfig(conv_kernel=2, head_dim=2, layers=(True, False)), use_rope=False)
+      kv_lora_rank=2, kda=KDAConfig(conv_kernel=2, head_dim=2, layers=(True, False)))
     model = Transformer(config)
     self.assertIsInstance(model.blk[0], KimiDeltaAttentionBlock)
     self.assertIsInstance(model.blk[1], MLATransformerBlock)
     model.blk[1]._init_state(Tensor.zeros(1, 1, config.dim))
     self.assertFalse(hasattr(model.blk[1], "freqs_cis"))
+
+  def test_transformer_chunked_prefill(self):
+    config = TransformerConfig(num_blocks=1, dim=4, hidden_dim=8, n_heads=2, n_kv_heads=1,
+      norm_eps=1e-5, vocab_size=16, head_dim=2, rope_theta=10000.0, rope_dim=1, v_head_dim=2, max_context=6,
+      kda=KDAConfig(conv_kernel=2, head_dim=2, layers=(True,)))
+    model = Transformer(config)
+    tokens = [1, 2, 3]
+    gen = model.generate(tokens, chunk_size=3)
+    next(gen)
+    next(gen)
+    next(gen)
+    self.assertEqual(len(tokens), config.max_context)
 
 class TestPairwiseTopk(unittest.TestCase):
   def test_basic_topk(self):

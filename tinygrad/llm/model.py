@@ -78,7 +78,6 @@ class TransformerConfig:
   qkv_bias: bool = False
   expert_bias: bool = False
   kda: KDAConfig|None = None
-  use_rope: bool = True
 
 class FFNBlock:
   def __init__(self, config:TransformerConfig):
@@ -219,13 +218,13 @@ class MLATransformerBlock(FFNBlock):
     q_proj = self.attn_q_b(self.attn_q_a_norm(self.attn_q_a(x))) if self.config.q_lora_rank > 0 else self.attn_q(x)
     q = q_proj.reshape(B, T, self.config.n_heads, self.config.head_dim).transpose(1, 2)
     q_nope, q_rope = q[..., :q_nope_head_dim], q[..., q_nope_head_dim:]
-    if self.config.use_rope: q_rope = apply_rope(q_rope, self.freqs_cis[start_pos:start_pos+T])
+    if self.config.kda is None: q_rope = apply_rope(q_rope, self.freqs_cis[start_pos:start_pos+T])
     q = (q_nope @ self.attn_k_b["weight"].transpose(-1, -2)).cat(q_rope, dim=-1)
 
     kv_a = self.attn_kv_a_mqa(x)
     c_kv = self.attn_kv_a_norm(kv_a[..., :self.config.kv_lora_rank])
     k_rope = kv_a[..., self.config.kv_lora_rank:].reshape(B, T, 1, self.config.rope_dim).transpose(1, 2)
-    if self.config.use_rope: k_rope = apply_rope(k_rope, self.freqs_cis[start_pos:start_pos+T])
+    if self.config.kda is None: k_rope = apply_rope(k_rope, self.freqs_cis[start_pos:start_pos+T])
 
     k_store = c_kv.reshape(B, 1, T, self.config.kv_lora_rank).cat(k_rope.reshape(B, 1, T, self.config.rope_dim), dim=-1)
     k = Tensor(self.cache_k.uop.after(self.cache_k[:, :, start_pos:start_pos+T, :].uop.store(k_store.uop)))[:, :, 0:start_pos+T, :]
@@ -242,7 +241,7 @@ class MLATransformerBlock(FFNBlock):
   def _init_state(self, x:Tensor):
     if not hasattr(self, "cache_k"):
       self.cache_k = Tensor.empty(x.shape[0], 1, self.config.max_context, self.config.kv_lora_rank + self.config.rope_dim, device=x.device)
-      if self.config.use_rope:
+      if self.config.kda is None:
         self.freqs_cis = precompute_freqs_cis(self.config.rope_dim, self.config.max_context, self.config.rope_theta, device=x.device)
 
 class DeltaNetBlock(FFNBlock):
@@ -324,6 +323,8 @@ class GatedDeltaNetBlock(DeltaNetBlock):
     return self.ssm_out((self.ssm_norm(x) * gate.silu()).reshape(x.shape[0], 1, -1).half())
 
 class KimiDeltaAttentionBlock(DeltaNetBlock):
+  CHUNK_SIZE = 64
+
   def __init__(self, config:TransformerConfig, kda:KDAConfig):
     super().__init__(config)
     self.head_dim = self.head_k_dim = self.head_v_dim = kda.head_dim
@@ -359,8 +360,54 @@ class KimiDeltaAttentionBlock(DeltaNetBlock):
     output_gate = self.ssm_g_b(self.ssm_g_a(x)).reshape(B, 1, self.num_heads, self.head_dim)
     return q, k, v, alpha, beta, output_gate, conv_state
 
+  def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
+    B, T, _ = x.shape
+    if not resolve(T != 1): return super()._attention(x, start_pos)
+    assert resolve(T <= self.CHUNK_SIZE, False), f"KDA chunk size must be <= {self.CHUNK_SIZE}"
+    x = x.half()
+
+    projected = self.attn_q(x).cat(self.attn_k(x), self.attn_v(x), dim=-1)
+    conv_weight = self.ssm_conv1d_q["weight"].squeeze(1).cat(self.ssm_conv1d_k["weight"].squeeze(1),
+                                                              self.ssm_conv1d_v["weight"].squeeze(1), dim=0)
+    window = self.conv_state.cat(projected, dim=1)
+    conv_out = (window.unfold(1, self.ssm_conv_kernel, 1) * conv_weight).sum(-1).silu()
+    q, k, v = (t.reshape(B, T, self.num_heads, self.head_dim).transpose(1, 2).float()
+               for t in conv_out.split([self.inner_size]*3, dim=-1))
+    q, k = q.normalize(dim=-1) * self.head_dim**-0.5, k.normalize(dim=-1)
+    g = (self.ssm_f_b(self.ssm_f_a(x)).float() + self.ssm_dt["bias"]).softplus()
+    g = (g.reshape(B, T, self.num_heads, self.head_dim) *
+         self.ssm_a.reshape(1, 1, self.num_heads, 1)).transpose(1, 2).cumsum(2)
+    beta = self.ssm_beta(x).float().sigmoid().reshape(B, T, self.num_heads).transpose(1, 2)
+    output_gate = self.ssm_g_b(self.ssm_g_a(x)).reshape(B, T, self.num_heads, self.head_dim)
+
+    qg, kg = q * g.exp(), k * g.exp()
+    lower = ((k.unsqueeze(-2) * k.unsqueeze(-3) * (g.unsqueeze(-2) - g.unsqueeze(-3)).exp()).sum(-1) *
+             beta.unsqueeze(-1)).tril(-1)
+    indices = Tensor.arange(T)
+    eye = (indices.unsqueeze(-1) == indices).cast(lower.dtype)
+    inverse, power = eye - lower, lower @ lower
+    for _ in range(self.CHUNK_SIZE.bit_length()-2):
+      inverse, power = inverse @ (eye + power), power @ power
+    transform = inverse * beta.unsqueeze(-2)
+    w, u = transform @ kg, transform @ v
+
+    state = self.recurrent_state.transpose(-1, -2)
+    pseudo_value = u - w @ state
+    scores = (q.unsqueeze(-2) * k.unsqueeze(-3) * (g.unsqueeze(-2) - g.unsqueeze(-3)).exp()).sum(-1).tril()
+    core = qg @ state + scores @ pseudo_value
+    final_g = g[:, :, T-1:T, :]
+    recurrent_state = (state * final_g.exp().transpose(-1, -2) +
+                       ((final_g - g).exp() * k).transpose(-1, -2) @ pseudo_value).transpose(-1, -2).contiguous()
+
+    conv_state = window[:, T:, :].contiguous()
+    core = core.transpose(1, 2).contiguous()
+    conv_state_store = self.conv_state.uop.store(conv_state.cast(self.conv_state.dtype).uop)
+    recurrent_state_store = self.recurrent_state.uop.store(recurrent_state.cast(self.recurrent_state.dtype).uop)
+    core = Tensor(core.uop.after(recurrent_state_store, conv_state_store))
+    return self._output(core, output_gate)
+
   def _output(self, x:Tensor, gate:Tensor) -> Tensor:
-    return self.attn_output((self.ssm_norm(x) * gate.sigmoid()).reshape(x.shape[0], 1, self.inner_size))
+    return self.attn_output((self.ssm_norm(x) * gate.sigmoid()).reshape(x.shape[0], x.shape[1], self.inner_size))
 
 class Transformer:
   def __init__(self, config:TransformerConfig):
@@ -376,7 +423,6 @@ class Transformer:
     self.output_norm = nn.RMSNorm(config.dim, config.norm_eps)
     self.output = nn.Linear(config.dim, config.vocab_size, bias=False)
     self.max_context = config.max_context
-    self.has_recurrent_block = any(isinstance(b, DeltaNetBlock) for b in self.blk)
     self._cached_tokens: list[int] = []
     # we specialize the JIT for prefill and rollout
     self.prefill_jit = TinyJit(self.forward)
@@ -457,7 +503,7 @@ class Transformer:
       full_attention_interval=kv.get(f'{arch}.full_attention_interval', 0),
       qkv_bias='blk.0.attn_q.bias' in state_dict,
       expert_bias=f"blk.{kv.get(f'{arch}.leading_dense_block_count', 0)}.exp_probs_b.bias" in state_dict,
-      kda=kda, use_rope=arch != 'kimi-linear')
+      kda=kda)
     model = Transformer(config)
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
@@ -471,7 +517,9 @@ class Transformer:
     return min(block._reusable_prefix_len(prefix_len, len(self._cached_tokens)) for block in self.blk)
 
   def generate(self, tokens:list[int], chunk_size:int=32, temperature:float=0.0):
-    if self.has_recurrent_block: chunk_size = 1
+    if any(isinstance(b, GatedDeltaNetBlock) for b in self.blk): chunk_size = 1
+    elif any(isinstance(b, KimiDeltaAttentionBlock) for b in self.blk):
+      chunk_size = min(chunk_size, KimiDeltaAttentionBlock.CHUNK_SIZE)
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
     v_toks = UOp.variable("toks", 1, chunk_size)
     # TODO: use UOp.variable for temperature once float variables are supported
@@ -484,7 +532,8 @@ class Transformer:
     out, prompt_len = None, len(tokens)
     while len(tokens) < self.max_context:
       sp, nt = v_start_pos.bind(start_pos), v_toks.bind(min(chunk_size, len(tokens) - start_pos))
-      out = self(t[:, sp:sp+nt] if start_pos < prompt_len or out is None else out, sp, temp).realize()
+      model_input = t[:, sp:sp+(1 if nt.val == 1 else nt)] if start_pos < prompt_len or out is None else out
+      out = self(model_input, sp, temp).realize()
       start_pos += nt.val
       # chunked prefill: keep processing until all prompt tokens are consumed
       if start_pos < len(tokens): continue
