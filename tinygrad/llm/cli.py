@@ -1,7 +1,7 @@
 from __future__ import annotations
 import sys, argparse, codecs, itertools, typing, re, unicodedata, json, time
 from typing import TYPE_CHECKING
-from tinygrad import nn
+from tinygrad import Device, Tensor, nn
 from tinygrad.uop.ops import UOp, Ops
 from tinygrad.helpers import partition, DEBUG, Timing, GlobalCounters, Context, fetch, profile_marker, getenv
 from tinygrad.llm.model import Transformer
@@ -167,6 +167,12 @@ def main():
     # run 2 tokens through the model twice to capture the JIT before serving
     with Context(DEBUG=max(DEBUG.value, 1)):
       for _ in range(2): list(zip(range(2), model.generate([0])))
+      chunk_size = 32
+      if model.has_recurrent_block and model.max_context > chunk_size*3+1:
+        next(model.generate([0] * (chunk_size*3+1), chunk_size))
+        if resets := [r for b in model.blk for r in b._state_reset_ops()]: Tensor.realize(*resets)
+        model._cached_tokens.clear()
+        Device[Device.DEFAULT].synchronize()
 
   # start server
   if args.serve: LLMServer(('', args.serve), model, model_name, tok, template).serve_forever()

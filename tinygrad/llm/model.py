@@ -238,6 +238,8 @@ class MLATransformerBlock(FFNBlock):
       self.freqs_cis = precompute_freqs_cis(self.config.rope_dim, self.config.max_context, self.config.rope_theta, device=x.device)
 
 class GatedDeltaNetBlock(FFNBlock):
+  CHUNK_SIZE = 64
+
   def __init__(self, config:TransformerConfig, ssm:SSMConfig):
     super().__init__(config)
     self.head_k_dim, self.num_k_heads, self.num_v_heads = ssm.state_size, ssm.group_count, ssm.time_step_rank
@@ -259,39 +261,70 @@ class GatedDeltaNetBlock(FFNBlock):
 
   def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
     B, T, _ = x.shape
-    assert T == 1, "GatedDeltaNetBlock currently only supports T=1"
+    chunked = resolve(T != 1)
+    if chunked: assert resolve(T <= self.CHUNK_SIZE, False), f"GatedDeltaNet chunk size must be <= {self.CHUNK_SIZE}"
 
     # input processing
     x = x.half()
     out_gate = self.ssm_g_b(self.ssm_g_a(x)) if hasattr(self, "ssm_g_a") else self.attn_gate(x)
-    out_gate = out_gate.reshape(B, 1, self.num_v_heads, self.head_v_dim)
-    beta = self.ssm_beta(x).sigmoid().reshape(B, self.num_v_heads, 1, 1)
-    alpha = self.ssm_f_b(self.ssm_f_a(x)) if hasattr(self, "ssm_f_a") else self.ssm_alpha(x)
-    alpha = ((alpha.float() + self.ssm_dt["bias"]).softplus().reshape(B, self.num_v_heads, -1) *
-             self.ssm_a.reshape(1, self.num_v_heads, -1)).exp().unsqueeze(-2)
+    out_gate = out_gate.reshape(B, T, self.num_v_heads, self.head_v_dim)
+    beta = self.ssm_beta(x).sigmoid().reshape(B, T, self.num_v_heads).transpose(1, 2)
+    g = self.ssm_f_b(self.ssm_f_a(x)) if hasattr(self, "ssm_f_a") else self.ssm_alpha(x)
+    g = ((g.float() + self.ssm_dt["bias"]).softplus().reshape(B, T, self.num_v_heads, -1) *
+         self.ssm_a.reshape(1, 1, self.num_v_heads, -1)).transpose(1, 2)
 
     # qkv conv
     conv_window = self.conv_state.cat(self.attn_qkv(x), dim=1)
-    conv_out = (conv_window * self.ssm_conv1d["weight"].T.unsqueeze(0)).sum(1).silu()
+    conv_out = (conv_window.unfold(1, self.ssm_conv_kernel, 1) * self.ssm_conv1d["weight"]).sum(-1).silu()
     q, k, v = conv_out.split([self.q_dim, self.q_dim, self.conv_channels - 2*self.q_dim], dim=-1)
-    q = q.reshape(B, self.num_k_heads, self.head_k_dim).normalize(dim=-1).repeat(1, self.num_v_heads//self.num_k_heads, 1)
-    k = k.reshape(B, self.num_k_heads, self.head_k_dim).normalize(dim=-1).repeat(1, self.num_v_heads//self.num_k_heads, 1)
-    v = v.reshape(B, self.num_v_heads, self.head_v_dim)
-    q, k, v = q.mul(self.head_k_dim**-0.5).unsqueeze(-1), k.unsqueeze(-1), v.unsqueeze(-1)
+    q = q.reshape(B, T, self.num_k_heads, self.head_k_dim).transpose(1, 2)
+    k = k.reshape(B, T, self.num_k_heads, self.head_k_dim).transpose(1, 2)
+    v = v.reshape(B, T, self.num_v_heads, self.head_v_dim).transpose(1, 2)
+    if chunked: q, k, v = q.float(), k.float(), v.float()
+    q = q.normalize(dim=-1).repeat(1, self.num_v_heads//self.num_k_heads, 1, 1) * self.head_k_dim**-0.5
+    k = k.normalize(dim=-1).repeat(1, self.num_v_heads//self.num_k_heads, 1, 1)
 
     # recurrent
-    recurrent_state = self.recurrent_state * alpha
-    recurrent_state = recurrent_state + ((v - recurrent_state@k) * beta)@k.transpose(-1, -2)
+    if chunked:
+      g = g.cumsum(2)
+      if g.shape[-1] == 1:
+        decay = (g - g.transpose(-1, -2)).exp()
+        lower, scores = (k @ k.transpose(-1, -2)) * decay, (q @ k.transpose(-1, -2)) * decay
+      else:
+        decay = (g.unsqueeze(-2) - g.unsqueeze(-3)).exp()
+        lower = (k.unsqueeze(-2) * k.unsqueeze(-3) * decay).sum(-1)
+        scores = (q.unsqueeze(-2) * k.unsqueeze(-3) * decay).sum(-1)
+      lower = (lower * beta.unsqueeze(-1)).tril(-1)
+      qg, kg = q * g.exp(), k * g.exp()
+      eye = Tensor.eye(T, dtype=lower.dtype)
+      inverse, power = eye - lower, lower @ lower
+      max_t = T if isinstance(T, int) else int(T.vmax)
+      for _ in range((max_t-1).bit_length()-1): inverse, power = inverse @ (eye + power), power @ power
+      transform = inverse * beta.unsqueeze(-2)
+      w, u = transform @ kg, transform @ v
+      state = self.recurrent_state.transpose(-1, -2)
+      pseudo_value = u - w @ state
+      core_attn_out = (qg @ state + scores.tril() @ pseudo_value).transpose(1, 2).contiguous()
+      final_g = g[:, :, T-1:T, :]
+      recurrent_state = (state * final_g.exp().transpose(-1, -2) +
+                         ((final_g - g).exp() * k).transpose(-1, -2) @ pseudo_value).transpose(-1, -2).contiguous()
+    else:
+      q, k, v = q.squeeze(2).unsqueeze(-1), k.squeeze(2).unsqueeze(-1), v.squeeze(2).unsqueeze(-1)
+      recurrent_state = self.recurrent_state * g.exp()
+      recurrent_state = recurrent_state + ((v - recurrent_state@k) * beta.unsqueeze(-1))@k.transpose(-1, -2)
 
     # store the updated state
-    conv_state_store = self.conv_state.uop.store(conv_window[:, 1:, :].cast(self.conv_state.dtype).uop)
+    conv_state_store = self.conv_state.uop.store(conv_window[:, T:, :].cast(self.conv_state.dtype).uop)
     recurrent_state_store = self.recurrent_state.uop.store(recurrent_state.cast(self.recurrent_state.dtype).uop)
-    recurrent_state = Tensor(self.recurrent_state.uop.after(recurrent_state_store, conv_state_store))
+    if chunked: core_attn_out = Tensor(core_attn_out.uop.after(recurrent_state_store, conv_state_store))
+    else:
+      recurrent_state = Tensor(self.recurrent_state.uop.after(recurrent_state_store, conv_state_store))
+      core_attn_out = (recurrent_state@q).squeeze(-1).reshape(B, 1, self.num_v_heads, self.head_v_dim)
 
     # output
-    core_attn_out = self.ssm_norm((recurrent_state@q).squeeze(-1).reshape(B, 1, self.num_v_heads, self.head_v_dim))
+    core_attn_out = self.ssm_norm(core_attn_out)
     out_gate = out_gate.sigmoid() if hasattr(self, "ssm_g_a") else out_gate.silu()
-    return self.ssm_out((core_attn_out * out_gate).reshape(B, 1, -1).cast(x.dtype))
+    return self.ssm_out((core_attn_out * out_gate).reshape(B, T, -1).cast(x.dtype))
 
   # recurrent state can't be partially reused after divergence, force a full rebuild
   def _state_reset_ops(self):
@@ -420,7 +453,7 @@ class Transformer:
     return min(block._reusable_prefix_len(prefix_len, len(self._cached_tokens)) for block in self.blk)
 
   def generate(self, tokens:list[int], chunk_size:int=32, temperature:float=0.0):
-    if self.has_recurrent_block: chunk_size = 1
+    if self.has_recurrent_block: chunk_size = min(chunk_size, GatedDeltaNetBlock.CHUNK_SIZE)
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
     v_toks = UOp.variable("toks", 1, chunk_size)
     # TODO: use UOp.variable for temperature once float variables are supported
@@ -432,9 +465,12 @@ class Transformer:
     if start_pos < len(self._cached_tokens) and (resets := [r for b in self.blk for r in b._state_reset_ops()]): Tensor.realize(*resets)
     out, prompt_len = None, len(tokens)
     while len(tokens) < self.max_context:
-      sp, nt = v_start_pos.bind(start_pos), v_toks.bind(min(chunk_size, len(tokens) - start_pos))
-      out = self(t[:, sp:sp+nt] if start_pos < prompt_len or out is None else out, sp, temp).realize()
-      start_pos += nt.val
+      nt = min(chunk_size, len(tokens) - start_pos)
+      if self.has_recurrent_block and nt != chunk_size: nt = 1
+      sp = v_start_pos.bind(start_pos)
+      model_nt = nt if self.has_recurrent_block else v_toks.bind(nt)
+      out = self(t[:, sp:sp+model_nt] if start_pos < prompt_len or out is None else out, sp, temp).realize()
+      start_pos += nt
       # chunked prefill: keep processing until all prompt tokens are consumed
       if start_pos < len(tokens): continue
       tokens.append(int(out.item()))

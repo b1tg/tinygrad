@@ -2,7 +2,7 @@ import unittest
 import numpy as np
 from tinygrad import Tensor, dtypes
 from tinygrad.llm.model import (
-  GatedDeltaNetBlock, SSMConfig, TransformerBlock, TransformerConfig,
+  GatedDeltaNetBlock, SSMConfig, Transformer, TransformerBlock, TransformerConfig,
   apply_rope as apply_rope_new, precompute_freqs_cis, pairwise_topk,
 )
 
@@ -175,6 +175,49 @@ class TestGatedDeltaNetBlock(unittest.TestCase):
                                  err_msg=f"GatedDeltaNet reset conv cache mismatch at step {step}")
       np.testing.assert_allclose(recurrent_state, expected_recurrent[step], rtol=1e-3, atol=1e-3,
                                  err_msg=f"GatedDeltaNet reset recurrent cache mismatch at step {step}")
+
+  def test_gatedeltanet_chunked(self):
+    config = self._make_config(max_context=4, ssm=SSMConfig(
+      conv_kernel=2, state_size=2, group_count=1, time_step_rank=2, inner_size=4))
+    block = self._make_block(config)
+    x = Tensor.linspace(-1.0, 1.0, 4 * config.dim, dtype=dtypes.float32).reshape(1, 4, config.dim)
+    expected_outs, expected_conv, expected_recurrent = self._naive_attention(block, x)
+
+    actual = self._run_attention(block, x, 0)
+    conv_state, recurrent_state = self._cache_views(block)
+    np.testing.assert_allclose(actual, np.concatenate(expected_outs, axis=1), rtol=2e-3, atol=2e-3)
+    np.testing.assert_allclose(conv_state, expected_conv[-1], rtol=2e-3, atol=2e-3)
+    np.testing.assert_allclose(recurrent_state, expected_recurrent[-1], rtol=2e-3, atol=2e-3)
+
+  def test_kda_chunked(self):
+    config = self._make_config(n_heads=2, max_context=8, ssm=SSMConfig(
+      conv_kernel=2, state_size=2, group_count=2, time_step_rank=2, inner_size=4, kda=True))
+    block = GatedDeltaNetBlock(config, config.ssm)
+    for i, weight in enumerate((block.attn_norm.weight, block.attn_qkv.weight, block.ssm_g_a.weight, block.ssm_g_b.weight,
+                                block.ssm_f_a.weight, block.ssm_f_b.weight, block.ssm_beta.weight,
+                                block.ssm_conv1d["weight"], block.ssm_norm.weight, block.ssm_out.weight)):
+      weight.assign(self._tensor_linspace(-0.2+i*0.02, 0.18+i*0.02, weight.shape)).realize()
+    block.ssm_dt["bias"] = self._tensor_linspace(-0.2, 0.15, block.ssm_dt["bias"].shape)
+    block.ssm_a = Tensor([[-0.3], [-0.7]], dtype=dtypes.float32)
+    x = Tensor.linspace(-0.8, 0.9, 8 * config.dim, dtype=dtypes.float32).reshape(1, 8, config.dim)
+    block._init_state(block.attn_norm(x[:, :1]))
+    initial_conv = self._tensor_linspace(-0.03, 0.04, block.conv_state.shape)
+    initial_recurrent = self._tensor_linspace(-0.05, 0.06, block.recurrent_state.shape)
+    Tensor.realize(block.conv_state.assign(initial_conv), block.recurrent_state.assign(initial_recurrent))
+
+    expected = np.concatenate([self._run_attention(block, x[:, i:i+1], i) for i in range(x.shape[1])], axis=1)
+    expected_conv, expected_recurrent = self._cache_views(block)
+    Tensor.realize(block.conv_state.assign(initial_conv), block.recurrent_state.assign(initial_recurrent))
+    actual = self._run_attention(block, x, 0)
+
+    np.testing.assert_allclose(actual, expected, rtol=2e-3, atol=2e-3)
+    np.testing.assert_allclose(block.conv_state.numpy(), expected_conv, rtol=2e-3, atol=2e-3)
+    np.testing.assert_allclose(block.recurrent_state.numpy(), expected_recurrent, rtol=2e-3, atol=2e-3)
+
+  def test_chunked_generate(self):
+    model = Transformer(self._make_config(max_context=6))
+    for _ in range(3): next(model.generate([1, 2, 3], chunk_size=3))
+    self.assertEqual(model.prefill_jit.cnt, 3)
 
   def test_kda_channel_decay(self):
     config = self._make_config(n_heads=2, ssm=SSMConfig(conv_kernel=2, state_size=2, group_count=2, time_step_rank=2, inner_size=4, kda=True))
