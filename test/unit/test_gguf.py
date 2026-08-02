@@ -55,6 +55,7 @@ class TestGGUF(unittest.TestCase):
   def test_dequantization_q4_k(self): self._test_dequantization(GGMLQuantizationType.Q4_K)
   def test_dequantization_q5_k(self): self._test_dequantization(GGMLQuantizationType.Q5_K)
   def test_dequantization_q6_k(self): self._test_dequantization(GGMLQuantizationType.Q6_K)
+  def test_dequantization_iq2_xs(self): self._test_dequantization(GGMLQuantizationType.IQ2_XS)
   def test_dequantization_iq3_xxs(self): self._test_dequantization(GGMLQuantizationType.IQ3_XXS)
   def test_dequantization_iq3_s(self): self._test_dequantization(GGMLQuantizationType.IQ3_S)
   def test_dequantization_iq2_s(self): self._test_dequantization(GGMLQuantizationType.IQ2_S)
