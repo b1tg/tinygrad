@@ -195,20 +195,19 @@ class FFNBlock:
       if normalize_topk: probs = probs / probs.sum(axis=-1, keepdim=True)
     probs = probs * self.config.routed_scaling_factor
 
+    gate, up = self.ffn_gate_exps(sel, h), self.ffn_up_exps(sel, h)
     if dsv4:
       clamp = dsv4.swiglu_clamp[getattr(self, "layer_id")]
-      gate, up = self.ffn_gate_exps(sel, h).float(), self.ffn_up_exps(sel, h).float()
-      hidden = (gate.minimum(clamp).silu()*up.clamp(-clamp, clamp)).cast(x.dtype)
-    else: hidden = (self.ffn_gate_exps(sel, h).silu() * self.ffn_up_exps(sel, h)).contiguous()
-    out = (self.ffn_down_exps(sel, hidden) * probs.unsqueeze(-1)).sum(axis=2)
+      gate, up = gate.float().minimum(clamp), up.float().clamp(-clamp, clamp)
+    x_down = self.ffn_down_exps(sel, (gate.silu() * up).contiguous())
+    out = (x_down * probs.unsqueeze(-1)).sum(axis=2)
 
     if hasattr(self, 'ffn_gate_shexp'):
+      gate, up = self.ffn_gate_shexp(x), self.ffn_up_shexp(x)
       if dsv4:
         clamp = dsv4.shared_swiglu_clamp[getattr(self, "layer_id")]
-        gate, up = self.ffn_gate_shexp(x).float(), self.ffn_up_shexp(x).float()
-        hidden = (gate.minimum(clamp).silu()*up.clamp(-clamp, clamp)).cast(x.dtype)
-      else: hidden = self.ffn_gate_shexp(x).silu().contiguous() * self.ffn_up_shexp(x)
-      shexp = self.ffn_down_shexp(hidden)
+        gate, up = gate.float().minimum(clamp), up.float().clamp(-clamp, clamp)
+      shexp = self.ffn_down_shexp(gate.silu().contiguous() * up)
       if not dsv4 and hasattr(self, 'ffn_gate_inp_shexp'):
         shexp = shexp * (x * self.ffn_gate_inp_shexp["weight"]).sum(axis=-1, keepdim=True).sigmoid()
       out = out + shexp
