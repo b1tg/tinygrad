@@ -95,6 +95,13 @@ class TestLLMTokenizer(unittest.TestCase):
     self.assertEqual(template.end_turn(), "[/INST]")
     self.assertEqual(template.role("assistant"), "")
 
+  def test_dbrx_preset_uses_chatml_fallback(self):
+    tok = SimpleTokenizer({}, {"<|im_end|>": 0}, preset="dbrx", eos_id=0)
+    template = FallbackTemplate(tok)
+    self.assertEqual(tok.preset, "qwen2")
+    self.assertEqual(template.role("user"), "<|im_start|>user\n")
+    self.assertEqual(template.end_turn(), "<|im_end|>\n")
+
   def test_stream_decoder(self):
     """stream_decoder buffers incomplete UTF-8: token 25677 has 3/4 of emoji, token 138 completes it."""
     bs = [*range(33, 127), *range(161, 173), *range(174, 256)]

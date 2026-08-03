@@ -1,8 +1,9 @@
-import unittest
+import math, unittest
+from dataclasses import replace
 import numpy as np
-from tinygrad import Tensor, dtypes
+from tinygrad import Tensor, dtypes, nn
 from tinygrad.llm.model import (
-  GatedDeltaNetBlock, SSMConfig, TransformerBlock, TransformerConfig,
+  FFNBlock, GatedDeltaNetBlock, SSMConfig, Transformer, TransformerBlock, TransformerConfig,
   apply_rope as apply_rope_new, precompute_freqs_cis, pairwise_topk,
 )
 
@@ -20,6 +21,68 @@ class TestAttention(unittest.TestCase):
     self.assertEqual(result.dtype, x.dtype)
     self.assertGreater((result - apply_rope(x, 5)).abs().max().item(), 1e-6)
     with self.assertRaises(AssertionError): apply_rope(Tensor.randn(1, 1, 4, 7, dtype=dtypes.float32), 0)
+
+  def test_yarn_freqs(self):
+    dim, end, theta = 8, 4, 500000.0
+    yarn = (8.0, 8192, 32.0, 1.0, 1.2079441541679836)
+    precompute_freqs_cis.cache_clear()
+    actual = precompute_freqs_cis(dim, end, theta, yarn=yarn).numpy()
+
+    factor, original_context, beta_fast, beta_slow, attn_factor = yarn
+    pos_freqs = theta ** (np.arange(0, dim, 2, dtype=np.float32) / dim)
+    def correction(rotations): return dim * math.log(original_context / (rotations * 2 * math.pi)) / (2 * math.log(theta))
+    low, high = max(math.floor(correction(beta_fast)), 0), min(math.ceil(correction(beta_slow)), dim-1)
+    ramp = np.clip((np.arange(dim//2, dtype=np.float32)-low) / (high-low if low != high else 0.001), 0, 1)
+    inv_freq = (1/pos_freqs)*(1-ramp) + (1/(factor*pos_freqs))*ramp
+    angles = np.arange(end, dtype=np.float32)[:, None] * inv_freq[None, :]
+    expected = np.concatenate((np.cos(angles), np.sin(angles)), axis=-1) * attn_factor
+    np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
+
+  def test_sliding_window_attention(self):
+    dim, seqlen, window = 2, 5, 3
+    config = TransformerConfig(num_blocks=1, dim=dim, hidden_dim=4, n_heads=1, n_kv_heads=1,
+                               norm_eps=1e-5, vocab_size=32, head_dim=dim, rope_theta=10000.0,
+                               rope_dim=dim, v_head_dim=dim, max_context=8, sliding_window=window)
+    block = TransformerBlock(config)
+    block.attn_q.weight = block.attn_k.weight = block.attn_v.weight = block.attn_output.weight = Tensor.eye(dim)
+    x = Tensor([[[1.0, 0.5], [0.5, -1.0], [2.0, 1.0], [-0.5, 1.5], [1.0, -2.0]]])
+    block._init_state(x)
+    actual = block._attention(x, 0).realize().numpy()[0]
+
+    q = apply_rope_new(x.reshape(1, seqlen, 1, dim).transpose(1, 2), block.freqs_cis[:seqlen]).numpy()[0, 0]
+    k, v = block.cache_kv[0, 0, 0, :seqlen].numpy(), block.cache_kv[1, 0, 0, :seqlen].numpy()
+    expected = np.empty((seqlen, dim), dtype=np.float32)
+    for i in range(seqlen):
+      begin = max(0, i-window+1)
+      scores = q[i] @ k[begin:i+1].T / math.sqrt(dim)
+      probs = np.exp(scores-scores.max())
+      probs /= probs.sum()
+      expected[i] = probs @ v[begin:i+1]
+    np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
+
+    full_block = TransformerBlock(replace(config, sliding_window=0))
+    full_block.attn_q.weight = full_block.attn_k.weight = full_block.attn_v.weight = full_block.attn_output.weight = Tensor.eye(dim)
+    full_block._init_state(x)
+    full = full_block._attention(x, 0).realize().numpy()[0]
+    np.testing.assert_allclose(actual[:window], full[:window], rtol=1e-5, atol=1e-5)
+    self.assertGreater(np.max(np.abs(actual[window:] - full[window:])), 1e-3)
+
+  def test_sliding_window_pattern(self):
+    yarn = (8.0, 8192, 32.0, 1.0, 1.2079441541679836)
+    config = TransformerConfig(num_blocks=4, dim=4, hidden_dim=8, n_heads=1, n_kv_heads=1,
+                               norm_eps=1e-5, vocab_size=32, head_dim=4, rope_theta=10000.0,
+                               rope_dim=4, v_head_dim=4, max_context=8, sliding_window=3,
+                               sliding_window_pattern=(True, True, True, False), yarn=yarn)
+    model = Transformer(config)
+    self.assertEqual([b.config.sliding_window for b in model.blk], [3, 3, 3, 0])
+    self.assertEqual([b.config.yarn for b in model.blk], [None, None, None, yarn])
+
+  def test_sliding_window_symbolic_start(self):
+    config = TransformerConfig(num_blocks=1, dim=4, hidden_dim=8, n_heads=1, n_kv_heads=1,
+                               norm_eps=1e-5, vocab_size=32, head_dim=4, rope_theta=10000.0,
+                               rope_dim=4, v_head_dim=4, max_context=9, sliding_window=3)
+    generated = list(Transformer(config).generate([1, 2, 3, 4, 5, 6, 7], chunk_size=2))
+    self.assertEqual(len(generated), 2)
 
   def test_partial_rope_in_attention(self):
     dim, rope_dim, seqlen = 8, 4, 3
@@ -39,6 +102,27 @@ class TestAttention(unittest.TestCase):
 
     expected = apply_rope_new(k[..., :rope_dim], block.freqs_cis[:seqlen]).cat(k[..., rope_dim:], dim=-1)
     np.testing.assert_allclose(block.cache_kv[0, :, :, :seqlen, :].numpy(), expected.numpy(), rtol=1e-5, atol=1e-5)
+
+  def test_post_norm_block(self):
+    class TestBlock(FFNBlock):
+      def _init_state(self, x): pass
+      def _attention(self, x, start_pos): return x * 2
+      def _feed_forward(self, x): return x * 3
+
+    config = TransformerConfig(num_blocks=1, dim=4, hidden_dim=8, n_heads=1, n_kv_heads=1,
+                               norm_eps=1e-5, vocab_size=32, head_dim=4, rope_theta=10000.0,
+                               rope_dim=4, v_head_dim=4, max_context=8, post_norm=True)
+    block = TestBlock(config)
+    state = nn.state.get_state_dict(block)
+    self.assertIn("post_attention_norm.weight", state)
+    self.assertIn("post_ffw_norm.weight", state)
+    self.assertNotIn("attn_norm.weight", state)
+    self.assertNotIn("ffn_norm.weight", state)
+
+    x = Tensor([[[1.0, -2.0, 3.0, -4.0]]])
+    h = x + block.post_attention_norm(x * 2)
+    expected = h + block.post_ffw_norm(h * 3)
+    np.testing.assert_allclose(block(x, 0).numpy(), expected.numpy(), rtol=1e-5, atol=1e-5)
 
 class TestGatedDeltaNetBlock(unittest.TestCase):
   def _tensor_linspace(self, start:float, stop:float, shape:tuple[int, ...]) -> Tensor:

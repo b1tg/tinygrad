@@ -1,15 +1,25 @@
 from __future__ import annotations
-import functools, itertools, pathlib
+import functools, itertools, math, pathlib
 from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function
 from tinygrad.llm.gguf import gguf_load
 from tinygrad.uop.ops import resolve
 
 @functools.cache
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, device:str|None=None) -> Tensor:
-  freqs = 1.0 / (theta ** (Tensor.arange(0, dim, 2)[:(dim // 2)] / dim))
+def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, device:str|None=None,
+                         yarn:tuple[float, int, float, float, float]|None=None) -> Tensor:
+  pos_freqs = theta ** (Tensor.arange(0, dim, 2)[:(dim // 2)] / dim)
+  attn_factor = 1.0
+  if yarn is not None:
+    factor, original_context, beta_fast, beta_slow, attn_factor = yarn
+    def correction_dim(rotations:float) -> float:
+      return dim * math.log(original_context / (rotations * 2 * math.pi)) / (2 * math.log(theta))
+    low, high = max(math.floor(correction_dim(beta_fast)), 0), min(math.ceil(correction_dim(beta_slow)), dim-1)
+    ramp = ((Tensor.arange(dim//2) - low) / (high-low if low != high else 0.001)).clip(0, 1)
+    freqs = (1.0 / pos_freqs) * (1-ramp) + (1.0 / (factor*pos_freqs)) * ramp
+  else: freqs = 1.0 / pos_freqs
   freqs = Tensor.arange(end).unsqueeze(dim=1) * freqs.unsqueeze(dim=0)
-  return freqs.cos().cat(freqs.sin(), dim=-1).clone(device)
+  return (freqs.cos().cat(freqs.sin(), dim=-1) * attn_factor).clone(device)
 
 class ExpertWeights:
   """Like nn.Linear but with num_experts dimension. Weight shape: (num_experts, out_features, in_features)."""
@@ -72,14 +82,22 @@ class TransformerConfig:
   routed_scaling_factor: float = 1.0
   qkv_bias: bool = False
   expert_bias: bool = False
+  post_norm: bool = False
+  yarn: tuple[float, int, float, float, float]|None = None
+  sliding_window: int = 0
+  sliding_window_pattern: tuple[bool, ...] = ()
 
 class FFNBlock:
   def __init__(self, config:TransformerConfig):
     self.config = config
 
     # --- RMSNorms --------------------------------------------------------
-    self.attn_norm   = nn.RMSNorm(config.dim, config.norm_eps)
-    self.ffn_norm    = nn.RMSNorm(config.dim, config.norm_eps)
+    if config.post_norm:
+      self.post_attention_norm = nn.RMSNorm(config.dim, config.norm_eps)
+      self.post_ffw_norm = nn.RMSNorm(config.dim, config.norm_eps)
+    else:
+      self.attn_norm = nn.RMSNorm(config.dim, config.norm_eps)
+      self.ffn_norm = nn.RMSNorm(config.dim, config.norm_eps)
 
     # --- feed-forward (MoE or dense) -------------------------------------
     if config.num_experts > 0:
@@ -133,6 +151,9 @@ class FFNBlock:
     # we pass in the weights implicitly so we unpack the GGUF on the fly
     @function(precompile=True, allow_implicit=True)
     def _run(x:Tensor, start_pos:int|UOp):
+      if self.config.post_norm:
+        h = x + self.post_attention_norm(self._attention(x, start_pos))
+        return (h + self.post_ffw_norm(self._feed_forward(h))).contiguous()
       h =     x + self._attention(self.attn_norm(x), start_pos)
       return (h + self._feed_forward(self.ffn_norm(h))).contiguous()
     return _run(x, start_pos)
@@ -180,6 +201,9 @@ class TransformerBlock(FFNBlock):
     # TODO: this if statement should be removed and it shouldn't generate extra kernels
     mask = Tensor.full((1, 1, T, start_pos+T), float("-inf"), dtype=x.dtype, buffer=False).triu(start_pos+1) \
       if resolve(T != 1) else None
+    if self.config.sliding_window:
+      sliding_mask = Tensor.full((1, 1, T, start_pos+T), float("-inf"), dtype=x.dtype, buffer=False).tril(start_pos-self.config.sliding_window)
+      mask = sliding_mask if mask is None else mask + sliding_mask
     attn = q.scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)     # (B,H,T,Hd)
     attn = attn.transpose(1, 2).reshape(B, T, -1)                                    # back to (B,T,D)
     return self.attn_output(attn if not self.config.attn_output_gate else (attn * gate.sigmoid()))
@@ -188,7 +212,8 @@ class TransformerBlock(FFNBlock):
     if not hasattr(self, "cache_kv"):
       # TODO: how is the dtype of this determined?
       self.cache_kv = Tensor.empty(2, x.shape[0], self.config.n_kv_heads, self.config.max_context, self.config.head_dim, device=x.device)
-      self.freqs_cis = precompute_freqs_cis(self.config.rope_dim, self.config.max_context, self.config.rope_theta, device=x.device)
+      self.freqs_cis = precompute_freqs_cis(self.config.rope_dim, self.config.max_context, self.config.rope_theta,
+                                            device=x.device, yarn=self.config.yarn)
 
 class MLATransformerBlock(FFNBlock):
   def __init__(self, config:TransformerConfig):
@@ -308,10 +333,17 @@ class Transformer:
   def __init__(self, config:TransformerConfig):
     dense_config = replace(config, num_experts=0, num_experts_per_tok=0, shared_expert_dim=0, hidden_dim=config.dense_hidden_dim or config.hidden_dim)
     if config.ssm: config = replace(config, qk_norm=config.head_dim)
+    if config.sliding_window_pattern: assert len(config.sliding_window_pattern) == config.num_blocks
+    def block_config(i:int) -> TransformerConfig:
+      base = dense_config if i < config.leading_dense_blocks else config
+      is_sliding = bool(config.sliding_window) and (not config.sliding_window_pattern or config.sliding_window_pattern[i])
+      # OLMo 3 uses regular RoPE on sliding-window layers and YaRN on global-attention layers.
+      return replace(base, sliding_window=config.sliding_window if is_sliding else 0,
+                     yarn=None if is_sliding else base.yarn)
     block_cls = MLATransformerBlock if config.kv_lora_rank > 0 else TransformerBlock
-    self.blk:list[FFNBlock] = [GatedDeltaNetBlock(dense_config if i < config.leading_dense_blocks else config, config.ssm)
+    self.blk:list[FFNBlock] = [GatedDeltaNetBlock(block_config(i), config.ssm)
                                if config.ssm and config.ssm_layers[i] else
-                               block_cls(dense_config if i < config.leading_dense_blocks else config) for i in range(config.num_blocks)]
+                               block_cls(block_config(i)) for i in range(config.num_blocks)]
     self.token_embd  = nn.Embedding(config.vocab_size, config.dim)
     self.output_norm = nn.RMSNorm(config.dim, config.norm_eps)
     self.output = nn.Linear(config.dim, config.vocab_size, bias=False)
@@ -370,6 +402,13 @@ class Transformer:
     kv_lora_rank = kv.get(f'{arch}.attention.kv_lora_rank', 0)
     head_dim = kv.get(f'{arch}.attention.key_length_mla', kv.get(f'{arch}.attention.key_length', kv[f'{arch}.embedding_length'] // n_heads))
     rope_dim = kv.get(f'{arch}.rope.dimension_count', head_dim)
+    yarn = None
+    if kv.get(f'{arch}.rope.scaling.type') == 'yarn':
+      factor = kv[f'{arch}.rope.scaling.factor']
+      yarn = (factor, kv[f'{arch}.rope.scaling.original_context_length'],
+              kv.get(f'{arch}.rope.scaling.yarn_beta_fast', 32.0), kv.get(f'{arch}.rope.scaling.yarn_beta_slow', 1.0),
+              kv.get(f'{arch}.rope.scaling.attn_factor', 0.1 * math.log(factor) + 1.0))
+    sliding_window_pattern = tuple(kv.get(f'{arch}.attention.sliding_window_pattern', ()))
 
     # Permute RoPE weights from interleaved to half-split layout.
     for name in state_dict:
@@ -406,7 +445,10 @@ class Transformer:
       routed_scaling_factor=kv.get(f'{arch}.expert_weights_scale', 1.0), attn_output_gate=arch in ('qwen35', 'qwen35moe'), ssm=ssm,
       ssm_layers=ssm_layers,
       qkv_bias='blk.0.attn_q.bias' in state_dict,
-      expert_bias=f"blk.{kv.get(f'{arch}.leading_dense_block_count', 0)}.exp_probs_b.bias" in state_dict)
+      expert_bias=f"blk.{kv.get(f'{arch}.leading_dense_block_count', 0)}.exp_probs_b.bias" in state_dict,
+      post_norm=arch == 'olmo2', yarn=yarn,
+      sliding_window=kv.get(f'{arch}.attention.sliding_window', 0),
+      sliding_window_pattern=sliding_window_pattern)
     model = Transformer(config)
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
