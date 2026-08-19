@@ -1,4 +1,4 @@
-import unittest
+import unittest, json
 from unittest.mock import patch
 from tinygrad import Tensor, UOp
 from tinygrad.schedule import schedule_cache
@@ -57,6 +57,17 @@ class TestTransformerGenerate(unittest.TestCase):
     router = StreamRouter(reasoning=True)
     self.assertEqual(list(router.route("reasoning</think>answer")),
                      [("reasoning_content", "reasoning"), ("content", "answer")])
+
+  def test_harmony(self):
+    r = StreamRouter()
+    self.assertEqual(list(r.route("<|channel|>analysis<|message|>think<|end|>"
+                                  "<|start|>assistant<|channel|>final<|message|>answer", final=True)),
+                     [("reasoning_content", "think"), ("content", "answer")])
+    r = StreamRouter()
+    self.assertEqual(list(r.route('<|channel|>analysis<|message|>need<|end|>'
+                                  '<|start|>assistant to=functions.read<|channel|>commentary json<|message|>{"path":"a"}',
+                                  final=True)), [("reasoning_content", "need")])
+    self.assertEqual((r.tool_name, json.loads(r.buf)), ("read", {"path": "a"}))
 
   def test_kv_cache_reuse(self):
     """Test that generate reuses the KV cache when tokens extend the cached prefix."""

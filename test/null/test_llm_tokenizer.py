@@ -81,6 +81,10 @@ class TestLLMTokenizer(unittest.TestCase):
     self.llama_tok.encode(first)
     self.assertEqual(self.llama_tok.encode(changed), expected)
 
+  def test_gpt4o_split(self):
+    self.assertEqual(SimpleTokenizer({}, {}, "gpt-4o")._split_to_word.findall("don't I'm iPhone"),
+                     ["don't", " I'm", " i", "Phone"])
+
   def test_tekken_from_gguf_kv(self):
     kv = {
       "tokenizer.ggml.tokens": ["<unk>", "<s>", "</s>", "[INST]", "[/INST]", "hello"],

@@ -27,6 +27,9 @@ def parse_tool_call(s:str) -> tuple[str, typing.Any]|None:
 def normalize_messages(messages:list[dict]) -> None:
   # chat templates expect tool_call arguments as dicts (OpenAI clients send JSON strings)
   for m in messages:
+    if isinstance(c := m.get("content"), list):
+      m["content"] = "".join(p.get("text", "") if isinstance(p, dict) else str(p) for p in c)
+    if (rsn := m.get("reasoning_content")) is not None: m.setdefault("thinking", rsn)
     for tc in m.get("tool_calls") or []:
       if "function" in tc and isinstance(args := tc["function"].get("arguments"), str):
         try: tc["function"]["arguments"] = json.loads(args)
@@ -37,6 +40,7 @@ class StreamRouter:
   def __init__(self, reasoning:bool=False):
     self.buf = ""
     self.mode = "reasoning" if reasoning else "undecided"  # output inside a think block is sent as reasoning_content
+    self.tool_name: str|None = None
   def split(self, tag:str, final:bool) -> tuple[str, bool]:
     # split buf on the first full tag, holding back a partial tag at the end unless final
     if tag in self.buf:
@@ -47,14 +51,26 @@ class StreamRouter:
     return emit, False
   def route(self, piece:str, final:bool=False) -> typing.Iterator[tuple[str, str]]:
     self.buf += piece
+    tool = None
+    if self.mode != "tool":
+      if not final and (self.buf.rfind("<") > self.buf.rfind(">") or
+          re.search(r"<\|(?:channel|start|end)\|>(?:analysis|final|commentary|assistant)?$", self.buf) or
+          (re.search(r"to=(?:functions\.)?(?!assistant(?:<|\s|$))\w+", self.buf) and "<|message|>" not in self.buf)): return
+      tool = re.search(r"to=(?:functions\.)?(?!assistant(?:<|\s|$))(\w+).*?<\|message\|>(.*)", self.buf, re.S)
+      if tool: self.buf, after = self.buf[:tool.start()], tool.group(2)
+      for a,b in (("<|channel|>analysis<|message|>","<think>"), ("<|end|>","</think>"),
+                  ("<|start|>assistant",""), ("<|channel|>final<|message|>",""),
+                  ("<|channel|>commentary to=assistant","")):
+        self.buf = self.buf.replace(a, b)
     if self.mode == "undecided":  # decide whether the output starts with a think block
       if not final and len(self.buf) < len("<think>") and "<think>".startswith(self.buf): return
       self.mode, self.buf = ("reasoning", self.buf[len("<think>"):]) if self.buf.startswith("<think>") else ("content", self.buf)
     if self.mode == "reasoning":
-      emit, done = self.split("</think>", final)
+      emit, done = self.split("</think>", final or tool is not None)
       if emit: yield "reasoning_content", emit
       if not done: return
       self.mode = "content"
+    if tool: self.tool_name, self.buf, self.mode = tool.group(1), after, "tool"
     if self.mode == "tool": return
     emit, found = self.split("<tool_call>", final)
     if emit: yield "content", emit
@@ -98,6 +114,10 @@ class Handler(HTTPRequestHandler):
           break
       for field, delta in router.route(dec(), final=True): yield chunk({field:delta})
       tool_calls: list[dict] = []
+      if router.tool_name:
+        try: args = json.loads(router.buf.strip() or "{}")
+        except json.JSONDecodeError: args = None
+        router.buf = "<tool_call>"+(json.dumps({"name":router.tool_name,"arguments":args}) if args is not None else router.buf)+"</tool_call>"
       for m in re.finditer(r"<tool_call>\s*(.*?)\s*(?:</tool_call>|$)", router.buf, re.DOTALL):
         if (parsed := parse_tool_call(m.group(1))) is None:
           stderr_log(f"failed to parse tool call: {m.group(1)[:200]}")

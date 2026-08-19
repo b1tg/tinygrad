@@ -26,8 +26,13 @@ class SimpleTokenizer:
       runs = [list(g) for _, g in itertools.groupby(cps, lambda e: e[1]-e[0])]
       return "".join(re.escape(chr(g[0][1])) + (f"-{re.escape(chr(g[-1][1]))}" if len(g) > 1 else "") for g in runs)
     r_ws, r_p_N, r_p_L = r"\t\n\x0b\x0c\r\x85" + ucat_range("Z"), ucat_range("N"), ucat_range("L")
-    self._split_to_word = re.compile("(?i:'s|'t|'re|'ve|'m|'ll|'d)|" + \
-      f"[^\\r\\n{r_p_N}{r_p_L}]?[{r_p_L}]+|[{r_p_N}]{{1,3}}| ?[^{r_ws}{r_p_N}{r_p_L}]+[\\r\\n]*|[{r_ws}]*[\\r\\n]+|[{r_ws}]+(?![^{r_ws}])|[{r_ws}]+")
+    r_contr, r_lead = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)", f"[^\\r\\n{r_p_N}{r_p_L}]?"
+    r_punct = f" ?[^{r_ws}{r_p_N}{r_p_L}]+[\\r\\n{'/' if preset == 'gpt-4o' else ''}]*"
+    r_word = f"{r_contr}|{r_lead}[{r_p_L}]+"
+    if preset == "gpt-4o":
+      r_up, r_lo = "".join(map(ucat_range, ("Lu","Lt","Lm","Lo","M"))), "".join(map(ucat_range, ("Ll","Lm","Lo","M")))
+      r_word = f"{r_lead}[{r_up}]*[{r_lo}]+{r_contr}?|{r_lead}[{r_up}]+[{r_lo}]*{r_contr}?"
+    self._split_to_word = re.compile(f"{r_word}|[{r_p_N}]{{1,3}}|{r_punct}|[{r_ws}]*[\\r\\n]+|[{r_ws}]+(?![^{r_ws}])|[{r_ws}]+")
     self._split_to_sentence = re.compile("|".join(re.escape(tok) for tok in special_tokens.keys()) if special_tokens else r"(?!)")
 
     self._normal_tokens = {bytes(self._byte_decoder[c] for c in tok): tid for tok, tid in normal_tokens.items()}
@@ -43,7 +48,7 @@ class SimpleTokenizer:
     normal_tokens, special_tokens = partition(vocab, lambda e: kv["tokenizer.ggml.token_type"][e[1]] == 1)
     special_tokens_dict = dict(special_tokens)
     return SimpleTokenizer(dict(normal_tokens), special_tokens_dict, kv["tokenizer.ggml.pre"],
-      bos_id=kv.get('tokenizer.ggml.bos_token_id') if kv.get('tokenizer.ggml.add_bos_token', True) else None,
+      bos_id=kv.get('tokenizer.ggml.bos_token_id') if kv.get('tokenizer.ggml.add_bos_token', kv["tokenizer.ggml.pre"] != "gpt-4o") else None,
       eos_id=kv.get('tokenizer.ggml.eos_token_id', 0), eot_id=kv.get('tokenizer.ggml.eot_token_id', special_tokens_dict.get('<|im_end|>')))
 
   def _encode_word(self, word:bytes) -> list[int]:
@@ -71,7 +76,7 @@ class SimpleTokenizer:
     dec = codecs.getincrementaldecoder('utf-8')('replace')
     def _decode(tid:int|None=None) -> str: return dec.decode(self._tok2bytes[tid]) if tid is not None else dec.decode(b'', final=True)
     return _decode
-  def is_end(self, token_id:int) -> bool: return token_id in (self.eos_id, self.eot_id)
+  def is_end(self, token_id:int) -> bool: return token_id in (self.eos_id, self.eot_id, self._special_tokens.get("<|call|>"))
 
 models = {
   "llama3.2:1b": "https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q6_K.gguf",
