@@ -1,7 +1,7 @@
 import numpy as np
 import unittest
 from tinygrad.function import function
-from tinygrad import Tensor, GlobalCounters, Device
+from tinygrad import Tensor, GlobalCounters, Device, Variable, TinyJit
 from tinygrad.dtype import Invalid
 from tinygrad.uop.ops import UOp, Ops, KernelInfo, ProgramInfo
 from test.helpers import assert_kernel_count, KernelCountException
@@ -135,6 +135,46 @@ class TestFunction(unittest.TestCase):
     sz = UOp.variable("sz", 1, 3)
     slic = table[:sz.bind(2)]
     np.testing.assert_equal(f(slic)[:2].numpy(), [20,40])
+
+  def test_precompiled_bound_variable_slot_collision(self):
+    cache0, cache1 = Tensor.zeros(8).realize(), Tensor.zeros(8).realize()
+
+    def make_block(cache:Tensor):
+      @function(precompile=True, allow_implicit=True)
+      def block(x:Tensor, start_pos:UOp) -> Tensor:
+        length = x.shape[0]
+        assigned = Tensor(cache.uop.after(cache[start_pos:start_pos+length].uop.store(x.uop)))
+        return (x + assigned[start_pos:start_pos+length] + start_pos).contiguous()
+      return block
+
+    block0, block1 = make_block(cache0), make_block(cache1)
+    data = Tensor([1, 2, 3, 4]).realize()
+    pos = Variable("start_pos", 0, 7).bind(0)
+    # The outer JIT's p3 is toks while each nested LINEAR's p3 is start_pos; parameter slots are call-local.
+    length = Variable("toks", 1, 4).bind(4)
+    @TinyJit
+    def run(x:Tensor, start_pos:UOp):
+      return block1(block0((x + 1).contiguous(), start_pos), start_pos)
+
+    out = run(data[pos:pos+length], pos).realize()
+    np.testing.assert_equal(out[:4].numpy(), [8, 12, 16, 20])
+
+  def test_precompiled_nested_bound_variable_scope(self):
+    cache0, cache1 = Tensor.zeros(8).realize(), Tensor.zeros(8).realize()
+    unused = Tensor([0]).realize()
+
+    @function(precompile=True)
+    def block(cache:Tensor, unused:Tensor, x:Tensor, start_pos:UOp) -> Tensor:
+      length = x.shape[0]
+      assigned = Tensor(cache.uop.after(cache[start_pos:start_pos+length].uop.store(x.uop)))
+      return (x + assigned[start_pos:start_pos+length]).contiguous()
+
+    # #17424's outer p3 is start_pos while the nested LINEAR's p3 is toks; slots are local to each CALL.
+    data = Tensor([1, 2, 3, 4]).realize()
+    pos = Variable("start_pos", 0, 7).bind(0)
+    length = Variable("toks", 1, 4).bind(4)
+    out = block(cache1, unused, block(cache0, unused, data[pos:pos+length], pos), pos)
+    np.testing.assert_equal(out[:4].numpy(), [4, 8, 12, 16])
 
   def test_nested_calls(self):
     w = Tensor([10., 20., 30.])
