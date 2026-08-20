@@ -1,5 +1,5 @@
 from __future__ import annotations
-import sys, argparse, codecs, itertools, typing, re, unicodedata, json, time
+import sys, argparse, codecs, typing, re, unicodedata, json, time
 from typing import TYPE_CHECKING
 from tinygrad import nn
 from tinygrad.uop.ops import UOp, Ops
@@ -11,23 +11,51 @@ if TYPE_CHECKING:
 class SimpleTokenizer:
   def __init__(self, normal_tokens:dict[str, int], special_tokens:dict[str, int], preset:str="llama3",
                bos_id:int|None=None, eos_id:int=0, eot_id:int|None=None):
-    preset = {"qwen35":"qwen2","qwen35moe":"qwen2"}.get(preset, preset)
-    if preset not in ("llama3","llama-v3","llama-bpe","qwen2","olmo","kimi-k2","tekken","glm4"):
+    preset = {"qwen35moe":"qwen35"}.get(preset, preset)
+    if preset not in ("llama3","llama-v3","llama-bpe","qwen2","qwen35","olmo","kimi-k2","tekken","glm4","gpt-4o"):
       raise ValueError(f"Invalid tokenizer preset '{preset}'")
     # https://github.com/openai/gpt-2/blob/9b63575ef42771a015060c964af2c3da4cf7c8ab/src/encoder.py#L9
     bs = [*range(33, 127), *range(161, 173), *range(174, 256)]  # bytes that map to themselves
     self._byte_decoder = {chr(b): b for b in bs} | {chr(256+i): b for i,b in enumerate(b for b in range(256) if b not in bs)}
 
-    # https://github.com/ggml-org/llama.cpp/blob/94933c8c2eeaa9a7983e3f6c08af76bd86724094/src/llama-vocab.cpp#L286
-    # 0x323b0 is one past the max codepoint in unicode categories L/N/Z (0x323af is max L)
+    # https://github.com/ggml-org/llama.cpp/blob/master/src/llama-vocab.cpp#L286
     # compact adjacent codepoints into ranges: listing them all makes re spend seconds on large prompts
-    def ucat_range(pre:str) -> str:
-      cps = enumerate(cp for cp in range(0x323b0) if unicodedata.category(chr(cp)).startswith(pre))
-      runs = [list(g) for _, g in itertools.groupby(cps, lambda e: e[1]-e[0])]
-      return "".join(re.escape(chr(g[0][1])) + (f"-{re.escape(chr(g[-1][1]))}" if len(g) > 1 else "") for g in runs)
-    r_ws, r_p_N, r_p_L = r"\t\n\x0b\x0c\r\x85" + ucat_range("Z"), ucat_range("N"), ucat_range("L")
-    self._split_to_word = re.compile("(?i:'s|'t|'re|'ve|'m|'ll|'d)|" + \
-      f"[^\\r\\n{r_p_N}{r_p_L}]?[{r_p_L}]+|[{r_p_N}]{{1,3}}| ?[^{r_ws}{r_p_N}{r_p_L}]+[\\r\\n]*|[{r_ws}]*[\\r\\n]+|[{r_ws}]+(?![^{r_ws}])|[{r_ws}]+")
+    def cpt_cls(pre:str|set[int]) -> str:  # compact a unicode category prefix (or codepoint set) into regex ranges
+      cps = {cp for cp in range(0x323b0) if unicodedata.category(chr(cp)).startswith(pre)} if isinstance(pre, str) else pre
+      runs: list[list[int]] = []
+      for cp in sorted(cps):
+        if runs and cp == runs[-1][1] + 1: runs[-1][1] = cp
+        else: runs.append([cp, cp])
+      return "".join(re.escape(chr(s)) + (f"-{re.escape(chr(e))}" if e > s else "") for s, e in runs)
+    HAN = set().union(*(set(range(a, b+1)) for a, b in
+      ((0x3400,0x4DBF),(0x4E00,0x9FFF),(0xF900,0xFAFF),(0x20000,0x2A6DF),(0x2A700,0x2B73F),
+       (0x2B740,0x2B81F),(0x2B820,0x2CEAF),(0x2CEB0,0x2EBEF),(0x2F800,0x2FA1F))))
+    L_SET = {cp for cp in range(0x323b0) if unicodedata.category(chr(cp)).startswith("L")}
+    r_ws, r_N, r_L = r"\t\n\x0b\x0c\r\x85" + cpt_cls("Z"), cpt_cls("N"), cpt_cls(L_SET)
+    r_M, r_han = cpt_cls("M"), cpt_cls(HAN)
+    r_L_nh = cpt_cls(L_SET - HAN)
+    lead, contr = f"[^\\r\\n{r_L}{r_N}]?", "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])"
+    num3, num1 = f"[{r_N}]{{1,3}}", f"[{r_N}]"
+    punct = f" ?[^{r_ws}{r_L}{r_N}]+[\\r\\n]*"
+    punct_slash = f" ?[^{r_ws}{r_L}{r_N}]+[\\r\\n/]*"
+    tail = f"[{r_ws}]*[\\r\\n]+|[{r_ws}]+(?![^{r_ws}])|[{r_ws}]+"
+    up, lo = f"(?:(?=[{r_L}])(?:[^a-z]))", f"(?:(?=[{r_L}])(?:[^A-Z]))"  # non-lower / non-upper letter runs
+    if preset in ("llama3", "llama-v3", "llama-bpe", "glm4", "qwen2"):
+      r_word, r_num, r_punct = f"{contr}|{lead}[{r_L}]+", num1 if preset == "qwen2" else num3, punct
+    elif preset == "qwen35":
+      r_word = f"{contr}|{lead}[{r_L}{r_M}]+"
+      r_num, r_punct = num1, f" ?[^{r_ws}{r_L}{r_M}{r_N}]+[\\r\\n]*"
+    elif preset == "olmo":  # gpt2 pre-tokenizer: unbounded numbers, no explicit newline/space alternatives
+      r_word, r_num = f"'s|'t|'re|'ve|'m|'ll|'d| ?[{r_L}]+", f" ?[{r_N}]+"
+      r_punct, tail = f" ?[^{r_ws}{r_L}{r_N}]+", f"[{r_ws}]+(?![^{r_ws}])|[{r_ws}]+|(?s:.)"
+    elif preset in ("tekken", "gpt-4o"):  # up/lower lookahead words; gpt-4o adds contractions + 3-digit numbers
+      c = f"{contr}?" if preset == "gpt-4o" else ""
+      r_word = f"{lead}{up}*{lo}+{c}|{lead}{up}+{lo}*{c}"
+      r_num, r_punct = num1 if preset == "tekken" else num3, punct_slash
+    elif preset == "kimi-k2":  # Han runs split out, letters exclude Han
+      r_word = f"[{r_han}]+|{lead}(?=[{r_L_nh}])[{r_L_nh}]+{contr}?"
+      r_num, r_punct = num3, punct
+    self._split_to_word = re.compile(f"{r_word}|{r_num}|{r_punct}|{tail}")
     self._split_to_sentence = re.compile("|".join(re.escape(tok) for tok in special_tokens.keys()) if special_tokens else r"(?!)")
 
     self._normal_tokens = {bytes(self._byte_decoder[c] for c in tok): tid for tok, tid in normal_tokens.items()}

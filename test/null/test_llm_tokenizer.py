@@ -104,5 +104,58 @@ class TestLLMTokenizer(unittest.TestCase):
     dec = tok.stream_decoder()
     self.assertEqual(dec(25677) + dec(138) + dec(), " 😊")
 
+  # each preset's pre-tokenizer must reproduce llama.cpp's unicode_regex_split
+  # (reference values generated from llama.cpp src/unicode.cpp)
+  def test_preset_splits_match_llama_cpp(self):
+    cases = {
+      "llama3": [
+        ("don't I'm iPhone", ['don', "'t", ' I', "'m", ' iPhone']),
+        ('42 123 1234 99999', ['42', ' ', '123', ' ', '123', '4', ' ', '999', '99']),
+        ('a,b.c!? ;:', ['a', ',b', '.c', '!?', ' ;:']),
+        ('line1\nline2\n\nline3', ['line', '1', '\n', 'line', '2', '\n\n', 'line', '3']),
+        ('你好世界 hello 東京', ['你好世界', ' hello', ' 東京']),
+      ],
+      "qwen2": [
+        ('42 123 1234 99999', ['4', '2', ' ', '1', '2', '3', ' ', '1', '2', '3', '4', ' ', '9', '9', '9', '9', '9']),
+        ("don't I'm iPhone", ['don', "'t", ' I', "'m", ' iPhone']),
+        ('END. start!', ['END', '.', ' start', '!']),
+        ('line1\nline2', ['line', '1', '\n', 'line', '2']),
+      ],
+      "qwen35": [
+        ('cafe\u0301 na\u0308ive', ['cafe\u0301', ' na\u0308ive']),
+        ('42 123 1234', ['4', '2', ' ', '1', '2', '3', ' ', '1', '2', '3', '4']),
+        ('e\u0301\u0302 x', ['e\u0301\u0302', ' x']),
+      ],
+      "olmo": [
+        ('42 123 1234 99999', ['42', ' 123', ' 1234', ' 99999']),
+        ('a,b.c!? ;:', ['a', ',', 'b', '.', 'c', '!?', ' ;:']),
+        ('  leading', [' ', ' leading']),
+        ("don't I'm iPhone", ['don', "'t", ' I', "'m", ' iPhone']),
+      ],
+      "tekken": [
+        ('HelloWorld camelCase', ['Hello', 'World', ' camel', 'Case']),
+        ("don't I'm iPhone", ['don', "'t", ' I', "'m", ' i', 'Phone']),
+        ('42 123 1234', ['4', '2', ' ', '1', '2', '3', ' ', '1', '2', '3', '4']),
+      ],
+      "gpt-4o": [
+        ("don't I'm iPhone", ["don't", " I'm", ' i', 'Phone']),
+        ('HelloWorld camelCase', ['Hello', 'World', ' camel', 'Case']),
+        ('42 123 1234', ['42', ' ', '123', ' ', '123', '4']),
+        ('cafe\u0301 na\u0308ive', ['cafe', '\u0301', ' na', '\u0308ive']),  # marks are not \p{L}, split out of words
+        ('https://example.com/path', ['https', '://', 'example', '.com', '/path']),
+      ],
+      "kimi-k2": [
+        ("don't I'm iPhone", ["don't", " I'm", ' iPhone']),
+        ('你好世界 hello 東京', ['你好世界', ' hello', ' ', '東京']),
+        ('上海abc 北京', ['上海', 'abc', ' ', '北京']),
+        ('HelloWorld camelCase', ['HelloWorld', ' camelCase']),
+        ('cafe\u0301 na\u0308ive', ['cafe', '\u0301', ' na', '\u0308ive']),
+      ],
+    }
+    for preset, checks in cases.items():
+      tok = SimpleTokenizer({}, {}, preset)
+      for text, expected in checks:
+        self.assertEqual(tok._split_to_word.findall(text), expected, f"preset {preset} on {text!r}")
+
 if __name__ == '__main__':
   unittest.main()
