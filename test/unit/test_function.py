@@ -1,7 +1,7 @@
 import numpy as np
 import unittest
 from tinygrad.function import function
-from tinygrad import Tensor, GlobalCounters, Device, Variable, TinyJit
+from tinygrad import Tensor, GlobalCounters, Device
 from tinygrad.dtype import Invalid
 from tinygrad.uop.ops import UOp, Ops, KernelInfo, ProgramInfo
 from test.helpers import assert_kernel_count, KernelCountException
@@ -136,45 +136,25 @@ class TestFunction(unittest.TestCase):
     slic = table[:sz.bind(2)]
     np.testing.assert_equal(f(slic)[:2].numpy(), [20,40])
 
-  def test_precompiled_bound_variable_slot_collision(self):
-    cache0, cache1 = Tensor.zeros(8).realize(), Tensor.zeros(8).realize()
-
-    def make_block(cache:Tensor):
-      @function(precompile=True, allow_implicit=True)
-      def block(x:Tensor, start_pos:UOp) -> Tensor:
-        length = x.shape[0]
-        assigned = Tensor(cache.uop.after(cache[start_pos:start_pos+length].uop.store(x.uop)))
-        return (x + assigned[start_pos:start_pos+length] + start_pos).contiguous()
-      return block
-
-    block0, block1 = make_block(cache0), make_block(cache1)
-    data = Tensor([1, 2, 3, 4]).realize()
-    pos = Variable("start_pos", 0, 7).bind(0)
-    # The outer JIT's p3 is toks while each nested LINEAR's p3 is start_pos; parameter slots are call-local.
-    length = Variable("toks", 1, 4).bind(4)
-    @TinyJit
-    def run(x:Tensor, start_pos:UOp):
-      return block1(block0((x + 1).contiguous(), start_pos), start_pos)
-
-    out = run(data[pos:pos+length], pos).realize()
-    np.testing.assert_equal(out[:4].numpy(), [8, 12, 16, 20])
-
-  def test_precompiled_nested_bound_variable_scope(self):
-    cache0, cache1 = Tensor.zeros(8).realize(), Tensor.zeros(8).realize()
-    unused = Tensor([0]).realize()
-
-    @function(precompile=True)
-    def block(cache:Tensor, unused:Tensor, x:Tensor, start_pos:UOp) -> Tensor:
-      length = x.shape[0]
-      assigned = Tensor(cache.uop.after(cache[start_pos:start_pos+length].uop.store(x.uop)))
-      return (x + assigned[start_pos:start_pos+length]).contiguous()
-
-    # #17424's outer p3 is start_pos while the nested LINEAR's p3 is toks; slots are local to each CALL.
-    data = Tensor([1, 2, 3, 4]).realize()
-    pos = Variable("start_pos", 0, 7).bind(0)
-    length = Variable("toks", 1, 4).bind(4)
-    out = block(cache1, unused, block(cache0, unused, data[pos:pos+length], pos), pos)
-    np.testing.assert_equal(out[:4].numpy(), [4, 8, 12, 16])
+  def test_chunked_prefill_replay_keeps_start_pos(self):
+    # qk_norm adds implicit inputs so the precompiled block's start_pos slot collides with the outer
+    # schedule's toks; multi-chunk generate() then replays the captured schedule with a stale start_pos
+    from tinygrad.llm.model import Transformer, TransformerConfig
+    from tinygrad.nn.state import get_state_dict
+    config = TransformerConfig(num_blocks=1, dim=8, hidden_dim=16, n_heads=1, n_kv_heads=1, norm_eps=1e-5,
+      vocab_size=32, head_dim=4, rope_theta=1000000, rope_dim=4, qk_norm=4, v_head_dim=4, max_context=128)
+    def model():
+      m = Transformer(config)
+      rng = np.random.RandomState(1234)
+      for t in get_state_dict(m).values():
+        t.assign(Tensor(rng.uniform(-1, 1, t.shape).astype(np.float32))).realize()
+      return m
+    def prefill(m, chunk_size):
+      gen = m.generate(list(range(1, 65)), chunk_size=chunk_size, temperature=0.0)
+      next(gen)
+      return [b.cache_kv.numpy() for b in m.blk]
+    for g, r in zip(prefill(model(), 32), prefill(model(), 128)):
+      np.testing.assert_allclose(g[:, :, :, :64, :], r[:, :, :, :64, :], atol=1e-5)
 
   def test_nested_calls(self):
     w = Tensor([10., 20., 30.])

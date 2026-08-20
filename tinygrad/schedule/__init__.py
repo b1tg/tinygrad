@@ -101,9 +101,10 @@ def resolve_linear_call(linear_call:UOp):
   linear = graph_rewrite(linear_call.src[0], pm_post_sched_cache, ctx=({}, linear_call.src[1:]), walk=True, name="params to buffers")
   # map the call body params back to the original Variables stored in the call args
   binds = {f"p{i}":x.src[0].replace(op=Ops.PARAM) for i,x in enumerate(linear_call.src[1:]) if x.is_bound_var}
-  sub = {v:binds[v.expr] for v in linear.variables() if v.expr in binds}
-  return linear.replace(src=tuple(si if si.op is Ops.CALL and si.src[0].op is Ops.LINEAR else
-                                  si.substitute(sub, enter_calls=True, name="resolve scalar params") for si in linear.src))
+  # only substitute when the bound variable structurally matches the kernel var, so a slot-name
+  # collision across nested schedules can't swap one Variable for another
+  sub = {v:b for v in linear.variables() if (b:=binds.get(v.expr)) is not None and b._min_max == v._min_max and b.dtype == v.dtype}
+  return linear.substitute(sub, enter_calls=True, name="resolve scalar params")
 
 pm_resolve_linear_call = PatternMatcher([
   # call LINEAR is resolved here
