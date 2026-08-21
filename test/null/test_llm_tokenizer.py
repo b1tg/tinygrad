@@ -95,6 +95,33 @@ class TestLLMTokenizer(unittest.TestCase):
     self.assertEqual(template.end_turn(), "[/INST]")
     self.assertEqual(template.role("assistant"), "")
 
+  def test_presets_match_llama_cpp(self):
+    def split(p, s): return SimpleTokenizer({}, {}, p)._split_to_word.findall(s)
+    self.assertEqual(split("qwen2", "12345"), list("12345"))
+    self.assertEqual(split("llama3", "12345"), ["123", "45"])
+    self.assertEqual(split("glm4", "12345"), ["123", "45"])
+    self.assertEqual(split("qwen35", "e\u0301"), ["e\u0301"])
+    self.assertEqual(split("kimi-k2", "it's don't"), ["it's", " don't"])
+    self.assertEqual(split("kimi-k2", "a中"), ["a", "中"])
+    self.assertEqual(split("tekken", "HelloWorld"), ["Hello", "World"])
+    self.assertEqual(split("olmo", "it's 12345"), ["it", "'s", " 12345"])
+    self.assertEqual(SimpleTokenizer({}, {}, "llama-bpe").preset, "llama3")
+    self.assertEqual(SimpleTokenizer({}, {}, "chatglm-bpe").preset, "glm4")
+
+  def test_gguf_specials_merges_bos(self):
+    tok = SimpleTokenizer({"a": 0}, {"<|end|>": 1, "<|endoftext|>": 2})
+    self.assertEqual(tok.encode("<|endoftext|>"), [2])
+    # merge rank beats token-id order: "bc" is later in vocab but first in merges
+    tok = SimpleTokenizer({"a": 0, "b": 1, "ab": 2, "c": 3, "bc": 4}, {}, merges=["b c", "a b"])
+    self.assertEqual(tok.encode("abc"), [0, 4])
+    base = {"tokenizer.ggml.tokens": ["<unk>", "hello", "[PAD]"], "tokenizer.ggml.token_type": [3, 1, 5],
+            "tokenizer.ggml.bos_token_id": 7, "tokenizer.ggml.eos_token_id": 0}
+    qwen = SimpleTokenizer.from_gguf_kv({**base, "tokenizer.ggml.pre": "qwen2"})
+    self.assertIsNone(qwen.bos_id)
+    self.assertIn("<unk>", qwen._special_tokens)
+    self.assertNotIn("[PAD]", qwen._special_tokens)
+    self.assertEqual(SimpleTokenizer.from_gguf_kv({**base, "tokenizer.ggml.pre": "llama3"}).bos_id, 7)
+
   def test_stream_decoder(self):
     """stream_decoder buffers incomplete UTF-8: token 25677 has 3/4 of emoji, token 138 completes it."""
     bs = [*range(33, 127), *range(161, 173), *range(174, 256)]

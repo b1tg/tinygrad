@@ -10,9 +10,9 @@ if TYPE_CHECKING:
 
 class SimpleTokenizer:
   def __init__(self, normal_tokens:dict[str, int], special_tokens:dict[str, int], preset:str="llama3",
-               bos_id:int|None=None, eos_id:int=0, eot_id:int|None=None):
-    preset = {"qwen35":"qwen2","qwen35moe":"qwen2"}.get(preset, preset)
-    if preset not in ("llama3","llama-v3","llama-bpe","qwen2","olmo","kimi-k2","tekken","glm4"):
+               bos_id:int|None=None, eos_id:int=0, eot_id:int|None=None, merges:list[str]|None=None):
+    preset = {"qwen35moe":"qwen35","chatglm-bpe":"glm4","llama-v3":"llama3","llama-bpe":"llama3"}.get(preset, preset)
+    if preset not in ("llama3","qwen2","qwen35","olmo","kimi-k2","tekken","glm4"):
       raise ValueError(f"Invalid tokenizer preset '{preset}'")
     # https://github.com/openai/gpt-2/blob/9b63575ef42771a015060c964af2c3da4cf7c8ab/src/encoder.py#L9
     bs = [*range(33, 127), *range(161, 173), *range(174, 256)]  # bytes that map to themselves
@@ -26,13 +26,48 @@ class SimpleTokenizer:
       runs = [list(g) for _, g in itertools.groupby(cps, lambda e: e[1]-e[0])]
       return "".join(re.escape(chr(g[0][1])) + (f"-{re.escape(chr(g[-1][1]))}" if len(g) > 1 else "") for g in runs)
     r_ws, r_p_N, r_p_L = r"\t\n\x0b\x0c\r\x85" + ucat_range("Z"), ucat_range("N"), ucat_range("L")
-    self._split_to_word = re.compile("(?i:'s|'t|'re|'ve|'m|'ll|'d)|" + \
-      f"[^\\r\\n{r_p_N}{r_p_L}]?[{r_p_L}]+|[{r_p_N}]{{1,3}}| ?[^{r_ws}{r_p_N}{r_p_L}]+[\\r\\n]*|[{r_ws}]*[\\r\\n]+|[{r_ws}]+(?![^{r_ws}])|[{r_ws}]+")
-    self._split_to_sentence = re.compile("|".join(re.escape(tok) for tok in special_tokens.keys()) if special_tokens else r"(?!)")
+    r_contr, r_lead = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)", f"[^\\r\\n{r_p_N}{r_p_L}]?"
+    r_num, r_punct = f"[{r_p_N}]{{1,3}}", f" ?[^{r_ws}{r_p_N}{r_p_L}]+[\\r\\n]*"
+    r_word, r_tail = f"{r_contr}|{r_lead}[{r_p_L}]+", f"[{r_ws}]*[\\r\\n]+|[{r_ws}]+(?![^{r_ws}])|[{r_ws}]+"
+    if preset in ("qwen2", "qwen35"):
+      r_num = f"[{r_p_N}]"
+      if preset == "qwen35":
+        r_M = ucat_range("M")
+        r_word, r_punct = f"{r_contr}|{r_lead}[{r_p_L}{r_M}]+", f" ?[^{r_ws}{r_p_N}{r_p_L}{r_M}]+[\\r\\n]*"
+    elif preset in ("kimi-k2", "tekken"):
+      def is_han(cp:int) -> bool:
+        return (0x4E00 <= cp <= 0x9FFF or 0x3400 <= cp <= 0x4DBF or 0xF900 <= cp <= 0xFAFF or
+                0x20000 <= cp <= 0x2A6DF or 0x2A700 <= cp <= 0x2B73F or 0x2B740 <= cp <= 0x2B81F or
+                0x2B820 <= cp <= 0x2CEAF or 0x2CEB0 <= cp <= 0x2EBEF or 0x2F800 <= cp <= 0x2FA1F)
+      def ucat_ex(*pre:str, exclude=None) -> str:
+        cps = enumerate(cp for cp in range(0xE0200) if unicodedata.category(chr(cp)).startswith(pre) and not (exclude and exclude(cp)))
+        runs = [list(g) for _, g in itertools.groupby(cps, lambda e: e[1]-e[0])]
+        return "".join(re.escape(chr(g[0][1])) + (f"-{re.escape(chr(g[-1][1]))}" if len(g) > 1 else "") for g in runs)
+      ex = is_han if preset == "kimi-k2" else None
+      r_up, r_lo = ucat_ex("Lu","Lt","Lm","Lo","M", exclude=ex), ucat_ex("Ll","Lm","Lo","M", exclude=ex)
+      r_c = r_contr + "?" if preset == "kimi-k2" else ""
+      r_word = f"{r_lead}[{r_up}]*[{r_lo}]+{r_c}|{r_lead}[{r_up}]+[{r_lo}]*{r_c}"
+      if preset == "kimi-k2":  # Han first, matching llama.cpp unicode_regex_split_custom_kimi_k2
+        r_han = "".join(chr(a)+"-"+chr(b) for a,b in ((0x3400,0x4DBF),(0x4E00,0x9FFF),(0xF900,0xFAFF),
+          (0x20000,0x2A6DF),(0x2A700,0x2B73F),(0x2B740,0x2B81F),(0x2B820,0x2CEAF),(0x2CEB0,0x2EBEF),(0x2F800,0x2FA1F)))
+        r_word = f"[{r_han}]+|{r_word}"
+      else: r_num, r_punct = f"[{r_p_N}]", f" ?[^{r_ws}{r_p_N}{r_p_L}]+[\\r\\n/]*"
+    elif preset == "olmo":
+      r_word, r_num, r_punct = f"'s|'t|'re|'ve|'m|'ll|'d| ?[{r_p_L}]+", f" ?[{r_p_N}]+", f" ?[^{r_ws}{r_p_N}{r_p_L}]+"
+    self._split_to_word = re.compile(f"{r_word}|{r_num}|{r_punct}|{r_tail}")
+    spec = sorted((tok for tok in special_tokens if tok), key=len, reverse=True)
+    self._split_to_sentence = re.compile("|".join(map(re.escape, spec)) if spec else r"(?!)")
 
     self._normal_tokens = {bytes(self._byte_decoder[c] for c in tok): tid for tok, tid in normal_tokens.items()}
     self._special_tokens = special_tokens
     self._tok2bytes = {tid: tok for tok, tid in self._normal_tokens.items()} | {tid: tok.encode() for tok, tid in self._special_tokens.items()}
+    self._bpe_ranks: dict[tuple[bytes, bytes], int] = {}
+    for i, m in enumerate(merges or ()):
+      pos = m.find(" ", 1)
+      if pos < 0: continue
+      a, b = m[:pos], m[pos+1:]
+      try: self._bpe_ranks[bytes(self._byte_decoder[c] for c in a), bytes(self._byte_decoder[c] for c in b)] = i
+      except KeyError: pass
     self.preset = preset
     self.bos_id, self.eos_id, self.eot_id = bos_id, eos_id, eot_id
 
@@ -40,22 +75,33 @@ class SimpleTokenizer:
   def from_gguf_kv(kv:dict):
     # https://github.com/ggml-org/llama.cpp/blob/94933c8c2eeaa9a7983e3f6c08af76bd86724094/src/llama-vocab.cpp#L1818-L1820
     vocab: typing.Iterable[tuple[str, int]] = ((tok, idx) for idx, tok in enumerate(kv["tokenizer.ggml.tokens"]))
-    normal_tokens, special_tokens = partition(vocab, lambda e: kv["tokenizer.ggml.token_type"][e[1]] == 1)
+    # llama.cpp special cache: UNKNOWN=2, CONTROL=3, USER_DEFINED=4
+    normal_tokens, special_tokens = partition(vocab, lambda e: kv["tokenizer.ggml.token_type"][e[1]] not in (2, 3, 4))
     special_tokens_dict = dict(special_tokens)
+    add_bos = kv.get('tokenizer.ggml.add_bos_token', kv["tokenizer.ggml.pre"] in ("llama3","llama-v3","llama-bpe","tekken"))
     return SimpleTokenizer(dict(normal_tokens), special_tokens_dict, kv["tokenizer.ggml.pre"],
-      bos_id=kv.get('tokenizer.ggml.bos_token_id') if kv.get('tokenizer.ggml.add_bos_token', True) else None,
-      eos_id=kv.get('tokenizer.ggml.eos_token_id', 0), eot_id=kv.get('tokenizer.ggml.eot_token_id', special_tokens_dict.get('<|im_end|>')))
+      bos_id=kv.get('tokenizer.ggml.bos_token_id') if add_bos else None,
+      eos_id=kv.get('tokenizer.ggml.eos_token_id', 0), eot_id=kv.get('tokenizer.ggml.eot_token_id', special_tokens_dict.get('<|im_end|>')),
+      merges=kv.get("tokenizer.ggml.merges"))
 
   def _encode_word(self, word:bytes) -> list[int]:
-    if (early_token:=self._normal_tokens.get(word)) is not None: return [early_token]
+    if self.preset in ("llama3","tekken") and (early_token:=self._normal_tokens.get(word)) is not None:
+      return [early_token]
     parts = [bytes([b]) for b in word]
-    # greedily merge any parts that we can
+    rank = (lambda a,b: self._bpe_ranks.get((a,b), sys.maxsize)) if self._bpe_ranks else \
+           (lambda a,b: self._normal_tokens.get(a+b, sys.maxsize))
     while True:
-      i = min([(sys.maxsize, -1)] + [(self._normal_tokens.get(parts[j]+parts[j+1], sys.maxsize), j) for j in range(len(parts)-1)])[1]
+      i = min([(sys.maxsize, -1)] + [(rank(parts[j], parts[j+1]), j) for j in range(len(parts)-1)])[1]
       if i == -1: break
       parts[i:i+2] = [parts[i] + parts[i+1]]
-    try: return [self._normal_tokens[p] for p in parts]
-    except KeyError: raise RuntimeError("token not found")
+    out: list[int] = []
+    for p in parts:
+      if (tid:=self._normal_tokens.get(p)) is not None: out.append(tid)
+      else:
+        for b in p:
+          if (tid:=self._normal_tokens.get(bytes([b]))) is not None: out.append(tid)
+    if not out and parts: raise RuntimeError("token not found")
+    return out
   def _encode_sentence(self, chunk:str) -> list[int]:
     return [tok for word in self._split_to_word.findall(chunk) for tok in self._encode_word(word.encode())]
   def encode(self, text:str) -> list[int]:
@@ -99,7 +145,7 @@ class FallbackTemplate:
   def role(self, role:str) -> str:
     if self.tok.preset == 'olmo': return "<|" + role + "|>\n"  # OLMoE Instruct format
     if self.tok.preset == 'kimi-k2': return "<|im_" + role + "|>" + role + "<|im_middle|>"
-    if self.tok.preset == 'qwen2': return "<|im_start|>" + role + "\n"
+    if self.tok.preset.startswith('qwen'): return "<|im_start|>" + role + "\n"
     if self.tok.preset == 'glm4': return "<|" + role + "|>"
     if self.tok.preset == 'tekken':
       if role == 'user': return "[INST]"
@@ -109,7 +155,7 @@ class FallbackTemplate:
   def end_turn(self) -> str:
     if self.tok.preset == 'olmo': return "\n"
     if self.tok.preset == 'kimi-k2': return self.tok.decode([self.tok.eos_id])
-    if self.tok.preset == 'qwen2': return self.tok.decode([self.tok.eos_id]) + "\n"
+    if self.tok.preset.startswith('qwen'): return self.tok.decode([self.tok.eos_id]) + "\n"
     if self.tok.preset == 'glm4': return ""
     if self.tok.preset == 'tekken': return "[/INST]"
     return self.tok.decode([self.tok.eos_id])
