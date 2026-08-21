@@ -107,6 +107,13 @@ class TestLLMTokenizer(unittest.TestCase):
     self.assertEqual(split("olmo", "it's 12345"), ["it", "'s", " 12345"])
     self.assertEqual(SimpleTokenizer({}, {}, "llama-bpe").preset, "llama3")
     self.assertEqual(SimpleTokenizer({}, {}, "chatglm-bpe").preset, "glm4")
+    # differential-tested against the llama.cpp splitters (src/unicode.cpp state machines + collapsed std::regex path)
+    self.assertEqual(split("kimi-k2", "iPhone aB simpleSimple"), ["iPhone", " aB", " simpleSimple"])  # no upper/lower split
+    self.assertEqual(split("kimi-k2", "e\u0301 \u0301x"), ["e", "\u0301", " \u0301", "x"])  # marks are not letters
+    self.assertEqual(split("kimi-k2", "A'I'M"), ["A", "'I'M"])  # contraction only after a letter run
+    self.assertEqual(split("tekken", "\u00dcNICODE HelloWorld"), ["\u00dc", "NICODE", " Hello", "World"])  # non-ascii letters match both cases
+    self.assertEqual(split("tekken", "e\u0301 it's"), ["e", "\u0301", " it", "'s"])  # marks are punctuation, apostrophe is a lead char
+    self.assertEqual(split("olmo", "a \n\nb x  y"), ["a", " \n", "\n", "b", " x", " ", " y"])  # gpt2 splitter: no \s*[\r\n]+ grouping
 
   def test_gguf_specials_merges_bos(self):
     tok = SimpleTokenizer({"a": 0}, {"<|end|>": 1, "<|endoftext|>": 2})

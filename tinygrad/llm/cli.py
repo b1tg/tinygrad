@@ -21,30 +21,30 @@ class SimpleTokenizer:
     # https://github.com/ggml-org/llama.cpp/blob/94933c8c2eeaa9a7983e3f6c08af76bd86724094/src/llama-vocab.cpp#L286
     # 0x323b0 is one past the max codepoint in unicode categories L/N/Z (0x323af is max L)
     # compact adjacent codepoints into ranges: listing them all makes re spend seconds on large prompts
-    def ucat_range(pre:str|tuple[str, ...], hi:int=0x323b0, exclude=None) -> str:
+    def ucat_range(pre:str, hi:int=0x323b0, exclude=None) -> str:
       cps = enumerate(cp for cp in range(hi) if unicodedata.category(chr(cp)).startswith(pre) and not (exclude and exclude(cp)))
       runs = [list(g) for _, g in itertools.groupby(cps, lambda e: e[1]-e[0])]
       return "".join(re.escape(chr(g[0][1])) + (f"-{re.escape(chr(g[-1][1]))}" if len(g) > 1 else "") for g in runs)
     r_ws, r_p_N, r_p_L = r"\t\n\x0b\x0c\r\x85" + ucat_range("Z"), ucat_range("N"), ucat_range("L")
+    r_L = r_p_L + ucat_range("M", 0xE0200) if preset == "qwen35" else r_p_L  # qwen35 treats marks as letters
     r_c, r_l = "(?i:'s|'t|'re|'ve|'m|'ll|'d)", f"[^\\r\\n{r_p_N}{r_p_L}]?"
-    r_n, r_p = f"[{r_p_N}]{{1,3}}", f" ?[^{r_ws}{r_p_N}{r_p_L}]+[\\r\\n]*"
-    r_w = f"{r_c}|{r_l}[{r_p_L}]+"
-    if preset == "qwen2": r_n = f"[{r_p_N}]"
-    elif preset == "qwen35":
-      r_M = ucat_range("M")
-      r_w, r_n, r_p = f"{r_c}|{r_l}[{r_p_L}{r_M}]+", f"[{r_p_N}]", f" ?[^{r_ws}{r_p_N}{r_p_L}{r_M}]+[\\r\\n]*"
-    elif preset in ("kimi-k2", "tekken"):
+    r_n, r_p = f"[{r_p_N}]{{1,3}}", f" ?[^{r_ws}{r_p_N}{r_L}]+[\\r\\n]*"
+    r_w = f"{r_c}|{r_l}[{r_L}]+"
+    r_t = f"[{r_ws}]*[\\r\\n]+|[{r_ws}]+(?![^{r_ws}])|[{r_ws}]+"
+    if preset in ("qwen2", "qwen35", "tekken"): r_n = f"[{r_p_N}]"
+    if preset == "kimi-k2":  # Han first, letters exclude Han: llama.cpp unicode_regex_split_custom_kimi_k2
       han = ((0x3400,0x4DBF),(0x4E00,0x9FFF),(0xF900,0xFAFF),(0x20000,0x2A6DF),(0x2A700,0x2B73F),
              (0x2B740,0x2B81F),(0x2B820,0x2CEAF),(0x2CEB0,0x2EBEF),(0x2F800,0x2FA1F))
-      ex = (lambda cp: any(a <= cp <= b for a, b in han)) if preset == "kimi-k2" else None
-      r_up, r_lo = ucat_range(("Lu","Lt","Lm","Lo","M"), 0xE0200, ex), ucat_range(("Ll","Lm","Lo","M"), 0xE0200, ex)
-      r_c = r_c + "?" if preset == "kimi-k2" else ""
-      r_w = f"{r_l}[{r_up}]*[{r_lo}]+{r_c}|{r_l}[{r_up}]+[{r_lo}]*{r_c}"
-      if preset == "kimi-k2":  # Han first, matching llama.cpp unicode_regex_split_custom_kimi_k2
-        r_w = f"[{''.join(f'{chr(a)}-{chr(b)}' for a, b in han)}]+|{r_w}"
-      else: r_n, r_p = f"[{r_p_N}]", f" ?[^{r_ws}{r_p_N}{r_p_L}]+[\\r\\n/]*"
-    elif preset == "olmo": r_w, r_n, r_p = "'s|'t|'re|'ve|'m|'ll|'d|" + f" ?[{r_p_L}]+", f" ?[{r_p_N}]+", f" ?[^{r_ws}{r_p_N}{r_p_L}]+"
-    self._split_to_word = re.compile(f"{r_w}|{r_n}|{r_p}|[{r_ws}]*[\\r\\n]+|[{r_ws}]+(?![^{r_ws}])|[{r_ws}]+")
+      r_han = "".join(f"{chr(a)}-{chr(b)}" for a, b in han)
+      r_w = f"[{r_han}]+|{r_l}[{ucat_range('L', exclude=lambda cp: any(a <= cp <= b for a, b in han))}]+{r_c}?"
+    elif preset == "tekken":  # llama.cpp runs this on collapsed text: non-ascii letters match both cases, marks are punctuation
+      r_up, r_lo = ucat_range("L", exclude=lambda cp: 0x61 <= cp <= 0x7A), ucat_range("L", exclude=lambda cp: 0x41 <= cp <= 0x5A)
+      r_w = f"{r_l}[{r_up}]*[{r_lo}]+|{r_l}[{r_up}]+[{r_lo}]*"
+      r_p = f" ?[^{r_ws}{r_p_N}{r_p_L}]+[\\r\\n/]*"
+    elif preset == "olmo":  # llama.cpp reuses its gpt2 splitter: no whitespace/newline grouping
+      r_w, r_n, r_p = f"'s|'t|'re|'ve|'m|'ll|'d| ?[{r_p_L}]+", f" ?[{r_p_N}]+", f" ?[^{r_ws}{r_p_N}{r_p_L}]+"
+      r_t = f"[{r_ws}]+(?![^{r_ws}])|[{r_ws}]+"
+    self._split_to_word = re.compile(f"{r_w}|{r_n}|{r_p}|{r_t}")
     self._split_to_sentence = re.compile("|".join(map(re.escape, sorted(filter(None, special_tokens), key=len, reverse=True))) or r"(?!)")
 
     self._normal_tokens = {bytes(self._byte_decoder[c] for c in tok): tid for tok, tid in normal_tokens.items()}
@@ -74,8 +74,7 @@ class SimpleTokenizer:
   def _encode_word(self, word:bytes) -> list[int]:
     if self.preset in ("llama3","tekken") and (early_token:=self._normal_tokens.get(word)) is not None: return [early_token]
     parts = [bytes([b]) for b in word]
-    rank = (lambda a,b: self._bpe_ranks.get((a,b), sys.maxsize)) if self._bpe_ranks else \
-           (lambda a,b: self._normal_tokens.get(a+b, sys.maxsize))
+    rank = (lambda a,b: self._bpe_ranks.get((a,b), sys.maxsize)) if self._bpe_ranks else (lambda a,b: self._normal_tokens.get(a+b, sys.maxsize))
     # greedily merge any parts that we can
     while True:
       i = min([(sys.maxsize, -1)] + [(rank(parts[j], parts[j+1]), j) for j in range(len(parts)-1)])[1]
@@ -85,7 +84,7 @@ class SimpleTokenizer:
     for p in parts:
       if (tid:=self._normal_tokens.get(p)) is not None: out.append(tid)
       else: out += [t for b in p if (t:=self._normal_tokens.get(bytes([b]))) is not None]
-    if not out and parts: raise RuntimeError("token not found")
+    if not out: raise RuntimeError("token not found")
     return out
   def _encode_sentence(self, chunk:str) -> list[int]:
     return [tok for word in self._split_to_word.findall(chunk) for tok in self._encode_word(word.encode())]
