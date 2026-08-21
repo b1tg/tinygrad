@@ -95,6 +95,43 @@ class TestLLMTokenizer(unittest.TestCase):
     self.assertEqual(template.end_turn(), "[/INST]")
     self.assertEqual(template.role("assistant"), "")
 
+  def test_qwen2_qwen35_patterns(self):
+    # upstream qwen2 tokenizer.json uses \p{N} (single digits) and qwen3.5 extends letter classes with \p{M}
+    def split(p, s): return SimpleTokenizer({}, {}, p)._split_to_word.findall(s)
+    self.assertEqual(split("qwen2", "12345"), list("12345"))                       # was grouped as ['123', '45']
+    self.assertEqual(split("qwen2", "call 1314151 days"), ["call", " ", "1", "3", "1", "4", "1", "5", "1", " days"])
+    self.assertEqual(split("qwen35", "12345"), list("12345"))                      # was aliased to qwen2 AND grouped
+    self.assertEqual(split("qwen35", "\u00e9 caf\u00e9"), ["\u00e9", " caf\u00e9"])  # marks join letters; was split off
+    self.assertEqual(split("qwen35", "caf\u00e9 na\u00efve e\u0301"), ["caf\u00e9", " na\u00efve", " e\u0301"])
+    # hebrew niqqud / arabic harakat: marks must not split words
+    self.assertEqual(split("qwen35", "\u05d5\u05b9 \u05e9\u05c1\u05dc\u05d5\u05dd"), ["\u05d5\u05b9", " \u05e9\u05c1\u05dc\u05d5\u05dd"])
+    self.assertEqual(split("qwen35", "\u0645\u064f\u0645\u0652\u062a\u064e\u0627\u0632"), ["\u0645\u064f\u0645\u0652\u062a\u064e\u0627\u0632"])
+    self.assertEqual(split("qwen35", "\u0915\u093f"), ["\u0915\u093f"])             # devanagari (Mc vowel sign)
+    self.assertEqual(split("qwen35", "Vie\u0302t Nam"), ["Vie\u0302t", " Nam"])     # vietnamese NFD
+    self.assertEqual(split("glm4", "12345"), ["123", "45"])                        # glm4 keeps \p{N}{1,3}
+    self.assertEqual(split("llama3", "it's don't"), ["it", "'s", " don", "'t"])     # llama3 unchanged
+
+  def test_qwen35_marks_join_id_level(self):
+    # with \p{M} in the letter class, a merge spanning the letter|mark boundary becomes reachable;
+    # master (no M) splits the input and can never emit the merged token
+    bs = [*range(33, 127), *range(161, 173), *range(174, 256)]
+    be = {b: chr(b) for b in bs} | {b: chr(256+i) for i, b in enumerate(b for b in range(256) if b not in bs)}
+    def g(s): return "".join(be[b] for b in s.encode())
+    kv = {"tokenizer.ggml.tokens": [g("a"), g("\u0301"), g("a\u0301")], "tokenizer.ggml.token_type": [1, 1, 1],
+          "tokenizer.ggml.merges": [f"{g('a')} {g(chr(0x301))}"], "tokenizer.ggml.pre": "qwen35",
+          "tokenizer.ggml.model": "gpt2"}
+    self.assertEqual(SimpleTokenizer.from_gguf_kv(kv).encode("a\u0301"), [2])
+
+  def test_qwen2_digit_split_id_level(self):
+    # upstream \p{N} forbids digit pairs inside one pre-token: a "12" vocab token must stay unreachable
+    bs = [*range(33, 127), *range(161, 173), *range(174, 256)]
+    be = {b: chr(b) for b in bs} | {b: chr(256+i) for i, b in enumerate(b for b in range(256) if b not in bs)}
+    def g(s): return "".join(be[b] for b in s.encode())
+    kv = {"tokenizer.ggml.tokens": [g("1"), g("2"), g("12")], "tokenizer.ggml.token_type": [1, 1, 1],
+          "tokenizer.ggml.merges": [f"{g('1')} {g('2')}"], "tokenizer.ggml.pre": "qwen2",
+          "tokenizer.ggml.model": "gpt2"}
+    self.assertEqual(SimpleTokenizer.from_gguf_kv(kv).encode("12"), [0, 1])
+
   def test_stream_decoder(self):
     """stream_decoder buffers incomplete UTF-8: token 25677 has 3/4 of emoji, token 138 completes it."""
     bs = [*range(33, 127), *range(161, 173), *range(174, 256)]

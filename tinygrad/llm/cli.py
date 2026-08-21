@@ -11,8 +11,8 @@ if TYPE_CHECKING:
 class SimpleTokenizer:
   def __init__(self, normal_tokens:dict[str, int], special_tokens:dict[str, int], preset:str="llama3",
                bos_id:int|None=None, eos_id:int=0, eot_id:int|None=None):
-    preset = {"qwen35":"qwen2","qwen35moe":"qwen2"}.get(preset, preset)
-    if preset not in ("llama3","llama-v3","llama-bpe","qwen2","olmo","kimi-k2","tekken","glm4"):
+    preset = {"qwen35moe":"qwen35"}.get(preset, preset)
+    if preset not in ("llama3","llama-v3","llama-bpe","qwen2","qwen35","olmo","kimi-k2","tekken","glm4"):
       raise ValueError(f"Invalid tokenizer preset '{preset}'")
     # https://github.com/openai/gpt-2/blob/9b63575ef42771a015060c964af2c3da4cf7c8ab/src/encoder.py#L9
     bs = [*range(33, 127), *range(161, 173), *range(174, 256)]  # bytes that map to themselves
@@ -26,8 +26,10 @@ class SimpleTokenizer:
       runs = [list(g) for _, g in itertools.groupby(cps, lambda e: e[1]-e[0])]
       return "".join(re.escape(chr(g[0][1])) + (f"-{re.escape(chr(g[-1][1]))}" if len(g) > 1 else "") for g in runs)
     r_ws, r_p_N, r_p_L = r"\t\n\x0b\x0c\r\x85" + ucat_range("Z"), ucat_range("N"), ucat_range("L")
+    r_M = ucat_range("M") if preset == "qwen35" else ""  # qwen35: marks join letter runs (tokenizer.json [\p{L}\p{M}])
+    r_n = f"[{r_p_N}]" if preset in ("qwen2", "qwen35") else f"[{r_p_N}]{{1,3}}"  # qwen splits numbers per digit
     self._split_to_word = re.compile("(?i:'s|'t|'re|'ve|'m|'ll|'d)|" + \
-      f"[^\\r\\n{r_p_N}{r_p_L}]?[{r_p_L}]+|[{r_p_N}]{{1,3}}| ?[^{r_ws}{r_p_N}{r_p_L}]+[\\r\\n]*|[{r_ws}]*[\\r\\n]+|[{r_ws}]+(?![^{r_ws}])|[{r_ws}]+")
+      f"[^\\r\\n{r_p_N}{r_p_L}]?[{r_p_L}{r_M}]+|{r_n}| ?[^{r_ws}{r_p_N}{r_p_L}{r_M}]+[\\r\\n]*|[{r_ws}]*[\\r\\n]+|[{r_ws}]+(?![^{r_ws}])|[{r_ws}]+")
     self._split_to_sentence = re.compile("|".join(re.escape(tok) for tok in special_tokens.keys()) if special_tokens else r"(?!)")
 
     self._normal_tokens = {bytes(self._byte_decoder[c] for c in tok): tid for tok, tid in normal_tokens.items()}
@@ -99,7 +101,7 @@ class FallbackTemplate:
   def role(self, role:str) -> str:
     if self.tok.preset == 'olmo': return "<|" + role + "|>\n"  # OLMoE Instruct format
     if self.tok.preset == 'kimi-k2': return "<|im_" + role + "|>" + role + "<|im_middle|>"
-    if self.tok.preset == 'qwen2': return "<|im_start|>" + role + "\n"
+    if self.tok.preset in ('qwen2', 'qwen35'): return "<|im_start|>" + role + "\n"
     if self.tok.preset == 'glm4': return "<|" + role + "|>"
     if self.tok.preset == 'tekken':
       if role == 'user': return "[INST]"
@@ -109,7 +111,7 @@ class FallbackTemplate:
   def end_turn(self) -> str:
     if self.tok.preset == 'olmo': return "\n"
     if self.tok.preset == 'kimi-k2': return self.tok.decode([self.tok.eos_id])
-    if self.tok.preset == 'qwen2': return self.tok.decode([self.tok.eos_id]) + "\n"
+    if self.tok.preset in ('qwen2', 'qwen35'): return self.tok.decode([self.tok.eos_id]) + "\n"
     if self.tok.preset == 'glm4': return ""
     if self.tok.preset == 'tekken': return "[/INST]"
     return self.tok.decode([self.tok.eos_id])
