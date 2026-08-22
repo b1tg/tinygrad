@@ -19,10 +19,10 @@ class SimpleTokenizer:
     self._byte_decoder = {chr(b): b for b in bs} | {chr(256+i): b for i,b in enumerate(b for b in range(256) if b not in bs)}
 
     # https://github.com/ggml-org/llama.cpp/blob/94933c8c2eeaa9a7983e3f6c08af76bd86724094/src/llama-vocab.cpp#L286
-    # 0x323b0 is one past the max codepoint in unicode categories L/N/Z (0x323af is max L)
     # compact adjacent codepoints into ranges: listing them all makes re spend seconds on large prompts
     def ucat_range(pre:str) -> str:
-      cps = enumerate(cp for cp in range(0x323b0) if unicodedata.category(chr(cp)).startswith(pre))
+      limit = {"Z": 0x3001, "N": 0x1fbfa, "L": 0x323b0, "M": 0xe0200}[pre]  # one past the max codepoint of each category (M extends to 0xe01ef)
+      cps = enumerate(cp for cp in range(limit) if unicodedata.category(chr(cp)).startswith(pre))
       runs = [list(g) for _, g in itertools.groupby(cps, lambda e: e[1]-e[0])]
       return "".join(re.escape(chr(g[0][1])) + (f"-{re.escape(chr(g[-1][1]))}" if len(g) > 1 else "") for g in runs)
     r_ws, r_p_N, r_p_L = r"\t\n\x0b\x0c\r\x85" + ucat_range("Z"), ucat_range("N"), ucat_range("L")

@@ -108,6 +108,7 @@ class TestLLMTokenizer(unittest.TestCase):
     self.assertEqual(split("qwen35", "\u0645\u064f\u0645\u0652\u062a\u064e\u0627\u0632"), ["\u0645\u064f\u0645\u0652\u062a\u064e\u0627\u0632"])
     self.assertEqual(split("qwen35", "\u0915\u093f"), ["\u0915\u093f"])             # devanagari (Mc vowel sign)
     self.assertEqual(split("qwen35", "Vie\u0302t Nam"), ["Vie\u0302t", " Nam"])     # vietnamese NFD
+    self.assertEqual(split("qwen35", "\u6238\U000E0100"), ["\u6238\U000E0100"])     # supplementary marks (U+E0100-E01EF) join letters
     self.assertEqual(split("glm4", "12345"), ["123", "45"])                        # glm4 keeps \p{N}{1,3}
     self.assertEqual(split("llama3", "it's don't"), ["it", "'s", " don", "'t"])     # llama3 unchanged
 
