@@ -322,7 +322,8 @@ def _q5_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, out_features:int, in_fea
 @functools.cache
 def _q4_0_q5_0_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, out_features:int, in_features:int, ggml_type:int) -> UOp:
   token_tile, output_tiles = (64, 1) if out_features <= 1024 and out.shape[0] % 64 == 0 else \
-    (64, 2) if out.shape[0] % 64 == 0 else (32 if out.shape[0] % 32 == 0 else 16, 1 if out_features == 16 else 2)
+    (64, 2) if out.shape[0] % 64 == 0 else (32 if out.shape[0] % 32 == 0 else 16, 2)
+  if out_features % (WMMA_N*output_tiles): output_tiles = 1
   type_size, qs_off, zero = (Q4_0_BYTES, 2, 8) if ggml_type == Q4_0 else (Q5_0_BYTES, 6, 16)
   def dequant(base:UOp, _subgroup:UOp, half:int) -> tuple[UOp, ...]:
     dbits = raw[base].cast(dtypes.uint16) | (raw[base+1].cast(dtypes.uint16) << 8)

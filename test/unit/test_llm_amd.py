@@ -63,7 +63,7 @@ class TestQ8Quantize(unittest.TestCase):
   def test_q_0_linear(self):
     if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
     rng = np.random.default_rng(42)
-    in_features, out_features = 2880, 32
+    in_features, out_features = 2880, 48
     for ggml_type,type_size in ((2, 18), (6, 22)):
       packed = rng.integers(0, 256, out_features*in_features//32*type_size, dtype=np.uint8)
       for i in range(out_features*in_features//32): packed[i*type_size:i*type_size+2] = np.array([0.01], dtype=np.float16).view(np.uint8)
