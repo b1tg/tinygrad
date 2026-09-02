@@ -31,14 +31,15 @@ def normalize_messages(messages:list[dict], harmony:bool=False) -> None:
       if "function" in tc and isinstance(args := tc["function"].get("arguments"), str):
         try: tc["function"]["arguments"] = json.loads(args)
         except json.JSONDecodeError: pass
-    # collapse OpenAI content parts into a plain string, chat templates expect strings
-    if isinstance(m.get("content"), list): m["content"] = "".join(c.get("text", "") for c in m["content"] if c.get("type") == "text")
+    # collapse text-only OpenAI content parts into a plain string, chat templates expect strings
+    if isinstance(parts := m.get("content"), list):
+      if any(not isinstance(c, dict) or c.get("type") != "text" or not isinstance(c.get("text"), str) for c in parts):
+        raise ValueError("only text content parts are supported")
+      m["content"] = "".join(c["text"] for c in parts)
     # harmony templates read CoT from 'thinking'; clients send it as 'reasoning_content'. Only map tool call turns:
     # the unsloth template misroutes content of plain turns with 'thinking' set (upstream llama.cpp maps the same way)
-    #return
-    if harmony and m.get("role") == "assistant" and m.get("tool_calls") and isinstance(rc := m.get("reasoning_content"), str) and "thinking" not in m:
-      m["thinking"] = rc
-      if m.get("content"): m["content"] = None  # the template rejects content+thinking together on tool call turns
+    if harmony and m.get("role") == "assistant" and m.get("tool_calls") and not m.get("content") \
+       and isinstance(rc := m.get("reasoning_content"), str) and "thinking" not in m: m["thinking"] = rc
 
 class StreamRouter:
   # routes streamed output text to (field, text) deltas, keeping tool_call regions in .buf for the final parse
@@ -145,10 +146,10 @@ class Handler(HTTPRequestHandler):
         if isinstance(tc, str):  # unparseable tool call, don't silently drop output the client can't use
           stderr_log(f"failed to parse tool call: {tc[:200]}")
           yield chunk({"content":tc})
-          continue
-        name, args = tc
-        tool_calls.append({"index":len(tool_calls), "id":f"call_{uuid.uuid4().hex[:24]}", "type":"function",
-                           "function":{"name":name, "arguments":args if isinstance(args, str) else json.dumps(args)}})
+        else:
+          name, args = tc
+          tool_calls.append({"index":len(tool_calls), "id":f"call_{uuid.uuid4().hex[:24]}", "type":"function",
+                             "function":{"name":name, "arguments":args if isinstance(args, str) else json.dumps(args)}})
       if tool_calls:
         yield chunk({"tool_calls":tool_calls})
         if finish_reason == "stop": finish_reason = "tool_calls"
@@ -170,7 +171,10 @@ class Handler(HTTPRequestHandler):
     if DEBUG >= 1: print(json.dumps(body, indent=2))
     if self.path == "/v1/chat/completions":
       # render and tokenize
-      normalize_messages(body["messages"], harmony=self.server.harmony)
+      try: normalize_messages(body["messages"], harmony=self.server.harmony)
+      except ValueError as e:
+        return self.send_data(json.dumps({"error":{"message":str(e), "type":"invalid_request_error", "param":"messages",
+          "code":"invalid_message"}}).encode(), status_code=400)
       rendered = self.server.template.render(messages=body["messages"], tools=body.get("tools"), add_generation_prompt=True, preserve_thinking=True)
       ids: list[int] = self.server.tok.encode(rendered)
       stderr_log(f"prep:{(time.perf_counter()-request_st)*1e3:5.0f} ms  {colored('--', 'BLACK')}  ")
