@@ -83,9 +83,8 @@ class HarmonyRouter(StreamRouter):
       if self.mode == "header":
         if "<|message|>" not in self.buf: break
         hdr, _ = self.split("<|message|>", final)
-        recipient = hdr.partition(" to=")[2].partition("<|")[0].strip()
-        if recipient:
-          self.mode, self.tool_name = "tool", recipient.removeprefix("functions.")
+        recipient = m.group(1) if (m := re.search(r"(?:^|\s)to=([^\s<]+)", hdr)) else ""
+        if recipient: self.mode, self.tool_name = "tool", recipient.removeprefix("functions.")
         else: self.mode = "reasoning" if hdr.rsplit("<|channel|>")[-1].strip() == "analysis" else "content"
       elif self.mode == "tool": return
       else:
@@ -96,7 +95,7 @@ class HarmonyRouter(StreamRouter):
   def tool_calls(self) -> typing.Iterator[tuple[str, typing.Any]|str]:
     if self.mode == "tool":
       try: yield self.tool_name, json.loads(self.buf.strip() or "{}")
-      except json.JSONDecodeError: yield self.buf
+      except json.JSONDecodeError: yield self.tool_name, self.buf
 
 class Handler(HTTPRequestHandler):
   server: LLMServer
