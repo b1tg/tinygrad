@@ -37,7 +37,7 @@ def normalize_messages(messages:list[dict], harmony:bool=False) -> None:
         raise ValueError("only text content parts are supported")
       m["content"] = "".join(c["text"] for c in parts)
     # harmony templates read CoT from 'thinking'; clients send it as 'reasoning_content'. Only map tool call turns:
-    # the unsloth template misroutes content of plain turns with 'thinking' set (upstream llama.cpp maps the same way)
+    # the unsloth template misroutes content of plain turns with 'thinking' set (llama.cpp maps the same way)
     if harmony and m.get("role") == "assistant" and m.get("tool_calls") and not m.get("content") \
        and isinstance(rc := m.get("reasoning_content"), str) and "thinking" not in m: m["thinking"] = rc
 
@@ -74,8 +74,6 @@ class StreamRouter:
       yield parse_tool_call(m.group(1)) or m.group(0)
 
 class HarmonyRouter(StreamRouter):
-  # Harmony alternates headers and bodies, delimited by <|message|> and <|end|>.
-  # Tool calls stop generation at <|call|>, leaving their arguments buffered for tool_calls().
   def __init__(self): self.buf, self.mode, self.tool_name = "", "header", ""
   def route(self, piece:str, final:bool=False) -> typing.Iterator[tuple[str, str]]:
     self.buf += piece
@@ -135,12 +133,12 @@ class Handler(HTTPRequestHandler):
           break
       for field, delta in router.route(dec(), final=True): yield chunk({field:delta})
       tool_calls: list[dict] = []
-      for tc in router.tool_calls():
-        if isinstance(tc, str):  # unparseable tool call, don't silently drop output the client can't use
-          stderr_log(f"failed to parse tool call: {tc[:200]}")
-          yield chunk({"content":tc})
+      for parsed in router.tool_calls():
+        if isinstance(parsed, str):
+          stderr_log(f"failed to parse tool call: {parsed[:200]}")
+          yield chunk({"content":parsed}) # don't silently drop output the client can't use
         else:
-          name, args = tc
+          name, args = parsed
           tool_calls.append({"index":len(tool_calls), "id":f"call_{uuid.uuid4().hex[:24]}", "type":"function",
                              "function":{"name":name, "arguments":args if isinstance(args, str) else json.dumps(args)}})
       if tool_calls:

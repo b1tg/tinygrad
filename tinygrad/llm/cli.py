@@ -51,9 +51,8 @@ class SimpleTokenizer:
     special_tokens_dict = dict(special_tokens)
     return SimpleTokenizer(dict(normal_tokens), special_tokens_dict, kv["tokenizer.ggml.pre"],
       bos_id=kv.get('tokenizer.ggml.bos_token_id') if kv.get('tokenizer.ggml.add_bos_token', True) else None,
-      eos_id=kv.get('tokenizer.ggml.eos_token_id', 0),
-      # <|call|> ends a harmony (gpt-oss) tool call turn
-      eot_id=kv.get('tokenizer.ggml.eot_token_id', special_tokens_dict.get('<|im_end|>', special_tokens_dict.get('<|call|>'))))
+      eos_id=kv.get('tokenizer.ggml.eos_token_id', 0), eot_id=kv.get('tokenizer.ggml.eot_token_id',
+        special_tokens_dict.get('<|im_end|>', special_tokens_dict.get('<|call|>'))))
 
   def _encode_word(self, word:bytes) -> list[int]:
     if (early_token:=self._normal_tokens.get(word)) is not None: return [early_token]
@@ -106,14 +105,11 @@ models = {
 
 class FallbackTemplate:
   # minimal jinja2.Template-compatible chat template without jinja2, no tool calling support
-  def __init__(self, tok:SimpleTokenizer, harmony:bool=False):  # harmony: gpt-oss chat format
-    self.tok, self.harmony = tok, harmony
+  def __init__(self, tok:SimpleTokenizer, harmony:bool=False): self.tok, self.harmony = tok, harmony
   def role(self, role:str) -> str:
-    if self.harmony:  # gpt-oss harmony format
-      if role == 'system': return "<|start|>developer<|message|>"
-      if role == 'user': return "<|start|>user<|message|>"
-      if role == 'assistant': return "<|start|>assistant<|channel|>final<|message|>"
-      raise ValueError(f"Unsupported role '{role}' for harmony format")
+    if self.harmony:
+      role = "developer" if role == "system" else role
+      return f"<|start|>{role}" + ("<|channel|>final" if role == "assistant" else "") + "<|message|>"
     if self.tok.preset == 'olmo': return "<|" + role + "|>\n"  # OLMoE Instruct format
     if self.tok.preset == 'kimi-k2': return "<|im_" + role + "|>" + role + "<|im_middle|>"
     if self.tok.preset == 'qwen2': return "<|im_start|>" + role + "\n"
@@ -133,10 +129,6 @@ class FallbackTemplate:
     return self.tok.decode([self.tok.eos_id])
   def render(self, messages:list[dict], tools=None, add_generation_prompt:bool=True, preserve_thinking:bool=False) -> str:
     out = self.tok.decode([] if self.tok.bos_id is None or self.harmony else [self.tok.bos_id]) + ("<sop>" if self.tok.preset == 'glm4' else "")
-    if self.harmony:  # harmony system preamble, like the model's chat template
-      out += ("<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06\nCurrent date: " +
-              time.strftime("%Y-%m-%d") + "\n\nReasoning: medium\n\n" +
-              "# Valid channels: analysis, commentary, final. Channel must be included for every message.<|end|>")
     for msg in messages:
       out += self.role(msg["role"])
       content = msg.get("content")
@@ -150,7 +142,7 @@ class FallbackTemplate:
     if not add_generation_prompt: return out
     return out + ("<|start|>assistant" if self.harmony else self.role("assistant"))
 
-from tinygrad.llm.serve import LLMServer, HarmonyRouter
+from tinygrad.llm.serve import LLMServer
 
 def main():
   parser = argparse.ArgumentParser()
@@ -217,17 +209,13 @@ def main():
     except EOFError: break
     ids = tok.encode(template.render(messages=messages, add_generation_prompt=True))
     reply, dec = "", tok.stream_decoder()
-    router = HarmonyRouter() if harmony else None  # filter out harmony tags, keep only message text
-    for next_id in model.generate(ids, temperature=1.0 if router is not None else 0.0):  # gpt-oss degenerates at temperature 0
-      end = tok.is_end(next_id)
-      deltas = router.route(dec() if end else dec(next_id), final=end) if router is not None else [("content", dec() if end else dec(next_id))]
-      for field, delta in deltas:
-        if field == "content": reply += delta
-        sys.stdout.write(delta)
-        sys.stdout.flush()
-      if end:
-        sys.stdout.write("\n\n")
+    for next_id in model.generate(ids, temperature=1.0 if harmony else 0.0):
+      if tok.is_end(next_id):
+        sys.stdout.write(dec() + "\n\n")
         break
+      reply += (piece := dec(next_id))
+      sys.stdout.write(piece)
+      sys.stdout.flush()
     messages.append({"role":"assistant", "content":reply})
 
 if __name__ == "__main__": main()
