@@ -74,34 +74,28 @@ class StreamRouter:
       yield parse_tool_call(m.group(1)) or m.group(0)
 
 class HarmonyRouter(StreamRouter):
-  # routes harmony format (gpt-oss) output to (field, text) deltas, accumulating tool call arguments in .buf
-  # state machine: header -> {tool (stop), reasoning -> header, content -> header}
-  # message format:
-  # response contains multiple messages
-  # one message: <|start|>{header}<|message|>{content}<|end|>
-  # {header} with channel: assistant<|channel|>final
-  # assistant tool call: <|start|>assistant to=functions.{name}<|channel|>commentary json<|message|>{args}<|call|>
-  # tool result: <|start|>functions.{name} to=assistant<|channel|>commentary<|message|>{output}<|end|>
-  # headers end at <|message|>: [<|start|>assistant][ to=NAME][<|channel|>CHANNEL]
+  # Harmony alternates headers and bodies, delimited by <|message|> and <|end|>.
+  # Tool calls stop generation at <|call|>, leaving their arguments buffered for tool_calls().
   def __init__(self): self.buf, self.mode, self.tool_name = "", "header", ""
   def route(self, piece:str, final:bool=False) -> typing.Iterator[tuple[str, str]]:
     self.buf += piece
-    while self.buf:  # every iteration either breaks (needs more input) or consumes a delimiter from self.buf
+    while self.buf:
       if self.mode == "header":
-        if "<|message|>" not in self.buf and not final: break  # hold the whole header, it must be parsed intact
+        if "<|message|>" not in self.buf: break
         hdr, _ = self.split("<|message|>", final)
-        if "to=" in hdr:  # tool call: to=functions.NAME[<|constrain|>json| code][<|channel|>commentary json]<|message|>ARGS<|call|>
-          self.mode, self.tool_name = "tool", hdr.split("to=")[1].split("<|")[0].split()[0].removeprefix("functions.")
+        recipient = hdr.partition(" to=")[2].partition("<|")[0].strip()
+        if recipient:
+          self.mode, self.tool_name = "tool", recipient.removeprefix("functions.")
         else: self.mode = "reasoning" if hdr.rsplit("<|channel|>")[-1].strip() == "analysis" else "content"
-      elif self.mode == "tool": break  # tool call arguments accumulate in .buf
-      else:  # reasoning or content message body until <|end|>, then a new header follows
+      elif self.mode == "tool": return
+      else:
         emit, done = self.split("<|end|>", final)
         if emit: yield ("reasoning_content" if self.mode == "reasoning" else "content"), emit
         if not done: break
         self.mode = "header"
   def tool_calls(self) -> typing.Iterator[tuple[str, typing.Any]|str]:
-    if self.mode == "tool":  # generation stops at <|call|>, so there is at most one call, and .buf holds its arguments
-      try: yield self.tool_name, json.loads(self.buf.strip() or "{}")  # empty arguments mean {}
+    if self.mode == "tool":
+      try: yield self.tool_name, json.loads(self.buf.strip() or "{}")
       except json.JSONDecodeError: yield self.buf
 
 class Handler(HTTPRequestHandler):
