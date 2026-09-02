@@ -51,7 +51,9 @@ class SimpleTokenizer:
     special_tokens_dict = dict(special_tokens)
     return SimpleTokenizer(dict(normal_tokens), special_tokens_dict, kv["tokenizer.ggml.pre"],
       bos_id=kv.get('tokenizer.ggml.bos_token_id') if kv.get('tokenizer.ggml.add_bos_token', True) else None,
-      eos_id=kv.get('tokenizer.ggml.eos_token_id', 0), eot_id=kv.get('tokenizer.ggml.eot_token_id', special_tokens_dict.get('<|im_end|>')))
+      eos_id=kv.get('tokenizer.ggml.eos_token_id', 0),
+      # <|call|> ends a harmony (gpt-oss) tool call turn
+      eot_id=kv.get('tokenizer.ggml.eot_token_id', special_tokens_dict.get('<|im_end|>', special_tokens_dict.get('<|call|>'))))
 
   def _encode_word(self, word:bytes) -> list[int]:
     if (early_token:=self._normal_tokens.get(word)) is not None: return [early_token]
@@ -104,8 +106,14 @@ models = {
 
 class FallbackTemplate:
   # minimal jinja2.Template-compatible chat template without jinja2, no tool calling support
-  def __init__(self, tok:SimpleTokenizer): self.tok = tok
+  def __init__(self, tok:SimpleTokenizer, harmony:bool=False):  # harmony: gpt-oss chat format
+    self.tok, self.harmony = tok, harmony
   def role(self, role:str) -> str:
+    if self.harmony:  # gpt-oss harmony format
+      if role == 'system': return "<|start|>developer<|message|>"
+      if role == 'user': return "<|start|>user<|message|>"
+      if role == 'assistant': return "<|start|>assistant<|channel|>final<|message|>"
+      raise ValueError(f"Unsupported role '{role}' for harmony format")
     if self.tok.preset == 'olmo': return "<|" + role + "|>\n"  # OLMoE Instruct format
     if self.tok.preset == 'kimi-k2': return "<|im_" + role + "|>" + role + "<|im_middle|>"
     if self.tok.preset == 'qwen2': return "<|im_start|>" + role + "\n"
@@ -116,6 +124,7 @@ class FallbackTemplate:
       raise ValueError(f"Unsupported role '{role}' for tokenizer preset '{self.tok.preset}'")
     return "<|start_header_id|>" + role + "<|end_header_id|>\n\n"
   def end_turn(self) -> str:
+    if self.harmony: return "<|end|>"
     if self.tok.preset == 'olmo': return "\n"
     if self.tok.preset == 'kimi-k2': return self.tok.decode([self.tok.eos_id])
     if self.tok.preset == 'qwen2': return self.tok.decode([self.tok.eos_id]) + "\n"
@@ -123,7 +132,11 @@ class FallbackTemplate:
     if self.tok.preset == 'tekken': return "[/INST]"
     return self.tok.decode([self.tok.eos_id])
   def render(self, messages:list[dict], tools=None, add_generation_prompt:bool=True, preserve_thinking:bool=False) -> str:
-    out = self.tok.decode([] if self.tok.bos_id is None else [self.tok.bos_id]) + ("<sop>" if self.tok.preset == 'glm4' else "")
+    out = self.tok.decode([] if self.tok.bos_id is None or self.harmony else [self.tok.bos_id]) + ("<sop>" if self.tok.preset == 'glm4' else "")
+    if self.harmony:  # harmony system preamble, like the model's chat template
+      out += ("<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06\nCurrent date: " +
+              time.strftime("%Y-%m-%d") + "\n\nReasoning: medium\n\n" +
+              "# Valid channels: analysis, commentary, final. Channel must be included for every message.<|end|>")
     for msg in messages:
       out += self.role(msg["role"])
       content = msg.get("content")
@@ -134,9 +147,10 @@ class FallbackTemplate:
           else: raise RuntimeError(f"unhandled type: {c['type']}")
       elif content is not None: raise RuntimeError(f"unknown content type: {type(content)}")
       out += self.end_turn()
-    return out + self.role("assistant") if add_generation_prompt else out
+    if not add_generation_prompt: return out
+    return out + ("<|start|>assistant" if self.harmony else self.role("assistant"))
 
-from tinygrad.llm.serve import LLMServer
+from tinygrad.llm.serve import LLMServer, HarmonyRouter
 
 def main():
   parser = argparse.ArgumentParser()
@@ -160,7 +174,8 @@ def main():
   tok = SimpleTokenizer.from_gguf_kv(kv)
 
   # use the model's chat template if jinja2 is available (enables model-specific formatting)
-  template: jinja2.Template|FallbackTemplate = FallbackTemplate(tok)
+  harmony = kv.get('general.architecture') == 'gpt-oss'
+  template: jinja2.Template|FallbackTemplate = FallbackTemplate(tok, harmony=harmony)
   if not args.no_chat_template and (ct := kv.get('tokenizer.chat_template')) is not None:
     try:
       import jinja2
@@ -178,7 +193,7 @@ def main():
     with Context(DEBUG=max(DEBUG.value, 1)): model.warmup()
 
   # start server
-  if args.serve: LLMServer(('', args.serve), model, model_name, tok, template).serve_forever()
+  if args.serve: LLMServer(('', args.serve), model, model_name, tok, template, harmony).serve_forever()
 
   # do benchmark
   if args.benchmark is not None:
@@ -202,13 +217,17 @@ def main():
     except EOFError: break
     ids = tok.encode(template.render(messages=messages, add_generation_prompt=True))
     reply, dec = "", tok.stream_decoder()
-    for next_id in model.generate(ids):
-      if tok.is_end(next_id):
-        sys.stdout.write(dec() + "\n\n")
+    router = HarmonyRouter() if harmony else None  # filter out harmony tags, keep only message text
+    for next_id in model.generate(ids, temperature=1.0 if router is not None else 0.0):  # gpt-oss degenerates at temperature 0
+      end = tok.is_end(next_id)
+      deltas = router.route(dec() if end else dec(next_id), final=end) if router is not None else [("content", dec() if end else dec(next_id))]
+      for field, delta in deltas:
+        if field == "content": reply += delta
+        sys.stdout.write(delta)
+        sys.stdout.flush()
+      if end:
+        sys.stdout.write("\n\n")
         break
-      reply += (piece := dec(next_id))
-      sys.stdout.write(piece)
-      sys.stdout.flush()
     messages.append({"role":"assistant", "content":reply})
 
 if __name__ == "__main__": main()

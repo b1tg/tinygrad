@@ -24,13 +24,21 @@ def parse_tool_call(s:str) -> tuple[str, typing.Any]|None:
     return fm.group(1), args
   return None
 
-def normalize_messages(messages:list[dict]) -> None:
+def normalize_messages(messages:list[dict], harmony:bool=False) -> None:
   # chat templates expect tool_call arguments as dicts (OpenAI clients send JSON strings)
   for m in messages:
     for tc in m.get("tool_calls") or []:
       if "function" in tc and isinstance(args := tc["function"].get("arguments"), str):
         try: tc["function"]["arguments"] = json.loads(args)
         except json.JSONDecodeError: pass
+    # collapse OpenAI content parts into a plain string, chat templates expect strings
+    if isinstance(m.get("content"), list): m["content"] = "".join(c.get("text", "") for c in m["content"] if c.get("type") == "text")
+    # harmony templates read CoT from 'thinking'; clients send it as 'reasoning_content'. Only map tool call turns:
+    # the unsloth template misroutes content of plain turns with 'thinking' set (upstream llama.cpp maps the same way)
+    #return
+    if harmony and m.get("role") == "assistant" and m.get("tool_calls") and isinstance(rc := m.get("reasoning_content"), str) and "thinking" not in m:
+      m["thinking"] = rc
+      if m.get("content"): m["content"] = None  # the template rejects content+thinking together on tool call turns
 
 class StreamRouter:
   # routes streamed output text to (field, text) deltas, keeping tool_call regions in .buf for the final parse
@@ -59,6 +67,41 @@ class StreamRouter:
     emit, found = self.split("<tool_call>", final)
     if emit: yield "content", emit
     if found: self.mode, self.buf = "tool", "<tool_call>" + self.buf
+  def tool_calls(self) -> typing.Iterator[tuple[str, typing.Any]|str]:
+    # yields (name, arguments) for each tool call region in .buf, or the raw text if parsing failed
+    for m in re.finditer(r"<tool_call>\s*(.*?)\s*(?:</tool_call>|$)", self.buf, re.DOTALL):
+      yield parse_tool_call(m.group(1)) or m.group(0)
+
+class HarmonyRouter(StreamRouter):
+  # routes harmony format (gpt-oss) output to (field, text) deltas, accumulating tool call arguments in .buf
+  # state machine: header -> {tool (stop), reasoning -> header, content -> header}
+  # message format:
+  # response contains multiple messages
+  # one message: <|start|>{header}<|message|>{content}<|end|>
+  # {header} with channel: assistant<|channel|>final
+  # assistant tool call: <|start|>assistant to=functions.{name}<|channel|>commentary json<|message|>{args}<|call|>
+  # tool result: <|start|>functions.{name} to=assistant<|channel|>commentary<|message|>{output}<|end|>
+  # headers end at <|message|>: [<|start|>assistant][ to=NAME][<|channel|>CHANNEL]
+  def __init__(self): self.buf, self.mode, self.tool_name = "", "header", ""
+  def route(self, piece:str, final:bool=False) -> typing.Iterator[tuple[str, str]]:
+    self.buf += piece
+    while self.buf:  # every iteration either breaks (needs more input) or consumes a delimiter from self.buf
+      if self.mode == "header":
+        if "<|message|>" not in self.buf and not final: break  # hold the whole header, it must be parsed intact
+        hdr, _ = self.split("<|message|>", final)
+        if "to=" in hdr:  # tool call: to=functions.NAME[<|constrain|>json| code][<|channel|>commentary json]<|message|>ARGS<|call|>
+          self.mode, self.tool_name = "tool", hdr.split("to=")[1].split("<|")[0].split()[0].removeprefix("functions.")
+        else: self.mode = "reasoning" if hdr.rsplit("<|channel|>")[-1].strip() == "analysis" else "content"
+      elif self.mode == "tool": break  # tool call arguments accumulate in .buf
+      else:  # reasoning or content message body until <|end|>, then a new header follows
+        emit, done = self.split("<|end|>", final)
+        if emit: yield ("reasoning_content" if self.mode == "reasoning" else "content"), emit
+        if not done: break
+        self.mode = "header"
+  def tool_calls(self) -> typing.Iterator[tuple[str, typing.Any]|str]:
+    if self.mode == "tool":  # generation stops at <|call|>, so there is at most one call, and .buf holds its arguments
+      try: yield self.tool_name, json.loads(self.buf.strip() or "{}")  # empty arguments mean {}
+      except json.JSONDecodeError: yield self.buf
 
 class Handler(HTTPRequestHandler):
   server: LLMServer
@@ -78,7 +121,7 @@ class Handler(HTTPRequestHandler):
     finish_reason = "stop"
     st = pt = time.perf_counter()
     dec = tok.stream_decoder()
-    router = StreamRouter(reasoning)
+    router = HarmonyRouter() if self.server.harmony else StreamRouter(reasoning)
     def log_stats(interrupted:bool=False):
       et = time.perf_counter()
       total = f"total:{et-st:6.2f}s"
@@ -98,14 +141,14 @@ class Handler(HTTPRequestHandler):
           break
       for field, delta in router.route(dec(), final=True): yield chunk({field:delta})
       tool_calls: list[dict] = []
-      for m in re.finditer(r"<tool_call>\s*(.*?)\s*(?:</tool_call>|$)", router.buf, re.DOTALL):
-        if (parsed := parse_tool_call(m.group(1))) is None:
-          stderr_log(f"failed to parse tool call: {m.group(1)[:200]}")
-          yield chunk({"content":m.group(0)})  # don't silently drop output the client can't use
-        else:
-          name, args = parsed
-          tool_calls.append({"index":len(tool_calls), "id":f"call_{uuid.uuid4().hex[:24]}", "type":"function",
-                             "function":{"name":name, "arguments":args if isinstance(args, str) else json.dumps(args)}})
+      for tc in router.tool_calls():
+        if isinstance(tc, str):  # unparseable tool call, don't silently drop output the client can't use
+          stderr_log(f"failed to parse tool call: {tc[:200]}")
+          yield chunk({"content":tc})
+          continue
+        name, args = tc
+        tool_calls.append({"index":len(tool_calls), "id":f"call_{uuid.uuid4().hex[:24]}", "type":"function",
+                           "function":{"name":name, "arguments":args if isinstance(args, str) else json.dumps(args)}})
       if tool_calls:
         yield chunk({"tool_calls":tool_calls})
         if finish_reason == "stop": finish_reason = "tool_calls"
@@ -127,7 +170,7 @@ class Handler(HTTPRequestHandler):
     if DEBUG >= 1: print(json.dumps(body, indent=2))
     if self.path == "/v1/chat/completions":
       # render and tokenize
-      normalize_messages(body["messages"])
+      normalize_messages(body["messages"], harmony=self.server.harmony)
       rendered = self.server.template.render(messages=body["messages"], tools=body.get("tools"), add_generation_prompt=True, preserve_thinking=True)
       ids: list[int] = self.server.tok.encode(rendered)
       stderr_log(f"prep:{(time.perf_counter()-request_st)*1e3:5.0f} ms  {colored('--', 'BLACK')}  ")
@@ -139,8 +182,9 @@ class Handler(HTTPRequestHandler):
 
       # reply
       max_tokens = body.get("max_completion_tokens") or body.get("max_tokens")
+      # harmony (gpt-oss) degenerates at temperature 0, default to 1.0 for it
       chunks = self.run_model(ids, body["model"], not body.get("stream") or body.get("stream_options",{}).get("include_usage", False),
-                              max_tokens=max_tokens, temperature=float(body.get("temperature", 0.0)),
+                              max_tokens=max_tokens, temperature=float(body.get("temperature", 1.0 if self.server.harmony else 0.0)),
                               reasoning=rendered.rstrip().endswith("<think>"))
       if body.get("stream"): self.stream_json(chunks)
       else:
@@ -162,6 +206,6 @@ class Handler(HTTPRequestHandler):
       raise RuntimeError(f"unhandled path {self.path}")
 
 class LLMServer(TCPServerWithReuse):
-  def __init__(self, server_address:tuple, model:Transformer, model_name:str, tok:SimpleTokenizer, template:typing.Any):
-    self.model, self.model_name, self.tok, self.template = model, model_name, tok, template
+  def __init__(self, server_address:tuple, model:Transformer, model_name:str, tok:SimpleTokenizer, template:typing.Any, harmony:bool=False):
+    self.model, self.model_name, self.tok, self.template, self.harmony = model, model_name, tok, template, harmony
     super().__init__(server_address, Handler)
