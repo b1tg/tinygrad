@@ -122,7 +122,7 @@ class FallbackTemplate:
     if self.tok.preset == 'glm4': return ""
     if self.tok.preset == 'tekken': return "[/INST]"
     return self.tok.decode([self.tok.eos_id])
-  def render(self, messages:list[dict], tools=None, add_generation_prompt:bool=True, preserve_thinking:bool=False) -> str:
+  def render(self, messages:list[dict], tools=None, add_generation_prompt:bool=True, preserve_thinking:bool=False, **kwargs) -> str:
     out = self.tok.decode([] if self.tok.bos_id is None else [self.tok.bos_id]) + ("<sop>" if self.tok.preset == 'glm4' else "")
     for msg in messages:
       out += self.role(msg["role"])
@@ -136,12 +136,14 @@ class FallbackTemplate:
       out += self.end_turn()
     return out + self.role("assistant") if add_generation_prompt else out
 
-from tinygrad.llm.serve import LLMServer
+from tinygrad.llm.serve import LLMServer, StreamRouter
 
 def main():
   parser = argparse.ArgumentParser()
   parser.add_argument("--model", "-m", default=list(models.keys())[0], help=f"Model choice ({', '.join(models.keys())}) or path to a local GGUF file")
   parser.add_argument("--max_context", type=int, default=4096, help="Max Context Length")
+  parser.add_argument("--shard", type=int, default=1, help="Pipeline the model across this many devices")
+  parser.add_argument("--reasoning_effort", choices=("low", "high", "max"), default="max", help="Chat-template reasoning effort")
   parser.add_argument("--serve", nargs='?', type=int, const=8000, metavar="PORT", help="Run OpenAI compatible API (optional port, default 8000)")
   parser.add_argument("--warmup", action="store_true", help="warmup the JIT")
   parser.add_argument("--benchmark", nargs='?', type=int, const=20, metavar="COUNT", help="Benchmark tok/s (optional count, default 20)")
@@ -150,11 +152,13 @@ def main():
 
   # load the model
   with Context(DEBUG=max(DEBUG.value, 2 if args.serve else 0)):
-    model, kv = Transformer.from_gguf(fetch(models.get(args.model, args.model)), args.max_context)
+    model, kv = Transformer.from_gguf(fetch(models.get(args.model, args.model)), args.max_context, shard=args.shard)
   model_name = kv.get('general.name') or kv.get('general.basename') or args.model
-  file_sizes = [y.nbytes() for y in UOp.sink(*[x.uop for x in nn.state.get_parameters(model)]).toposort() if y.op is Ops.BUFFER]
-  print(f"using model \"{model_name}\" with {sum(file_sizes):,} bytes and {sum(x.numel() for x in nn.state.get_parameters(model)):,} params, "
-        f"max context {args.max_context} on {nn.state.get_parameters(model)[0].device}")
+  params = nn.state.get_parameters(model)
+  file_sizes = [y.nbytes() for y in UOp.sink(*[x.uop for x in params]).toposort() if y.op is Ops.BUFFER]
+  devices = ', '.join(model.devices) if model.devices is not None else str(params[0].device)
+  print(f"using model \"{model_name}\" with {sum(file_sizes):,} bytes and {sum(x.numel() for x in params):,} params, "
+        f"max context {model.max_context} on {devices}")
 
   # get tokenizer
   tok = SimpleTokenizer.from_gguf_kv(kv)
@@ -164,7 +168,7 @@ def main():
   if not args.no_chat_template and (ct := kv.get('tokenizer.chat_template')) is not None:
     try:
       import jinja2
-      env = jinja2.Environment()
+      env = jinja2.Environment(extensions=["jinja2.ext.loopcontrols"])
       env.filters['tojson'] = lambda obj, **kwargs: json.dumps(obj, **kwargs)  # jinja2's tojson escapes <>& for HTML safety
       env.globals['raise_exception'] = lambda msg: (_ for _ in ()).throw(RuntimeError(msg))
       env.globals['strftime_now'] = lambda fmt: time.strftime(fmt)
@@ -200,14 +204,21 @@ def main():
   while 1:
     try: messages.append({"role":"user", "content":input('>>> ')})
     except EOFError: break
-    ids = tok.encode(template.render(messages=messages, add_generation_prompt=True))
+    rendered = template.render(messages=messages, add_generation_prompt=True, reasoning_effort=args.reasoning_effort)
+    ids = tok.encode(rendered)
     reply, dec = "", tok.stream_decoder()
+    router = StreamRouter(reasoning=rendered.rstrip().endswith("<think>"))
     for next_id in model.generate(ids):
       if tok.is_end(next_id):
-        sys.stdout.write(dec() + "\n\n")
+        pieces = router.route(dec(), final=True)
+        for field, piece in pieces:
+          if field == "content": reply += piece
+          sys.stdout.write(piece)
+        sys.stdout.write("\n\n")
         break
-      reply += (piece := dec(next_id))
-      sys.stdout.write(piece)
+      for field, piece in router.route(dec(next_id)):
+        if field == "content": reply += piece
+        sys.stdout.write(piece)
       sys.stdout.flush()
     messages.append({"role":"assistant", "content":reply})
 

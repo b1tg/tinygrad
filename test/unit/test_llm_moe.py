@@ -2,7 +2,8 @@ import unittest
 import numpy as np
 from dataclasses import replace
 from tinygrad import Tensor
-from tinygrad.llm.model import ExpertGating, TransformerBlock, TransformerConfig
+from tinygrad.llm.gguf import ggml_data_to_tensor
+from tinygrad.llm.model import ExpertGating, ExpertWeights, TransformerBlock, TransformerConfig
 
 def _moe_config(dim=8, hidden=16, n_heads=2, num_experts=4, num_experts_per_tok=2):
   return TransformerConfig(
@@ -12,6 +13,25 @@ def _moe_config(dim=8, hidden=16, n_heads=2, num_experts=4, num_experts_per_tok=
     num_experts=num_experts, num_experts_per_tok=num_experts_per_tok)
 
 class TestMoEFeedForward(unittest.TestCase):
+  def test_selected_iq4_xs_experts(self):
+    # GLM-5.3 uses IQ4_XS for a few routed down projections. Keep them packed and
+    # decode only the selected experts, as with its more common IQ2_XS/IQ3_XS weights.
+    experts, out_features, in_features, block_bytes = 3, 2, 256, 136
+    rng = np.random.default_rng(42)
+    packed = rng.integers(0, 256, size=(experts * out_features, block_bytes), dtype=np.uint8)
+    packed[:, :2] = np.frombuffer(np.float16(0.25).tobytes(), dtype=np.uint8)
+    raw = Tensor(packed.flatten()).realize()
+    full = ggml_data_to_tensor(raw, experts * out_features * in_features, 23).reshape(experts, out_features, in_features)
+
+    weight = ExpertWeights(experts, in_features, out_features)
+    weight.weight = full
+    selected = Tensor([[[0, 2]]])
+    x = Tensor(rng.standard_normal((1, 1, 2, in_features), dtype=np.float32))
+    expected = (x.unsqueeze(-2) @ full[selected].transpose(-1, -2)).squeeze(-2)
+
+    np.testing.assert_allclose(weight(selected, x).numpy(), expected.numpy(), rtol=2e-3, atol=2e-3)
+    self.assertEqual(weight.ggml_type, 23)
+
   def test_moe_feed_forward(self):
     dim, hidden, n_heads = 8, 16, 2
     num_experts, k = 4, 2
