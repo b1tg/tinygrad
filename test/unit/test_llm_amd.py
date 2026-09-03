@@ -104,7 +104,7 @@ class TestQ8Quantize(unittest.TestCase):
     np.testing.assert_allclose(out.numpy(), expected.numpy(), rtol=2e-3, atol=2e-3)
 
   def test_prefill_attention_unaligned_start(self):
-    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("custom kernels required")
     rng = np.random.default_rng(42)
     start_pos = 1718
     q = Tensor.zeros(1, 8, 32, 128)
