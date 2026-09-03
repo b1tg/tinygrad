@@ -197,4 +197,46 @@ class TestQ8Quantize(unittest.TestCase):
     np.testing.assert_allclose(linear(Tensor(x_pre)).numpy(), x_pre @ weight.T, rtol=2e-2, atol=4e-1)
     self.assertEqual(linear.ggml_type, 14)
 
+  def test_iq3_xxs_linear(self):
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
+    rng = np.random.default_rng(42)
+    in_features, out_features = 2048, 16
+    blocks = out_features * in_features // 256
+    packed = rng.integers(0, 256, blocks * 98, dtype=np.uint8)
+    for i in range(blocks): packed[i*98:i*98+2] = np.array([0.01], dtype=np.float16).view(np.uint8)
+    raw = Tensor(np.pad(packed, (4, 0))).contiguous().realize()[4:]
+    decoded = ggml_data_to_tensor(raw, out_features * in_features, 18).reshape(out_features, in_features)
+    weight = decoded.numpy()
+    linear = Linear(in_features, out_features, bias=False)
+    nn.state.load_state_dict(linear, {"weight": decoded}, verbose=False, realize=False)
+    x = rng.normal(size=(3, in_features)).astype(np.float32)
+    scale = np.maximum(np.abs(x).reshape(3, in_features//32, 32).max(-1, keepdims=True) / 127, 1e-8)
+    xq = np.clip(np.rint(x.reshape(3, in_features//32, 32) / scale), -127, 127) * scale
+    np.testing.assert_allclose(linear(Tensor(x)).numpy(), xq.reshape(3, in_features) @ weight.T, rtol=2e-3, atol=2e-2)
+    self.assertEqual(linear.ggml_type, 18)
+    self.assertEqual(linear.weight.dtype, dtypes.uint8)
+    x_pre = rng.normal(size=(16, in_features)).astype(np.float32)
+    np.testing.assert_allclose(linear(Tensor(x_pre)).numpy(), x_pre @ weight.T, rtol=2e-2, atol=4e-1)
+
+  def test_iq2_xs_linear(self):
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
+    rng = np.random.default_rng(42)
+    in_features, out_features = 2048, 16
+    blocks = out_features * in_features // 256
+    packed = rng.integers(0, 256, blocks * 74, dtype=np.uint8)
+    for i in range(blocks): packed[i*74:i*74+2] = np.array([0.01], dtype=np.float16).view(np.uint8)
+    raw = Tensor(np.pad(packed, (4, 0))).contiguous().realize()[4:]
+    decoded = ggml_data_to_tensor(raw, out_features * in_features, 17).reshape(out_features, in_features)
+    weight = decoded.numpy()
+    linear = Linear(in_features, out_features, bias=False)
+    nn.state.load_state_dict(linear, {"weight": decoded}, verbose=False, realize=False)
+    x = rng.normal(size=(3, in_features)).astype(np.float32)
+    scale = np.maximum(np.abs(x).reshape(3, in_features//32, 32).max(-1, keepdims=True) / 127, 1e-8)
+    xq = np.clip(np.rint(x.reshape(3, in_features//32, 32) / scale), -127, 127) * scale
+    np.testing.assert_allclose(linear(Tensor(x)).numpy(), xq.reshape(3, in_features) @ weight.T, rtol=2e-3, atol=2e-2)
+    self.assertEqual(linear.ggml_type, 17)
+    self.assertEqual(linear.weight.dtype, dtypes.uint8)
+    x_pre = rng.normal(size=(16, in_features)).astype(np.float32)
+    np.testing.assert_allclose(linear(Tensor(x_pre)).numpy(), x_pre @ weight.T, rtol=2e-2, atol=4e-1)
+
 if __name__ == "__main__": unittest.main()
