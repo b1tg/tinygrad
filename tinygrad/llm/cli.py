@@ -10,9 +10,9 @@ if TYPE_CHECKING:
 
 class SimpleTokenizer:
   def __init__(self, normal_tokens:dict[str, int], special_tokens:dict[str, int], preset:str="llama3",
-               bos_id:int|None=None, eos_id:int=0, eot_id:int|None=None):
+               bos_id:int|None=None, eos_id:int=0, eot_id:int|None=None, merges:list[str]|None=None):
     preset = {"qwen35":"qwen2","qwen35moe":"qwen2"}.get(preset, preset)
-    if preset not in ("llama3","llama-v3","llama-bpe","qwen2","olmo","kimi-k2","tekken","glm4","gpt-4o"):
+    if preset not in ("llama3","llama-v3","llama-bpe","qwen2","olmo","kimi-k2","tekken","glm4","gpt-4o","gemma4"):
       raise ValueError(f"Invalid tokenizer preset '{preset}'")
     # https://github.com/openai/gpt-2/blob/9b63575ef42771a015060c964af2c3da4cf7c8ab/src/encoder.py#L9
     bs = [*range(33, 127), *range(161, 173), *range(174, 256)]  # bytes that map to themselves
@@ -34,12 +34,20 @@ class SimpleTokenizer:
       r_up, r_lo = ucat_range(("Lu","Lt","Lm","Lo","M")), ucat_range(("Ll","Lm","Lo","M"))
       sfx = f"{contr}?" if preset == "gpt-4o" else ""
       r_p, r_w = f" ?[^{r_ws}{r_p_N}{r_p_L}]+[\\r\\n/]*", f"{r_l}[{r_up}]*[{r_lo}]+{sfx}|{r_l}[{r_up}]+[{r_lo}]*{sfx}"
-    self._split_to_word = re.compile(f"{r_w}|{r_n}|{r_p}|{r_t}")
+    self._split_to_word = re.compile(r"[^\n]+|[\n]+" if preset == "gemma4" else f"{r_w}|{r_n}|{r_p}|{r_t}")
     self._split_to_sentence = re.compile("|".join(re.escape(tok) for tok in special_tokens.keys()) if special_tokens else r"(?!)")
 
-    self._normal_tokens = {bytes(self._byte_decoder[c] for c in tok): tid for tok, tid in normal_tokens.items()}
+    self._normal_tokens = {tok.encode():tid for tok,tid in normal_tokens.items()} if preset == "gemma4" else \
+      {bytes(self._byte_decoder[c] for c in tok): tid for tok, tid in normal_tokens.items()}
+    self._token_to_id = self._normal_tokens | {tok.encode():tid for tok,tid in special_tokens.items()}
+    self._merge_ranks = {tuple(x.encode() for x in merge.split(" ", 1)):rank for rank,merge in enumerate(merges or [])}
     self._special_tokens = special_tokens
-    self._tok2bytes = {tid: tok for tok, tid in self._normal_tokens.items()} | {tid: tok.encode() for tok, tid in self._special_tokens.items()}
+    if preset == "gemma4":
+      def token_bytes(tok:str) -> bytes:
+        return bytes([int(tok[3:5], 16)]) if re.fullmatch(r"<0x[0-9A-Fa-f]{2}>", tok) else tok.replace("▁", " ").encode()
+      self._tok2bytes = {tid:token_bytes(tok) for tok,tid in (normal_tokens | special_tokens).items()}
+    else:
+      self._tok2bytes = {tid: tok for tok, tid in self._normal_tokens.items()} | {tid: tok.encode() for tok, tid in self._special_tokens.items()}
     self.preset = preset
     self.bos_id, self.eos_id, self.eot_id = bos_id, eos_id, eot_id
 
@@ -47,11 +55,30 @@ class SimpleTokenizer:
   def from_gguf_kv(kv:dict):
     # https://github.com/ggml-org/llama.cpp/blob/94933c8c2eeaa9a7983e3f6c08af76bd86724094/src/llama-vocab.cpp#L1818-L1820
     vocab: typing.Iterable[tuple[str, int]] = ((tok, idx) for idx, tok in enumerate(kv["tokenizer.ggml.tokens"]))
-    normal_tokens, special_tokens = partition(vocab, lambda e: kv["tokenizer.ggml.token_type"][e[1]] == 1)
+    preset = kv.get("tokenizer.ggml.pre", kv.get("tokenizer.ggml.model"))
+    normal_tokens, special_tokens = partition(vocab, lambda e: kv["tokenizer.ggml.token_type"][e[1]] == 1 or
+      (preset == "gemma4" and kv["tokenizer.ggml.token_type"][e[1]] == 6))
     special_tokens_dict = dict(special_tokens)
-    return SimpleTokenizer(dict(normal_tokens), special_tokens_dict, kv["tokenizer.ggml.pre"],
+    return SimpleTokenizer(dict(normal_tokens), special_tokens_dict, preset,
       bos_id=kv.get('tokenizer.ggml.bos_token_id') if kv.get('tokenizer.ggml.add_bos_token', True) else None,
-      eos_id=kv.get('tokenizer.ggml.eos_token_id', 0), eot_id=kv.get('tokenizer.ggml.eot_token_id', special_tokens_dict.get('<|im_end|>')))
+      eos_id=kv.get('tokenizer.ggml.eos_token_id', 0), eot_id=kv.get('tokenizer.ggml.eot_token_id', special_tokens_dict.get('<|im_end|>')),
+      merges=kv.get('tokenizer.ggml.merges'))
+
+  def _encode_gemma4_word(self, word:bytes) -> list[int]:
+    if word.strip(b"\n") == b"" and word in self._token_to_id: return [self._token_to_id[word]]
+    parts = [c.encode() for c in word.decode()]
+    while candidates := [(self._merge_ranks[pair], i) for i in range(len(parts)-1)
+                         if (pair:=(parts[i], parts[i+1])) in self._merge_ranks]:
+      _, i = min(candidates)
+      parts[i:i+2] = [parts[i] + parts[i+1]]
+    tokens = []
+    for part in parts:
+      if (tid:=self._token_to_id.get(part)) is not None: tokens.append(tid)
+      else:
+        for byte in part:
+          if (tid:=self._token_to_id.get(f"<0x{byte:02X}>".encode())) is None: raise RuntimeError("token not found")
+          tokens.append(tid)
+    return tokens
 
   def _encode_word(self, word:bytes) -> list[int]:
     if (early_token:=self._normal_tokens.get(word)) is not None: return [early_token]
@@ -64,6 +91,8 @@ class SimpleTokenizer:
     try: return [self._normal_tokens[p] for p in parts]
     except KeyError: raise RuntimeError("token not found")
   def _encode_sentence(self, chunk:str) -> list[int]:
+    if self.preset == "gemma4":
+      return [tok for word in self._split_to_word.findall(chunk.replace(" ", "▁")) for tok in self._encode_gemma4_word(word.encode())]
     return [tok for word in self._split_to_word.findall(chunk) for tok in self._encode_word(word.encode())]
   def encode(self, text:str) -> list[int]:
     tokens: list[int] = []

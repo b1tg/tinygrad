@@ -95,6 +95,16 @@ class TestLLMTokenizer(unittest.TestCase):
     self.assertEqual(template.end_turn(), "[/INST]")
     self.assertEqual(template.role("assistant"), "")
 
+  def test_gemma4_from_gguf_kv(self):
+    tokens = ["<pad>", "<eos>", "<bos>", "<unk>", "<mask>", "▁", "h", "e", "l", "o", "he", "ll", "hell", "hello", "▁hello", "\n",
+              "<0xF0>", "<0x9F>", "<0x98>", "<0x8A>"]
+    kv = {"tokenizer.ggml.tokens":tokens, "tokenizer.ggml.token_type":[3]*5+[1]*11+[6]*4,
+      "tokenizer.ggml.model":"gemma4", "tokenizer.ggml.merges":["h e", "l l", "he ll", "hell o", "▁ hello"],
+      "tokenizer.ggml.bos_token_id":2, "tokenizer.ggml.eos_token_id":1}
+    tok = SimpleTokenizer.from_gguf_kv(kv)
+    self.assertEqual(tok.encode(" hello\n😊"), [14, 15, 16, 17, 18, 19])
+    self.assertEqual(tok.decode([14, 15, 16, 17, 18, 19]), " hello\n😊")
+
   def test_tekken_gpt4o_split(self):
     split = {p: SimpleTokenizer({}, {}, p)._split_to_word.findall for p in ("tekken", "gpt-4o")}
     shared = {
