@@ -5,16 +5,17 @@ from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported, q8_qu
 from tinygrad.llm.gguf import ggml_data_to_tensor
 
 class TestQ8Quantize(unittest.TestCase):
-  def test_word_quant_weights_use_typed_buffer_view(self):
-    for ggml_type, type_size in ((13, 176), (23, 136)):
+  def test_quant_weights_use_typed_buffer_view(self):
+    for ggml_type,nbytes,dtype in ((2, 144, dtypes.uint8), (6, 176, dtypes.uint8), (12, 144, dtypes.uint32),
+                                   (13, 176, dtypes.uint32), (23, 136, dtypes.uint32)):
       with self.subTest(ggml_type=ggml_type):
-        raw = Tensor(np.zeros(type_size + 4, dtype=np.uint8), device="CPU").contiguous().realize()[4:]
+        raw = Tensor(np.zeros(nbytes + 4, dtype=np.uint8), device="CPU").contiguous().realize()[4:]
         decoded = ggml_data_to_tensor(raw, 256, ggml_type).reshape(1, 256)
         linear = Linear(256, 1, bias=False)
         linear.set_quantized(decoded)
         self.assertEqual(linear.ggml_type, ggml_type)
-        self.assertEqual(linear.weight.dtype, dtypes.uint32)
-        self.assertEqual(linear.weight.nbytes(), type_size)
+        self.assertEqual(linear.weight.dtype, dtype)
+        self.assertEqual(linear.weight.nbytes(), nbytes)
         self.assertEqual(linear.weight.uop.buf_uop.buffer.offset, 4)
 
   def test_values_and_scales(self):
@@ -60,6 +61,30 @@ class TestQ8Quantize(unittest.TestCase):
     xq = np.clip(np.rint(x.reshape(3, in_features//32, 32) / scale), -127, 127) * scale
     np.testing.assert_allclose(linear(Tensor(x)).numpy(), xq.reshape(3, in_features) @ weight.T, rtol=2e-3, atol=2e-2)
     self.assertEqual(linear.ggml_type, 12)
+
+  def test_q_0_linear(self):
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
+    rng = np.random.default_rng(42)
+    in_features, out_features = 2880, 48
+    for ggml_type,type_size in ((2, 18), (6, 22)):
+      packed = rng.integers(0, 256, out_features*in_features//32*type_size, dtype=np.uint8)
+      for i in range(out_features*in_features//32): packed[i*type_size:i*type_size+2] = np.array([0.01], dtype=np.float16).view(np.uint8)
+      raw = Tensor(np.pad(packed, (4, 0))).contiguous().realize()[4:]
+      decoded = ggml_data_to_tensor(raw, out_features*in_features, ggml_type).reshape(out_features, in_features)
+      weight = decoded.numpy()
+      for tokens in (3, 16):
+        with self.subTest(ggml_type=ggml_type, tokens=tokens):
+          linear = Linear(in_features, out_features, bias=False)
+          nn.state.load_state_dict(linear, {"weight":decoded}, verbose=False, realize=False)
+          x = rng.normal(size=(tokens, in_features)).astype(np.float32)
+          if tokens % 16:
+            scale = np.maximum(np.abs(x).reshape(tokens, in_features//32, 32).max(-1, keepdims=True) / 127, 1e-8)
+            xref = (np.clip(np.rint(x.reshape(tokens, in_features//32, 32) / scale), -127, 127) * scale).reshape(tokens, in_features)
+            expected = xref @ weight.T
+          else:
+            expected = x.astype(np.float16).astype(np.float32) @ weight.astype(np.float16).astype(np.float32).T
+          np.testing.assert_allclose(linear(Tensor(x)).numpy(), expected, rtol=2e-3, atol=2e-2)
+          self.assertEqual(linear.ggml_type, ggml_type)
 
   def test_q6_linear_multiple_tokens(self):
     if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
