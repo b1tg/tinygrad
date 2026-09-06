@@ -37,11 +37,10 @@ if __name__ == "__main__":
     # normalize answer key (some use 1/2/3/4 instead of A/B/C/D)
     correct = answer.as_py().strip()
     if correct not in LABEL: correct = LABEL[int(correct) - 1]
-    # extract answer: take last single capital letter A-D from response (prompt asks model to end with the answer)
     text = resp.choices[0].message.content.strip()
     if args.debug: print(f"\n--- PROMPT ---\n{phrasing}\n--- RESPONSE ---\n{text}\n---")
-    m = re.findall(r'\b([A-D])\b', text)
-    given = m[-1] if m else text[:1]
+    m = re.search(r'The best answer is ([A-D])\s*', text.splitlines()[-1])
+    given = m.group(1) if m else "INVALID"
     num_correct += correct == given
     num_answered += 1
     print(f"{num_answered:4d}/{total_questions:4d}  "+\

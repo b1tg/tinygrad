@@ -24,13 +24,22 @@ def parse_tool_call(s:str) -> tuple[str, typing.Any]|None:
     return fm.group(1), args
   return None
 
-def normalize_messages(messages:list[dict]) -> None:
+def normalize_messages(messages:list[dict], harmony:bool=False) -> None:
   # chat templates expect tool_call arguments as dicts (OpenAI clients send JSON strings)
   for m in messages:
     for tc in m.get("tool_calls") or []:
       if "function" in tc and isinstance(args := tc["function"].get("arguments"), str):
         try: tc["function"]["arguments"] = json.loads(args)
         except json.JSONDecodeError: pass
+    # collapse text-only OpenAI content parts into a plain string, chat templates expect strings
+    if isinstance(parts := m.get("content"), list):
+      if any(not isinstance(c, dict) or c.get("type") != "text" or not isinstance(c.get("text"), str) for c in parts):
+        raise ValueError("only text content parts are supported")
+      m["content"] = "".join(c["text"] for c in parts)
+    # harmony templates read CoT from 'thinking'; clients send it as 'reasoning_content'. Only map tool call turns:
+    # the unsloth template misroutes content of plain turns with 'thinking' set (llama.cpp maps the same way)
+    if harmony and m.get("role") == "assistant" and m.get("tool_calls") and not m.get("content") \
+       and isinstance(rc := m.get("reasoning_content"), str) and "thinking" not in m: m["thinking"] = rc
 
 class StreamRouter:
   # routes streamed output text to (field, text) deltas, keeping tool_call regions in .buf for the final parse
@@ -59,6 +68,32 @@ class StreamRouter:
     emit, found = self.split("<tool_call>", final)
     if emit: yield "content", emit
     if found: self.mode, self.buf = "tool", "<tool_call>" + self.buf
+  def tool_calls(self) -> typing.Iterator[tuple[str, typing.Any]|str]:
+    # yields (name, arguments) for each tool call region in .buf, or the raw text if parsing failed
+    for m in re.finditer(r"<tool_call>\s*(.*?)\s*(?:</tool_call>|$)", self.buf, re.DOTALL):
+      yield parse_tool_call(m.group(1)) or m.group(0)
+
+class HarmonyRouter(StreamRouter):
+  def __init__(self): self.buf, self.mode, self.tool_name = "", "header", ""
+  def route(self, piece:str, final:bool=False) -> typing.Iterator[tuple[str, str]]:
+    self.buf += piece
+    while self.buf:
+      if self.mode == "header":
+        if "<|message|>" not in self.buf: break
+        hdr, _ = self.split("<|message|>", final)
+        recipient = m.group(1) if (m := re.search(r"(?:^|\s)to=([^\s<]+)", hdr)) else ""
+        if recipient: self.mode, self.tool_name = "tool", recipient.removeprefix("functions.")
+        else: self.mode = "reasoning" if hdr.rsplit("<|channel|>")[-1].strip() == "analysis" else "content"
+      elif self.mode == "tool": return
+      else:
+        emit, done = self.split("<|end|>", final)
+        if emit: yield ("reasoning_content" if self.mode == "reasoning" else "content"), emit
+        if not done: break
+        self.mode = "header"
+  def tool_calls(self) -> typing.Iterator[tuple[str, typing.Any]|str]:
+    if self.mode == "tool":
+      try: yield self.tool_name, json.loads(self.buf.strip() or "{}")
+      except json.JSONDecodeError: yield self.tool_name, self.buf
 
 class Handler(HTTPRequestHandler):
   server: LLMServer
@@ -78,7 +113,7 @@ class Handler(HTTPRequestHandler):
     finish_reason = "stop"
     st = pt = time.perf_counter()
     dec = tok.stream_decoder()
-    router = StreamRouter(reasoning)
+    router = HarmonyRouter() if self.server.harmony else StreamRouter(reasoning)
     def log_stats(interrupted:bool=False):
       et = time.perf_counter()
       total = f"total:{et-st:6.2f}s"
@@ -98,10 +133,10 @@ class Handler(HTTPRequestHandler):
           break
       for field, delta in router.route(dec(), final=True): yield chunk({field:delta})
       tool_calls: list[dict] = []
-      for m in re.finditer(r"<tool_call>\s*(.*?)\s*(?:</tool_call>|$)", router.buf, re.DOTALL):
-        if (parsed := parse_tool_call(m.group(1))) is None:
-          stderr_log(f"failed to parse tool call: {m.group(1)[:200]}")
-          yield chunk({"content":m.group(0)})  # don't silently drop output the client can't use
+      for parsed in router.tool_calls():
+        if isinstance(parsed, str):
+          stderr_log(f"failed to parse tool call: {parsed[:200]}")
+          yield chunk({"content":parsed}) # don't silently drop output the client can't use
         else:
           name, args = parsed
           tool_calls.append({"index":len(tool_calls), "id":f"call_{uuid.uuid4().hex[:24]}", "type":"function",
@@ -127,7 +162,10 @@ class Handler(HTTPRequestHandler):
     if DEBUG >= 1: print(json.dumps(body, indent=2))
     if self.path == "/v1/chat/completions":
       # render and tokenize
-      normalize_messages(body["messages"])
+      try: normalize_messages(body["messages"], harmony=self.server.harmony)
+      except ValueError as e:
+        return self.send_data(json.dumps({"error":{"message":str(e), "type":"invalid_request_error", "param":"messages",
+          "code":"invalid_message"}}).encode(), status_code=400)
       rendered = self.server.template.render(messages=body["messages"], tools=body.get("tools"), add_generation_prompt=True, preserve_thinking=True)
       ids: list[int] = self.server.tok.encode(rendered)
       stderr_log(f"prep:{(time.perf_counter()-request_st)*1e3:5.0f} ms  {colored('--', 'BLACK')}  ")
@@ -139,8 +177,9 @@ class Handler(HTTPRequestHandler):
 
       # reply
       max_tokens = body.get("max_completion_tokens") or body.get("max_tokens")
+      # harmony (gpt-oss) degenerates at temperature 0, default to 1.0 for it
       chunks = self.run_model(ids, body["model"], not body.get("stream") or body.get("stream_options",{}).get("include_usage", False),
-                              max_tokens=max_tokens, temperature=float(body.get("temperature", 0.0)),
+                              max_tokens=max_tokens, temperature=float(body.get("temperature", 1.0 if self.server.harmony else 0.0)),
                               reasoning=rendered.rstrip().endswith("<think>"))
       if body.get("stream"): self.stream_json(chunks)
       else:
@@ -162,6 +201,6 @@ class Handler(HTTPRequestHandler):
       raise RuntimeError(f"unhandled path {self.path}")
 
 class LLMServer(TCPServerWithReuse):
-  def __init__(self, server_address:tuple, model:Transformer, model_name:str, tok:SimpleTokenizer, template:typing.Any):
-    self.model, self.model_name, self.tok, self.template = model, model_name, tok, template
+  def __init__(self, server_address:tuple, model:Transformer, model_name:str, tok:SimpleTokenizer, template:typing.Any, harmony:bool=False):
+    self.model, self.model_name, self.tok, self.template, self.harmony = model, model_name, tok, template, harmony
     super().__init__(server_address, Handler)
