@@ -2,7 +2,8 @@ from __future__ import annotations
 import enum, functools, itertools, pathlib
 from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes
-from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
+from tinygrad.llm.kernels.amd import Linear, ExpertWeights, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
+from tinygrad.llm.kernels.amd import topk_softmax_256_8
 from tinygrad.llm.gguf import gguf_load
 from tinygrad.uop.ops import resolve
 
@@ -17,14 +18,6 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, device:str|
   freqs = 1.0 / (theta ** (Tensor.arange(0, dim, 2)[:(dim // 2)] / dim))
   freqs = Tensor.arange(end).unsqueeze(dim=1) * freqs.unsqueeze(dim=0)
   return freqs.cos().cat(freqs.sin(), dim=-1).clone(device)
-
-class ExpertWeights:
-  """Like Linear but with num_experts dimension. Weight shape: (num_experts, out_features, in_features)."""
-  def __init__(self, num_experts:int, in_features:int, out_features:int):
-    self.weight = Tensor.zeros(num_experts, out_features, in_features)
-  def __call__(self, sel:Tensor, x:Tensor) -> Tensor:
-    # sel: (B, T, k), x: (B, T, 1, in) or (B, T, k, in) -> output: (B, T, k, out)
-    return (x.unsqueeze(-2) @ self.weight[sel].transpose(-1, -2)).contiguous().squeeze(-2)
 
 def apply_rope(x:Tensor, freqs_cis:Tensor) -> Tensor:
   assert x.shape[-1] % 2 == 0
@@ -120,11 +113,15 @@ class FFNBlock:
       elif gating == ExpertGating.SIGMOID:        scores = logits.sigmoid()
       elif gating == ExpertGating.SQRT_SOFTPLUS:  scores = logits.softplus().sqrt()
 
-      _, sel = pairwise_topk(scores if bias is None else scores + bias, self.config.num_experts_per_tok)
-      probs = scores.gather(-1, sel)
-      # SOFTMAX_WEIGHT applies softmax after top-k selection
-      if gating == ExpertGating.SOFTMAX_WEIGHT: probs = probs.softmax(-1)
-      if normalize_topk: probs = probs / probs.sum(axis=-1, keepdim=True)
+      if gating == ExpertGating.SOFTMAX_WEIGHT and bias is None and self.config.num_experts_per_tok == 8 \
+        and scores.shape == (1, 1, 256) and scores.dtype == dtypes.float32 and amd_custom_kernels_supported(scores.device):
+        probs, sel = topk_softmax_256_8(scores)
+      else:
+        _, sel = pairwise_topk(scores if bias is None else scores + bias, self.config.num_experts_per_tok)
+        probs = scores.gather(-1, sel)
+        # SOFTMAX_WEIGHT applies softmax after top-k selection
+        if gating == ExpertGating.SOFTMAX_WEIGHT: probs = probs.softmax(-1)
+        if normalize_topk: probs = probs / probs.sum(axis=-1, keepdim=True)
       probs = probs * self.config.routed_scaling_factor
       x_down = self.ffn_down_exps(sel, (self.ffn_gate_exps(sel, h).silu() * self.ffn_up_exps(sel, h)).contiguous())  # (B, T, k, D)
       out = (x_down * probs.unsqueeze(-1)).sum(axis=2)  # (B, T, D)

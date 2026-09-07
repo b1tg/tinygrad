@@ -2,8 +2,56 @@ import unittest
 from unittest.mock import patch
 import numpy as np
 from tinygrad import Tensor, UOp, dtypes, nn, function
-from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported, q8_quantize, flash_attention, gated_delta_prefill
+from tinygrad.llm.kernels.amd import Linear, ExpertWeights, amd_custom_kernels_supported, q8_quantize, flash_attention, gated_delta_prefill
 from tinygrad.llm.gguf import ggml_data_to_tensor
+
+class TestTopKSoftmax(unittest.TestCase):
+  def test_values_ties_and_jit(self):
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
+    from tinygrad import TinyJit
+    from tinygrad.llm.kernels.amd import topk_softmax_256_8
+    rng = np.random.default_rng(42)
+    cases = [rng.normal(size=(1, 1, 256)).astype(np.float32) for _ in range(10)]
+    cases += [np.zeros((1, 1, 256), np.float32), rng.integers(-3, 4, size=(1, 1, 256)).astype(np.float32),
+              np.linspace(-1000, 1000, 256, dtype=np.float32).reshape(1, 1, 256)]
+    @function(allow_implicit=True)
+    def run(x:Tensor): return topk_softmax_256_8(x)
+    def realize_outputs(x):
+      probs, sel = run(x)
+      Tensor.realize(probs, sel)
+      return probs, sel
+    jit = TinyJit(realize_outputs)
+    for values in cases:
+      expected_sel = np.argsort(-values, axis=-1, kind='stable')[..., :8][..., ::-1]
+      scores = np.take_along_axis(values, expected_sel, -1)
+      expected = np.exp(scores-scores.max(-1, keepdims=True))
+      expected /= expected.sum(-1, keepdims=True)
+      probs, sel = jit(Tensor(values).realize())
+      np.testing.assert_array_equal(sel.numpy(), expected_sel)
+      np.testing.assert_allclose(probs.numpy(), expected, rtol=1e-5, atol=1e-6)
+
+  def test_moe_matches_pairwise(self):
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
+    from dataclasses import replace
+    from tinygrad.llm.model import TransformerBlock, pairwise_topk
+    from tinygrad.llm.kernels.amd import topk_softmax_256_8
+    from test.unit.test_llm_moe import _moe_config
+    rng = np.random.default_rng(42)
+    block = TransformerBlock(replace(_moe_config(dim=8, hidden=16, num_experts=256, num_experts_per_tok=8), norm_topk_prob=True))
+    for parameter in nn.state.get_parameters(block):
+      parameter.replace(Tensor(rng.normal(0, 0.1, parameter.shape).astype(np.float32)))
+    def reference(x):
+      _, sel = pairwise_topk(x, 8)
+      return x.gather(-1, sel).softmax(-1), sel
+    x = Tensor(rng.normal(size=(1, 1, 8)).astype(np.float32)).realize()
+    with patch('tinygrad.llm.model.topk_softmax_256_8', wraps=topk_softmax_256_8) as custom:
+      actual = block._feed_forward(x).numpy()
+      self.assertEqual(custom.call_count, 1)
+    with patch('tinygrad.llm.model.topk_softmax_256_8', side_effect=reference): expected = block._feed_forward(x).numpy()
+    np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=1e-6)
+    with patch('tinygrad.llm.model.topk_softmax_256_8', wraps=topk_softmax_256_8) as custom:
+      block._feed_forward(x.expand(1, 3, 8)).realize()
+      self.assertEqual(custom.call_count, 0)
 
 class TestQ8Quantize(unittest.TestCase):
   def test_word_quant_weights_use_typed_buffer_view(self):
@@ -34,6 +82,51 @@ class TestQ8Quantize(unittest.TestCase):
     values = np.array([-127,127]+[i+0.5 for i in range(-15,15)],dtype=np.float32)
     quant,_,_ = q8_quantize(Tensor(values),1,32)
     np.testing.assert_array_equal(quant.bitcast(dtypes.int8).reshape(32).numpy(),np.rint(values).astype(np.int8))
+
+  def test_q8_0_decode_and_prefill(self):
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
+    rng = np.random.default_rng(42)
+    for width, rows in ((128, 17), (2048, 64)):
+      packed = rng.integers(0, 256, (rows*width//32, 34), dtype=np.uint8)
+      scales = rng.uniform(-0.02, 0.02, len(packed)).astype(np.float16)
+      packed[:, :2] = scales.view(np.uint8).reshape(-1, 2)
+      raw = Tensor(np.pad(packed.flatten(), (2, 0))).realize()[2:]
+      decoded = ggml_data_to_tensor(raw, rows*width, 8).reshape(rows, width)
+      for dtype in (dtypes.float32, dtypes.float16):
+        weight = decoded.cast(dtype)
+        reference_w = weight.numpy().astype(np.float32)
+        linear = Linear(width, rows, bias=False)
+        linear.weight = weight
+        # Prefill first must not disable the subsequent decode fast path.
+        for tokens in (3, 1):
+          x = rng.normal(size=(1, tokens, width)).astype(np.float32)
+          actual = linear(Tensor(x)).numpy()
+          np.testing.assert_allclose(actual, x @ reference_w.T, rtol=3e-4, atol=3e-5)
+        self.assertIsNotNone(linear._q8_0_weight)
+        @function(allow_implicit=True)
+        def run(x:Tensor): return linear(x)
+        np.testing.assert_allclose(run(Tensor(x)).numpy(), x @ reference_w.T, rtol=3e-4, atol=3e-5)
+
+  def test_q8_0_decode_selection(self):
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
+    from tinygrad.llm.kernels.amd import packed_q8_0_weight
+    rng = np.random.default_rng(9)
+    packed = rng.integers(0, 256, (16*128//32, 34), dtype=np.uint8)
+    packed[:, :2] = np.array([0.01], dtype=np.float16).view(np.uint8)
+    raw = Tensor(np.pad(packed.flatten(), (2, 0))).realize()[2:]
+    weight = ggml_data_to_tensor(raw, 16*128, 8).reshape(16, 128)
+    self.assertIsNone(packed_q8_0_weight(weight.reshape(2, 8, 128).transpose(0, 1).reshape(16, 128), 16*128))
+    self.assertIsNone(packed_q8_0_weight(weight + 1, 16*128))
+    self.assertIsNone(packed_q8_0_weight(weight.cast(dtypes.int8).float(), 16*128))
+    linear = Linear(128, 16, bias=True)
+    linear.weight = weight
+    linear.bias = Tensor(rng.normal(size=16).astype(np.float32))
+    x = Tensor(rng.normal(size=(1, 3, 128)).astype(np.float32)).realize()
+    toks = UOp.variable("q8_toks", 1, 3).bind(3)
+    # A symbolic prefill with minimum length one must not select the decode kernel.
+    ref = x.numpy() @ weight.numpy().T + linear.bias.numpy()
+    np.testing.assert_allclose(linear(x[:, :toks]).pad_to((1, 3, 16)).numpy(), ref, rtol=3e-4, atol=3e-5)
+    np.testing.assert_allclose(linear(x[:, :1]).numpy(), ref[:, :1], rtol=3e-4, atol=3e-5)
 
   def test_q6_linear_compiles_in_function(self):
     if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
@@ -195,6 +288,139 @@ class TestQ8Quantize(unittest.TestCase):
     np.testing.assert_allclose(generic(sym)[:3].numpy(), xq.reshape(3, in_features) @ weight.T, rtol=2e-3, atol=2e-2)
     self.assertTrue(generic.use_custom_quant)
     self.assertEqual(generic.ggml_type, 14)
+
+  def test_q4_k_expert(self): self._test_quant_expert(12, 144)
+  def test_q4_k_expert_wide(self): self._test_quant_expert(12, 144, in_features=512, out_features=32)
+  def test_q5_k_expert(self): self._test_quant_expert(13, 176)
+  def test_iq4_expert(self): self._test_quant_expert(23, 136)
+
+  def test_q6_k_expert(self):
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
+    self._test_quant_expert(14, 210, in_features=256, out_features=16, token_counts=(1, 3))
+
+  def test_q4_k_expert_matches_linear_gate(self):
+    # Qwen3.6-35B-A3B gate/up: (E, 512, 2048)
+    self._test_expert_matches_linear(12, 144, num_experts=16, in_features=2048, out_features=512, k=8)
+
+  def test_q5_k_expert_matches_linear_down(self):
+    # Qwen3.6-35B-A3B down: (E, 2048, 512)
+    self._test_expert_matches_linear(13, 176, num_experts=8, in_features=512, out_features=2048, k=8, shared=False)
+
+  def test_q6_k_expert_matches_linear_down(self):
+    self._test_expert_matches_linear(14, 210, num_experts=4, in_features=512, out_features=256, k=4, shared=False)
+
+  def test_expert_noncontiguous_indices(self):
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
+    from tinygrad import TinyJit
+    _, decoded = self._packed_decoded(12, 144, 8, 256, 32)
+    layer = ExpertWeights(8, 256, 32)
+    layer.weight = decoded
+    rng = np.random.default_rng(7)
+    indices = np.array([[0, 3, 5], [2, 4, 7]], dtype=np.int64)
+    x = Tensor(rng.normal(size=(1, 3, 1, 256)).astype(np.float32)).realize()
+    ref = layer(Tensor(indices.T.copy()).reshape(1, 3, 2), x).numpy()
+    @function(allow_implicit=True)
+    def run(index:Tensor, x:Tensor): return layer(index.transpose(0, 1).reshape(1, 3, 2), x)
+    jit = TinyJit(lambda index, x: run(index, x).realize())
+    for _ in range(3):
+      actual = jit(Tensor(indices).realize(), x).numpy()
+      np.testing.assert_allclose(actual, ref, rtol=1e-5, atol=1e-6)
+
+  def _packed_decoded(self, ggml_type, block_bytes, num_experts, in_features, out_features, seed=42):
+    rng = np.random.default_rng(seed)
+    n = num_experts * out_features * in_features
+    packed = rng.integers(0, 256, (n // 256, block_bytes), dtype=np.uint8)
+    packed[:, :2] = np.array([0.001], dtype=np.float16).view(np.uint8)
+    if ggml_type in (12, 13): packed[:, 2:4] = np.array([0.0002], dtype=np.float16).view(np.uint8)
+    if ggml_type == 14:
+      packed[:, :2] = 0
+      packed[:, -2:] = np.array([0.01], dtype=np.float16).view(np.uint8)
+    raw = Tensor(np.pad(packed.flatten(), (4, 0))).contiguous().realize()[4:]
+    decoded = ggml_data_to_tensor(raw, n, ggml_type).reshape(num_experts, out_features, in_features)
+    return packed, decoded
+
+  def _linear_from_expert(self, packed, ggml_type, block_bytes, expert, in_features, out_features):
+    blocks = out_features * in_features // 256
+    raw = Tensor(np.pad(packed[expert*blocks:(expert+1)*blocks].flatten(), (4, 0))).contiguous().realize()[4:]
+    decoded = ggml_data_to_tensor(raw, out_features * in_features, ggml_type).reshape(out_features, in_features)
+    linear = Linear(in_features, out_features, bias=False)
+    linear.weight = decoded
+    return linear
+
+  def _test_expert_matches_linear(self, ggml_type, block_bytes, num_experts, in_features, out_features, k, shared=True):
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
+    packed, decoded = self._packed_decoded(ggml_type, block_bytes, num_experts, in_features, out_features)
+    layer = ExpertWeights(num_experts, in_features, out_features)
+    layer.weight = decoded
+    rng = np.random.default_rng(0)
+    sel = np.array([0, 1, num_experts-1] + list(range(2, k)), dtype=np.int32)[:k]
+    if shared:
+      x = rng.normal(size=(1, in_features)).astype(np.float32)
+      y = layer(Tensor(sel).reshape(1, 1, k), Tensor(x).reshape(1, 1, 1, in_features)).realize()
+    else:
+      x = rng.normal(size=(k, in_features)).astype(np.float32)
+      y = layer(Tensor(sel).reshape(1, 1, k), Tensor(x).reshape(1, 1, k, in_features)).realize()
+    self.assertEqual(layer.ggml_type, ggml_type)
+    y = y.numpy()[0, 0]
+    for i, expert in enumerate(sel):
+      linear = self._linear_from_expert(packed, ggml_type, block_bytes, int(expert), in_features, out_features)
+      ref = linear(Tensor(x if shared else x[i:i+1])).realize().numpy()[0]
+      self.assertEqual(linear.ggml_type, ggml_type)
+      np.testing.assert_allclose(y[i], ref, rtol=1e-4, atol=1e-4, err_msg=f"expert {expert} slot {i}")
+
+    # prefill-shaped batch: same q8 GEMV as decode, one Linear per (token, expert)
+    tokens = 32
+    sel_t = ((np.arange(tokens)[:, None] + np.arange(k)[None, :]) % num_experts).astype(np.int32)
+    x_t = rng.normal(size=(tokens, 1 if shared else k, in_features)).astype(np.float32)
+    y_t = layer(Tensor(sel_t).reshape(1, tokens, k), Tensor(x_t).reshape(1, tokens, x_t.shape[1], in_features)).numpy()[0]
+    for t, i in ((0, 0), (0, k-1), (tokens-1, 0), (17, min(3, k-1))):
+      expert = int(sel_t[t, i])
+      linear = self._linear_from_expert(packed, ggml_type, block_bytes, expert, in_features, out_features)
+      xin = x_t[t, 0 if shared else i]
+      ref = linear(Tensor(xin.reshape(1, in_features))).numpy()[0]
+      np.testing.assert_allclose(y_t[t, i], ref, rtol=1e-4, atol=1e-4, err_msg=f"T={t} expert {expert} slot {i}")
+
+  def _test_quant_expert(self, ggml_type, block_bytes, num_experts=4, in_features=256, out_features=64, k=2,
+                         token_counts=(1, 3)):
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
+    rng = np.random.default_rng(42)
+    _, decoded = self._packed_decoded(ggml_type, block_bytes, num_experts, in_features, out_features)
+    weight = decoded.numpy()
+    layer = ExpertWeights(num_experts, in_features, out_features)
+    layer.weight = decoded
+    for tokens in token_counts:
+      chosen = ((np.arange(tokens)[:, None] + np.arange(k)[None, :]) % num_experts)[None]
+      with self.subTest(tokens=tokens, shared=True):
+        x = rng.normal(size=(1, tokens, 1, in_features)).astype(np.float32 if tokens == 3 else np.float16)
+        grouped = x.astype(np.float32)[:, :, 0].reshape(tokens, -1, 32)
+        scale = np.maximum(np.abs(grouped).max(-1, keepdims=True) / 127, 1e-8)
+        reference_x = (np.clip(np.rint(grouped/scale), -127, 127)*scale).reshape(tokens, in_features)
+        expected = np.stack([reference_x[t] @ weight[chosen[0, t, e]].T for t in range(tokens) for e in range(k)], axis=0)
+        expected = expected.reshape(1, tokens, k, out_features)
+        np.testing.assert_allclose(layer(Tensor(chosen), Tensor(x)).numpy(), expected, rtol=3e-3, atol=5e-2)
+      with self.subTest(tokens=tokens, shared=False):
+        xk = rng.normal(size=(1, tokens, k, in_features)).astype(np.float32 if tokens == 3 else np.float16)
+        grouped = xk.astype(np.float32).reshape(tokens, k, -1, 32)
+        scale = np.maximum(np.abs(grouped).max(-1, keepdims=True) / 127, 1e-8)
+        reference_x = (np.clip(np.rint(grouped/scale), -127, 127)*scale).reshape(tokens, k, in_features)
+        expected = np.stack([reference_x[t, e] @ weight[chosen[0, t, e]].T for t in range(tokens) for e in range(k)])
+        expected = expected.reshape(1, tokens, k, out_features)
+        np.testing.assert_allclose(layer(Tensor(chosen), Tensor(xk)).numpy(), expected, rtol=3e-3, atol=5e-2)
+    self.assertEqual(layer.ggml_type, ggml_type)
+
+    # symbolic token counts take the padded kernel path
+    tokens = 3
+    x = rng.normal(size=(1, tokens, 1, in_features)).astype(np.float32)
+    chosen = ((np.arange(tokens)[:, None] + np.arange(k)[None, :]) % num_experts)[None]
+    grouped = x.astype(np.float32)[:, :, 0].reshape(tokens, -1, 32)
+    scale = np.maximum(np.abs(grouped).max(-1, keepdims=True) / 127, 1e-8)
+    xq = (np.clip(np.rint(grouped/scale), -127, 127)*scale).reshape(tokens, in_features)
+    expected = np.stack([xq[t] @ weight[chosen[0, t, e]].T for t in range(tokens) for e in range(k)])
+    expected = expected.reshape(1, tokens, k, out_features)
+    vt = UOp.variable("toks", 1, 4).bind(tokens)
+    x_sym = Tensor(np.concatenate([x, np.zeros((1, 1, 1, in_features), np.float32)], axis=1)).contiguous()[:, :vt]
+    sel_sym = Tensor(np.concatenate([chosen, np.zeros((1, 1, k), np.int32)], axis=1)).contiguous()[:, :vt]
+    np.testing.assert_allclose(layer(sel_sym, x_sym)[:, :tokens].numpy(), expected, rtol=3e-3, atol=5e-2)
 
   def test_attention_fallback_shapes(self):
     if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")

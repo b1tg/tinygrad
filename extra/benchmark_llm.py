@@ -1,4 +1,5 @@
 import argparse, time
+from tinygrad.helpers import profile_marker
 from tinygrad.llm.model import Transformer
 
 if __name__ == "__main__":
@@ -15,6 +16,7 @@ if __name__ == "__main__":
   print(f"load {time.perf_counter()-st:.3f}s", flush=True)
 
   st = time.perf_counter()
+  profile_marker("warmup")
   model.warmup()
   print(f"warm {time.perf_counter()-st:.3f}s", flush=True)
 
@@ -22,10 +24,15 @@ if __name__ == "__main__":
   gen = model.generate(prompt, chunk_size=args.chunk_size)
   st = time.perf_counter()
   # first token is time-to-first-token; counted as part of prefill
+  profile_marker("prefill")
   output = [next(gen)]
   pt = time.perf_counter()
   print(f"prefill {args.prompt_tokens/(pt-st):.3f} tok/s", flush=True)
 
-  for _ in range(args.decode_tokens): output.append(next(gen))
+  profile_marker("decode")
+  for i in range(args.decode_tokens):
+    profile_marker(f"decode @ {i}")
+    output.append(next(gen))
+  profile_marker("done")
   et = time.perf_counter()
   print(f"decode {args.decode_tokens/(et-pt):.3f} tok/s output {output}", flush=True)
