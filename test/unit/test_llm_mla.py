@@ -1,6 +1,6 @@
 import unittest
 import numpy as np
-from tinygrad import Tensor, UOp, nn
+from tinygrad import Context, Tensor, UOp, nn
 from tinygrad.llm.model import (_kda_log_decay, AttentionIndexer, IndexerConfig, Transformer, TransformerConfig, apply_rope,
                                 bitonic_topk, gather_rows, MLATransformerBlock, precompute_freqs_cis)
 
@@ -18,6 +18,19 @@ class TestMLA(unittest.TestCase):
       "norm_eps": 1e-5, "vocab_size": 100, "head_dim": 16, "rope_theta": 10000.0, "rope_dim": 8, "max_context": 32,
       "kv_lora_rank": 16, "v_head_dim": 8,
     } | kwargs)
+
+  def test_hyper_connection_jit_matches_eager(self):
+    Tensor.manual_seed(42)
+    model = Transformer(self._make_config(num_blocks=2, dim=16, hidden_dim=32, n_heads=2, n_kv_heads=2,
+      vocab_size=32, head_dim=8, v_head_dim=8, kv_lora_rank=0, max_context=16, hc_mult=4, hc_eps=1e-6, hc_sinkhorn_iters=5))
+    Tensor.realize(*nn.state.get_parameters(model))
+    def generate(jit):
+      model._cached_tokens = []
+      model.prefill_jit.reset()
+      model.rollout_jit.reset()
+      with Context(JIT=jit): return [token for _, token in zip(range(5), model.generate([1]))]
+    # Cover both capture and replay: rebuilding a layer output from its raw Buffer loses its JIT identity.
+    self.assertEqual(generate(0), generate(1))
 
   def test_mla_attention_matches_naive(self):
     config = self._make_config(max_context=16)

@@ -147,6 +147,7 @@ def main():
   parser.add_argument("--serve", nargs='?', type=int, const=8000, metavar="PORT", help="Run OpenAI compatible API (optional port, default 8000)")
   parser.add_argument("--warmup", action="store_true", help="warmup the JIT")
   parser.add_argument("--benchmark", nargs='?', type=int, const=20, metavar="COUNT", help="Benchmark tok/s (optional count, default 20)")
+  parser.add_argument("--benchmark_prompt", default="Hi", help="User message for the benchmark")
   parser.add_argument("--no_chat_template", action="store_true", help="Don't use the model's chat template, always use the fallback template")
   args = parser.parse_args()
 
@@ -186,7 +187,9 @@ def main():
 
   # do benchmark
   if args.benchmark is not None:
-    gen = model.generate(toks:=[tok.bos_id or 0])
+    prompt = template.render(messages=[{"role":"user", "content":args.benchmark_prompt}], add_generation_prompt=True,
+                             reasoning_effort=args.reasoning_effort)
+    gen = model.generate(toks:=tok.encode(prompt))
     for i in range(args.benchmark):
       profile_marker(f"decode @ {i}")
       GlobalCounters.reset()

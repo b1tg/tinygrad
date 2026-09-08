@@ -638,9 +638,6 @@ class Transformer:
       x = block(x, start_pos)
       if self.hc_mult:
         x = x.contiguous().realize()  # materialize a standalone output and bound scratch to one GLM block
-        buffer = x.uop.buf_uop.buffer
-        assert buffer is not None
-        x = Tensor(UOp.from_buffer(buffer))[:x.numel()].reshape(x.shape)  # discard executed dependencies before stage copies
     if self.hc_mult: x = x.mean(2)
     if x.device != self.output.weight.device: x = x.to(self.output.weight.device).contiguous().realize()
     # only run the output projection on the last token
