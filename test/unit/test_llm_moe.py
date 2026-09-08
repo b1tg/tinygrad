@@ -25,6 +25,7 @@ class TestMoEFeedForward(unittest.TestCase):
 
     weight = ExpertWeights(experts, in_features, out_features)
     weight.weight = full
+    weight.use_custom_quant = False  # this test covers the generic selected-decode fallback
     selected = Tensor([[[0, 2]]])
     x = Tensor(rng.standard_normal((1, 1, 2, in_features), dtype=np.float32))
     expected = (x.unsqueeze(-2) @ full[selected].transpose(-1, -2)).squeeze(-2)

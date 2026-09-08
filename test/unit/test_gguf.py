@@ -227,6 +227,24 @@ class TestGGUF(unittest.TestCase):
       with self.assertRaises(FileNotFoundError):
         gguf_load(d / "test-00001-of-00002.gguf")
 
+  def test_pipeline_device_load_skips_auxiliary_blocks(self):
+    with tempfile.TemporaryDirectory() as d:
+      path = pathlib.Path(d) / "pipeline.gguf"
+      data = np.array([1.0], dtype=np.float32).tobytes()
+      tensors = [
+        ("token_embd.weight", (1,), 0, data),
+        ("blk.0.weight", (1,), 0, data),
+        ("blk.1.weight", (1,), 0, data),
+        ("blk.2.unsupported", (256,), 1337, b"\x00"),
+        ("output.weight", (1,), 0, data),
+      ]
+      kvs = [("general.architecture", "test"), ("test.block_count", 3), ("test.nextn_predict_layers", 1)]
+      path.write_bytes(self._build_gguf(tensors, kvs))
+      kv, state = gguf_load(path, devices=("CPU", "CPU"))
+      self.assertEqual(kv["test.nextn_predict_layers"], 1)
+      self.assertEqual(set(state), {"token_embd.weight", "blk.0.weight", "blk.1.weight", "output.weight"})
+      self.assertNotIn("blk.2.unsupported", state)
+
   def _test_dequantization(self, qtype: GGMLQuantizationType):
     block_size, type_size = GGML_QUANT_SIZES[qtype]
     n_el, n_bytes = ggml_test_block_count * block_size, ggml_test_block_count * type_size

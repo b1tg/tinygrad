@@ -3,6 +3,7 @@ import numpy as np
 from tinygrad import Tensor, UOp, dtypes, nn, function
 from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported, q8_quantize, flash_attention
 from tinygrad.llm.gguf import ggml_data_to_tensor
+from tinygrad.llm.model import ExpertWeights
 
 class TestQ8Quantize(unittest.TestCase):
   def test_word_quant_weights_use_typed_buffer_view(self):
@@ -118,5 +119,177 @@ class TestQ8Quantize(unittest.TestCase):
     values = np.concatenate([old_kv[1, 0, 0], new_kv[1, 0, 0]]).astype(np.float16).astype(np.float32)
     expected = np.stack([values[:start_pos+i+1].mean(0) for i in range(32)])[None, None].repeat(8, axis=1)
     np.testing.assert_allclose(out.numpy(), expected, rtol=2e-3, atol=2e-3)
+
+  def test_q4_0_linear(self):
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
+    rng = np.random.default_rng(42)
+    in_features, out_features = 2048, 16
+    blocks = out_features * in_features // 32
+    packed = rng.integers(0, 256, blocks * 18, dtype=np.uint8)
+    for i in range(blocks): packed[i*18:i*18+2] = np.array([0.01], dtype=np.float16).view(np.uint8)
+    raw = Tensor(np.pad(packed, (4, 0))).contiguous().realize()[4:]
+    decoded = ggml_data_to_tensor(raw, out_features * in_features, 2).reshape(out_features, in_features)
+    weight = decoded.numpy()
+    linear = Linear(in_features, out_features, bias=False)
+    nn.state.load_state_dict(linear, {"weight": decoded}, verbose=False, realize=False)
+    x = rng.normal(size=(3, in_features)).astype(np.float32)
+    scale = np.maximum(np.abs(x).reshape(3, in_features//32, 32).max(-1, keepdims=True) / 127, 1e-8)
+    xq = np.clip(np.rint(x.reshape(3, in_features//32, 32) / scale), -127, 127) * scale
+    np.testing.assert_allclose(linear(Tensor(x)).numpy(), xq.reshape(3, in_features) @ weight.T, rtol=2e-3, atol=2e-2)
+    self.assertEqual(linear.ggml_type, 2)
+    self.assertEqual(linear.weight.dtype, dtypes.uint8)
+    x_pre = rng.normal(size=(16, in_features)).astype(np.float32)
+    np.testing.assert_allclose(linear(Tensor(x_pre)).numpy(), x_pre @ weight.T, rtol=1e-2, atol=1e-1)
+
+  def test_q8_0_linear(self):
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
+    rng = np.random.default_rng(42)
+    in_features, out_features = 2048, 16
+    blocks = out_features * in_features // 32
+    packed = rng.integers(0, 256, blocks * 34, dtype=np.uint8)
+    for i in range(blocks): packed[i*34:i*34+2] = np.array([0.01], dtype=np.float16).view(np.uint8)
+    raw = Tensor(np.pad(packed, (4, 0))).contiguous().realize()[4:]
+    decoded = ggml_data_to_tensor(raw, out_features * in_features, 8).reshape(out_features, in_features)
+    weight = decoded.numpy()
+    linear = Linear(in_features, out_features, bias=False)
+    nn.state.load_state_dict(linear, {"weight": decoded}, verbose=False, realize=False)
+    x = rng.normal(size=(3, in_features)).astype(np.float32)
+    scale = np.maximum(np.abs(x).reshape(3, in_features//32, 32).max(-1, keepdims=True) / 127, 1e-8)
+    xq = np.clip(np.rint(x.reshape(3, in_features//32, 32) / scale), -127, 127) * scale
+    np.testing.assert_allclose(linear(Tensor(x)).numpy(), xq.reshape(3, in_features) @ weight.T, rtol=2e-3, atol=2e-2)
+    self.assertEqual(linear.ggml_type, 8)
+    self.assertEqual(linear.weight.dtype, dtypes.uint8)
+    x_pre = rng.normal(size=(16, in_features)).astype(np.float32)
+    np.testing.assert_allclose(linear(Tensor(x_pre)).numpy(), x_pre @ weight.T, rtol=1e-2, atol=1e-1)
+
+  def test_q5_k_linear(self):
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
+    rng = np.random.default_rng(42)
+    in_features, out_features = 2048, 16
+    blocks = out_features * in_features // 256
+    packed = rng.integers(0, 256, blocks * 176, dtype=np.uint8)
+    for i in range(blocks): packed[i*176:i*176+4] = np.array([0.01, 0.002], dtype=np.float16).view(np.uint8)
+    raw = Tensor(np.pad(packed, (4, 0))).contiguous().realize()[4:]
+    decoded = ggml_data_to_tensor(raw, out_features * in_features, 13).reshape(out_features, in_features)
+    weight = decoded.numpy()
+    linear = Linear(in_features, out_features, bias=False)
+    nn.state.load_state_dict(linear, {"weight": decoded}, verbose=False, realize=False)
+    x = rng.normal(size=(3, in_features)).astype(np.float32)
+    scale = np.maximum(np.abs(x).reshape(3, in_features//32, 32).max(-1, keepdims=True) / 127, 1e-8)
+    xq = np.clip(np.rint(x.reshape(3, in_features//32, 32) / scale), -127, 127) * scale
+    np.testing.assert_allclose(linear(Tensor(x)).numpy(), xq.reshape(3, in_features) @ weight.T, rtol=2e-3, atol=2e-2)
+    self.assertEqual(linear.ggml_type, 13)
+    x_pre = rng.normal(size=(16, in_features)).astype(np.float32)
+    np.testing.assert_allclose(linear(Tensor(x_pre)).numpy(), x_pre @ weight.T, rtol=1e-2, atol=1e-1)
+
+  def test_q6_k_wmma_prefill(self):
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
+    rng = np.random.default_rng(42)
+    in_features, out_features = 2048, 16
+    blocks = out_features * in_features // 256
+    packed = rng.integers(0, 256, blocks * 210, dtype=np.uint8)
+    for i in range(blocks): packed[i*210+208:i*210+210] = np.array([0.01], dtype=np.float16).view(np.uint8)
+    raw = Tensor(np.pad(packed, (4, 0))).contiguous().realize()[4:]
+    decoded = ggml_data_to_tensor(raw, out_features * in_features, 14).reshape(out_features, in_features)
+    weight = decoded.numpy()
+    linear = Linear(in_features, out_features, bias=False)
+    nn.state.load_state_dict(linear, {"weight": decoded}, verbose=False, realize=False)
+    x_pre = rng.normal(size=(16, in_features)).astype(np.float32)
+    np.testing.assert_allclose(linear(Tensor(x_pre)).numpy(), x_pre @ weight.T, rtol=2e-2, atol=4e-1)
+    self.assertEqual(linear.ggml_type, 14)
+
+  def test_iq3_xxs_linear(self):
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
+    rng = np.random.default_rng(42)
+    in_features, out_features = 2048, 16
+    blocks = out_features * in_features // 256
+    packed = rng.integers(0, 256, blocks * 98, dtype=np.uint8)
+    for i in range(blocks): packed[i*98:i*98+2] = np.array([0.01], dtype=np.float16).view(np.uint8)
+    raw = Tensor(np.pad(packed, (4, 0))).contiguous().realize()[4:]
+    decoded = ggml_data_to_tensor(raw, out_features * in_features, 18).reshape(out_features, in_features)
+    weight = decoded.numpy()
+    linear = Linear(in_features, out_features, bias=False)
+    nn.state.load_state_dict(linear, {"weight": decoded}, verbose=False, realize=False)
+    x = rng.normal(size=(3, in_features)).astype(np.float32)
+    scale = np.maximum(np.abs(x).reshape(3, in_features//32, 32).max(-1, keepdims=True) / 127, 1e-8)
+    xq = np.clip(np.rint(x.reshape(3, in_features//32, 32) / scale), -127, 127) * scale
+    np.testing.assert_allclose(linear(Tensor(x)).numpy(), xq.reshape(3, in_features) @ weight.T, rtol=2e-3, atol=2e-2)
+    self.assertEqual(linear.ggml_type, 18)
+    self.assertEqual(linear.weight.dtype, dtypes.uint8)
+    x_pre = rng.normal(size=(16, in_features)).astype(np.float32)
+    np.testing.assert_allclose(linear(Tensor(x_pre)).numpy(), x_pre @ weight.T, rtol=2e-2, atol=4e-1)
+
+  def test_iq2_xs_linear(self):
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
+    rng = np.random.default_rng(42)
+    in_features, out_features = 2048, 16
+    blocks = out_features * in_features // 256
+    packed = rng.integers(0, 256, blocks * 74, dtype=np.uint8)
+    for i in range(blocks): packed[i*74:i*74+2] = np.array([0.01], dtype=np.float16).view(np.uint8)
+    raw = Tensor(np.pad(packed, (4, 0))).contiguous().realize()[4:]
+    decoded = ggml_data_to_tensor(raw, out_features * in_features, 17).reshape(out_features, in_features)
+    weight = decoded.numpy()
+    linear = Linear(in_features, out_features, bias=False)
+    nn.state.load_state_dict(linear, {"weight": decoded}, verbose=False, realize=False)
+    x = rng.normal(size=(3, in_features)).astype(np.float32)
+    scale = np.maximum(np.abs(x).reshape(3, in_features//32, 32).max(-1, keepdims=True) / 127, 1e-8)
+    xq = np.clip(np.rint(x.reshape(3, in_features//32, 32) / scale), -127, 127) * scale
+    np.testing.assert_allclose(linear(Tensor(x)).numpy(), xq.reshape(3, in_features) @ weight.T, rtol=2e-3, atol=2e-2)
+    self.assertEqual(linear.ggml_type, 17)
+    self.assertEqual(linear.weight.dtype, dtypes.uint8)
+    x_pre = rng.normal(size=(16, in_features)).astype(np.float32)
+    np.testing.assert_allclose(linear(Tensor(x_pre)).numpy(), x_pre @ weight.T, rtol=2e-2, atol=4e-1)
+
+  def test_fused_routed_iq_experts(self):
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
+    rng = np.random.default_rng(42)
+    experts, in_features, out_features = 3, 256, 16
+    selected_np = np.array([[[0, 2], [1, 0]]], dtype=np.int32)
+    selected = Tensor(selected_np)
+
+    for ggml_type, block_bytes in ((17, 74), (18, 98), (23, 136)):
+      blocks = experts * out_features * in_features // 256
+      packed = rng.integers(0, 256, blocks * block_bytes, dtype=np.uint8)
+      for i in range(blocks): packed[i*block_bytes:i*block_bytes+2] = np.array([0.01], dtype=np.float16).view(np.uint8)
+      raw = Tensor(np.pad(packed, (4, 0))).contiguous().realize()[4:]
+      decoded = ggml_data_to_tensor(raw, experts * out_features * in_features, ggml_type).reshape(experts, out_features, in_features)
+      reference = ggml_data_to_tensor(raw, experts * out_features * in_features, ggml_type).reshape(experts, out_features, in_features).numpy()
+      weight = ExpertWeights(experts, in_features, out_features)
+      weight.weight = decoded
+
+      for shared_input in (True, False):
+        with self.subTest(ggml_type=ggml_type, shared_input=shared_input):
+          x_shape = (1, 2, 1 if shared_input else 2, in_features)
+          x = rng.normal(size=x_shape).astype(np.float32)
+          flat = x.reshape(-1, in_features//32, 32)
+          scale = np.maximum(np.abs(flat).max(-1, keepdims=True) / 127, 1e-8)
+          xq = (np.clip(np.rint(flat / scale), -127, 127) * scale).reshape(x_shape)
+          expected = np.matmul(xq[..., None, :], reference[selected_np].swapaxes(-1, -2)).squeeze(-2)
+          np.testing.assert_allclose(weight(selected, Tensor(x)).numpy(), expected, rtol=3e-3, atol=3e-2)
+          self.assertEqual(weight.ggml_type, ggml_type)
+          self.assertEqual(weight.weight.dtype, dtypes.uint8)
+
+  def test_fused_routed_iq_experts_symbolic_tokens(self):
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
+    rng = np.random.default_rng(7)
+    experts, in_features, out_features, block_bytes = 3, 256, 16, 74
+    blocks = experts * out_features * in_features // 256
+    packed = rng.integers(0, 256, blocks * block_bytes, dtype=np.uint8)
+    for i in range(blocks): packed[i*block_bytes:i*block_bytes+2] = np.array([0.01], dtype=np.float16).view(np.uint8)
+    raw = Tensor(np.pad(packed, (4, 0))).contiguous().realize()[4:]
+    decoded = ggml_data_to_tensor(raw, experts * out_features * in_features, 17).reshape(experts, out_features, in_features)
+    reference = ggml_data_to_tensor(raw, experts * out_features * in_features, 17).reshape(experts, out_features, in_features).numpy()
+    weight = ExpertWeights(experts, in_features, out_features)
+    weight.weight = decoded
+    selected_np = np.array([[[0, 2], [1, 0]]], dtype=np.int32)
+    x = rng.normal(size=(1, 2, 1, in_features)).astype(np.float32)
+    flat = x.reshape(-1, in_features//32, 32)
+    scale = np.maximum(np.abs(flat).max(-1, keepdims=True) / 127, 1e-8)
+    xq = (np.clip(np.rint(flat / scale), -127, 127) * scale).reshape(x.shape)
+    expected = np.matmul(xq[..., None, :], reference[selected_np].swapaxes(-1, -2)).squeeze(-2)[:, :1]
+    tokens = UOp.variable("expert_tokens", 1, 2).bind(1)
+    out = weight(Tensor(selected_np)[:, :tokens], Tensor(x)[:, :tokens])
+    np.testing.assert_allclose(out[:, :1].numpy(), expected, rtol=3e-3, atol=3e-2)
+    self.assertEqual(out.shape, (1, tokens, 2, out_features))
 
 if __name__ == "__main__": unittest.main()

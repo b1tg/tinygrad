@@ -2,7 +2,7 @@ from __future__ import annotations
 import enum, functools, itertools, pathlib
 from dataclasses import dataclass, replace
 from tinygrad import Device, Tensor, nn, UOp, TinyJit, getenv, function, dtypes
-from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
+from tinygrad.llm.kernels.amd import Linear, expert_quant_linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
 from tinygrad.llm.gguf import ggml_data_to_tensor, gguf_load
 from tinygrad.uop.ops import KernelInfo, Ops, resolve
 
@@ -26,6 +26,7 @@ def _device_arange(end:int, device:str) -> Tensor:
 class ExpertWeights:
   """Like Linear but with num_experts dimension. Weight shape: (num_experts, out_features, in_features)."""
   _PACKED_BLOCK_BYTES = {17: 74, 18: 98, 23: 136}  # IQ2_XS, IQ3_XS, IQ4_XS
+  use_custom_quant = True
   def __init__(self, num_experts:int, in_features:int, out_features:int):
     self.num_experts, self.in_features, self.out_features = num_experts, in_features, out_features
     self.weight = Tensor.zeros(num_experts, out_features, in_features)
@@ -45,6 +46,8 @@ class ExpertWeights:
   def __call__(self, sel:Tensor, x:Tensor) -> Tensor:
     # sel: (B, T, k), x: (B, T, 1, in) or (B, T, k, in) -> output: (B, T, k, out)
     if self.ggml_type is None: self._set_quantized()
+    if self.ggml_type is not None and self.use_custom_quant and amd_custom_kernels_supported(self.weight.device):
+      return expert_quant_linear(self.weight, self.ggml_type, sel, x, self.out_features, self.in_features)
     if self.ggml_type is not None:
       n = sel.numel() * self.out_features * self.in_features
       weight = ggml_data_to_tensor(self.weight[sel].flatten(), n, self.ggml_type)
