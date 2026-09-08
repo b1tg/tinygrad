@@ -3,7 +3,7 @@ import enum, functools, itertools, pathlib
 from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes
 from tinygrad.llm.kernels.amd import Linear, ExpertWeights, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
-from tinygrad.llm.kernels.amd import topk_softmax_256_8
+from tinygrad.llm.kernels.amd import topk_softmax_256_8, q8_0_gemv_fused
 from tinygrad.llm.gguf import gguf_load
 from tinygrad.uop.ops import resolve
 
@@ -123,10 +123,15 @@ class FFNBlock:
         if gating == ExpertGating.SOFTMAX_WEIGHT: probs = probs.softmax(-1)
         if normalize_topk: probs = probs / probs.sum(axis=-1, keepdim=True)
       probs = probs * self.config.routed_scaling_factor
-      x_down = self.ffn_down_exps(sel, (self.ffn_gate_exps(sel, h).silu() * self.ffn_up_exps(sel, h)).contiguous())  # (B, T, k, D)
+      quant = self.ffn_gate_exps.quantize(h)
+      x_down = self.ffn_down_exps(sel, (self.ffn_gate_exps(sel, h, quant).silu() * self.ffn_up_exps(sel, h, quant)).contiguous())  # (B, T, k, D)
       out = (x_down * probs.unsqueeze(-1)).sum(axis=2)  # (B, T, D)
       if hasattr(self, 'ffn_gate_shexp'):
-        shexp = self.ffn_down_shexp(self.ffn_gate_shexp(x).silu().contiguous() * self.ffn_up_shexp(x))
+        if (fused := q8_0_gemv_fused([self.ffn_gate_shexp, self.ffn_up_shexp], x)) is not None:
+          g_shexp, u_shexp = fused
+        else:
+          g_shexp, u_shexp = self.ffn_gate_shexp(x), self.ffn_up_shexp(x)
+        shexp = self.ffn_down_shexp(g_shexp.silu().contiguous() * u_shexp)
         if hasattr(self, 'ffn_gate_inp_shexp'): shexp = shexp * (x * self.ffn_gate_inp_shexp["weight"]).sum(axis=-1, keepdim=True).sigmoid()
         out = out + shexp
       return out
@@ -162,7 +167,10 @@ class TransformerBlock(FFNBlock):
     if config.qk_norm: self.attn_q_norm, self.attn_k_norm = nn.RMSNorm(config.qk_norm, config.norm_eps), nn.RMSNorm(config.qk_norm, config.norm_eps)
 
   def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
-    q, k, v = self.attn_q(x), self.attn_k(x), self.attn_v(x)
+    if (fused := q8_0_gemv_fused([self.attn_q, self.attn_k, self.attn_v], x)) is not None:
+      q, k, v = fused
+    else:
+      q, k, v = self.attn_q(x), self.attn_k(x), self.attn_v(x)
     if self.config.qk_norm and self.config.qk_norm != self.config.head_dim: q, k = self.attn_q_norm(q), self.attn_k_norm(k)
 
     B, T, _ = x.shape
@@ -285,8 +293,12 @@ class GatedDeltaNetBlock(FFNBlock):
 
     # input processing
     x = x.half()
-    out_gate = self.ssm_g_b(self.ssm_g_a(x)) if is_kda else self.attn_gate(x)
-    out_gate = out_gate.reshape(B, T, self.num_v_heads, self.head_v_dim)
+    if not is_kda and (fused := q8_0_gemv_fused([self.attn_qkv, self.attn_gate], x)) is not None:
+      qkv, out_gate = fused
+      out_gate = out_gate.reshape(B, T, self.num_v_heads, self.head_v_dim)
+    else:
+      qkv = None
+      out_gate = (self.ssm_g_b(self.ssm_g_a(x)) if is_kda else self.attn_gate(x)).reshape(B, T, self.num_v_heads, self.head_v_dim)
     beta = self.ssm_beta(x).sigmoid().reshape(B, T, self.num_v_heads)
     alpha = self.ssm_f_b(self.ssm_f_a(x)) if is_kda else self.ssm_alpha(x)
     log_alpha = ((alpha.float() + self.ssm_dt["bias"]).softplus().reshape(B, T, self.num_v_heads, -1) *
@@ -298,7 +310,8 @@ class GatedDeltaNetBlock(FFNBlock):
     # padded steps are exact no-ops: beta=0 (delta rule off), log_alpha=0 (decay 1 after exp)
     win = Tensor.zeros(B, self.ssm_conv_kernel-1 + T_pad, self.conv_channels).uop
     win = win.after(win[:, :self.ssm_conv_kernel-1].store(conv_state.cast(win.dtype).uop))
-    win = win.after(win[:, self.ssm_conv_kernel-1:self.ssm_conv_kernel-1+T].store(self.attn_qkv(x).cast(win.dtype).uop))
+    win = win.after(win[:, self.ssm_conv_kernel-1:self.ssm_conv_kernel-1+T].store(
+      (qkv if qkv is not None else self.attn_qkv(x)).cast(win.dtype).uop))
     conv_window = Tensor(win)
     # the last conv_kernel-1 columns of the window become the next conv state
     conv_state_store = self.conv_state.uop.store(conv_window[:, T:T+self.ssm_conv_kernel-1].cast(self.conv_state.dtype).uop)

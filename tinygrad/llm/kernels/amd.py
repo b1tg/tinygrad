@@ -83,15 +83,19 @@ def packed_ggml_weight(decoded:Tensor, n_elements:int) -> tuple[int, Tensor]|Non
 class Linear(nn.Linear):
   ggml_type:int|None = None
   use_custom_quant = True
+  _q8_0_weight:Tensor|None = None
+  _q8_0_tried:bool = False
+  _fused_q8_0_weight:Tensor|None = None
   def __init__(self, in_features:int, out_features:int, bias=True):
     super().__init__(in_features, out_features, bias)
     self.in_features, self.out_features = in_features, out_features
   def set_quantized(self, decoded:Tensor):
+    if self.in_features % GGML_BLOCK_SIZE: return
     if (matched:=packed_ggml_weight(decoded, self.in_features * self.out_features)) is None: return
     self.ggml_type, self.weight = matched
   def __call__(self, x:Tensor) -> Tensor:
     if amd_custom_kernels_supported(self.weight.device):
-      if not hasattr(self, '_q8_0_weight'): self._q8_0_weight = packed_q8_0_weight(self.weight, self.in_features * self.out_features)
+      if not self._q8_0_tried: self._q8_0_tried, self._q8_0_weight = True, packed_q8_0_weight(self.weight, self.in_features * self.out_features)
       if self._q8_0_weight is not None and self.in_features % 128 == 0 and resolve(prod(x.shape[:-1]) == 1, default=False):
         return q8_0_gemv(self, x)
     supported = self.use_custom_quant and amd_custom_kernels_supported(self.weight.device)
@@ -122,16 +126,31 @@ class ExpertWeights:
     self.weight = Tensor.zeros(num_experts, out_features, in_features)
     self.num_experts, self.in_features, self.out_features = num_experts, in_features, out_features
   def set_quantized(self, decoded:Tensor):
+    if self.in_features % GGML_BLOCK_SIZE: return
     if (matched:=packed_ggml_weight(decoded, self.num_experts * self.in_features * self.out_features)) is None: return
     self.ggml_type, self.weight = matched
-  def __call__(self, sel:Tensor, x:Tensor) -> Tensor:
-    # sel: (B, T, k), x: (B, T, 1, in) or (B, T, k, in) -> output: (B, T, k, out)
-    supported = self.use_custom_quant and amd_custom_kernels_supported(self.weight.device)
-    if self.ggml_type is None and supported:
+  def _ensure_quant(self):
+    if self.ggml_type is None and self.use_custom_quant and amd_custom_kernels_supported(self.weight.device):
       self.set_quantized(self.weight)
-      if self.ggml_type is None: self.use_custom_quant = supported = False
+      if self.ggml_type is None: self.use_custom_quant = False
+  def quantize(self, x:Tensor) -> tuple[Tensor, Tensor, Tensor]|None:
+    # the q8 activation quantization depends only on x: calls sharing an input (gate/up projections) share it
+    self._ensure_quant()
+    if self.ggml_type not in (Q4_K, Q5_K, Q6_K, IQ4_XS): return None
+    B, T = x.shape[0], x.shape[1]
+    if not isinstance(B, int) or not isinstance(T, int): return None
+    xr = x.reshape(B, T, -1, self.in_features)
+    rows = xr.shape[2]
+    assert isinstance(rows, int)
+    tokens = B*T if rows == 1 else B*T*rows
+    x_flat = xr.reshape(tokens, self.in_features).contiguous()
+    return q8_quantize(x_flat, tokens, self.in_features)
+  def __call__(self, sel:Tensor, x:Tensor, quant:tuple[Tensor, Tensor, Tensor]|None=None) -> Tensor:
+    # sel: (B, T, k), x: (B, T, 1, in) or (B, T, k, in) -> output: (B, T, k, out)
+    self._ensure_quant()
+    supported = self.use_custom_quant and amd_custom_kernels_supported(self.weight.device)
     if self.ggml_type in (Q4_K, Q5_K, Q6_K, IQ4_XS) and supported:
-      if isinstance(sel.numel(), int): return q8_expert(self, sel, x)
+      if isinstance(sel.numel(), int): return q8_expert(self, sel, x, quant)
       out = q8_expert(self, sel.pad_to(sel.max_shape), x.pad_to(x.max_shape))
       return out.shrink(tuple((0, s) for s in (*sel.shape, self.out_features)))
     return (x.unsqueeze(-2) @ self.weight[sel].transpose(-1, -2)).contiguous().squeeze(-2)
@@ -161,13 +180,14 @@ def _iq4_bytes(packed:UOp, shift:int) -> UOp:
   return _amd_byte_perm(high, low, 0x03020100 | ((selectors & 0x08080808) >> 1))
 
 def _q5_scales(raw:UOp, base:UOp, subgroup:UOp) -> tuple[UOp, UOp, UOp, UOp]:
-  # scales/mins (6-bit each) live in block bytes 4-15: three words total, same for the whole super-block's lanes
-  w1, w2, w3 = _amd_load(raw[base+1]), _amd_load(raw[base+2]), _amd_load(raw[base+3])
+  # scales/mins (6-bit each) live in block bytes 4-15: one vector load for the d/dmin word and the three scale words
+  sc = _amd_load(raw[base], 4)
+  w1, w2, w3 = sc[1], sc[2], sc[3]
   sb = (subgroup & 3) * 8  # byte within word
   byte1, byte2, byte3 = (w1 >> sb) & 255, (w2 >> sb) & 255, (w3 >> sb) & 255
   scale = (subgroup < 4).where(byte1 & 63, (byte3 & 15) | ((byte1 >> 6) << 4))
   minimum = (subgroup < 4).where(byte2 & 63, (byte3 >> 4) | ((byte2 >> 6) << 4))
-  d, dmin = (raw[base] & 0xffff).cast(dtypes.uint16), (raw[base] >> 16).cast(dtypes.uint16)
+  d, dmin = (sc[0] & 0xffff).cast(dtypes.uint16), (sc[0] >> 16).cast(dtypes.uint16)
   return _half(d), _half(dmin), scale.float(), minimum.float()
 
 def _iq4_scales(raw:UOp, base:UOp, subgroup:UOp) -> tuple[UOp, UOp]:
@@ -227,8 +247,8 @@ def _quant_group_dot(raw:UOp, xq:UOp, xd:UOp, xs:UOp, ggml_type:int,
     base = idx * (Q4_WORDS if ggml_type == Q4_K else Q5_WORDS)
     qs_base, dot = base + (4 if ggml_type == Q4_K else 12) + (subgroup//2)*8, UOp.const(0, dtypes.int32)
     # vectorize the 8 packed-weight words and (for Q5_K) the 32-byte high-bit bitmap
-    qs_pair = (_amd_load(raw[qs_base], 4), _amd_load(raw[qs_base+4], 4))
-    if ggml_type == Q5_K: qh_pair = (_amd_load(raw[base+4], 4), _amd_load(raw[base+8], 4))
+    qs_pair = (_amd_load(raw[qs_base], 4, stream=True), _amd_load(raw[qs_base+4], 4, stream=True))
+    if ggml_type == Q5_K: qh_pair = (_amd_load(raw[base+4], 4, stream=True), _amd_load(raw[base+8], 4, stream=True))
     for word_idx in range(8):
       word = (qs_pair[word_idx//4][word_idx%4] >> ((subgroup&1)*4).cast(dtypes.uint32)) & 0x0f0f0f0f
       if ggml_type == Q5_K: word |= ((qh_pair[word_idx//4][word_idx%4] >> subgroup.cast(dtypes.uint32)) & 0x01010101) << 4
@@ -278,24 +298,25 @@ def _quant_mul_mat_id_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, sel:UOp, 
   row_blocks = in_features // GGML_BLOCK_SIZE
   chunks = out.shape[3]
   tokens = out.shape[0]
-  token_output = UOp.range(tokens*out_features, 0, axis_type=AxisType.GLOBAL)
+  # one workgroup per (token, expert slot, output row): folding the slot into the grid keeps the
+  # waves busy (8 slots x outputs) instead of looping the experts serially inside one workgroup
+  token_slot_output = UOp.range(tokens*k*out_features, 0, axis_type=AxisType.GLOBAL)
   chunk, lane = UOp.range(chunks, 1, axis_type=AxisType.GLOBAL), UOp.range(32, 2, axis_type=AxisType.LOCAL)
-  token, output = token_output // out_features, token_output % out_features
+  token, rem = token_slot_output // (k*out_features), token_slot_output % (k*out_features)
+  slot, output = rem // out_features, rem % out_features
   group = (lane+chunk*32).minimum(group_count-1)
   block, subgroup = group // 8, group % 8
   exact = chunks*32 == group_count
   tail_ok = lane+chunk*32 < group_count
-  stores = []
-  for slot in range(k):
-    expert = sel[token, slot].load().cast(dtypes.int32)
-    x_tok = token if shared else token*k + slot
-    idx = expert * (out_features * row_blocks) + output * row_blocks + block
-    value = _quant_group_dot(raw, xq, xd, xs, ggml_type, x_tok, idx, group, subgroup)
-    if not exact: value = tail_ok.where(value, UOp.const(0, dtypes.float32))
-    total = warp_reduce(value, full_wave=True)
-    stores.append(out[token, slot, output, chunk.valid(lane.eq(0))].store(total.cast(out.dtype)))
+  expert = sel[token, slot].load().cast(dtypes.int32)
+  x_tok = token if shared else token*k + slot
+  idx = expert * (out_features * row_blocks) + output * row_blocks + block
+  value = _quant_group_dot(raw, xq, xd, xs, ggml_type, x_tok, idx, group, subgroup)
+  if not exact: value = tail_ok.where(value, UOp.const(0, dtypes.float32))
+  total = warp_reduce(value, full_wave=True)
+  store = out[token, slot, output, chunk.valid(lane.eq(0))].store(total.cast(out.dtype))
   names = {Q4_K: "mul_mat_id_q4_k", Q5_K: "mul_mat_id_q5_k", IQ4_XS: "mul_mat_id_iq4_xs", Q6_K: "mul_mat_id_q6"}
-  return UOp.group(*stores).end(token_output, chunk, lane).sink(arg=KernelInfo(name=names[ggml_type], opts_to_apply=()))
+  return store.end(token_slot_output, chunk, lane).sink(arg=KernelInfo(name=names[ggml_type], opts_to_apply=()))
 
 def _wmma_layout(out:UOp, out_features:int, token_tile:int, output_tiles:int):
   if out_features % (16*output_tiles): output_tiles = 1
@@ -404,7 +425,7 @@ def q8_linear(layer:Linear, x:Tensor) -> Tensor:
   out = Tensor.empty(tokens, out_features, (in_features+1023)//1024, dtype=dtypes.float32, device=x.device).uop
   return run(decode, out, raw, xq_.uop, xd.uop, xs.uop)
 
-def q8_expert(layer:ExpertWeights, sel:Tensor, x:Tensor) -> Tensor:
+def q8_expert(layer:ExpertWeights, sel:Tensor, x:Tensor, quant:tuple[Tensor, Tensor, Tensor]|None=None) -> Tensor:
   assert layer.ggml_type in (Q4_K, Q5_K, Q6_K, IQ4_XS)
   B, T, k = sel.shape
   assert all(isinstance(s, int) for s in (B, T, k))
@@ -414,10 +435,12 @@ def q8_expert(layer:ExpertWeights, sel:Tensor, x:Tensor) -> Tensor:
   shared = x.shape[2] == 1
   assert x.shape[2] in (1, k)
   tokens = B * T
-  x_flat = x.reshape(tokens if shared else tokens * k, in_features).contiguous()
   # Let custom-kernel lowering handle views; an explicit contiguous copies already packed routing indices.
   sel2 = sel.reshape(tokens, k).cast(dtypes.int32)
-  xq_, xd, xs = q8_quantize(x_flat, tokens if shared else tokens * k, in_features)
+  if quant is None:
+    x_flat = x.reshape(tokens if shared else tokens * k, in_features).contiguous()
+    quant = q8_quantize(x_flat, tokens if shared else tokens * k, in_features)
+  xq_, xd, xs = quant
   out = Tensor.empty(tokens, k, out_features, (in_features+1023)//1024, dtype=dtypes.float32, device=x.device).uop
   raw = layer.weight.uop
   srcs = (out, raw, xq_.uop, xd.uop, xs.uop, sel2.uop)
@@ -459,10 +482,32 @@ def _q8_0_gemv_kernel(out:UOp, raw:UOp, x:UOp, *, in_features:int, out_features:
   return out[row.valid(lane.eq(0))].store(total).end(row, lane).sink(arg=KernelInfo(name="linear_q8_0_gemv", opts_to_apply=()))
 
 def q8_0_gemv(layer:Linear, x:Tensor) -> Tensor:
+  assert layer._q8_0_weight is not None
   out = Tensor.empty(layer.out_features, dtype=dtypes.float32, device=x.device)
   fxn = functools.partial(_q8_0_gemv_kernel, in_features=layer.in_features, out_features=layer.out_features, weight_dtype=layer.weight.dtype)
   ret = Tensor.custom_kernel(out, layer._q8_0_weight, x.contiguous().reshape(-1), fxn=fxn)[0].reshape(*x.shape[:-1], layer.out_features)
   return ret if layer.bias is None else ret + layer.bias
+
+def q8_0_gemv_fused(layers:list[Linear], x:Tensor) -> list[Tensor]|None:
+  # one gemv over the concatenated packed weights of Linears sharing one input: fewer kernel launches
+  # and a bigger grid than separate small gemvs. Returns None when the fast path doesn't apply.
+  if not amd_custom_kernels_supported(x.device): return None
+  if not resolve(prod(x.shape[:-1]) == 1, default=False): return None
+  if any(l.bias is not None or l.in_features % 128 or l.in_features != layers[0].in_features or
+         l.weight.dtype != layers[0].weight.dtype for l in layers): return None
+  for l in layers:
+    if not l._q8_0_tried: l._q8_0_tried, l._q8_0_weight = True, packed_q8_0_weight(l.weight, l.in_features * l.out_features)
+    if l._q8_0_weight is None: return None
+  if layers[0]._fused_q8_0_weight is None:
+    # @function contexts set ALLOW_DEVICE_USAGE=0: the one-time repack is a device op
+    with Context(ALLOW_DEVICE_USAGE=1):
+      layers[0]._fused_q8_0_weight = Tensor.cat(*[cast(Tensor, l._q8_0_weight).reshape(-1) for l in layers]).contiguous().realize()
+  fused, out_features = layers[0]._fused_q8_0_weight, sum(l.out_features for l in layers)
+  out = Tensor.empty(out_features, dtype=dtypes.float32, device=x.device)
+  fxn = functools.partial(_q8_0_gemv_kernel, in_features=layers[0].in_features, out_features=out_features,
+                          weight_dtype=layers[0].weight.dtype)
+  ret = Tensor.custom_kernel(out, fused, x.contiguous().reshape(-1), fxn=fxn)[0]
+  return [s.reshape(*x.shape[:-1], l.out_features) for s, l in zip(ret.split([l.out_features for l in layers]), layers)]
 
 # ******** tiny dense fp16 gemv ********
 
@@ -519,17 +564,18 @@ def _amd_flash_attention_decode_partial(out, stats, q, cache_kv, valid_kv_len, m
   SEC = CHUNK // WAVES  # keys each wave scans independently
   total_chunks = (valid_kv_len+CHUNK-1)//CHUNK
   live_chunks = min(total_chunks, PARTIALS) if isinstance(total_chunks, int) else total_chunks.minimum(PARTIALS)
-  block_bhkv, block_chunk = UOp.range(B*H_KV, 0, AxisType.GLOBAL), UOp.range(live_chunks, 1, AxisType.GLOBAL)
+  # one workgroup per (batch, query head, chunk): GQA shares the KV head reads across the per-head workgroups
+  block_bh, block_chunk = UOp.range(B*H, 0, AxisType.GLOBAL), UOp.range(live_chunks, 1, AxisType.GLOBAL)
   lane, wave = UOp.range(WARP_SIZE, -1, axis_type=AxisType.WARP), UOp.range(WAVES, 3, axis_type=AxisType.LOCAL)
-  b, kv_head = block_bhkv // H_KV, block_bhkv % H_KV
-  # per-lane query fragments for every GQA head, kept packed in registers; unpacked at use
-  qf = tuple(_vec_load(q[b, kv_head*G+h, 0, lane*DPL], DPL) for h in range(G))
+  b, h = block_bh // H, block_bh % H
+  kv_head = h // G
+  qf = _vec_load(q[b, h, 0, lane*DPL], DPL)
   zerof = UOp.const(0, dtypes.float)
   # Each block scans every PARTIALS-th chunk, keeping an online softmax across rounds.
   chunk_round = UOp.range((total_chunks-1-block_chunk)//PARTIALS+1, 4, AxisType.REDUCE)
   chunk_id = block_chunk + chunk_round*PARTIALS
   valids: list[UOp] = []
-  scores: list[list[UOp]] = [[zerof]*G for _ in range(SEC)]
+  scores: list[UOp] = [zerof]*SEC
   vfrags: list[tuple[UOp, ...]] = [()]*SEC
   for j in range(SEC):
     key = chunk_id*CHUNK + wave*SEC + j
@@ -538,54 +584,49 @@ def _amd_flash_attention_decode_partial(out, stats, q, cache_kv, valid_kv_len, m
     kfrag = _vec_load(cache_kv[0, b, kv_head, key, lane*DPL], DPL)
     # V is prefetched in the score pass so both streams are in flight together
     vfrags[j] = tuple(valid.where(v, zerof) for v in _vec_load(cache_kv[1, b, kv_head, key, lane*DPL], DPL))
-    for h in range(G):
-      s = warp_reduce(sum((qf[h][i]*kfrag[i] for i in range(DPL)), UOp.const(0, dtypes.float)), full_wave=True) * (1/math.sqrt(D))
-      scores[j][h] = valid.where(s, UOp.const(-1e30, dtypes.float))
+    s = warp_reduce(sum((qf[i]*kfrag[i] for i in range(DPL)), UOp.const(0, dtypes.float)), full_wave=True) * (1/math.sqrt(D))
+    scores[j] = valid.where(s, UOp.const(-1e30, dtypes.float))
   # A finite initial max keeps fully masked waves from computing exp(-inf - -inf).
-  acc_reg, max_reg, sum_reg = _reg((G, DPL), 2, 0), _reg((G,), 3, -1e30), _reg((G,), 4, 0)
+  acc_reg, max_reg, sum_reg = _reg((1, DPL), 2, 0), _reg((1,), 3, -1e30), _reg((1,), 4, 0)
   prev_acc, prev_max, prev_sum = acc_reg.after(chunk_round), max_reg.after(chunk_round), sum_reg.after(chunk_round)
-  row_max = [functools.reduce(UOp.maximum, (scores[j][h] for j in range(SEC)), prev_max[h].load()) for h in range(G)]
+  row_max = functools.reduce(UOp.maximum, scores, prev_max[0].load())
   # Rescale the previous rounds to the new max, then accumulate this round's keys.
-  alpha = [((prev_max[h].load()-row_max[h])*LOG2E).exp2() for h in range(G)]
-  accs = [[alpha[h]*prev_acc[h, i].load() for i in range(DPL)] for h in range(G)]
-  row_sums = [alpha[h]*prev_sum[h].load() for h in range(G)]
+  alpha = ((prev_max[0].load()-row_max)*LOG2E).exp2()
+  accs = [alpha*prev_acc[0, i].load() for i in range(DPL)]
+  row_sum = alpha*prev_sum[0].load()
   for j in range(SEC):
-    for h in range(G):
-      beta = valids[j].where(((scores[j][h]-row_max[h])*LOG2E).exp2(), zerof)
-      accs[h] = [a + beta*v for a, v in zip(accs[h], vfrags[j])]
-      row_sums[h] = row_sums[h] + beta
-  update = UOp.group(acc_reg.store(UOp.stack(*(x for acc in accs for x in acc)).reshape(G, DPL)),
-                     max_reg.store(UOp.stack(*row_max)), sum_reg.store(UOp.stack(*row_sums))).end(chunk_round)
+    beta = valids[j].where(((scores[j]-row_max)*LOG2E).exp2(), zerof)
+    accs = [a + beta*v for a, v in zip(accs, vfrags[j])]
+    row_sum = row_sum + beta
+  update = UOp.group(acc_reg.store(UOp.stack(*accs).reshape(1, DPL)),
+                     max_reg.store(UOp.stack(row_max)), sum_reg.store(UOp.stack(row_sum))).end(chunk_round)
   acc_reg, max_reg, sum_reg = acc_reg.after(update), max_reg.after(update), sum_reg.after(update)
   # exchange across the block's waves through LDS (fp16 halves LDS so more blocks fit per CU)
-  # Matching cache/LDS strides can reuse a loop-local cache index outside the loop. Pad that layout.
-  acc_lds = UOp.placeholder((WAVES, G, D + (LDS_PAD if G == SEC else 0)), dtypes.half, slot=0, addrspace=AddrSpace.LOCAL)[:, :, :D]
-  ml_lds = UOp.placeholder((WAVES, G, 2), dtypes.float, slot=1, addrspace=AddrSpace.LOCAL)
-  lds_acc = acc_lds.reshape(WAVES, G, WARP_SIZE, DPL)
+  acc_lds = UOp.placeholder((WAVES, D + LDS_PAD), dtypes.half, slot=0, addrspace=AddrSpace.LOCAL)[:, :D]
+  ml_lds = UOp.placeholder((WAVES, 2), dtypes.float, slot=1, addrspace=AddrSpace.LOCAL)
+  lds_acc = acc_lds.reshape(WAVES, WARP_SIZE, DPL)
   # Normalize before fp16 to avoid overflow. Nonempty waves have sum >= 1; empty waves keep their zero accumulator.
-  stores = [lds_acc[wave, h, lane].store((acc_reg[h].load() / sum_reg[h].load().maximum(1)).cast(dtypes.half)) for h in range(G)]
   # NOTE: duplicate stores of the same value from every lane are harmless here
-  stores += [ml_lds[wave, h, i].store(x) for h in range(G) for i, x in enumerate((max_reg[h].load(), sum_reg[h].load()))]
+  stores = [lds_acc[wave, lane].store((acc_reg[0].load() / sum_reg[0].load().maximum(1)).cast(dtypes.half)),
+            ml_lds[wave, 0].store(max_reg[0].load()), ml_lds[wave, 1].store(sum_reg[0].load())]
   barrier = UOp.barrier(UOp.group(*stores))
   acc_lds, ml_lds = acc_lds.after(barrier), ml_lds.after(barrier)
   tid = wave*WARP_SIZE + lane
   final_stores:list[UOp] = []
-  for i in range(-(-G*D//(WAVES*WARP_SIZE))):
-    flat = tid + i*WAVES*WARP_SIZE
-    h, d = flat // D, flat % D
-    M = functools.reduce(UOp.maximum, (ml_lds[w, h, 0].load() for w in range(WAVES)))
+  for i in range(-(-D//(WAVES*WARP_SIZE))):
+    d = tid + i*WAVES*WARP_SIZE
+    M = functools.reduce(UOp.maximum, (ml_lds[w, 0].load() for w in range(WAVES)))
     # LDS holds normalized values; restore each wave's sum before combining.
-    val = sum((((ml_lds[w, h, 0].load()-M)*LOG2E).exp2() * ml_lds[w, h, 1].load() * acc_lds[w, h, d].load().float()
+    val = sum((((ml_lds[w, 0].load()-M)*LOG2E).exp2() * ml_lds[w, 1].load() * acc_lds[w, d % D].load().float()
                for w in range(WAVES)), zerof)
-    oidx = out[b, kv_head*G + h, block_chunk, d]
-    if G*D % (WAVES*WARP_SIZE): oidx = out[b, (kv_head*G + h).valid(flat < G*D), block_chunk, d]
+    oidx = out[b, h, block_chunk, d] if D % (WAVES*WARP_SIZE) == 0 else out[b, h, block_chunk, d.valid(d < D)]
     final_stores.append(oidx.store(val))
-  hstat = tid
-  M = functools.reduce(UOp.maximum, (ml_lds[w, hstat, 0].load() for w in range(WAVES)))
-  L = sum((((ml_lds[w, hstat, 0].load()-M)*LOG2E).exp2() * ml_lds[w, hstat, 1].load() for w in range(WAVES)), zerof)
-  q_head = (kv_head*G + hstat).valid(hstat < G) if WAVES*WARP_SIZE > G else kv_head*G + hstat
-  final_stores += [stats[b, q_head, block_chunk, 0].store(M), stats[b, q_head, block_chunk, 1].store(L)]
-  return UOp.group(*final_stores).end(lane, wave, block_chunk, block_bhkv).sink(arg=KernelInfo(name="flash_decode_partial", opts_to_apply=()))
+  M = functools.reduce(UOp.maximum, (ml_lds[w, 0].load() for w in range(WAVES)))
+  L = sum((((ml_lds[w, 0].load()-M)*LOG2E).exp2() * ml_lds[w, 1].load() for w in range(WAVES)), zerof)
+  first = tid.eq(0)
+  final_stores += [stats[b, h, block_chunk, UOp.const(0).valid(first)].store(M),
+                   stats[b, h, block_chunk, UOp.const(1).valid(first)].store(L)]
+  return UOp.group(*final_stores).end(lane, wave, block_chunk, block_bh).sink(arg=KernelInfo(name="flash_decode_partial", opts_to_apply=()))
 
 @functools.cache
 def _amd_flash_decode_combine(o:UOp, partial:UOp, stats:UOp, live:int|UOp) -> UOp:
@@ -622,8 +663,8 @@ def amd_flash_attention_decode(q:Tensor, cache_kv:Tensor, valid_kv_len:int|UOp, 
   chunks = min(48, max_kv_len // 64)
   partial = Tensor.empty(B, H, chunks, D, dtype="float32", device=q.device)
   stats = Tensor.empty(B, H, chunks, 2, dtype="float32", device=q.device)
-  waves, group = 16, H // cache_kv.shape[2]
-  while waves * group * ((D+LDS_PAD)*2 + 8) > 65536: waves //= 2
+  waves = 16
+  while waves * ((D+LDS_PAD)*2 + 8) > 65536: waves //= 2
   assert waves > 0, "attention head group exceeds shared memory capacity"
   fxn = functools.partial(_amd_flash_attention_decode_partial, valid_kv_len=valid_kv_len, max_kv_len=max_kv_len, block_n=64, waves=waves)
   partial, stats = Tensor.custom_kernel(partial, stats, q, cache_kv, fxn=fxn)[:2]
@@ -720,10 +761,10 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
 def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
   # cached flash attention on the half KV cache (already written through assigned_kv); valid_end stays bound at the graph level
   T_real, q_start = q.shape[2], None
-  D, N, group = q.shape[3], assigned_kv.shape[3], q.shape[1] // assigned_kv.shape[2]
+  D, N = q.shape[3], assigned_kv.shape[3]
   decode = resolve(T_real == 1, False)
   # Non-power-of-two decode dimensions can lose tail-store masks. Q/P, K, and V use separate LDS allocations.
-  supported = D % 32 == 0 and (D & (D-1) == 0 and N % 64 == 0 and group*((D+LDS_PAD)*2+8) <= 65536 if decode else
+  supported = D % 32 == 0 and (D & (D-1) == 0 and N % 64 == 0 and (D+LDS_PAD)*2+8 <= 65536 if decode else
     D >= 64 and 2*(2*BLOCK_M*(D+LDS_PAD) + D*(BLOCK_N+LDS_PAD)) <= 65536 and N % BLOCK_N == 0 and q.max_shape[2] % BLOCK_M == 0)
   if not supported:
     k, v = (assigned_kv[i, :, :, :valid_end].float() for i in range(2))
