@@ -1,4 +1,5 @@
 import argparse, time
+from tinygrad import Device
 from tinygrad.helpers import profile_marker
 from tinygrad.llm.model import Transformer
 
@@ -9,10 +10,12 @@ if __name__ == "__main__":
   parser.add_argument("--prompt-tokens", type=int, default=1024, help="number of prompt tokens (default: %(default)s)")
   parser.add_argument("--decode-tokens", type=int, default=16, help="number of tokens to decode (default: %(default)s)")
   parser.add_argument("--chunk-size", type=int, default=32, help="chunk size for prefill (default: %(default)s)")
+  parser.add_argument("--shard", type=int, default=1, help="number of GPUs for tensor parallel inference")
   args = parser.parse_args()
 
   st = time.perf_counter()
-  model, _ = Transformer.from_gguf(args.model, args.max_context)
+  devices = tuple(Device.canonicalize(f"{Device.DEFAULT}:{i}") for i in range(args.shard)) if args.shard > 1 else None
+  model, _ = Transformer.from_gguf(args.model, args.max_context, devices=devices)
   print(f"load {time.perf_counter()-st:.3f}s", flush=True)
 
   st = time.perf_counter()

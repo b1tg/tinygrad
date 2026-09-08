@@ -768,7 +768,8 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
     D >= 64 and 2*(2*BLOCK_M*(D+LDS_PAD) + D*(BLOCK_N+LDS_PAD)) <= 65536 and N % BLOCK_N == 0 and q.max_shape[2] % BLOCK_M == 0)
   if not supported:
     k, v = (assigned_kv[i, :, :, :valid_end].float() for i in range(2))
-    mask = None if decode else Tensor.full((T_real, valid_end), -math.inf, dtype=dtypes.float32, device=q.device).triu(valid_end-T_real+1)
+    mask = None if decode else (Tensor.arange(q.max_shape[2])[:T_real].unsqueeze(-1) + Tensor(valid_end-T_real) <
+                                Tensor.arange(N)[:valid_end]).where(-math.inf, 0)
     return q.float().scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)
   if decode: return amd_flash_attention_decode(q.half(), assigned_kv, valid_end, cast(int, N))
   if isinstance(T_real, UOp):
@@ -783,6 +784,31 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
   return out if q_start is None else out[:, :, :T_real]
 
 # ******** gated delta net: fused recurrent scan ********
+
+@functools.cache
+def _ssm_conv_decode_kernel(out:UOp, state:UOp, x:UOp, weight:UOp, start_pos:UOp) -> UOp:
+  batch, history, channels = cast(tuple[int, int, int], state.shape)
+  group, lane = UOp.range(batch*channels//32, 0, AxisType.GLOBAL), UOp.range(32, 1, AxisType.LOCAL)
+  bc = group*32 + lane
+  b, c = bc // channels, bc % channels
+  # Read the full channel history before shifting it in place.
+  values = UOp.placeholder((history+1,), dtypes.float32, slot=0, addrspace=AddrSpace.REG)
+  values = values.after(values.store(UOp.stack(*(start_pos.eq(0).where(0, state[b, i, c].float()) for i in range(history)),
+                                               x.reshape(batch, channels)[b, c].float())))
+  y = functools.reduce(lambda a,b:a+b, (values[i].load() * weight[c, i].float() for i in range(history+1)))
+  stores = [state[b, i, c].store(values[i+1].load().cast(state.dtype)) for i in range(history)]
+  return UOp.group(out.reshape(batch, channels)[b, c].store(y / (1 + (-y).exp())), *stores).end(lane, group).sink(
+    arg=KernelInfo(name='ssm_conv_decode', opts_to_apply=()))
+
+def ssm_conv_decode(x:Tensor, state:Tensor, weight:Tensor, start_pos:Tensor) -> tuple[Tensor, Tensor]:
+  assert x.shape == (state.shape[0], 1, state.shape[2]) and weight.shape == (state.shape[2], state.shape[1]+1)
+  assert start_pos.uop.is_bound_var and state.shape[2] % 32 == 0
+  out = Tensor.empty(*x.shape, device=x.device)
+  state = Tensor(state.uop.after(start_pos.uop))
+  srcs = (out.uop, state.uop, x.contiguous().uop, weight.contiguous().uop)
+  params = tuple(UOp.placeholder_like(x, slot=i) for i,x in enumerate(srcs))
+  call = _ssm_conv_decode_kernel(*params, kernel_var(start_pos.uop.src[0])).call(*srcs)
+  return Tensor(out.uop.after(call)), Tensor(state.uop.after(call))
 
 @functools.cache
 def _gated_delta_prefill_kernel(core:UOp, q:UOp, k:UOp, v:UOp, beta:UOp, alpha:UOp, state:UOp, kq:UOp, start_pos:UOp|None=None) -> UOp:

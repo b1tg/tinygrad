@@ -212,6 +212,25 @@ class TestQ8Quantize(unittest.TestCase):
     linear.weight = Tensor.full((1, 128), 1/128, dtype=dtypes.float32).realize()
     np.testing.assert_array_equal(linear(Tensor.full((1, 128), 65536, dtype=dtypes.float32)).numpy(), 65536)
 
+  def test_ssm_conv_decode_state_and_jit(self):
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
+    from tinygrad import TinyJit
+    from tinygrad.llm.kernels.amd import ssm_conv_decode
+    rng = np.random.default_rng(42)
+    for batch, channels in ((1,4096), (2,128)):
+      ref = rng.normal(size=(batch,3,channels)).astype(np.float32)
+      weights = rng.normal(size=(channels,4)).astype(np.float16)
+      state, weight = Tensor(ref.copy()).realize(), Tensor(weights).realize()
+      jit = TinyJit(lambda x,pos: ssm_conv_decode(x, state, weight, Tensor(pos))[0].realize())
+      for pos in (0,1,2,3,0,1):
+        x = rng.normal(size=(batch,1,channels)).astype(np.float32)
+        window = np.concatenate((np.zeros_like(ref) if pos == 0 else ref,x), axis=1)
+        y = sum(window[:,i:i+1]*weights[:,i] for i in range(4))
+        actual = jit(Tensor(x).realize(), UOp.variable("start_pos",0,31).bind(pos)).numpy()
+        np.testing.assert_allclose(actual, y/(1+np.exp(-y)), atol=2e-5, rtol=2e-5)
+        ref = window[:,1:].copy()
+        np.testing.assert_array_equal(state.numpy(), ref)
+
   def test_gated_delta_state_and_precision(self):
     if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
     for case in ("view", "reset", "half"):
