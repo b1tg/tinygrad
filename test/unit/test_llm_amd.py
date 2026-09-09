@@ -128,6 +128,42 @@ class TestQ8Quantize(unittest.TestCase):
     np.testing.assert_allclose(linear(x[:, :toks]).pad_to((1, 3, 16)).numpy(), ref, rtol=3e-4, atol=3e-5)
     np.testing.assert_allclose(linear(x[:, :1]).numpy(), ref[:, :1], rtol=3e-4, atol=3e-5)
 
+  def test_q8_0_wmma_linear(self):
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
+    rng = np.random.default_rng(42)
+    for in_features, out_features, token_counts in ((2048, 64, (16, 32, 64)), (512, 512, (32,)), (2048, 4096, (32,))):
+      with self.subTest(in_features=in_features, out_features=out_features):
+        packed = rng.integers(0, 256, (out_features*in_features//32, 34), dtype=np.uint8)
+        packed[:, :2] = rng.uniform(-0.02, 0.02, len(packed)).astype(np.float16).view(np.uint8).reshape(-1, 2)
+        raw = Tensor(np.pad(packed.flatten(), (4, 0))).contiguous().realize()[4:]
+        decoded = ggml_data_to_tensor(raw, out_features*in_features, 8).reshape(out_features, in_features)
+        weight = decoded.numpy()
+        linear = Linear(in_features, out_features, bias=False)
+        linear.weight = decoded
+        for tokens in token_counts:
+          with self.subTest(tokens=tokens):
+            x = rng.normal(size=(tokens, in_features)).astype(np.float16)
+            reference_w = weight.astype(np.float16).astype(np.float32)
+            np.testing.assert_allclose(linear(Tensor(x)).numpy(), x.astype(np.float32) @ reference_w.T, rtol=3e-3, atol=2e-2)
+        self.assertIsNotNone(linear._q8_0_weight)
+        self.assertEqual(linear.ggml_type, None)
+
+  def test_q8_0_wmma_linear_symbolic(self):
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
+    rng = np.random.default_rng(7)
+    in_features, out_features = 2048, 64
+    packed = rng.integers(0, 256, (out_features*in_features//32, 34), dtype=np.uint8)
+    packed[:, :2] = np.array([0.01], dtype=np.float16).view(np.uint8)
+    raw = Tensor(np.pad(packed.flatten(), (4, 0))).contiguous().realize()[4:]
+    decoded = ggml_data_to_tensor(raw, out_features*in_features, 8).reshape(out_features, in_features)
+    linear = Linear(in_features, out_features, bias=False)
+    linear.weight = decoded
+    x = Tensor(rng.normal(size=(1, 32, in_features)).astype(np.float16)).realize()
+    toks = UOp.variable("q8_wmma_toks", 1, 32).bind(32)
+    ref = x.numpy().astype(np.float32) @ decoded.half().numpy().astype(np.float32).T
+    np.testing.assert_allclose(linear(x[:, :toks]).pad_to((1, 32, out_features)).numpy(), ref, rtol=3e-3, atol=2e-2)
+    self.assertIsNotNone(linear._q8_0_weight)
+
   def test_q6_linear_compiles_in_function(self):
     if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
     rng = np.random.default_rng(42)
