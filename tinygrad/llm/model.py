@@ -3,7 +3,7 @@ import enum, functools, itertools, pathlib
 from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Context
 from tinygrad.llm.kernels.amd import Linear, ExpertWeights, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
-from tinygrad.llm.kernels.amd import topk_softmax_256_8, q8_0_gemv_fused, f16_gemv_fused, ssm_conv_decode
+from tinygrad.llm.kernels.amd import topk_softmax_256_8, topk_bias_256_8, q8_0_gemv_fused, f16_gemv_fused, ssm_conv_decode
 from tinygrad.llm.gguf import gguf_load
 from tinygrad.uop.ops import resolve
 
@@ -118,7 +118,11 @@ class FFNBlock:
         and scores.shape == (1, 1, 256) and scores.dtype == dtypes.float32 and amd_custom_kernels_supported(scores.device):
         probs, sel = topk_softmax_256_8(scores)
       else:
-        _, sel = pairwise_topk(scores if bias is None else scores + bias, self.config.num_experts_per_tok)
+        if gating == ExpertGating.SIGMOID and bias is not None and normalize_topk and self.config.num_experts_per_tok == 8 \
+          and scores.shape == (1, 1, 256) and scores.dtype == dtypes.float32 and amd_custom_kernels_supported(scores.device):
+          sel = topk_bias_256_8(scores, bias)
+        else:
+          _, sel = pairwise_topk(scores if bias is None else scores + bias, self.config.num_experts_per_tok)
         probs = scores.gather(-1, sel)
         # SOFTMAX_WEIGHT applies softmax after top-k selection
         if gating == ExpertGating.SOFTMAX_WEIGHT: probs = probs.softmax(-1)

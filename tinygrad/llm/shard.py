@@ -87,7 +87,6 @@ class ShardedBlock(FFNBlock):
   def __init__(self, block, devices):
     assert not any(hasattr(block, k) for k in ('cache_kv', 'cache_k', 'conv_state')), 'shard before initializing caches'
     assert type(block) in (TransformerBlock, GatedDeltaNetBlock, MLATransformerBlock), 'unsupported block for tensor parallel'
-    assert not block.config.ssm or not block.config.ssm.kda, 'tensor parallel KDA is not supported'
     self.devices, self.blocks = devices, []
     n = len(devices)
     for rank, device in enumerate(devices):
@@ -122,6 +121,8 @@ class ShardedBlock(FFNBlock):
         rows['attn_qkv'] = [qr, (qr[0]+block.q_dim,qr[1]+block.q_dim)] + [(s+2*block.q_dim,e+2*block.q_dim) for s,e in vr]
         for name in ('ssm_alpha', 'ssm_beta'): rows[name] = heads
         rows['attn_gate'], cols['ssm_out'] = vr, vr
+        if hasattr(block, 'ssm_g_a'):
+          rows['ssm_g_b'], rows['ssm_f_b'] = vr, vr
         local.num_k_heads, local.num_v_heads = ke-ks, block.num_v_heads//n
         local.q_dim = (ke-ks)*block.head_k_dim
         local.conv_channels = block.conv_channels//n
@@ -139,7 +140,8 @@ class ShardedBlock(FFNBlock):
           local.ffn_gateup_exps = fused
       if isinstance(block, GatedDeltaNetBlock):
         local.ssm_conv1d = {'weight':Tensor.cat(*(block.ssm_conv1d['weight'][s:e] for s,e in rows['attn_qkv'])).to(device).contiguous().realize()}
-        local.ssm_dt = {'bias':Tensor.cat(*(block.ssm_dt['bias'][s:e] for s,e in heads)).to(device).contiguous().realize()}
+        dt_rows = vr if hasattr(block, 'ssm_g_a') else heads
+        local.ssm_dt = {'bias':Tensor.cat(*(block.ssm_dt['bias'][s:e] for s,e in dt_rows)).to(device).contiguous().realize()}
         local.ssm_a = Tensor.cat(*(block.ssm_a[s:e] for s,e in heads)).to(device).contiguous().realize()
       self.blocks.append(local)
 

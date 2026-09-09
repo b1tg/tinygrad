@@ -32,6 +32,21 @@ class TestLLMShard(unittest.TestCase):
         actual = (jit(x, sp) if count == 1 else run(x, sp)).numpy()
         np.testing.assert_allclose(actual, expected, atol=3e-4, rtol=3e-4)
 
+  def test_kda_blocks_and_reset(self):
+    c = TransformerConfig(num_blocks=1, dim=256, hidden_dim=512, n_heads=4, n_kv_heads=4, norm_eps=1e-6, vocab_size=512,
+      head_dim=64, rope_theta=10000, rope_dim=64, v_head_dim=64, max_context=32, num_experts=4, num_experts_per_tok=2,
+      norm_topk_prob=True, ssm=SSMConfig(4,64,4,4,256,kda=True), ssm_layers=(True,))
+    block = Transformer(c).blk[0]
+    for name,t in get_state_dict(block).items():
+      t.replace(Tensor.randn(*t.shape)*0.03 if 'norm' not in name else Tensor.ones(*t.shape)).realize()
+    parallel = ShardedBlock(block, self.devices)
+    jit = TinyJit(lambda x,pos: parallel(x,pos).to(self.devices[0]).realize())
+    for pos,count in ((0,3),(3,1),(4,1),(5,1),(0,1)):
+      x,sp = Tensor.randn(1,count,c.dim).realize(), UOp.variable('start_pos',0,31).bind(pos)
+      expected = block(x,sp).numpy()
+      actual = (jit(x,sp) if count == 1 else parallel(x,sp).to(self.devices[0])).numpy()
+      np.testing.assert_allclose(actual,expected,atol=3e-4,rtol=3e-4)
+
   def test_mla_blocks(self):
     c = TransformerConfig(num_blocks=1, dim=256, hidden_dim=512, n_heads=4, n_kv_heads=1, norm_eps=1e-6, vocab_size=512,
       head_dim=64, rope_theta=10000, rope_dim=32, v_head_dim=32, max_context=32, num_experts=4, num_experts_per_tok=2,

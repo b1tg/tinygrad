@@ -6,6 +6,22 @@ from tinygrad.llm.kernels.amd import Linear, ExpertWeights, amd_custom_kernels_s
 from tinygrad.llm.gguf import ggml_data_to_tensor
 
 class TestTopKSoftmax(unittest.TestCase):
+  def test_bias_indices_and_jit(self):
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
+    from tinygrad import TinyJit
+    from tinygrad.llm.kernels.amd import topk_bias_256_8
+    rng = np.random.default_rng(42)
+    jit = TinyJit(lambda x,b: topk_bias_256_8(x,b).realize())
+    for trial in range(12):
+      scores = rng.random((1,1,256), dtype=np.float32)
+      bias = (rng.normal(size=256)*0.1).astype(np.float16)
+      if trial in (4,5):
+        scores[:] = 0.5
+        bias[:] = 0 if trial == 4 else rng.integers(-2,3,256)*0.1
+      expected = np.argsort(-(scores+bias), axis=-1, kind='stable')[..., :8][..., ::-1]
+      actual = jit(Tensor(scores).realize(),Tensor(bias).realize()).numpy()
+      np.testing.assert_array_equal(actual,expected)
+
   def test_values_ties_and_jit(self):
     if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
     from tinygrad import TinyJit
@@ -345,6 +361,8 @@ class TestQ8Quantize(unittest.TestCase):
     self.assertEqual(generic.ggml_type, 14)
 
   def test_q4_k_expert(self): self._test_quant_expert(12, 144)
+  def test_iq4_expert_2304(self): self._test_quant_expert(23, 136, in_features=2304, out_features=32)
+
   def test_q4_k_expert_wide(self): self._test_quant_expert(12, 144, in_features=512, out_features=32)
   def test_q5_k_expert(self): self._test_quant_expert(13, 176)
   def test_iq4_expert(self): self._test_quant_expert(23, 136)

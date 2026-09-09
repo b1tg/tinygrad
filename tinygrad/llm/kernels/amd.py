@@ -314,8 +314,7 @@ def _quant_mul_mat_id_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, sel:UOp, 
   # one workgroup per (token, expert slot, output row): folding the slot into the grid keeps the
   # waves busy (8 slots x outputs) instead of looping the experts serially inside one workgroup.
   # rows narrower than the wave are packed several-per-wave so no lanes idle.
-  rows_packed = 32 // group_count if chunks == 1 and group_count < 32 else 1
-  assert group_count % 32 == 0 or 32 % group_count == 0
+  rows_packed = 32 // group_count if chunks == 1 and group_count < 32 and 32 % group_count == 0 else 1
   if rows_packed > 1: rows_per_wg = 1
   assert (out_features // rows_packed) % rows_per_wg == 0
   grid_rows = out_features // rows_packed // rows_per_wg
@@ -933,12 +932,12 @@ def gated_delta_prefill(q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:Tensor,
 # ******** single-token MoE routing ********
 
 @functools.cache
-def _topk_softmax_256_8_kernel(probs:UOp, sel:UOp, x:UOp) -> UOp:
+def _topk_softmax_256_8_kernel(probs:UOp, sel:UOp, x:UOp, bias:UOp|None=None) -> UOp:
   probs, sel, x = probs.reshape(8), sel.reshape(8), x.reshape(256)
   # Keep eight candidates per lane, selecting each winner entirely within one wave.
   lane = UOp.range(32, 0, AxisType.LOCAL)
   ids = [lane+j*32 for j in range(8)]
-  values = [x[i].load() for i in ids]
+  values = [x[i].load() if bias is None else x[i].load() + bias.reshape(256)[i].float() for i in ids]
   winners, scores = [], []
   for _ in range(8):
     maximum = warp_reduce(functools.reduce(UOp.maximum, values), maximum=True, full_wave=True)
@@ -948,7 +947,7 @@ def _topk_softmax_256_8_kernel(probs:UOp, sel:UOp, x:UOp) -> UOp:
     winners.append(winner.cast(dtypes.int32))
     scores.append(maximum)
     values = [i.eq(winner.cast(dtypes.int32)).where(float('-inf'), v) for i,v in zip(ids, values)]
-  exps = [((v-scores[0])*LOG2E).exp2() for v in scores]
+  exps = [((v-scores[0])*LOG2E).exp2() for v in scores] if bias is None else [x[i].load() for i in winners]
   denominator = sum(exps)
   stores = []
   for j in range(8):
@@ -964,3 +963,10 @@ def topk_softmax_256_8(x:Tensor) -> tuple[Tensor, Tensor]:
   sel = Tensor.empty(1, 1, 8, device=x.device, dtype=dtypes.int32)
   probs, sel = Tensor.custom_kernel(probs, sel, x, fxn=_topk_softmax_256_8_kernel)[:2]
   return probs, sel
+
+
+def topk_bias_256_8(x:Tensor, bias:Tensor) -> Tensor:
+  assert x.shape == (1, 1, 256) and x.dtype == dtypes.float32 and bias.shape == (256,)
+  probs = Tensor.empty(1, 1, 8, device=x.device, dtype=dtypes.float32)
+  sel = Tensor.empty(1, 1, 8, device=x.device, dtype=dtypes.int32)
+  return Tensor.custom_kernel(probs, sel, x.contiguous(), bias, fxn=_topk_softmax_256_8_kernel)[1]
