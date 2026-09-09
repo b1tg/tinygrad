@@ -32,6 +32,24 @@ class TestLLMShard(unittest.TestCase):
         actual = (jit(x, sp) if count == 1 else run(x, sp)).numpy()
         np.testing.assert_allclose(actual, expected, atol=3e-4, rtol=3e-4)
 
+  def test_mla_blocks(self):
+    c = TransformerConfig(num_blocks=1, dim=256, hidden_dim=512, n_heads=4, n_kv_heads=1, norm_eps=1e-6, vocab_size=512,
+      head_dim=64, rope_theta=10000, rope_dim=32, v_head_dim=32, max_context=32, num_experts=4, num_experts_per_tok=2,
+      norm_topk_prob=True, shared_expert_dim=256, kv_lora_rank=64, q_lora_rank=0)
+    model = Transformer(c)
+    for name,t in get_state_dict(model).items():
+      t.replace(Tensor.randn(*t.shape)*0.03 if 'norm' not in name else Tensor.ones(*t.shape)).realize()
+    block = model.blk[0]
+    sharded = ShardedBlock(block, self.devices)
+    def run(x, pos): return sharded(x, pos).to(self.devices[0]).realize()
+    jit = TinyJit(run)
+    for pos, count in ((0,3), (3,1), (4,1), (0,1)):
+      x = Tensor.randn(1,count,c.dim).realize()
+      sp = UOp.variable('start_pos', 0, 31).bind(pos)
+      expected = block(x, sp).numpy()
+      actual = (jit(x, sp) if count == 1 else run(x, sp)).numpy()
+      np.testing.assert_allclose(actual, expected, atol=3e-4, rtol=3e-4)
+
   def test_packed_q8_rows_and_columns(self):
     if not amd_custom_kernels_supported(Device.DEFAULT): self.skipTest('RDNA3 required')
     rng = np.random.default_rng(42)

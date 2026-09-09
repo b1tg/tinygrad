@@ -27,9 +27,10 @@ def apply_rope(x:Tensor, freqs_cis:Tensor) -> Tensor:
 
 def pairwise_topk(x: Tensor, k: int) -> tuple[Tensor, Tensor]:
   n = x.shape[-1]
-  vals = Tensor.arange(n).reshape(1,1,n).cast(x.dtype).expand(x.shape)
+  idx = Tensor.arange(n).to(x.device)  # explicit device: x may be on a non-default shard
+  vals = idx.reshape(1,1,n).cast(x.dtype).expand(x.shape)
   cmp = (x.unsqueeze(-1) > x.unsqueeze(-2)) | ((x.unsqueeze(-1) == x.unsqueeze(-2)) & \
-    (Tensor.arange(n).reshape(1,1,n,1) < Tensor.arange(n).reshape(1,1,1,n)))
+    (idx.reshape(1,1,n,1) < idx.reshape(1,1,1,n)))
   sel = x.const_like(0).scatter(-1, cmp.sum(axis=-1).cast('int32'), vals)[:,:,n-k:].cast('int32')
   return x.gather(-1, sel), sel
 
@@ -255,8 +256,13 @@ class MLATransformerBlock(FFNBlock):
     k = Tensor(self.cache_k.uop.after(self.cache_k[:, :, start_pos:start_pos+T, :].uop.store(k_store.uop)))[:, :, 0:start_pos+T, :]
     v = k[..., :self.config.kv_lora_rank]
 
-    mask = Tensor.full((1, 1, T, start_pos+T), float("-inf"), dtype=x.dtype, buffer=False).triu(start_pos+1) \
-      if resolve(T != 1) else None
+    # build the causal mask on x's device: triu() would materialize its bool mask on the default device,
+    # which breaks multi-device (sharded) execution
+    if resolve(T != 1):
+      qpos = Tensor.arange(x.max_shape[1]).to(x.device)[:T].unsqueeze(-1) + Tensor(start_pos).to(x.device)
+      mask = (qpos < Tensor.arange(self.config.max_context).to(x.device)[:start_pos+T]).where(float("-inf"), 0).cast(x.dtype)
+    else:
+      mask = None
     attn = q @ k.transpose(-1, -2) * (1.0 / self.config.head_dim ** 0.5)
     if mask is not None: attn = attn + mask
     attn = attn.softmax(-1)

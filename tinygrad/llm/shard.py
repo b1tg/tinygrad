@@ -4,7 +4,7 @@ from dataclasses import replace
 from tinygrad import Tensor, UOp, function, Device
 from tinygrad.llm.gguf import ggml_data_to_tensor
 from tinygrad.llm.kernels.amd import Linear, ExpertWeights, packed_q8_0_weight, packed_ggml_weight, amd_custom_kernels_supported
-from tinygrad.llm.model import Transformer, FFNBlock, TransformerBlock, GatedDeltaNetBlock
+from tinygrad.llm.model import Transformer, FFNBlock, TransformerBlock, GatedDeltaNetBlock, MLATransformerBlock
 
 
 def _replicate(obj, device):
@@ -30,12 +30,15 @@ def _linear(layer, device, rows=None, cols=None):
   supported = amd_custom_kernels_supported(device)
   q8 = packed_q8_0_weight(layer.weight, ne*ni*no) if supported and isinstance(layer, Linear) else None
   packed = packed_ggml_weight(layer.weight, ne*ni*no) if supported and ni % 256 == 0 else None
+  # a sharded in_features split must keep whole quantization blocks, else fall back to the unpacked fp16 path
+  if cols is not None:
+    if q8 is not None and any(c % 32 for r in cols for c in r): q8 = None
+    if packed is not None and any(c % 256 for r in cols for c in r): packed = None
   if q8 is not None or packed is not None:
     if q8 is not None: typ, raw, block = 8, q8, 32
     else:
       assert packed is not None
       typ, raw, block = *packed, 256
-    assert cols is None or all(c % block == 0 for r in cols for c in r), 'shards must contain whole quantization blocks'
     w = raw.reshape(ne, no, ni//block, -1)
     if rows is not None: w = Tensor.cat(*(w[:, s:e] for s,e in rows), dim=1)
     if cols is not None: w = Tensor.cat(*(w[:, :, s//block:e//block] for s,e in cols), dim=2)
@@ -50,6 +53,7 @@ def _linear(layer, device, rows=None, cols=None):
     w = layer.weight.reshape(ne, no, ni)
     if rows is not None: w = Tensor.cat(*(w[:, s:e] for s,e in rows), dim=1)
     if cols is not None: w = Tensor.cat(*(w[:, :, s:e] for s,e in cols), dim=2)
+    ret.ggml_type = None
     ret.weight = w.reshape(*((ne,) if isinstance(layer, ExpertWeights) else ()), ret.out_features, ret.in_features).to(device).contiguous().realize()
   if isinstance(layer, Linear) and layer.bias is not None:
     bias = layer.bias if rows is None else Tensor.cat(*(layer.bias[s:e] for s,e in rows))
@@ -81,8 +85,8 @@ def _fused_gate_up_exps(gate:ExpertWeights, up:ExpertWeights, device, rank, n) -
 
 class ShardedBlock(FFNBlock):
   def __init__(self, block, devices):
-    assert not any(hasattr(block, k) for k in ('cache_kv', 'conv_state')), 'shard before initializing caches'
-    assert type(block) in (TransformerBlock, GatedDeltaNetBlock), 'tensor parallel MLA is not supported'
+    assert not any(hasattr(block, k) for k in ('cache_kv', 'cache_k', 'conv_state')), 'shard before initializing caches'
+    assert type(block) in (TransformerBlock, GatedDeltaNetBlock, MLATransformerBlock), 'unsupported block for tensor parallel'
     assert not block.config.ssm or not block.config.ssm.kda, 'tensor parallel KDA is not supported'
     self.devices, self.blocks = devices, []
     n = len(devices)
@@ -101,6 +105,14 @@ class ShardedBlock(FFNBlock):
         local.config = replace(local.config, n_heads=block.config.n_heads//n, n_kv_heads=block.config.n_kv_heads//n)
         for name in ('attn_q', 'attn_k', 'attn_v'): rows[name] = [_part(getattr(block, name).out_features, rank, n)]
         cols['attn_output'] = _part(block.attn_output.in_features, rank, n)
+      elif isinstance(block, MLATransformerBlock):
+        # MLA: heads are independent, but the KV latent (n_kv_heads=1) is shared across all heads and must stay
+        # replicated. Shard Q and the per-head K_B/V_B by head, and attn_output by head on its input side.
+        _part(block.config.n_heads, rank, n)
+        local.config = replace(local.config, n_heads=block.config.n_heads//n)
+        rows['attn_q_b' if block.config.q_lora_rank > 0 else 'attn_q'] = [
+          _part((block.attn_q_b if block.config.q_lora_rank > 0 else block.attn_q).out_features, rank, n)]
+        cols['attn_output'] = _part(block.attn_output.in_features, rank, n)
       else:
         # Keep every repeated V-head group with its Q/K heads, avoiding duplicated Q/K projections.
         ks, ke = _part(block.num_k_heads, rank, n)
@@ -117,6 +129,11 @@ class ShardedBlock(FFNBlock):
         if name == 'config': continue
         if isinstance(value, (Linear, ExpertWeights)): setattr(local, name, _linear(value, device, rows.get(name), cols.get(name)))
         elif isinstance(value, (Tensor, dict)) or hasattr(value, 'weight'): setattr(local, name, _replicate(value, device))
+      if isinstance(block, MLATransformerBlock):
+        # per-head MLA weights (plain tensors, not Linear): shard the leading head axis
+        hs, he = _part(block.config.n_heads, rank, n)
+        local.attn_k_b = {"weight": block.attn_k_b["weight"][hs:he].to(device).contiguous().realize()}
+        local.attn_v_b = {"weight": block.attn_v_b["weight"][hs:he].to(device).contiguous().realize()}
       if hasattr(block, 'ffn_gate_exps'):
         if (fused := _fused_gate_up_exps(block.ffn_gate_exps, block.ffn_up_exps, device, rank, n)) is not None:
           local.ffn_gateup_exps = fused
