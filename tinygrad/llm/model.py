@@ -101,7 +101,7 @@ class FFNBlock:
       self.ffn_down    = Linear(config.hidden_dim, config.dim, bias=False)
 
   def _feed_forward(self, x:Tensor) -> Tensor:
-    if hasattr(self, 'ffn_gate_exps'):
+    if hasattr(self, 'ffn_gate_exps') or hasattr(self, 'ffn_gateup_exps'):
       h = x.unsqueeze(2)  # (B, T, 1, D) - add expert dim for broadcasting
       logits = self.ffn_gate_inp(x)
       bias = self.exp_probs_b["bias"] if hasattr(self, 'exp_probs_b') else None

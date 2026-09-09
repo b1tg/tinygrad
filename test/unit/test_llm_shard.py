@@ -97,6 +97,37 @@ class TestLLMShard(unittest.TestCase):
       sp = UOp.variable('start_pos', 0, 63).bind(pos)
       np.testing.assert_array_equal(parallel(x,sp,temp).numpy(), model(x,sp,temp).numpy())
 
+  def test_fused_experts_do_not_allocate_separate_weights(self):
+    if not amd_custom_kernels_supported(Device.DEFAULT): self.skipTest('RDNA3 required')
+    from unittest.mock import patch
+    c = TransformerConfig(num_blocks=1, dim=256, hidden_dim=512, n_heads=4, n_kv_heads=2, norm_eps=1e-6, vocab_size=512,
+      head_dim=64, rope_theta=10000, rope_dim=64, v_head_dim=64, max_context=32, num_experts=4, num_experts_per_tok=2,
+      norm_topk_prob=True)
+    block = Transformer(c).blk[0]
+    rng = np.random.default_rng(42)
+    for name,t in get_state_dict(block).items():
+      t.replace(Tensor.randn(*t.shape)*0.03 if 'norm' not in name else Tensor.ones(*t.shape)).realize()
+    for layer in (block.ffn_gate_exps, block.ffn_up_exps):
+      packed = rng.integers(0,256,(4*512*256//256,136),dtype=np.uint8)
+      packed[:,:2] = np.array([0.001],dtype=np.float16).view(np.uint8)
+      raw = Tensor(np.pad(packed.flatten(),(4,0))).realize()[4:]
+      layer.weight = ggml_data_to_tensor(raw,4*512*256,23).reshape(4,512,256).half()
+    with patch('tinygrad.llm.shard._linear', wraps=_linear) as linear:
+      parallel = ShardedBlock(block,self.devices)
+    for call in linear.call_args_list:
+      self.assertIsNot(call.args[0],block.ffn_gate_exps)
+      self.assertIsNot(call.args[0],block.ffn_up_exps)
+    for local in parallel.blocks:
+      self.assertTrue(hasattr(local,'ffn_gateup_exps'))
+      self.assertFalse(hasattr(local,'ffn_gate_exps'))
+      self.assertFalse(hasattr(local,'ffn_up_exps'))
+    jit = TinyJit(lambda x,pos: parallel(x,pos).to(self.devices[0]).realize())
+    for pos,count in ((0,3),(3,1),(4,1),(5,1)):
+      x,sp = Tensor.randn(1,count,c.dim).realize(), UOp.variable('start_pos',0,31).bind(pos)
+      expected = block(x,sp).numpy()
+      actual = (jit(x,sp) if count == 1 else parallel(x,sp).to(self.devices[0])).numpy()
+      np.testing.assert_allclose(actual,expected,atol=3e-4,rtol=3e-4)
+
   def test_packed_expert_rows_and_columns(self):
     if not amd_custom_kernels_supported(Device.DEFAULT): self.skipTest('RDNA3 required')
     rng = np.random.default_rng(42)

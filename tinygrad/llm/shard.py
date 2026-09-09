@@ -126,7 +126,12 @@ class ShardedBlock(FFNBlock):
         local.num_k_heads, local.num_v_heads = ke-ks, block.num_v_heads//n
         local.q_dim = (ke-ks)*block.head_k_dim
         local.conv_channels = block.conv_channels//n
+      fused = _fused_gate_up_exps(block.ffn_gate_exps, block.ffn_up_exps, device, rank, n) if hasattr(block, 'ffn_gate_exps') else None
+      if fused is not None:
+        local.ffn_gateup_exps = fused
+        del local.ffn_gate_exps, local.ffn_up_exps
       for name, value in vars(block).items():
+        if fused is not None and name in ('ffn_gate_exps', 'ffn_up_exps'): continue
         if name == 'config': continue
         if isinstance(value, (Linear, ExpertWeights)): setattr(local, name, _linear(value, device, rows.get(name), cols.get(name)))
         elif isinstance(value, (Tensor, dict)) or hasattr(value, 'weight'): setattr(local, name, _replicate(value, device))
@@ -135,9 +140,6 @@ class ShardedBlock(FFNBlock):
         hs, he = _part(block.config.n_heads, rank, n)
         local.attn_k_b = {"weight": block.attn_k_b["weight"][hs:he].to(device).contiguous().realize()}
         local.attn_v_b = {"weight": block.attn_v_b["weight"][hs:he].to(device).contiguous().realize()}
-      if hasattr(block, 'ffn_gate_exps'):
-        if (fused := _fused_gate_up_exps(block.ffn_gate_exps, block.ffn_up_exps, device, rank, n)) is not None:
-          local.ffn_gateup_exps = fused
       if isinstance(block, GatedDeltaNetBlock):
         local.ssm_conv1d = {'weight':Tensor.cat(*(block.ssm_conv1d['weight'][s:e] for s,e in rows['attn_qkv'])).to(device).contiguous().realize()}
         dt_rows = vr if hasattr(block, 'ssm_g_a') else heads
