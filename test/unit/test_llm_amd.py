@@ -3,6 +3,7 @@ from unittest.mock import patch
 import numpy as np
 from tinygrad import Tensor, UOp, dtypes, nn, function
 from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported, q8_quantize, flash_attention, gated_delta_prefill
+from tinygrad.llm.kernels.amd import hc_prepare, dsa_decode
 from tinygrad.llm.gguf import ggml_data_to_tensor
 from tinygrad.llm.model import ExpertWeights
 
@@ -430,7 +431,7 @@ class TestQ8Quantize(unittest.TestCase):
     selected_np = np.array([[[0, 2], [1, 0]]], dtype=np.int32)
     selected = Tensor(selected_np)
 
-    for ggml_type, block_bytes in ((17, 74), (18, 98), (23, 136)):
+    for ggml_type, block_bytes in ((17, 74), (18, 98), (21, 110), (23, 136)):
       blocks = experts * out_features * in_features // 256
       packed = rng.integers(0, 256, blocks * block_bytes, dtype=np.uint8)
       for i in range(blocks): packed[i*block_bytes:i*block_bytes+2] = np.array([0.01], dtype=np.float16).view(np.uint8)
@@ -450,7 +451,7 @@ class TestQ8Quantize(unittest.TestCase):
           expected = np.matmul(xq[..., None, :], reference[selected_np].swapaxes(-1, -2)).squeeze(-2)
           np.testing.assert_allclose(weight(selected, Tensor(x)).numpy(), expected, rtol=3e-3, atol=3e-2)
           self.assertEqual(weight.ggml_type, ggml_type)
-          self.assertEqual(weight.weight.dtype, dtypes.uint8)
+          self.assertEqual(weight.weight.dtype, dtypes.uint32 if ggml_type == 23 else dtypes.uint8)
 
   def test_fused_routed_iq_experts_symbolic_tokens(self):
     if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
@@ -474,5 +475,67 @@ class TestQ8Quantize(unittest.TestCase):
     out = weight(Tensor(selected_np)[:, :tokens], Tensor(x)[:, :tokens])
     np.testing.assert_allclose(out[:, :1].numpy(), expected, rtol=3e-3, atol=3e-2)
     self.assertEqual(out.shape, (1, tokens, 2, out_features))
+
+  def test_hc_prepare(self):
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("custom kernels required")
+    rng = np.random.default_rng(42)
+    hc, iters, eps = 4, 20, 1e-6
+    width = (2 + hc) * hc
+    base = Tensor(rng.normal(size=(width,)).astype(np.float32))
+    scale = Tensor(rng.normal(size=(3,)).astype(np.float32))
+    for B, T in ((1, 1), (1, 8), (2, 3)):
+      with self.subTest(B=B, T=T):
+        mixes = Tensor(rng.normal(size=(B, T, width)).astype(np.float32))
+        pre, post, comb = hc_prepare(mixes, base, scale, hc, eps, iters)
+        pre_ref = (mixes[..., :hc] * scale[0] + base[:hc]).sigmoid() + eps
+        post_ref = (mixes[..., hc:2*hc] * scale[1] + base[hc:2*hc]).sigmoid() * 2
+        comb_ref = (mixes[..., 2*hc:] * scale[2] + base[2*hc:]).reshape(B, T, hc, hc).softmax(-1) + eps
+        comb_ref = comb_ref / (comb_ref.sum(-2, keepdim=True) + eps)
+        for _ in range(1, iters):
+          comb_ref = comb_ref / (comb_ref.sum(-1, keepdim=True) + eps)
+          comb_ref = comb_ref / (comb_ref.sum(-2, keepdim=True) + eps)
+        np.testing.assert_allclose(pre.numpy(), pre_ref.numpy(), rtol=1e-5, atol=1e-6)
+        np.testing.assert_allclose(post.numpy(), post_ref.numpy(), rtol=1e-5, atol=1e-6)
+        np.testing.assert_allclose(comb.numpy(), comb_ref.numpy(), rtol=1e-4, atol=1e-5)
+
+  def test_dsa_decode(self):
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("custom kernels required")
+    rng = np.random.default_rng(42)
+    B, H, D, LORA, N, K = 1, 8, 576, 512, 512, 2051
+    q = Tensor(rng.normal(size=(B, H, D)).astype(np.float16))
+    cached = Tensor(rng.normal(size=(B, N, D)).astype(np.float16))
+    idx = rng.integers(0, N, (B, K)).astype(np.int32)
+    idx[:, ::7] = -1  # sparse selections carry invalid entries
+    scale = 0.25
+    got = dsa_decode(q, cached, Tensor(idx), scale, LORA)
+    # float64 reference
+    q64, c64 = q.numpy().astype(np.float64), cached.numpy().astype(np.float64)
+    sel = np.where(idx < 0, 0, idx)
+    rows = c64[0][sel[0]]
+    sc = np.einsum('hd,kd->hk', q64[0], rows) * scale
+    sc[:, idx[0] < 0] = -np.inf
+    p = np.exp(sc - sc.max(-1, keepdims=True))
+    p /= p.sum(-1, keepdims=True)
+    want = p @ rows[:, :LORA]
+    np.testing.assert_allclose(got.numpy(), want[None], rtol=1e-3, atol=1e-3)
+
+  def test_dsa_decode_sparse_tail_unwritten_cache(self):
+    # early decode steps select almost only invalid entries, and the cache past the cursor is uninitialized
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("custom kernels required")
+    rng = np.random.default_rng(42)
+    B, H, D, LORA, N, K = 1, 8, 576, 512, 512, 2051
+    q = Tensor(rng.normal(size=(B, H, D)).astype(np.float16))
+    cache_buf = Tensor.empty(B, N, D, dtype=dtypes.half)
+    new = Tensor(rng.normal(size=(B, 2, D)).astype(np.float16))
+    cached = Tensor(cache_buf.uop.after(cache_buf[:, 0:2].uop.store(new.uop)))
+    idx = np.full((B, K), -1, dtype=np.int32)
+    idx[0, -3:] = [0, 1, -1]
+    got = dsa_decode(q, cached, Tensor(idx), 0.25, LORA).numpy()
+    rows = cached.numpy()[0][[0, 1]]
+    sc = (q.numpy()[0].astype(np.float64) @ rows.astype(np.float64).T) * 0.25
+    p = np.exp(sc - sc.max(-1, keepdims=True))
+    p /= p.sum(-1, keepdims=True)
+    want = p @ rows[:, :LORA].astype(np.float64)
+    np.testing.assert_allclose(got, want[None], rtol=1e-3, atol=1e-3)
 
 if __name__ == "__main__": unittest.main()

@@ -13,6 +13,17 @@ def _ggml_iq_grid(device: str, grid: tuple[int, ...], grid_shape: tuple[int, int
   values = [float((w >> (8*i)) & 0xFF) for w in grid for i in range(grid_shape[1])]
   return Tensor(values, dtype=dtypes.float32, device=device).reshape(grid_shape)
 
+# the sign tables must be cached per device: a fresh buffer per call would never graph-match the weight's dequant
+# expression in the custom-kernel Linear/ExpertWeights detection (buffer identity is part of the graph key)
+@functools.lru_cache(None)
+def _ggml_ksigns_iq2xs(device: str) -> Tensor:
+  from tinygrad.runtime.autogen import ggml_common as _ggml
+  return Tensor(list(_ggml.ksigns_iq2xs), dtype=dtypes.uint8, device=device)
+
+@functools.lru_cache(None)
+def _ggml_even_signs(device: str) -> Tensor:
+  return Tensor([i | (0x80 if i.bit_count() % 2 else 0) for i in range(128)], dtype=dtypes.uint8, device=device)
+
 # native types {ggml_type: dtype}
 _GGML_NATIVE = {0: dtypes.float32, 1: dtypes.float16, 24: dtypes.int8, 25: dtypes.int16,
                 26: dtypes.int32, 27: dtypes.int64, 28: dtypes.float64, 30: dtypes.bfloat16}
@@ -106,7 +117,7 @@ def ggml_data_to_tensor(t: Tensor, n: int|UOp, ggml_type: int) -> Tensor:
       scales = Tensor.stack((s:=blocks[:, 66:74]).bitwise_and(0xF), s.rshift(4), dim=2).cast(dtypes.float32)
       scales = (d * (scales + 0.5).unsqueeze(-1) * 0.25).expand((-1, 8, 2, 2)).reshape((-1, 8, 4, 1))
       grid = _ggml_iq_grid(t.device, _ggml.iq2xs_grid, (512, 8))[qs.bitwise_and(511).cast(dtypes.int32)]
-      sign_masks = Tensor(list(_ggml.ksigns_iq2xs), dtype=dtypes.uint8, device=t.device)[qs.rshift(9).cast(dtypes.int32)]
+      sign_masks = _ggml_ksigns_iq2xs(t.device)[qs.rshift(9).cast(dtypes.int32)]
       signs = (q_to_uint8(sign_masks.unsqueeze(-1), 1) == 0).where(1.0, -1.0)
       return (scales * grid * signs).flatten(-3)
     if ggml_type == 18:
@@ -114,7 +125,7 @@ def ggml_data_to_tensor(t: Tensor, n: int|UOp, ggml_type: int) -> Tensor:
       scale_words = blocks[:, 66:98].bitcast(dtypes.uint32)
       db = d * (scale_words.rshift(28).cast(dtypes.float32) + 0.5).reshape((-1, 8, 1, 1)) * 0.5
       sign_idx = scale_words.unsqueeze(-1).rshift(Tensor.const((0, 7, 14, 21), dtypes.uint32)).bitwise_and(0x7F).reshape((-1, 32)).cast(dtypes.int32)
-      even_signs = Tensor([i | (0x80 if i.bit_count() % 2 else 0) for i in range(128)], dtype=dtypes.uint8, device=t.device)
+      even_signs = _ggml_even_signs(t.device)
       signs = (q_to_uint8(even_signs[sign_idx].reshape((-1, 32, 1)), 1) == 0).where(1.0, -1.0).reshape((-1, 8, 4, 8))
       grid = _ggml_iq_grid(t.device, _ggml.iq3xxs_grid, (256, 4))[blocks[:, 2:66]].reshape((-1, 8, 4, 8))
       return (db * grid * signs).flatten(-3)

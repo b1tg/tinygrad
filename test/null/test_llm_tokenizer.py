@@ -95,6 +95,16 @@ class TestLLMTokenizer(unittest.TestCase):
     self.assertEqual(template.end_turn(), "[/INST]")
     self.assertEqual(template.role("assistant"), "")
 
+  def test_glm_end_of_message(self):
+    kv = {"tokenizer.ggml.tokens": ["hello", "<|endoftext|>", "<|user|>", "<|observation|>", "</tool_call>"],
+          "tokenizer.ggml.token_type": [1, 3, 3, 3, 3], "tokenizer.ggml.pre": "glm4",
+          "tokenizer.ggml.eos_token_id": 1, "tokenizer.ggml.eot_token_id": 2, "tokenizer.ggml.eom_token_id": 3}
+    tok = SimpleTokenizer.from_gguf_kv(kv)
+    self.assertEqual([tok.is_end(i) for i in range(5)], [False, True, True, True, False])
+    del kv["tokenizer.ggml.eom_token_id"]
+    tok = SimpleTokenizer.from_gguf_kv(kv)
+    self.assertEqual([tok.is_end(i) for i in range(5)], [False, True, True, False, False])
+
   def test_tekken_gpt4o_split(self):
     split = {p: SimpleTokenizer({}, {}, p)._split_to_word.findall for p in ("tekken", "gpt-4o")}
     shared = {

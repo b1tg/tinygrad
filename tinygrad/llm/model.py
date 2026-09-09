@@ -1,8 +1,11 @@
 from __future__ import annotations
 import enum, functools, itertools, pathlib
 from dataclasses import dataclass, replace
+from typing import cast
 from tinygrad import Device, Tensor, nn, UOp, TinyJit, getenv, function, dtypes
-from tinygrad.llm.kernels.amd import Linear, expert_quant_linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
+from tinygrad.device import Buffer
+from tinygrad.llm.kernels.amd import Linear, expert_quant_linear, gated_delta_prefill, flash_attention, hc_prepare, dsa_decode
+from tinygrad.llm.kernels.amd import amd_custom_kernels_supported
 from tinygrad.llm.gguf import ggml_data_to_tensor, gguf_load
 from tinygrad.uop.ops import KernelInfo, Ops, resolve
 
@@ -25,7 +28,7 @@ def _device_arange(end:int, device:str) -> Tensor:
 
 class ExpertWeights:
   """Like Linear but with num_experts dimension. Weight shape: (num_experts, out_features, in_features)."""
-  _PACKED_BLOCK_BYTES = {17: 74, 18: 98, 23: 136}  # IQ2_XS, IQ3_XS, IQ4_XS
+  _PACKED_BLOCK_BYTES = {17: 74, 18: 98, 21: 110, 23: 136}  # IQ2_XS, IQ3_XXS, IQ3_S, IQ4_XS
   use_custom_quant = True
   def __init__(self, num_experts:int, in_features:int, out_features:int):
     self.num_experts, self.in_features, self.out_features = num_experts, in_features, out_features
@@ -39,9 +42,22 @@ class ExpertWeights:
     raw = next((u for u in self.weight.uop.toposort() if u.device == self.weight.device
                 and u.op in (Ops.BUFFER, Ops.SHRINK) and u.dtype == dtypes.uint8 and u.max_numel() in packed_sizes), None)
     if raw is None: return
-    self.ggml_type = packed_sizes[raw.max_numel()]
-    block_bytes = self._PACKED_BLOCK_BYTES[self.ggml_type]
-    self.weight = Tensor(raw).reshape(self.num_experts, self.out_features, self.in_features//256, block_bytes)
+    ggml_type = packed_sizes[raw.max_numel()]
+    # Q3_K and IQ3_S share the 110-byte block size: require the exact dequantization expression, like Linear does.
+    def unwrapped(u:UOp) -> UOp:
+      while u.op in (Ops.RESHAPE, Ops.CONTIGUOUS) or (u.op is Ops.CAST and dtypes.is_float(u.dtype) and dtypes.is_float(u.src[0].dtype)):
+        u = u.src[0]
+      return u
+    expected = ggml_data_to_tensor(Tensor(raw), self.weight.numel(), ggml_type)
+    if unwrapped(self.weight.uop).key != unwrapped(expected.uop).key: return
+    self.ggml_type = ggml_type
+    # store a typed buffer view of the packed bytes, like Linear.set_quantized: a lazy view of the packed GGUF
+    # source would be materialized (copying the whole expert bank) on every custom-kernel call
+    raw_offset = raw.contiguous_view_offset()
+    assert raw_offset is not None and raw_offset % 4 == 0 and raw.buf_uop.dtype == dtypes.uint8
+    packed_dtype = dtypes.uint32 if ggml_type == 23 else dtypes.uint8  # IQ4_XS kernels read word-aligned u32
+    self.weight = Tensor(UOp.from_buffer(cast(Buffer, raw.buf_uop.buffer)
+      .view(raw.max_numel() // packed_dtype.itemsize, packed_dtype, raw_offset)))
 
   def __call__(self, sel:Tensor, x:Tensor) -> Tensor:
     # sel: (B, T, k), x: (B, T, 1, in) or (B, T, k, in) -> output: (B, T, k, out)
@@ -49,8 +65,12 @@ class ExpertWeights:
     if self.ggml_type is not None and self.use_custom_quant and amd_custom_kernels_supported(self.weight.device):
       return expert_quant_linear(self.weight, self.ggml_type, sel, x, self.out_features, self.in_features)
     if self.ggml_type is not None:
+      block_bytes = self._PACKED_BLOCK_BYTES[self.ggml_type]
+      packed = self.weight.reshape(self.num_experts, self.out_features, self.in_features//256,
+                                   block_bytes // (4 if self.ggml_type == 23 else 1))
+      if self.ggml_type == 23: packed = packed.bitcast(dtypes.uint8)  # ggml_data_to_tensor wants the byte view
       n = sel.numel() * self.out_features * self.in_features
-      weight = ggml_data_to_tensor(self.weight[sel].flatten(), n, self.ggml_type)
+      weight = ggml_data_to_tensor(packed[sel].flatten(), n, self.ggml_type)
       weight = weight.reshape(*sel.shape, self.out_features, self.in_features).cast(x.dtype)
     else:
       weight = self.weight[sel]
@@ -200,6 +220,10 @@ class HyperConnection:
     flat = flat * (flat.square().mean(-1, keepdim=True) + self.norm_eps).rsqrt()
     mixes = flat @ self.fn["weight"].float().T
     scale, base = self.scale["weight"].float(), self.base["weight"].float()
+    if amd_custom_kernels_supported(mixes.device):
+      # the (hc, hc) sinkhorn iterations are dozens of tiny dependent kernels: one fused kernel instead
+      pre, post, comb = hc_prepare(mixes, base, scale, self.hc, self.eps, self.iters)
+      return (pre.unsqueeze(-1) * x).sum(2).cast(x.dtype), post, comb
     B, T, _ = mixes.shape
     pre = (mixes[..., :self.hc] * scale[0] + base[:self.hc]).sigmoid() + self.eps
     post = (mixes[..., self.hc:2*self.hc] * scale[1] + base[self.hc:2*self.hc]).sigmoid() * 2
@@ -332,8 +356,9 @@ class TransformerBlock(FFNBlock):
     # NOTE: we don't want to change self.cache_kv, the function API doesn't support this well
     store = self.cache_kv[:, :, :, start_pos:start_pos+T, :].uop.store(Tensor.stack(k, v).cast(self.cache_kv.dtype).uop)
     assigned_kv = Tensor(self.cache_kv.uop.after(store))
-    # on RDNA3, hybrid models use custom flash attention kernels on the KV cache
-    if amd_custom_kernels_supported(x.device) and self.config.ssm is not None:
+    # custom flash attention kernels on the KV cache; flash_attention falls back to sdpa when the
+    # shapes are unsupported, so this is not gated on the model being a hybrid (ssm) one
+    if amd_custom_kernels_supported(x.device):
       attn = flash_attention(q, assigned_kv, start_pos+T)
       attn = attn.transpose(1, 2).reshape(B, T, -1)                                    # back to (B,T,D)
       return self.attn_output(attn if not self.config.attn_output_gate else (attn * gate.sigmoid()))
@@ -478,12 +503,17 @@ class MLATransformerBlock(FFNBlock):
     if hasattr(self, "indexer"):
       assert q_resid is not None
       indices = self.indexer(x, q_resid, start_pos)
-      valid = indices >= 0
-      selected = gather_rows(cached[:, 0], indices.clip(0, self.config.max_context-1))
       q_selected = q.transpose(1, 2)
-      attn = (q_selected.unsqueeze(-2) * selected.unsqueeze(2)).sum(-1) * (1.0 / self.config.head_dim ** 0.5)
-      attn = valid.unsqueeze(2).where(attn, attn.const_like(float("-inf"))).softmax(-1)
-      latent = (attn.unsqueeze(-2) @ selected[..., :self.config.kv_lora_rank].unsqueeze(2)).squeeze(-2)
+      if resolve(T == 1) and amd_custom_kernels_supported(x.device):
+        # fused decode: scores + softmax + latent accumulation over the selected rows in one kernel per head
+        latent = dsa_decode(q_selected[:, 0], cached[:, 0], indices[:, 0], self.config.head_dim ** -0.5,
+                            self.config.kv_lora_rank).reshape(B, T, self.config.n_heads, self.config.kv_lora_rank)
+      else:
+        valid = indices >= 0
+        selected = gather_rows(cached[:, 0], indices.clip(0, self.config.max_context-1))
+        attn = (q_selected.unsqueeze(-2) * selected.unsqueeze(2)).sum(-1) * (1.0 / self.config.head_dim ** 0.5)
+        attn = valid.unsqueeze(2).where(attn, attn.const_like(float("-inf"))).softmax(-1)
+        latent = (attn.unsqueeze(-2) @ selected[..., :self.config.kv_lora_rank].unsqueeze(2)).squeeze(-2)
       value_weight = self.attn_v_b["weight"].transpose(-1, -2).reshape(1, 1, self.config.n_heads,
                                                                  self.config.kv_lora_rank, self.config.v_head_dim)
       out = (latent.unsqueeze(-2) @ value_weight).squeeze(-2).reshape(B, T, -1)
@@ -573,7 +603,7 @@ class GatedDeltaNetBlock(FFNBlock):
     # layout the per-step operands to broadcast against the (B, H, V, K) state
     q, k, v, beta = (z.transpose(1, 2).float() for z in (q, k, v, beta))
     q = q * self.head_k_dim**-0.5
-    alpha = log_alpha.transpose(1, 2).exp()  # per-channel decay for kda, per-head otherwise (B, H, T, V|1)
+    alpha = log_alpha.transpose(1, 2).exp()  # per-key decay for KDA, per-head otherwise (B, H, T, K|1)
 
     # recurrent: scan over the (padded) tokens, updating the recurrent state. collect the per-step outputs
     state = Tensor(self.recurrent_state.uop.after(conv_state_store))  # carry the conv write into this graph
@@ -582,7 +612,7 @@ class GatedDeltaNetBlock(FFNBlock):
       core = gated_delta_prefill(q, k, v, beta, alpha, state, Tensor(start_pos, device=x.device)).transpose(1, 2)
     else:
       q, k, v, beta = q.unsqueeze(-2), k.unsqueeze(-2), v.unsqueeze(-1), beta.unsqueeze(-1).unsqueeze(-1)
-      alpha = alpha.unsqueeze(-1)
+      alpha = alpha.unsqueeze(-2)  # state is (B, H, V, K): KDA gates decay key columns
       state = initial.where(0, state.float())
       outs = []
       for t in range(T_pad):

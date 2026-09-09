@@ -1,5 +1,5 @@
 from __future__ import annotations
-import json, pathlib, re, time, typing, uuid
+import json, pathlib, re, threading, time, typing, uuid
 from typing import TYPE_CHECKING
 from tinygrad.helpers import DEBUG, colored, stderr_log
 from tinygrad.viz.serve import TCPServerWithReuse, Handler as VizHandler
@@ -14,6 +14,13 @@ def parse_tool_call(s:str) -> tuple[str, typing.Any]|None:
       call = json.loads(s)
       return call["name"], call.get("arguments", call.get("parameters", {}))
     except (json.JSONDecodeError, KeyError): return None
+  # GLM format: name<arg_key>key</arg_key><arg_value>value</arg_value>...
+  if (gm := re.fullmatch(r"([\w.-]+)\s*((?:<arg_key>[^<]+</arg_key>\s*<arg_value>.*?</arg_value>\s*)*)", s, re.DOTALL)):
+    args = {}
+    for key, value in re.findall(r"<arg_key>([^<]+)</arg_key>\s*<arg_value>(.*?)</arg_value>", gm.group(2), re.DOTALL):
+      try: args[key] = json.loads(value)
+      except json.JSONDecodeError: args[key] = value
+    return gm.group(1), args
   # XML format: <function=name>\n<parameter=key>\nvalue\n</parameter>...</function>
   if (fm := re.match(r"<function=([^>]+)>\s*(.*?)\s*(?:</function>)?$", s, re.DOTALL)):
     args = {}
@@ -62,6 +69,38 @@ class StreamRouter:
 
 class Handler(VizHandler):
   server: LLMServer
+  def stream_json(self, source, heartbeat_interval:float=15.0):
+    # Prefill can take minutes. Keep the HTTP body alive without moving model execution off the request thread.
+    stopped, lock = threading.Event(), threading.Lock()
+    def write(data:bytes):
+      with lock:
+        self.wfile.write(data)
+        self.wfile.flush()
+    def heartbeat():
+      while not stopped.wait(heartbeat_interval):
+        try: write(b": keep-alive\n\n")
+        except (BrokenPipeError, ConnectionResetError):
+          stopped.set()
+          return
+    worker = threading.Thread(target=heartbeat, daemon=True)
+    try:
+      self.send_response(200)
+      self.send_header("Content-Type", "text/event-stream")
+      self.send_header("Cache-Control", "no-cache")
+      self.end_headers()
+      worker.start()
+      for chunk in source:
+        if stopped.is_set(): break
+        write(f"data: {json.dumps(chunk)}\n\n".encode())
+      stopped.set()
+      if worker.is_alive(): worker.join()
+      write(b"data: [DONE]\n\n")
+    except (BrokenPipeError, ConnectionResetError): pass
+    finally:
+      stopped.set()
+      if worker.is_alive(): worker.join()
+      source.close()
+
   def log_request(self, code='-', size='-'): pass
   def do_GET(self):
     if self.path == "/v1/models": self.send_data(json.dumps({"object":"list","data":[{"id":self.server.model_name,"object":"model"}]}).encode())
