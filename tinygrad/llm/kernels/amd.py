@@ -35,8 +35,10 @@ def amd_custom_kernels_supported(device:str|tuple[str, ...]|None) -> bool:
   with Context(ALLOW_DEVICE_USAGE=1):
     return (t:=getattr(Device[device], "target", None)) is not None and t[0] == 11 and isinstance(Device[device].renderer, HIPRenderer)
 
-def warp_reduce(val:UOp, maximum:bool=False, full_wave:bool=False) -> UOp:
-  for offset in ((16, 8, 4, 2, 1) if full_wave else (8, 4, 2, 1)):
+def warp_reduce(val:UOp, maximum:bool=False, full_wave:bool=False, reduce_lanes:int|None=None) -> UOp:
+  # reduce_lanes bounds the butterfly to subgroups of the wave (e.g. several output rows packed in one wave)
+  lanes = reduce_lanes or (32 if full_wave else 16)
+  for offset in (o for o in (16, 8, 4, 2, 1) if o < lanes):
     if val.op is Ops.INDEX and val.addrspace == AddrSpace.REG: val = val.load()
     other = UOp(Ops.CUSTOM, src=(val,), arg=
       (f"__builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, {{0}}), {0x1f | offset<<10}))", dtypes.float))
@@ -86,6 +88,7 @@ class Linear(nn.Linear):
   _q8_0_weight:Tensor|None = None
   _q8_0_tried:bool = False
   _fused_q8_0_weight:Tensor|None = None
+  _fused_f16_weight:Tensor|None = None
   def __init__(self, in_features:int, out_features:int, bias=True):
     super().__init__(in_features, out_features, bias)
     self.in_features, self.out_features = in_features, out_features
@@ -299,12 +302,20 @@ def _quant_mul_mat_id_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, sel:UOp, 
   chunks = out.shape[3]
   tokens = out.shape[0]
   # one workgroup per (token, expert slot, output row): folding the slot into the grid keeps the
-  # waves busy (8 slots x outputs) instead of looping the experts serially inside one workgroup
-  token_slot_output = UOp.range(tokens*k*out_features, 0, axis_type=AxisType.GLOBAL)
-  chunk, lane = UOp.range(chunks, 1, axis_type=AxisType.GLOBAL), UOp.range(32, 2, axis_type=AxisType.LOCAL)
-  token, rem = token_slot_output // (k*out_features), token_slot_output % (k*out_features)
-  slot, output = rem // out_features, rem % out_features
-  group = (lane+chunk*32).minimum(group_count-1)
+  # waves busy (8 slots x outputs) instead of looping the experts serially inside one workgroup.
+  # rows narrower than the wave are packed several-per-wave so no lanes idle.
+  rows_packed = 32 // group_count if chunks == 1 and group_count < 32 else 1
+  assert group_count % 32 == 0 or 32 % group_count == 0
+  grid_rows = out_features // rows_packed
+  token_slot_output = UOp.range(tokens*k*grid_rows, 0, axis_type=AxisType.GLOBAL)
+  # the WARP lane type keeps the range unsplit: sub-wave reductions rely on lane numbering
+  chunk = UOp.range(chunks, 1, axis_type=AxisType.GLOBAL)
+  lane = UOp.range(32, -1 if rows_packed > 1 else 2, axis_type=AxisType.WARP if rows_packed > 1 else AxisType.LOCAL)
+  token, rem = token_slot_output // (k*grid_rows), token_slot_output % (k*grid_rows)
+  slot, out_base = rem // grid_rows, (rem % grid_rows) * rows_packed
+  lane_row = lane // group_count if rows_packed > 1 else UOp.const(0)
+  output = out_base + lane_row
+  group = (lane % group_count) if rows_packed > 1 else (lane+chunk*32).minimum(group_count-1)
   block, subgroup = group // 8, group % 8
   exact = chunks*32 == group_count
   tail_ok = lane+chunk*32 < group_count
@@ -312,9 +323,10 @@ def _quant_mul_mat_id_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, sel:UOp, 
   x_tok = token if shared else token*k + slot
   idx = expert * (out_features * row_blocks) + output * row_blocks + block
   value = _quant_group_dot(raw, xq, xd, xs, ggml_type, x_tok, idx, group, subgroup)
-  if not exact: value = tail_ok.where(value, UOp.const(0, dtypes.float32))
-  total = warp_reduce(value, full_wave=True)
-  store = out[token, slot, output, chunk.valid(lane.eq(0))].store(total.cast(out.dtype))
+  if not exact and rows_packed == 1: value = tail_ok.where(value, UOp.const(0, dtypes.float32))
+  total = warp_reduce(value, full_wave=True, reduce_lanes=group_count if rows_packed > 1 else None)
+  first = (lane % group_count).eq(0) if rows_packed > 1 else lane.eq(0)
+  store = out[token, slot, output, chunk.valid(first)].store(total.cast(out.dtype))
   names = {Q4_K: "mul_mat_id_q4_k", Q5_K: "mul_mat_id_q5_k", IQ4_XS: "mul_mat_id_iq4_xs", Q6_K: "mul_mat_id_q6"}
   return store.end(token_slot_output, chunk, lane).sink(arg=KernelInfo(name=names[ggml_type], opts_to_apply=()))
 
@@ -545,6 +557,19 @@ def f16_gemv(layer:Linear, x:Tensor) -> Tensor:
   fxn = functools.partial(_amd_f16_gemv_kernel, in_features=layer.in_features, out_features=layer.out_features, tokens=tokens)
   srcs = (out, weight.reshape(-1), x.reshape(tokens, layer.in_features)) + (() if layer.bias is None else (_view_back(layer.bias),))
   return Tensor.custom_kernel(*srcs, fxn=fxn)[0].reshape(*x.shape[:-1], layer.out_features)
+
+def f16_gemv_fused(layers:list[Linear], x:Tensor) -> list[Tensor]|None:
+  # one gemv over concatenated dense weights of Linears sharing one input. Returns None when unsupported.
+  if not amd_custom_kernels_supported(x.device): return None
+  if not resolve(prod(x.shape[:-1]) == 1, default=False): return None
+  if any(l.bias is not None or l.in_features % (WARP_SIZE*4) != 0 or l.in_features != layers[0].in_features for l in layers): return None
+  if layers[0]._fused_f16_weight is None:
+    with Context(ALLOW_DEVICE_USAGE=1):
+      layers[0]._fused_f16_weight = Tensor.cat(*[_view_back(l.weight).reshape(l.out_features, l.in_features) for l in layers]).contiguous().realize()
+  out = Tensor.empty(1, sum(l.out_features for l in layers), dtype=dtypes.float32, device=x.device)
+  fxn = functools.partial(_amd_f16_gemv_kernel, in_features=layers[0].in_features, out_features=out.shape[1], tokens=1)
+  ret = Tensor.custom_kernel(out, layers[0]._fused_f16_weight.reshape(-1), x.contiguous().reshape(1, layers[0].in_features), fxn=fxn)[0]
+  return [s.reshape(*x.shape[:-1], l.out_features) for s, l in zip(ret.reshape(-1).split([l.out_features for l in layers]), layers)]
 
 # ******** flash attention on the KV cache ********
 

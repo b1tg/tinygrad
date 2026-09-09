@@ -3,7 +3,7 @@ import enum, functools, itertools, pathlib
 from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Context
 from tinygrad.llm.kernels.amd import Linear, ExpertWeights, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
-from tinygrad.llm.kernels.amd import topk_softmax_256_8, q8_0_gemv_fused, ssm_conv_decode
+from tinygrad.llm.kernels.amd import topk_softmax_256_8, q8_0_gemv_fused, f16_gemv_fused, ssm_conv_decode
 from tinygrad.llm.gguf import gguf_load
 from tinygrad.uop.ops import resolve
 
@@ -123,8 +123,14 @@ class FFNBlock:
         if gating == ExpertGating.SOFTMAX_WEIGHT: probs = probs.softmax(-1)
         if normalize_topk: probs = probs / probs.sum(axis=-1, keepdim=True)
       probs = probs * self.config.routed_scaling_factor
-      quant = self.ffn_gate_exps.quantize(h)
-      x_down = self.ffn_down_exps(sel, (self.ffn_gate_exps(sel, h, quant).silu() * self.ffn_up_exps(sel, h, quant)).contiguous())  # (B, T, k, D)
+      quant_src = self.ffn_gateup_exps if hasattr(self, 'ffn_gateup_exps') else self.ffn_gate_exps
+      quant = quant_src.quantize(h)
+      if hasattr(self, 'ffn_gateup_exps'):
+        gu = self.ffn_gateup_exps(sel, h, quant)
+        g_out, u_out = gu[..., :gu.shape[-1]//2], gu[..., gu.shape[-1]//2:]
+      else:
+        g_out, u_out = self.ffn_gate_exps(sel, h, quant), self.ffn_up_exps(sel, h, quant)
+      x_down = self.ffn_down_exps(sel, (g_out.silu() * u_out).contiguous())  # (B, T, k, D)
       out = (x_down * probs.unsqueeze(-1)).sum(axis=2)  # (B, T, D)
       if hasattr(self, 'ffn_gate_shexp'):
         if (fused := q8_0_gemv_fused([self.ffn_gate_shexp, self.ffn_up_shexp], x)) is not None:
@@ -299,8 +305,12 @@ class GatedDeltaNetBlock(FFNBlock):
     else:
       qkv = None
       out_gate = (self.ssm_g_b(self.ssm_g_a(x)) if is_kda else self.attn_gate(x)).reshape(B, T, self.num_v_heads, self.head_v_dim)
-    beta = self.ssm_beta(x).sigmoid().reshape(B, T, self.num_v_heads)
-    alpha = self.ssm_f_b(self.ssm_f_a(x)) if is_kda else self.ssm_alpha(x)
+    if not is_kda and (fused_ab := f16_gemv_fused([self.ssm_alpha, self.ssm_beta], x)) is not None:
+      alpha, beta_pre = fused_ab
+      beta = beta_pre.sigmoid().reshape(B, T, self.num_v_heads)
+    else:
+      beta = self.ssm_beta(x).sigmoid().reshape(B, T, self.num_v_heads)
+      alpha = self.ssm_f_b(self.ssm_f_a(x)) if is_kda else self.ssm_alpha(x)
     log_alpha = ((alpha.float() + self.ssm_dt["bias"]).softplus().reshape(B, T, self.num_v_heads, -1) *
                  self.ssm_a.reshape(self.num_v_heads, -1))
 
@@ -391,6 +401,22 @@ class Transformer:
     logits = self.output(self.output_norm(x[:, -1:]))[:, -1, :]
     # Gumbel-max trick: argmax(logits/temp - log(-log(uniform))) is equivalent to sampling from softmax(logits/temp)
     sample = logits / temperature.to(logits.device).maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()
+    if isinstance(sample.device, tuple):
+      # sharded vocab: argmax each shard locally, then pick the global winner with one explicit exchange.
+      # (the generic multi-device argmax lowering occasionally returns garbage)
+      # NOTE: mselect views are global-shaped with only the shard's leading region valid: shrink before reducing.
+      devs = sample.device
+      vocab = sample.shape[-1]
+      lens = [vocab*(i+1)//len(devs) - vocab*i//len(devs) for i in range(len(devs))]
+      shards = [Tensor(sample.uop.mselect(i))[:, :l] for i, l in enumerate(lens)]
+      vals = [s.max(-1, keepdim=True) for s in shards]
+      idxs = [s.argmax(-1, keepdim=True) + int(vocab)*i//len(devs) for i, s in enumerate(shards)]
+      acc_v, acc_i = vals[0], idxs[0]
+      for v, i in zip(vals[1:], idxs[1:]):
+        vv, ii = v.to(acc_v.device), i.to(acc_v.device)
+        acc_i = (acc_v >= vv).where(acc_i, ii)
+        acc_v = acc_v.maximum(vv)
+      return acc_i.to(tokens.device)
     return sample.argmax(-1, keepdim=True).to(tokens.device)
 
   def __call__(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:

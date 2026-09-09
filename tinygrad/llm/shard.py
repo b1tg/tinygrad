@@ -1,5 +1,5 @@
 """Tensor parallel LLM blocks. Packed GGML blocks are partitioned before dequantization."""
-import copy
+import copy, functools
 from dataclasses import replace
 from tinygrad import Tensor, UOp, function, Device
 from tinygrad.llm.gguf import ggml_data_to_tensor
@@ -62,9 +62,21 @@ def _part(size, rank, count):
   return size*rank//count, size*(rank+1)//count
 
 
-def _sum(xs):
-  xs = [x.contiguous() for x in xs]
-  return [sum((x.to(y.device) for x in xs[1:]), xs[0].to(y.device)) for y in xs]
+def _fused_gate_up_exps(gate:ExpertWeights, up:ExpertWeights, device, rank, n) -> ExpertWeights|None:
+  """Interleave the gate/up packed weights per expert so one mul_mat_id call covers both (bigger grid, one launch)."""
+  if gate.in_features != up.in_features or gate.out_features != up.out_features: return None
+  if gate.in_features % 256: return None
+  E, ni, no = gate.num_experts, gate.in_features, gate.out_features
+  pg, pu = packed_ggml_weight(gate.weight, E*ni*no), packed_ggml_weight(up.weight, E*ni*no)
+  if pg is None or pu is None or pg[0] != pu[0]: return None
+  ggml_type, raw_g, raw_u = pg[0], pg[1], pu[1]
+  gs, ge = _part(no, rank, n)
+  wg = raw_g.reshape(E, no, -1)[:, gs:ge]
+  wu = raw_u.reshape(E, no, -1)[:, gs:ge]
+  fused = ExpertWeights(E, ni, ge-gs + ge-gs)
+  fused.ggml_type = ggml_type
+  fused.weight = Tensor.cat(wg, wu, dim=1).contiguous().reshape(-1).to(device).realize()
+  return fused
 
 
 class ShardedBlock(FFNBlock):
@@ -105,6 +117,9 @@ class ShardedBlock(FFNBlock):
         if name == 'config': continue
         if isinstance(value, (Linear, ExpertWeights)): setattr(local, name, _linear(value, device, rows.get(name), cols.get(name)))
         elif isinstance(value, (Tensor, dict)) or hasattr(value, 'weight'): setattr(local, name, _replicate(value, device))
+      if hasattr(block, 'ffn_gate_exps'):
+        if (fused := _fused_gate_up_exps(block.ffn_gate_exps, block.ffn_up_exps, device, rank, n)) is not None:
+          local.ffn_gateup_exps = fused
       if isinstance(block, GatedDeltaNetBlock):
         local.ssm_conv1d = {'weight':Tensor.cat(*(block.ssm_conv1d['weight'][s:e] for s,e in rows['attn_qkv'])).to(device).contiguous().realize()}
         local.ssm_dt = {'bias':Tensor.cat(*(block.ssm_dt['bias'][s:e] for s,e in heads)).to(device).contiguous().realize()}
@@ -119,10 +134,11 @@ class ShardedBlock(FFNBlock):
     for b,t in zip(self.blocks, xs): b._init_state(t)
     @function(precompile=True, allow_implicit=True)
     def run(*xs):
-      attn = [b._attention(b.attn_norm(t), start_pos) for b,t in zip(self.blocks, xs)]
-      hs = [t+a for t,a in zip(xs, _sum(attn))]
-      ffn = [b._feed_forward(b.ffn_norm(h)) for b,h in zip(self.blocks, hs)]
-      return tuple((h+f).contiguous() for h,f in zip(hs, _sum(ffn)))
+      attn = [b._attention(b.attn_norm(t), start_pos).contiguous() for b,t in zip(self.blocks, xs)]
+      # residual add fused into the all-reduce: one elementwise kernel instead of sum + add
+      hs = [functools.reduce(lambda acc, a: acc + a.to(t.device), attn, t) for t in xs]
+      ffn = [b._feed_forward(b.ffn_norm(h)).contiguous() for b,h in zip(self.blocks, hs)]
+      return tuple(functools.reduce(lambda acc, f: acc + f.to(h.device), ffn, h).contiguous() for h in hs)
     return Tensor(UOp.mstack(*(t.uop for t in run(*xs))))
 
 
