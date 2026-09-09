@@ -165,6 +165,38 @@ class TestLLMServer(unittest.TestCase):
     Handler.stream_json(handler, source)
     source.close.assert_called_once()
 
+  def test_stream_heartbeat_during_prefill(self):
+    import socket
+    from tinygrad.llm.serve import Handler
+    reader, writer = socket.socketpair()
+    reader.settimeout(0.2)
+    received, errors, threads = bytearray(), [], []
+    def receive():
+      try:
+        while b"data: [DONE]\n\n" not in received: received.extend(reader.recv(4096))
+      except Exception as exc: errors.append(exc)
+    def source():
+      threads.append(threading.get_ident())
+      yield {"choices": []}
+      time.sleep(0.6)  # longer than the client's idle timeout
+      yield {"choices": [{"delta": {"content": "answer"}}]}
+    handler = Mock(wfile=writer.makefile("wb", buffering=0))
+    client = threading.Thread(target=receive)
+    client.start()
+    try:
+      Handler.stream_json(handler, source(), heartbeat_interval=0.02)
+      client.join(timeout=2)
+      self.assertFalse(client.is_alive())
+      self.assertEqual(errors, [])
+      self.assertIn(b": keep-alive\n\n", received)
+      self.assertIn(b'"content": "answer"', received)
+      self.assertTrue(received.endswith(b"data: [DONE]\n\n"))
+      self.assertEqual(threads, [threading.get_ident()])
+    finally:
+      handler.wfile.close()
+      writer.close()
+      reader.close()
+
   def test_non_streaming(self):
     resp = self.client.chat.completions.create(
       model="test-model",
@@ -286,17 +318,30 @@ class TestLLMToolCalls(unittest.TestCase):
     self.assertEqual([json.loads(tc.function.arguments)["path"] for tc in response.choices[0].message.tool_calls], ["a", "b"])
     self.assertEqual(response.choices[0].finish_reason, "tool_calls")
 
-  def test_streaming_glm_tool_calls(self):
-    self.set_output("before<tool_call>read<arg_key>path</arg_key><arg_value>a</arg_value></tool_call>"
-                    "<tool_call>read\n<arg_key>path</arg_key>\n<arg_value>\nb\n</arg_value>\n</tool_call>")
-    chunks = list(self.client.chat.completions.create(model="tool-model", messages=[{"role":"user", "content":"Read files"}],
-                                                     tools=self.tools(), stream=True))
-    self.assertEqual("".join(c.choices[0].delta.content or "" for c in chunks if c.choices), "before")
+  def test_glm_tool_calls_stop_at_observation(self):
+    from tinygrad.llm.cli import SimpleTokenizer
+    text = ('<tool_call>read<arg_key>path</arg_key><arg_value>README.md</arg_value>'
+            '<arg_key>offset</arg_key><arg_value>2</arg_value></tool_call><tool_call>get_time</tool_call>')
+    self.set_output(text)
+    def generate(ids, **kwargs):
+      yield from range(1, len(text)+1)
+      yield 999  # GLM yields control to the client here, before the tool observation
+      self.fail("generation continued past the tool handoff")
+    tok = SimpleTokenizer({}, {"<|observation|>": 999}, eom_id=999)
+    with patch.object(self.mock_tok, "is_end", tok.is_end), patch.object(self.mock_model, "generate", side_effect=generate):
+      chunks = list(self.client.chat.completions.create(model="tool-model", messages=[{"role":"user", "content":"Read README.md"}],
+                                                       tools=self.tools(), stream=True))
     calls = [tc for c in chunks if c.choices for tc in c.choices[0].delta.tool_calls or []]
-    self.assertEqual([tc.function.name for tc in calls], ["read", "read"])
-    self.assertEqual([json.loads(tc.function.arguments) for tc in calls], [{"path":"a"}, {"path":"b"}])
-    self.assertEqual([tc.index for tc in calls], [0, 1])
+    self.assertEqual([(tc.function.name, json.loads(tc.function.arguments)) for tc in calls],
+                     [("read", {"path":"README.md", "offset":2}), ("get_time", {})])
     self.assertEqual(chunks[-1].choices[0].finish_reason, "tool_calls")
+
+  def test_glm_tool_argument_types_and_whitespace(self):
+    from tinygrad.llm.serve import parse_tool_call
+    self.assertEqual(parse_tool_call('write<arg_key>content</arg_key><arg_value>\n first\nsecond\n\n</arg_value>'
+                                    '<arg_key>options</arg_key><arg_value>{"a":[1,true,null]}</arg_value>'),
+                     ("write", {"content":" first\nsecond\n", "options":{"a":[1,True,None]}}))
+    self.assertIsNone(parse_tool_call('write<arg_key>content</arg_key><arg_value>truncated'))
 
   def test_multiline_tool_argument_preserves_trailing_newline(self):
     self.set_output("<tool_call>\n<function=write>\n<parameter=content>\nfirst\nsecond\n\n</parameter>\n"
