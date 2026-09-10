@@ -210,7 +210,8 @@ class TransformerConfig:
 class HyperConnection:
   def __init__(self, config:TransformerConfig):
     width = (2 + config.hc_mult) * config.hc_mult
-    self.fn = {"weight": Tensor.zeros(width, config.hc_mult * config.dim)}
+    self.fn = Linear(config.hc_mult * config.dim, width, bias=False)
+    self.fn.weight = Tensor.zeros(width, config.hc_mult * config.dim)
     self.base, self.scale = {"weight": Tensor.zeros(width)}, {"weight": Tensor.zeros(3)}
     self.hc, self.norm_eps = config.hc_mult, config.norm_eps
     self.eps, self.iters = config.hc_eps, config.hc_sinkhorn_iters
@@ -218,7 +219,7 @@ class HyperConnection:
   def prepare(self, x:Tensor) -> tuple[Tensor, Tensor, Tensor]:
     flat = x.flatten(2).float()
     flat = flat * (flat.square().mean(-1, keepdim=True) + self.norm_eps).rsqrt()
-    mixes = flat @ self.fn["weight"].float().T
+    mixes = self.fn(flat)
     scale, base = self.scale["weight"].float(), self.base["weight"].float()
     if amd_custom_kernels_supported(mixes.device):
       # the (hc, hc) sinkhorn iterations are dozens of tiny dependent kernels: one fused kernel instead
@@ -507,7 +508,8 @@ class MLATransformerBlock(FFNBlock):
       if resolve(T == 1) and amd_custom_kernels_supported(x.device):
         # fused decode: scores + softmax + latent accumulation over the selected rows in one kernel per head
         latent = dsa_decode(q_selected[:, 0], cached[:, 0], indices[:, 0], self.config.head_dim ** -0.5,
-                            self.config.kv_lora_rank).reshape(B, T, self.config.n_heads, self.config.kv_lora_rank)
+                            self.config.kv_lora_rank, valid_tokens=start_pos+1,
+                            pool_size=self.indexer.index_config.kpool).reshape(B, T, self.config.n_heads, self.config.kv_lora_rank)
       else:
         valid = indices >= 0
         selected = gather_rows(cached[:, 0], indices.clip(0, self.config.max_context-1))

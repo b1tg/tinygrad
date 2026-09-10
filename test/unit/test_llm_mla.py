@@ -2,7 +2,7 @@ import unittest
 import numpy as np
 from tinygrad import Context, Tensor, UOp, nn
 from tinygrad.llm.model import (_kda_log_decay, AttentionIndexer, IndexerConfig, Transformer, TransformerConfig, apply_rope,
-                                bitonic_topk, gather_rows, MLATransformerBlock, precompute_freqs_cis)
+                                bitonic_topk, gather_rows, HyperConnection, MLATransformerBlock, precompute_freqs_cis)
 
 class TestMLA(unittest.TestCase):
   def test_glm_bounded_decay_uses_converted_a(self):
@@ -18,6 +18,30 @@ class TestMLA(unittest.TestCase):
       "norm_eps": 1e-5, "vocab_size": 100, "head_dim": 16, "rope_theta": 10000.0, "rope_dim": 8, "max_context": 32,
       "kv_lora_rank": 16, "v_head_dim": 8,
     } | kwargs)
+
+  def test_hyper_connection_quantized_projection(self):
+    from tinygrad.llm.gguf import ggml_data_to_tensor
+    from tinygrad.llm.kernels.amd import amd_custom_kernels_supported
+    hc = HyperConnection(self._make_config(hc_mult=4, hc_eps=1e-6, hc_sinkhorn_iters=20))
+    rng = np.random.default_rng(42)
+    packed = rng.integers(0, 256, (24*256//32, 34), dtype=np.uint8)
+    packed[:, :2] = np.array([0.001], dtype=np.float16).view(np.uint8)
+    raw = Tensor(np.pad(packed.flatten(), (4, 0))).contiguous().realize()[4:]
+    weight = ggml_data_to_tensor(raw, 24*256, 8).reshape(24, 256)
+    reference_w = weight.numpy()
+    # Keep the GGUF state-dict key unchanged while enabling packed Linear dispatch.
+    self.assertEqual(set(nn.state.get_state_dict(hc)), {"fn.weight", "base.weight", "scale.weight"})
+    nn.state.load_state_dict(hc, {"fn.weight": weight}, strict=False, verbose=False, realize=False)
+    for tokens in (1, 3, 32):
+      with self.subTest(tokens=tokens):
+        x = rng.normal(size=(1, tokens, 256)).astype(np.float32)
+        reference_x = x
+        if amd_custom_kernels_supported(weight.device):
+          grouped = x.reshape(1, tokens, 8, 32)
+          scale = np.maximum(np.abs(grouped).max(-1, keepdims=True) / 127, 1e-8)
+          reference_x = (np.clip(np.rint(grouped / scale), -127, 127) * scale).reshape(x.shape)
+        np.testing.assert_allclose(hc.fn(Tensor(x)).numpy(), reference_x @ reference_w.T, rtol=2e-3, atol=2e-3)
+        if amd_custom_kernels_supported(weight.device): self.assertEqual(hc.fn.ggml_type, 8)
 
   def test_hyper_connection_jit_matches_eager(self):
     Tensor.manual_seed(42)

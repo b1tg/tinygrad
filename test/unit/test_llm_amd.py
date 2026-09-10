@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import patch
 import numpy as np
-from tinygrad import Tensor, UOp, dtypes, nn, function
+from tinygrad import Tensor, TinyJit, UOp, dtypes, nn, function
 from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported, q8_quantize, flash_attention, gated_delta_prefill
 from tinygrad.llm.kernels.amd import hc_prepare, dsa_decode
 from tinygrad.llm.gguf import ggml_data_to_tensor
@@ -476,6 +476,26 @@ class TestQ8Quantize(unittest.TestCase):
     np.testing.assert_allclose(out[:, :1].numpy(), expected, rtol=3e-3, atol=3e-2)
     self.assertEqual(out.shape, (1, tokens, 2, out_features))
 
+  def test_hc_prepare_jit(self):
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("custom kernels required")
+    @TinyJit
+    def run(mixes, base, scale):
+      result = hc_prepare(mixes, base, scale, 4, 1e-6, 20)
+      Tensor.realize(*result)
+      return result
+    rng = np.random.default_rng(7)
+    for magnitude in (1, 1, 20, 0, 0.01):
+      mixes = Tensor(rng.normal(size=(1, 1, 24)).astype(np.float32)*magnitude).realize()
+      base = Tensor(rng.normal(size=24).astype(np.float32)).realize()
+      scale = Tensor(rng.normal(size=3).astype(np.float32)).realize()
+      got = run(mixes, base, scale)
+      expected = hc_prepare(mixes, base, scale, 4, 1e-6, 20)
+      for actual, reference in zip(got, expected):
+        np.testing.assert_allclose(actual.numpy(), reference.numpy(), rtol=1e-5, atol=1e-6)
+      comb = got[2].numpy()
+      self.assertTrue(np.isfinite(comb).all())
+      np.testing.assert_allclose(comb.sum(-2), 1, rtol=1e-5, atol=1e-5)
+
   def test_hc_prepare(self):
     if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("custom kernels required")
     rng = np.random.default_rng(42)
@@ -518,6 +538,36 @@ class TestQ8Quantize(unittest.TestCase):
     p /= p.sum(-1, keepdims=True)
     want = p @ rows[:, :LORA]
     np.testing.assert_allclose(got.numpy(), want[None], rtol=1e-3, atol=1e-3)
+
+  def test_dsa_decode_effective_selection(self):
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("custom kernels required")
+    rng = np.random.default_rng(42)
+    B, H, D, LORA, N, K = 2, 4, 160, 128, 512, 259
+    q_np = rng.normal(size=(B, H, D)).astype(np.float16)
+    cache_np = rng.normal(size=(B, N, D)).astype(np.float16)
+    q = Tensor(q_np).realize()
+    @TinyJit
+    def run(cached, indices, valid):
+      return dsa_decode(q, cached, indices, 0.25, LORA, valid_tokens=valid).realize()
+    for length in (1, 3, 4, 127, 128, 131, 256, 259, 511, 1):
+      with self.subTest(length=length):
+        idx = np.full((B, K), -1, dtype=np.int32)
+        for b in range(B):
+          pools = rng.permutation(length//4)[:64]
+          prefix = (pools[:, None]*4 + np.arange(4)).flatten()
+          idx[b, :len(prefix)] = prefix
+          idx[b, 256:256+length%4] = np.arange(length//4*4, length)
+        cached = cache_np.copy()
+        cached[:, length:] = np.nan  # skipped indices must not access unwritten rows
+        want = []
+        for b in range(B):
+          rows = cached[b, idx[b, idx[b] >= 0]].astype(np.float64)
+          scores = q_np[b].astype(np.float64) @ rows.T * 0.25
+          p = np.exp(scores - scores.max(-1, keepdims=True))
+          want.append((p / p.sum(-1, keepdims=True)) @ rows[:, :LORA])
+        valid = UOp.variable("dsa_valid_tokens", 1, N).bind(length)
+        got = run(Tensor(cached).realize(), Tensor(idx).realize(), valid).numpy()
+        np.testing.assert_allclose(got, np.array(want), rtol=1e-3, atol=1e-3)
 
   def test_dsa_decode_sparse_tail_unwritten_cache(self):
     # early decode steps select almost only invalid entries, and the cache past the cursor is uninitialized

@@ -905,6 +905,34 @@ def q8_linear(layer:Linear, x:Tensor) -> Tensor:
 # ******** hyper-connection gates: sigmoid/softmax + sinkhorn on the tiny (hc,hc) mix matrix ********
 
 @functools.cache
+def _hc_prepare_wave_kernel(pre:UOp, post:UOp, comb:UOp, mixes:UOp, base:UOp, scale:UOp, sinkhorn_iters:int, eps:float) -> UOp:
+  # Each 4x4 matrix occupies 16 lanes; row and column reductions each need two shuffles.
+  B, T = comb.shape[:2]
+  bt, lane = UOp.range(B*T, 0, AxisType.GLOBAL), UOp.range(32, -1, AxisType.WARP)
+  pos = lane % 16
+  m, b, s = mixes.reshape(B*T, 24)[bt], base.reshape(-1), scale.reshape(-1)
+  def reduce(v:UOp, offsets:tuple[int, ...], maximum:bool=False) -> UOp:
+    for offset in offsets:
+      other = UOp(Ops.CUSTOM, src=(v,), arg=(
+        f"__builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, {{0}}), {0x1f | offset<<10}))", dtypes.float))
+      v = v.maximum(other) if maximum else v + other
+    return v
+  c = m[8+pos].load()*s[2].load() + b[8+pos].load()
+  c = (c-reduce(c, (1, 2), True)).exp()
+  c = c/reduce(c, (1, 2)) + eps
+  c = c/(reduce(c, (4, 8)) + eps)
+  for _ in range(1, sinkhorn_iters):
+    c = c/(reduce(c, (1, 2)) + eps)
+    c = c/(reduce(c, (4, 8)) + eps)
+  i = lane%4
+  pre_v = (m[i].load()*s[0].load() + b[i].load()).sigmoid() + eps
+  post_v = (m[4+i].load()*s[1].load() + b[4+i].load()).sigmoid()*2
+  return UOp.group(pre.reshape(B*T, 4)[bt, i.valid(lane < 4)].store(pre_v),
+                   post.reshape(B*T, 4)[bt, i.valid(lane < 4)].store(post_v),
+                   comb.reshape(B*T, 16)[bt, pos.valid(lane < 16)].store(c)).end(lane, bt).sink(
+                     arg=KernelInfo(name="hc_prepare_wave", opts_to_apply=()))
+
+@functools.cache
 def _hc_prepare_kernel(pre:UOp, post:UOp, comb:UOp, mixes:UOp, base:UOp, scale:UOp, sinkhorn_iters:int, eps:float) -> UOp:
   # one thread per (b, t) row: the whole gate computation fits in registers, replacing ~5 tiny-kernel
   # launches per sinkhorn iteration
@@ -945,7 +973,7 @@ def hc_prepare(mixes:Tensor, base:Tensor, scale:Tensor, hc:int, eps:float, iters
   out = [Tensor.empty(B, T, hc, dtype=dtypes.float32, device=mixes.device),
          Tensor.empty(B, T, hc, dtype=dtypes.float32, device=mixes.device),
          Tensor.empty(B, T, hc, hc, dtype=dtypes.float32, device=mixes.device)]
-  fxn = functools.partial(_hc_prepare_kernel, sinkhorn_iters=iters, eps=eps)
+  fxn = functools.partial(_hc_prepare_wave_kernel if hc == 4 else _hc_prepare_kernel, sinkhorn_iters=iters, eps=eps)
   pre, post, comb = Tensor.custom_kernel(*out, mixes, base, scale, fxn=fxn)[:3]
   if not symbolic: return pre, post, comb
   return pre[:, :orig_shape[1]], post[:, :orig_shape[1]], comb[:, :orig_shape[1]]
@@ -1311,14 +1339,14 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
 # ******** DSA decode: sparse attention over indexer-selected latent cache rows ********
 
 @functools.cache
-def _dsa_decode_kernel(out:UOp, q:UOp, cache:UOp, idx:UOp, scale:float) -> UOp:
-  # four waves per (batch, head): score the selected rows (one row per lane per pass, warp-reduced dot),
-  # softmax stats exchanged through LDS, then each wave accumulates the latent values of its row quarter.
-  # out: (B, H, kv_lora) f32; q: (B, H, D); cache: (B, N, D) half; idx: (B, K) int32 with -1 for invalid
+def _dsa_decode_kernel(out:UOp, stats:UOp, q:UOp, cache:UOp, idx:UOp, scale:float, prefix:int|UOp, tail:int|UOp, tail_start:int) -> UOp:
+  # Split the effective selection across blocks; each block writes an unnormalized softmax numerator and (max, sum).
   B, H, D = q.shape
-  K, kv_lora = cast(int, idx.shape[1]), cast(int, out.shape[2])
-  WAVES = 4
+  K, kv_lora, WAVES = 128, cast(int, out.shape[3]), 4
+  prefix, tail = _unbind(prefix), _unbind(tail)
+  live = prefix + tail
   bh = UOp.range(B*H, 0, AxisType.GLOBAL)
+  chunk = UOp.range((live+K-1)//K, 1, AxisType.GLOBAL)
   lane, wave = UOp.range(32, -1, axis_type=AxisType.WARP), UOp.range(WAVES, 3, axis_type=AxisType.LOCAL)
   b, h = bh // H, bh % H
   wl = wave*32 + lane
@@ -1330,8 +1358,13 @@ def _dsa_decode_kernel(out:UOp, q:UOp, cache:UOp, idx:UOp, scale:float) -> UOp:
   qf = tuple(q[b, h, lane*DPL + i].load().float() for i in range(DPL))
   jj = UOp.range(-(-K // WAVES), 1000, AxisType.REDUCE)
   k_i, in_range = wave + jj*WAVES, wave + jj*WAVES < K
-  sel = idx[b, k_i.minimum(K-1)].load()
-  valid, row = sel >= 0, (sel >= 0).where(sel, 0)
+  def selection(pos:UOp) -> tuple[UOp, UOp]:
+    logical = chunk*K + pos
+    physical = (logical < prefix).where(logical, tail_start + logical - prefix).minimum(idx.shape[1]-1)
+    sel = idx[b, physical].load()
+    valid = (logical < live) & (sel >= 0)
+    return valid, valid.where(sel, 0)
+  valid, row = selection(k_i)
   part = sum((qf[i] * cache[b, row, lane*DPL + i].load().float() for i in range(DPL)), UOp.const(0, dtypes.float32))
   dot = warp_reduce(part, full_wave=True)
   dot_store = scores[k_i.valid(in_range)].store(valid.where(dot * scale, UOp.const(-math.inf, dtypes.float32))).end(jj)
@@ -1357,25 +1390,43 @@ def _dsa_decode_kernel(out:UOp, q:UOp, cache:UOp, idx:UOp, scale:float) -> UOp:
   accv = _reg((dpl,), 102, 0)
   k2 = UOp.range(-(-K // WAVES), 3000, AxisType.REDUCE)
   kk, inb2 = wave + k2*WAVES, wave + k2*WAVES < K
-  sel2 = idx[b, kk.minimum(K-1)].load()
-  row2 = (sel2 >= 0).where(sel2, 0)
-  a = inb2.where(((scores[kk.minimum(K-1)].load() - m)*LOG2E).exp2() * (1/s), UOp.const(0, dtypes.float32))
-  upd2 = UOp.group(*[accv[i].store(accv.after(k2)[i].load() + a * cache[b, row2, lane*dpl+i].load().float())
+  valid2, row2 = selection(kk)
+  a = (inb2 & valid2).where(((scores[kk.minimum(K-1)].load() - m)*LOG2E).exp2(), UOp.const(0, dtypes.float32))
+  upd2 = UOp.group(*[accv[i].store(accv.after(k2)[i].load() + a * valid2.where(cache[b, row2, lane*dpl+i].load().float(), 0))
                      for i in range(dpl)]).end(k2)
   part_store = UOp.group(*[part_lds[wave, lane*dpl+i].store(accv.after(upd2)[i].load()) for i in range(dpl)])
   part = part_lds.after(UOp.barrier(part_store))
   cpb = kv_lora // (32*WAVES)
-  stores = [out[b, h, wl*cpb + i].store(sum((part[w, wl*cpb + i].load() for w in range(WAVES)), UOp.const(0, dtypes.float32)))
+  stores = [out[b, h, chunk, wl*cpb + i].store(sum((part[w, wl*cpb + i].load() for w in range(WAVES)), UOp.const(0, dtypes.float32)))
             for i in range(cpb)]
-  return UOp.group(*stores).end(lane, wave, bh).sink(arg=KernelInfo(name="dsa_decode", opts_to_apply=()))
+  stores += [stats[b, h, chunk, i].store(v) for i, v in enumerate((m, s))]
+  return UOp.group(*stores).end(lane, wave, chunk, bh).sink(arg=KernelInfo(name="dsa_decode_partial", opts_to_apply=()))
 
-def dsa_decode(q:Tensor, cache:Tensor, idx:Tensor, scale:float, kv_lora:int) -> Tensor:
-  """Fused sparse-attention decode over indexer-selected latent rows. q: (B,H,D), cache: (B,N,D), idx: (B,K)."""
+def dsa_decode(q:Tensor, cache:Tensor, idx:Tensor, scale:float, kv_lora:int,
+               valid_tokens:int|UOp|None=None, pool_size:int=4) -> Tensor:
+  """Sparse decode. Optional valid_tokens describes the indexer's sorted complete pools followed by its fixed-width tail."""
   if q.ndim != 3 or cache.ndim != 3 or idx.ndim != 2 or q.shape[0] != cache.shape[0] or cache.shape[0] != idx.shape[0]:
     raise ValueError(f"expected q(B,H,D), cache(B,N,D), idx(B,K), got {q.shape=} {cache.shape=} {idx.shape=}")
   B, H, D = cast(tuple[int, int, int], q.shape)
-  out = Tensor.empty(B, H, kv_lora, dtype=dtypes.float32, device=q.device)
-  return Tensor.custom_kernel(out, q.contiguous(), cache, idx.contiguous(), fxn=functools.partial(_dsa_decode_kernel, scale=scale))[0]
+  K = cast(int, idx.shape[1])
+  prefix: int|UOp = K
+  tail: int|UOp = 0
+  tail_start = K
+  if valid_tokens is not None:
+    assert pool_size > 0 and K >= pool_size and (K-pool_size+1) % pool_size == 0
+    tail_start = K-pool_size+1
+    complete = valid_tokens//pool_size*pool_size
+    prefix = complete.minimum(tail_start) if isinstance(complete, UOp) else min(complete, tail_start)
+    tail = valid_tokens % pool_size
+  # Keep the bound cursor in the tensor graph even when the caller supplies an already-realized cache.
+  if isinstance(valid_tokens, UOp): cache = Tensor(cache.contiguous().uop.after(Tensor(valid_tokens, device=cache.device).uop))
+  live = (prefix+tail+127)//128
+  partial = Tensor.empty(B, H, (K+127)//128, kv_lora, dtype=dtypes.float32, device=q.device)
+  stats = Tensor.empty(B, H, (K+127)//128, 2, dtype=dtypes.float32, device=q.device)
+  fxn = functools.partial(_dsa_decode_kernel, scale=scale, prefix=prefix, tail=tail, tail_start=tail_start)
+  partial, stats = Tensor.custom_kernel(partial, stats, q.contiguous(), cache, idx.contiguous(), fxn=fxn)[:2]
+  out = Tensor.empty(B, H, 1, kv_lora, dtype=dtypes.float32, device=q.device)
+  return Tensor.custom_kernel(out, partial, stats, fxn=functools.partial(_amd_flash_decode_combine, live=live))[0].reshape(B, H, kv_lora)
 
 # ******** gated delta net: fused recurrent scan ********
 
