@@ -1,7 +1,7 @@
 import os, struct, unittest, tempfile, pathlib, sys
 from tinygrad import dtypes, Tensor, fetch, Device
 from tinygrad.helpers import disable_gc
-from tinygrad.llm.gguf import _ggml_iq_grid, ggml_data_to_tensor, gguf_load
+from tinygrad.llm.gguf import _ggml_iq_grid, ggml_data_to_tensor, gguf_load, _shard_tensor
 from tinygrad.runtime.autogen import ggml_common as _ggml
 import numpy as np
 from gguf import GGUFReader, GGUFValueType, GGMLQuantizationType, GGML_QUANT_SIZES, dequantize, quantize
@@ -9,6 +9,23 @@ from gguf.quants import IQ1_S, IQ2_S, IQ2_XS, IQ2_XXS, IQ3_S, IQ3_XXS
 
 ggml_test_block_count = 4
 supported_dtypes = Device[Device.DEFAULT].renderer.supported_dtypes()
+
+class TestGGUFSharding(unittest.TestCase):
+  def test_quantized_axes(self):
+    devices = ("CPU", "CPU:1", "CPU:2", "CPU:3")
+    # Last-axis slices cross Q4_K block boundaries when the row has six blocks.
+    for shape in ((8, 1024), (4, 8, 1024), (4, 8, 1536)):
+      blocks = np.zeros((np.prod(shape)//256, 144), dtype=np.uint8)
+      blocks[:, :2] = np.frombuffer(np.float16(0.5).tobytes(), dtype=np.uint8)
+      blocks[:, 4:16] = 1
+      blocks[:, 16:] = np.arange(len(blocks), dtype=np.uint8)[:, None]
+      raw = Tensor(blocks.flatten(), device="CPU")
+      expected = ggml_data_to_tensor(raw, int(np.prod(shape)), 12).reshape(shape).numpy()
+      for axis in range(len(shape)):
+        with self.subTest(shape=shape, axis=axis):
+          actual = _shard_tensor(raw, 0, ("weight", tuple(reversed(shape)), 12, 0), devices, axis)
+          self.assertEqual(actual.uop.axis, axis)
+          np.testing.assert_equal(actual.numpy(), expected)
 
 class TestGGUFTables(unittest.TestCase):
   def test_iq2_xxs_grid_matches_gguf_py(self):
@@ -221,6 +238,13 @@ class TestGGUF(unittest.TestCase):
       self.assertEqual(kv["split.count"], 2)
       np.testing.assert_equal(ts["a"].numpy(), a)
       np.testing.assert_equal(ts["b"].numpy(), b)
+
+      devices = ("CPU", "CPU:1", "CPU:2", "CPU:3")
+      _, sharded = gguf_load(d / "test-00001-of-00002.gguf", devices, lambda name: 0 if name == "a" else "replicate")
+      self.assertEqual(sharded["a"].uop.axis, 0)
+      self.assertEqual(sharded["b"].device, devices)
+      np.testing.assert_equal(sharded["a"].numpy(), a)
+      np.testing.assert_equal(sharded["b"].numpy(), b)
 
       # missing part 2
       (d / "test-00002-of-00002.gguf").unlink()

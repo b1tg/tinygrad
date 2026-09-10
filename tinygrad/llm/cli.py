@@ -30,10 +30,19 @@ class SimpleTokenizer:
     r_ws, r_p_N, r_p_L = r"\t\n\x0b\x0c\r\x85" + ucat_range("Z"), ucat_range("N"), ucat_range("L")
     contr, r_l, r_n = "(?i:'s|'t|'re|'ve|'m|'ll|'d)", f"[^\\r\\n{r_p_N}{r_p_L}]?", f"[{r_p_N}]" if preset == "tekken" else f"[{r_p_N}]{{1,3}}"
     r_p, r_w, r_t = f" ?[^{r_ws}{r_p_N}{r_p_L}]+[\\r\\n]*", f"{contr}|{r_l}[{r_p_L}]+", f"[{r_ws}]*[\\r\\n]+|[{r_ws}]+(?![^{r_ws}])|[{r_ws}]+"
-    if preset in ("tekken", "gpt-4o"):
-      r_up, r_lo = ucat_range(("Lu","Lt","Lm","Lo","M")), ucat_range(("Ll","Lm","Lo","M"))
-      sfx = f"{contr}?" if preset == "gpt-4o" else ""
-      r_p, r_w = f" ?[^{r_ws}{r_p_N}{r_p_L}]+[\\r\\n/]*", f"{r_l}[{r_up}]*[{r_lo}]+{sfx}|{r_l}[{r_up}]+[{r_lo}]*{sfx}"
+    if preset in ("tekken", "gpt-4o", "kimi-k2"):
+      r_up, r_lo = f"[{ucat_range(('Lu','Lt','Lm','Lo','M'))}]", f"[{ucat_range(('Ll','Lm','Lo','M'))}]"
+      sfx = f"{contr}?" if preset in ("gpt-4o", "kimi-k2") else ""
+      han = ""
+      if preset == "kimi-k2":
+        # Unicode Script=Han. Kimi excludes Han from the mixed-case word alternatives.
+        han = ("\u2e80-\u2e99\u2e9b-\u2ef3\u2f00-\u2fd5\u3005\u3007\u3021-\u3029\u3038-\u303b"
+               "\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufa6d\ufa70-\ufad9\U00016fe2-\U00016fe3\U00016ff0-\U00016ff6"
+               "\U00020000-\U0002a6df\U0002a700-\U0002b81d\U0002b820-\U0002cead\U0002ceb0-\U0002ebe0"
+               "\U0002ebf0-\U0002ee5d\U0002f800-\U0002fa1d\U00030000-\U0003134a\U00031350-\U00033479")
+        r_up, r_lo = f"(?:(?![{han}]){r_up})", f"(?:(?![{han}]){r_lo})"
+      else: r_p = f" ?[^{r_ws}{r_p_N}{r_p_L}]+[\\r\\n/]*"
+      r_w = (f"[{han}]+|" if han else "") + f"{r_l}{r_up}*{r_lo}+{sfx}|{r_l}{r_up}+{r_lo}*{sfx}"
     self._split_to_word = re.compile(f"{r_w}|{r_n}|{r_p}|{r_t}")
     self._split_to_sentence = re.compile("|".join(re.escape(tok) for tok in special_tokens.keys()) if special_tokens else r"(?!)")
 
@@ -146,11 +155,12 @@ def main():
   parser.add_argument("--warmup", action="store_true", help="warmup the JIT")
   parser.add_argument("--benchmark", nargs='?', type=int, const=20, metavar="COUNT", help="Benchmark tok/s (optional count, default 20)")
   parser.add_argument("--no_chat_template", action="store_true", help="Don't use the model's chat template, always use the fallback template")
+  parser.add_argument("--shard", type=int, default=1, help="Tensor-parallel model across N devices")
   args = parser.parse_args()
 
   # load the model
   with Context(DEBUG=max(DEBUG.value, 2 if args.serve else 0)):
-    model, kv = Transformer.from_gguf(fetch(models.get(args.model, args.model)), args.max_context)
+    model, kv = Transformer.from_gguf(fetch(models.get(args.model, args.model)), args.max_context, shard=args.shard)
   model_name = kv.get('general.name') or kv.get('general.basename') or args.model
   file_sizes = [y.nbytes() for y in UOp.sink(*[x.uop for x in nn.state.get_parameters(model)]).toposort() if y.op is Ops.BUFFER]
   print(f"using model \"{model_name}\" with {sum(file_sizes):,} bytes and {sum(x.numel() for x in nn.state.get_parameters(model)):,} params, "
@@ -164,7 +174,7 @@ def main():
   if not args.no_chat_template and (ct := kv.get('tokenizer.chat_template')) is not None:
     try:
       import jinja2
-      env = jinja2.Environment()
+      env = jinja2.Environment(extensions=["jinja2.ext.loopcontrols"])
       env.filters['tojson'] = lambda obj, **kwargs: json.dumps(obj, **kwargs)  # jinja2's tojson escapes <>& for HTML safety
       env.globals['raise_exception'] = lambda msg: (_ for _ in ()).throw(RuntimeError(msg))
       env.globals['strftime_now'] = lambda fmt: time.strftime(fmt)

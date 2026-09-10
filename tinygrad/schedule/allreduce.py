@@ -57,9 +57,11 @@ def handle_allreduce(buf:UOp, red:UOp) -> UOp|None:
   # reassemble
   return UOp.usum(*[c.pad(((s,numel-e),)) for (s,e),c in zip(chunks, copied_chunks)]).reshape(shape)
 
-def create_allreduce_function(buf:UOp, red:UOp, output:UOp|None=None) -> UOp|None:
-  if output is None: output = UOp.invalids(red.shape, dtype=red.dtype, device=red.device)
+def create_allreduce_function(buf:UOp, red:UOp) -> UOp|None:
+  # The writable call argument must be full storage. A symbolic view is materialized into a separate buffer at the call boundary.
+  output = UOp.invalids(red.max_shape, dtype=red.dtype, device=red.device)
   to = red.param_like(0)
   src = buf.param_like(1)
-  red = src.allreduce(*red.arg)
-  return output.after(to.after(to.store(handle_allreduce(src, red))).sink().call(output, buf.contiguous(), name="allreduce", precompile=True))
+  reduced = handle_allreduce(src, src.allreduce(*red.arg))
+  if reduced is None: return None
+  return output.after(to.after(to.store(reduced)).sink().call(output, buf.contiguous(), name="allreduce", precompile=True)).shrink_to(red.shape)

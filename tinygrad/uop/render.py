@@ -4,14 +4,32 @@ from tinygrad.uop.ops import ParamArg, UOp, PatternMatcher, UPat, multirange_str
 from tinygrad.helpers import strip_parens
 
 def pretty_print(x:UOp, cache=None, d=0)->str:
-  def dfs(x:UOp, cache:dict):
-    for s in x.src:
+  if cache is None:
+    cache = {}
+    pending = [iter(x.src)]
+    while pending:
+      if (s:=next(pending[-1], None)) is None:
+        pending.pop()
+        continue
       cache.setdefault(s, [len(cache), 0, False])[1] += 1
-      if cache[s][1] == 1: dfs(s, cache)
-  if cache is None: dfs(x, cache:={})
-  if (cx:=cache.setdefault(x, [0,0,False]))[2]: return f"{' '*d}x{cx[0]}"
-  cx[2], srcs = True, (''.join(f'\n{pretty_print(s, cache, d+2)},' for s in x.src))
-  return f"{' '*d}{f'x{cx[0]}:=' * (cx[1]>1)}{type(x).__name__}({x.op}, arg={x.argstr()}{x.tagstr()}, src=({srcs}))"
+      if cache[s][1] == 1: pending.append(iter(s.src))
+  parts: list[str] = []
+  stack: list[tuple[UOp|None, int]] = [(x, d)]
+  while stack:
+    node, depth = stack.pop()
+    if node is None:
+      parts.append("))" + ("," if depth > d else ""))
+      continue
+    if depth > d: parts.append("\n")
+    cx = cache.setdefault(node, [0, 0, False])
+    if cx[2]:
+      parts.append(f"{' '*depth}x{cx[0]}" + ("," if depth > d else ""))
+      continue
+    cx[2] = True
+    parts.append(f"{' '*depth}{f'x{cx[0]}:=' * (cx[1]>1)}{type(node).__name__}({node.op}, arg={node.argstr()}{node.tagstr()}, src=(")
+    stack.append((None, depth))
+    stack.extend((s, depth+2) for s in reversed(node.src))
+  return ''.join(parts)
 
 # ***** uop helpers *****
 

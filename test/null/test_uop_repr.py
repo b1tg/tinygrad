@@ -1,7 +1,21 @@
 import unittest
 from tinygrad import UOp
+from tinygrad.uop import Ops
 
 class TestUOpRepr(unittest.TestCase):
+  def test_deep_graph(self):
+    import sys
+    node = UOp.const(1)
+    for _ in range(400): node = UOp(Ops.NOOP, src=(node,))
+    limit = sys.getrecursionlimit()
+    try:
+      sys.setrecursionlimit(300)
+      rendered = repr(node)
+    finally:
+      sys.setrecursionlimit(limit)
+    self.assertEqual(rendered.count("UOp(Ops.NOOP"), 400)
+    self.assertIn("UOp(Ops.CONST, arg=1, src=())", rendered)
+
   def test_simple_const(self):
     a = UOp.const(42)
     self.assertEqual(repr(a), "UOp(Ops.CONST, arg=42, src=())")

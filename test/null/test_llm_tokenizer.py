@@ -2,6 +2,14 @@ import unittest, base64, functools, re, sys, time, unicodedata
 from tinygrad.llm.cli import SimpleTokenizer, FallbackTemplate
 from tinygrad.helpers import fetch
 
+class TestKimiTokenizer(unittest.TestCase):
+  def test_word_boundaries(self):
+    split = SimpleTokenizer({}, {}, "kimi-k2")._split_to_word.findall
+    self.assertEqual(split("HelloWorld I'm TEST's"), ["Hello", "World", " I'm", " TEST's"])
+    self.assertEqual(split("hello你好world 你好世界!"), ["hello", "你好", "world", " ", "你好世界", "!"])
+    self.assertEqual(split("中文ABC中文"), ["中文", "ABC", "中文"])
+    self.assertEqual(split("e\u0301lan 1234567"), ["e\u0301lan", " ", "123", "456", "7"])
+
 @unittest.skipIf(sys.platform == 'win32', "fetch race condition on Windows")
 class TestLLMTokenizer(unittest.TestCase):
   @functools.cached_property

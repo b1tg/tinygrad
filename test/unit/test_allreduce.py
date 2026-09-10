@@ -1,4 +1,4 @@
-import unittest
+import unittest, numpy as np
 from tinygrad import Tensor, UOp, dtypes
 from tinygrad.helpers import Context
 from tinygrad.uop.ops import Ops
@@ -64,6 +64,16 @@ class TestRingAllReduce(unittest.TestCase):
     out = t[:rows].sum(1).realize()
     self.assertEqual(out.shape, (rows,))
     self.assertTrue((out == 4).all().item())
+
+  def test_symbolic_shape_matmul(self):
+    # allreduce on a symbolic-shaped buffer keeps the full storage as the writable call argument
+    ds = ("CPU:0", "CPU:1", "CPU:2", "CPU:3")
+    rows = UOp.variable("rows", 1, 32).bind(3)
+    x = Tensor.randn(1, 32, 64).realize()
+    w = Tensor.randn(128, 64).realize()
+    out = x.to(ds)[:, :rows] @ w.shard(ds, axis=1).T
+    self.assertEqual(out.shape, (1, rows, 128))
+    np.testing.assert_allclose(out[:, :3].to("CPU").numpy(), (x[:, :3] @ w.T).numpy(), atol=1e-3, rtol=1e-3)
 
   def test_correct_ring(self):
     with Context(RING=2):

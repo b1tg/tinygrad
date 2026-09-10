@@ -1,10 +1,29 @@
 from __future__ import annotations
-import enum, functools, itertools, pathlib
+import enum, functools, itertools, math, pathlib
 from dataclasses import dataclass, replace
-from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes
+from tinygrad import Device, Tensor, nn, UOp, TinyJit, getenv, function, dtypes
 from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
 from tinygrad.llm.gguf import gguf_load
 from tinygrad.uop.ops import resolve
+
+_TP_LAYOUT: dict[str, int|str] = {
+  "attn_q.weight":0, "attn_q_b.weight":0, "attn_k.weight":0, "attn_k.bias":0, "attn_v.weight":0, "attn_v.bias":0,
+  "attn_k_b.weight":0, "attn_v_b.weight":0, "attn_output.weight":1, "attn_gate.weight":0,
+  "ssm_conv1d_q.weight":0, "ssm_conv1d_k.weight":0, "ssm_conv1d_v.weight":0,
+  "ssm_g.weight":0, "ssm_g_a.weight":"replicate", "ssm_g_b.weight":0,
+  "ssm_f_a.weight":"replicate", "ssm_f_b.weight":0, "ssm_beta.weight":0, "ssm_a":0, "ssm_dt.bias":0, "ssm_norm.weight":"replicate",
+  "ffn_gate.weight":0, "ffn_up.weight":0, "ffn_down.weight":1,
+  "ffn_gate_shexp.weight":"replicate", "ffn_up_shexp.weight":"replicate", "ffn_down_shexp.weight":"replicate",
+  "ffn_gate_exps.weight":1, "ffn_up_exps.weight":1, "ffn_down_exps.weight":2,
+  "ffn_routed_down.weight":"replicate", "ffn_routed_up.weight":"replicate", "ffn_routed_norm.weight":"replicate",
+  "attn_norm.weight":"replicate", "attn_q_norm.weight":"replicate", "attn_k_norm.weight":"replicate",
+  "attn_q_a.weight":"replicate", "attn_q_a_norm.weight":"replicate",
+  "attn_kv_a_mqa.weight":"replicate", "attn_kv_a_norm.weight":"replicate",
+  "ffn_norm.weight":"replicate", "ffn_gate_inp.weight":"replicate", "ffn_gate_inp_shexp.weight":"replicate", "exp_probs_b.bias":"replicate",
+  "attn_res_score.weight":"replicate", "ffn_res_score.weight":"replicate", "output_res_score.weight":"replicate",
+  "output.weight":0, "output_norm.weight":"replicate",
+}
+def _shard_policy(name:str) -> int|str|None: return _TP_LAYOUT.get(name.split(".", 2)[-1] if name.startswith("blk.") else name)
 
 class ExpertGating(enum.IntEnum):
   SOFTMAX = 1
@@ -12,11 +31,29 @@ class ExpertGating(enum.IntEnum):
   SOFTMAX_WEIGHT = 3  # softmax over the top-k selected logits
   SQRT_SOFTPLUS = 4
 
+@dataclass(frozen=True)
+class YaRNConfig:
+  # DeepSeek MLA applies the YaRN magnitude correction to the full attention score, not just the rotary dimensions.
+  factor: float
+  original_context: int
+  beta_fast: float = 32.0
+  beta_slow: float = 1.0
+  log_multiplier: float = 0.1
+
+  @property
+  def attention_factor(self) -> float: return (1 + self.log_multiplier * math.log(self.factor)) ** 2 if self.factor > 1 else 1.0
+
 @functools.cache
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, device:str|None=None) -> Tensor:
+def precompute_freqs_cis(dim:int, end:int, theta:float=10000.0, device:str|tuple[str, ...]|None=None, yarn:YaRNConfig|None=None) -> Tensor:
   freqs = 1.0 / (theta ** (Tensor.arange(0, dim, 2)[:(dim // 2)] / dim))
-  freqs = Tensor.arange(end).unsqueeze(dim=1) * freqs.unsqueeze(dim=0)
+  if yarn is not None:
+    def correction(rotations:float) -> float: return dim * math.log(yarn.original_context / (rotations * 2 * math.pi)) / (2 * math.log(theta))
+    low, high = max(math.floor(correction(yarn.beta_fast)), 0), min(math.ceil(correction(yarn.beta_slow)), dim-1)
+    ramp = ((Tensor.arange(dim//2).float() - low) / (high-low if high != low else 0.001)).clip(0, 1)
+    freqs = freqs * (1-ramp) + freqs / yarn.factor * ramp
+  freqs = Tensor.arange(end).unsqueeze(1) * freqs.unsqueeze(0)
   return freqs.cos().cat(freqs.sin(), dim=-1).clone(device)
+
 
 class ExpertWeights:
   """Like Linear but with num_experts dimension. Weight shape: (num_experts, out_features, in_features)."""
@@ -80,6 +117,7 @@ class TransformerConfig:
   routed_scaling_factor: float = 1.0
   qkv_bias: bool = False
   expert_bias: bool = False
+  yarn: YaRNConfig|None = None
 
 class FFNBlock:
   def __init__(self, config:TransformerConfig):
@@ -208,6 +246,8 @@ class TransformerBlock(FFNBlock):
       # zeroed so the flash kernels can safely read whole tiles past the valid region (masked lanes multiply by 0)
       self.cache_kv = Tensor.zeros(2, x.shape[0], self.config.n_kv_heads, self.config.max_context, self.config.head_dim,
                                    dtype=dtypes.half, device=x.device)
+      if isinstance(x.device, tuple):
+        self.cache_kv = Tensor.zeros(*self.cache_kv.shape, dtype=dtypes.half, device=x.device[0]).contiguous().shard(x.device, axis=2).realize()
       self.freqs_cis = precompute_freqs_cis(self.config.rope_dim, self.config.max_context, self.config.rope_theta, device=x.device)
 
 class MLATransformerBlock(FFNBlock):
@@ -246,7 +286,7 @@ class MLATransformerBlock(FFNBlock):
 
     mask = Tensor.full((1, 1, T, start_pos+T), float("-inf"), dtype=x.dtype, buffer=False).triu(start_pos+1) \
       if resolve(T != 1) else None
-    attn = q @ k.transpose(-1, -2) * (1.0 / self.config.head_dim ** 0.5)
+    attn = q @ k.transpose(-1, -2) * ((self.config.yarn.attention_factor if self.config.yarn else 1.0) / self.config.head_dim ** 0.5)
     if mask is not None: attn = attn + mask
     attn = attn.softmax(-1)
     attn = ((attn @ v) @ self.attn_v_b["weight"].transpose(-1, -2)).transpose(1, 2).reshape(B, T, -1)
@@ -254,8 +294,11 @@ class MLATransformerBlock(FFNBlock):
 
   def _init_state(self, x:Tensor):
     if not hasattr(self, "cache_k"):
-      self.cache_k = Tensor.empty(x.shape[0], 1, self.config.max_context, self.config.kv_lora_rank + self.config.rope_dim, device=x.device)
-      self.freqs_cis = precompute_freqs_cis(self.config.rope_dim, self.config.max_context, self.config.rope_theta, device=x.device)
+      shape = (x.shape[0], 1, self.config.max_context, self.config.kv_lora_rank + self.config.rope_dim)
+      self.cache_k = (Tensor.zeros(*shape, device=x.device[0]).contiguous().shard(x.device).realize()
+                      if isinstance(x.device, tuple) else Tensor.empty(*shape, device=x.device))
+      self.freqs_cis = precompute_freqs_cis(self.config.rope_dim, self.config.max_context, self.config.rope_theta,
+                                            device=x.device, yarn=self.config.yarn)
 
 class GatedDeltaNetBlock(FFNBlock):
   def __init__(self, config:TransformerConfig, ssm:SSMConfig):
@@ -362,6 +405,7 @@ class Transformer:
     self.token_embd  = nn.Embedding(config.vocab_size, config.dim)
     self.output_norm = nn.RMSNorm(config.dim, config.norm_eps)
     self.output = Linear(config.dim, config.vocab_size, bias=False)
+    self.devices: tuple[str, ...]|None = None
     self.max_context = config.max_context
     self.has_recurrent_block = any(isinstance(b, GatedDeltaNetBlock) for b in self.blk)
     self._cached_tokens: list[int] = []
@@ -371,23 +415,30 @@ class Transformer:
 
   def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
     x = self.token_embd(tokens).float()                   # (B, T, D)
+    if self.devices is not None: x = x.to(self.devices)
     for block in self.blk: x = block(x, start_pos)
     # only run the output projection on the last token
-    logits = self.output(self.output_norm(x[:, -1:]))[:, -1, :]
+    x = self.output_norm(x[:, -1:])
+    if self.devices is not None and not isinstance(self.output.weight.device, tuple): x = x.to(self.devices[0])
+    logits = self.output(x)[:, -1, :]
+    temperature = temperature.to(logits.device)
     # Gumbel-max trick: argmax(logits/temp - log(-log(uniform))) is equivalent to sampling from softmax(logits/temp)
-    return (logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1, keepdim=True)
+    out = (logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1, keepdim=True)
+    return out.to(self.devices[0]) if self.devices is not None else out
 
   def __call__(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
     return (self.prefill_jit if resolve(tokens.shape[1] != 1) else self.rollout_jit)(tokens.contiguous(), start_pos, temperature)
 
   @staticmethod
   def from_gguf(gguf:Tensor|str|pathlib.Path, max_context:int|None=None,
-                realize=bool(getenv("REALIZE", 0))) -> tuple[Transformer, dict]:
-    # TODO: remove the need for copy to default device
-    kv, state_dict = gguf_load(gguf.to(None).realize() if isinstance(gguf, Tensor) else gguf)
+                realize=bool(getenv("REALIZE", 0)), shard:int=1) -> tuple[Transformer, dict]:
+    if shard < 1: raise ValueError("shard must be positive")
+    devices = tuple(Device.canonicalize(f"{Device.DEFAULT}:{i}") for i in range(shard)) if shard > 1 else None
+    kv, state_dict = gguf_load(gguf, devices, _shard_policy)
 
-    # all state items should be float16, not float32
-    state_dict = {k:v.cast('float16') if getenv("HALF", 1) else v for k,v in state_dict.items()}
+    # Keep routing weights and selection biases in FP32, as in the model's noaux_tc router.
+    state_dict = {k:v.cast('float16') if getenv("HALF", 1) and not k.endswith(("ffn_gate_inp.weight", "exp_probs_b.bias")) else v
+                  for k,v in state_dict.items()}
 
     # some models like Llama 3.2 don't have an output.weight, they just tie to the token_embd.weight
     if 'output.weight' not in state_dict: state_dict['output.weight'] = state_dict['token_embd.weight']
@@ -455,8 +506,16 @@ class Transformer:
       routed_scaling_factor=kv.get(f'{arch}.expert_weights_scale', 1.0), attn_output_gate=arch in ('qwen35', 'qwen35moe'), ssm=ssm,
       ssm_layers=ssm_layers,
       qkv_bias='blk.0.attn_q.bias' in state_dict,
-      expert_bias=f"blk.{kv.get(f'{arch}.leading_dense_block_count', 0)}.exp_probs_b.bias" in state_dict)
+      expert_bias=f"blk.{kv.get(f'{arch}.leading_dense_block_count', 0)}.exp_probs_b.bias" in state_dict,
+      yarn=YaRNConfig(kv[f'{arch}.rope.scaling.factor'], kv[f'{arch}.rope.scaling.original_context_length'],
+                      kv.get(f'{arch}.rope.scaling.yarn_beta_fast', 32.0), kv.get(f'{arch}.rope.scaling.yarn_beta_slow', 1.0),
+                      kv.get(f'{arch}.rope.scaling.yarn_log_multiplier', 0.1))
+        if kv_lora_rank and kv.get(f'{arch}.rope.scaling.type') == 'yarn' else None)
     model = Transformer(config)
+    model.devices = devices
+    for k,v in nn.state.get_state_dict(model).items():
+      if (sd:=state_dict.get(k)) is not None and isinstance(sd.device, tuple) and not isinstance(v.device, tuple):
+        v.replace(Tensor.empty(*v.shape, device=sd.device[0]).shard(sd.device, axis=sd.uop.axis))
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:
