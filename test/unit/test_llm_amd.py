@@ -82,6 +82,22 @@ class TestQ8Quantize(unittest.TestCase):
         self.assertEqual(linear.weight.nbytes(), type_size)
         self.assertEqual(linear.weight.uop.buf_uop.buffer.offset, 4)
 
+  def test_exact_size_packed_weight_is_recovered(self):
+    # the streamed loader realizes small packed tensors as exact-size CPU buffers: the full-range slice folds away,
+    # so the raw packed bytes are the BUFFER itself. set_quantized must still recover the packed representation.
+    for ggml_type, type_size in ((12, 144), (13, 176), (14, 210), (23, 136)):
+      with self.subTest(ggml_type=ggml_type):
+        rng = np.random.default_rng(ggml_type)
+        packed = rng.integers(0, 256, (512*512//256, type_size), dtype=np.uint8)
+        packed[:, -2:] = np.array([0.001], dtype=np.float16).view(np.uint8)
+        if ggml_type != 14: packed[:, :2] = np.array([0.001], dtype=np.float16).view(np.uint8)
+        raw = Tensor(packed.flatten(), device="CPU").realize()
+        decoded = ggml_data_to_tensor(raw, 512*512, ggml_type).reshape(512, 512).half()
+        linear = Linear(512, 512, bias=False)
+        linear.set_quantized(decoded)
+        self.assertEqual(linear.ggml_type, ggml_type)
+        self.assertEqual(linear.weight.dtype, dtypes.uint32)
+
   def test_values_and_scales(self):
     if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
     x = np.linspace(-3.1, 2.7, 64, dtype=np.float32).reshape(2, 32)
@@ -199,6 +215,9 @@ class TestQ8Quantize(unittest.TestCase):
   def test_q4_k_linear(self): self._test_quant_linear(12, 144)
   def test_iq4_linear(self): self._test_quant_linear(23, 136)
   def test_q5_linear(self): self._test_quant_linear(13, 176)
+  # IQ2_XS/IQ3_XXS have no WMMA path yet: only the q8 decode kernel decodes them
+  def test_iq2_xs_linear(self): self._test_quant_linear(17, 74, token_counts=(1, 3))
+  def test_iq3_xxs_linear(self): self._test_quant_linear(18, 98, token_counts=(1, 3))
 
   def test_quant_linear_partial_output_tile(self):
     # Cover a sub-tile output, a trailing tile, and IQ4's larger-output tile selection.
@@ -283,6 +302,31 @@ class TestQ8Quantize(unittest.TestCase):
         ref = window[:,1:].copy()
         np.testing.assert_array_equal(state.numpy(), ref)
 
+  def test_kda_key_decay_reference(self):
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
+    from tinygrad import TinyJit
+    rng = np.random.default_rng(42)
+    for key_dim, value_dim in ((32, 8), (128, 128)):
+      with self.subTest(key_dim=key_dim, value_dim=value_dim):
+        state = Tensor.zeros(1, 2, value_dim, key_dim).contiguous().realize()
+        ref = np.zeros((1, 2, key_dim, value_dim), np.float32)
+        run = TinyJit(lambda q,k,v,b,a,pos: gated_delta_prefill(q,k,v,b,a,state,Tensor(pos)).realize())
+        for pos in (0, 3, 6, 9, 0):
+          q, k = [rng.normal(size=(1,2,3,key_dim)).astype(np.float32)*0.1 for _ in range(2)]
+          v = rng.normal(size=(1,2,3,value_dim)).astype(np.float32)
+          beta = rng.random((1,2,3), dtype=np.float32)
+          alpha = rng.random((1,2,3,key_dim), dtype=np.float32)
+          if pos == 0: ref.fill(0)
+          expected = []
+          for t in range(3):
+            ref *= alpha[:,:,t,:,None]
+            delta = (v[:,:,t] - np.einsum('bhkv,bhk->bhv', ref, k[:,:,t])) * beta[:,:,t,None]
+            ref += k[:,:,t,:,None] * delta[:,:,None,:]
+            expected.append(np.einsum('bhkv,bhk->bhv', ref, q[:,:,t]))
+          actual = run(*(Tensor(z).realize() for z in (q,k,v,beta,alpha)), UOp.variable("start_pos",0,31).bind(pos)).numpy()
+          np.testing.assert_allclose(actual, np.stack(expected, axis=2), atol=1e-6, rtol=1e-5)
+          np.testing.assert_allclose(state.numpy(), ref.swapaxes(-1,-2), atol=1e-6, rtol=1e-5)
+
   def test_gated_delta_state_and_precision(self):
     if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
     for case in ("view", "reset", "half"):
@@ -366,6 +410,8 @@ class TestQ8Quantize(unittest.TestCase):
   def test_q4_k_expert_wide(self): self._test_quant_expert(12, 144, in_features=512, out_features=32)
   def test_q5_k_expert(self): self._test_quant_expert(13, 176)
   def test_iq4_expert(self): self._test_quant_expert(23, 136)
+  def test_iq2_xs_expert(self): self._test_quant_expert(17, 74)
+  def test_iq3_xxs_expert(self): self._test_quant_expert(18, 98)
 
   def test_q6_k_expert(self):
     if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")

@@ -1,4 +1,5 @@
 import os, struct, unittest, tempfile, pathlib, sys
+from unittest.mock import patch
 from tinygrad import dtypes, Tensor, fetch, Device
 from tinygrad.helpers import disable_gc
 from tinygrad.llm.gguf import _ggml_iq_grid, ggml_data_to_tensor, gguf_load
@@ -226,6 +227,48 @@ class TestGGUF(unittest.TestCase):
       (d / "test-00002-of-00002.gguf").unlink()
       with self.assertRaises(FileNotFoundError):
         gguf_load(d / "test-00001-of-00002.gguf")
+
+  def test_stream_coalesces_weights(self):
+    a = np.arange(8, dtype=np.float32)
+    q8 = np.float16(2).tobytes() + np.arange(32, dtype=np.int8).tobytes()
+    with tempfile.TemporaryDirectory() as d:
+      p = pathlib.Path(d) / "batch.gguf"
+      p.write_bytes(self._build_gguf([("a", (8,), 0, a.tobytes()), ("q", (32,), 8, q8),
+                                     ("b", (8,), 0, a.tobytes())], []))
+      allocator = Device[f"DISK:{p}"].allocator
+      with patch.object(allocator, '_copyout', wraps=allocator._copyout) as copyout:
+        _, sd = gguf_load(p, stream=True)
+        # The first read is TensorIO's buffered header read, followed by one weight batch.
+        self.assertEqual([len(c.args[0]) for c in copyout.call_args_list[1:]], [a.nbytes*2 + len(q8)])
+      np.testing.assert_equal(sd['a'].numpy(), a)
+      np.testing.assert_equal(sd['b'].numpy(), a)
+      np.testing.assert_equal(sd['q'].numpy(), np.arange(32) * 2)
+      self.assertEqual(bytes(sd['q']._packed_raw[1].data()), q8)
+
+  def test_stream_bounds_reads_and_skips_large_packed(self):
+    # Use sparse file storage: three 32 MiB native weights require two batches; the packed weight stays on DISK.
+    native_size, packed_size = 32 << 20, ((64 << 20) // 34 + 1) * 34
+    infos = [("a", native_size//4, 0, 0), ("b", native_size//4, 0, native_size),
+             ("c", native_size//4, 0, native_size*2), ("packed", packed_size//34*32, 8, native_size*3),
+             ("d", 1, 0, native_size*3 + packed_size)]
+    header = bytearray(struct.pack('<4siqq', b'GGUF', 3, len(infos), 0))
+    # Directory order need not match the order of the weights in the file.
+    for name, n, typ, off in reversed(infos):
+      header += struct.pack('<Q', len(name)) + name.encode() + struct.pack('<IQiQ', 1, n, typ, off)
+    header += bytes(-len(header) % 32)
+    with tempfile.TemporaryDirectory() as d:
+      p = pathlib.Path(d) / "bounded.gguf"
+      with p.open('wb') as f:
+        f.write(header)
+        f.truncate(len(header) + native_size*3 + packed_size + 4)
+      allocator = Device[f"DISK:{p}"].allocator
+      with patch.object(allocator, '_copyout', wraps=allocator._copyout) as copyout:
+        _, sd = gguf_load(p, stream=True)
+        self.assertEqual([len(c.args[0]) for c in copyout.call_args_list[1:]], [native_size*2, native_size, 4])
+      self.assertEqual(sd['packed'].device, f'DISK:{p}')
+      for name in ('a', 'b', 'c', 'd'):
+        self.assertEqual(sd[name].device, 'CPU')
+        self.assertEqual(sd[name][0].item(), 0)
 
   def _test_dequantization(self, qtype: GGMLQuantizationType):
     block_size, type_size = GGML_QUANT_SIZES[qtype]

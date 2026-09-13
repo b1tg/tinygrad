@@ -12,6 +12,12 @@ def _ggml_iq_grid(device: str, grid: tuple[int, ...], grid_shape: tuple[int, int
   values = [float((w >> (8*i)) & 0xFF) for w in grid for i in range(grid_shape[1])]
   return Tensor(values, dtype=dtypes.float32, device=device).reshape(grid_shape)
 
+@functools.lru_cache(None)
+def _ggml_even_signs(device: str) -> Tensor:
+  # bit k is sign of element k, bit 7 is the parity of the 7-bit index. cached so two decodes of the
+  # same packed tensor produce identical UOp keys (packed_ggml_weight compares them for exactness).
+  return Tensor([i | (0x80 if i.bit_count() % 2 else 0) for i in range(128)], dtype=dtypes.uint8, device=device)
+
 # native types {ggml_type: dtype}
 _GGML_NATIVE = {0: dtypes.float32, 1: dtypes.float16, 24: dtypes.int8, 25: dtypes.int16,
                 26: dtypes.int32, 27: dtypes.int64, 28: dtypes.float64, 30: dtypes.bfloat16}
@@ -21,6 +27,17 @@ _GGML_QUANT = {2:(32,18), 3:(32,20), 6:(32,22), 7:(32,24), 8:(32,34),
                10:(256,84), 11:(256,110), 12:(256,144), 13:(256,176), 14:(256,210),
                16:(256,66), 17:(256,74), 18:(256,98), 19:(256,50), 20:(32,18), 21:(256,110), 22:(256,82), 23:(256,136),
                29:(256,56), 39:(32,17), 41:(128,18)}
+
+# types the AMD custom quant kernels keep packed; a streamed load keeps these on DISK until sharded.
+# Q6_K is excluded because packed_ggml_weight pads its 210-byte blocks, a compute op the DISK device can't render.
+_STREAM_PACKED = frozenset((8, 12, 13, 17, 18, 23))
+# quant types the packed-weight recovery handles (Q6_K is materialized but still worth a raw handle)
+_PACKED_HANDLE_TYPES = _STREAM_PACKED | {14}
+
+def _ggml_nbytes(n:int, typ:int) -> int:
+  if (dtype := _GGML_NATIVE.get(typ)) is not None: return n * dtype.itemsize
+  nelements, nbytes = _GGML_QUANT[typ]
+  return n // nelements * nbytes
 
 def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
   """
@@ -91,7 +108,7 @@ def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
       scale_words = blocks[:, 66:98].bitcast(dtypes.uint32)
       db = d * (scale_words.rshift(28).cast(dtypes.float32) + 0.5).reshape((-1, 8, 1, 1)) * 0.5
       sign_idx = scale_words.unsqueeze(-1).rshift(Tensor.const((0, 7, 14, 21), dtypes.uint32)).bitwise_and(0x7F).reshape((-1, 32)).cast(dtypes.int32)
-      even_signs = Tensor([i | (0x80 if i.bit_count() % 2 else 0) for i in range(128)], dtype=dtypes.uint8, device=t.device)
+      even_signs = _ggml_even_signs(t.device)
       signs = (q_to_uint8(even_signs[sign_idx].reshape((-1, 32, 1)), 1) == 0).where(1.0, -1.0).reshape((-1, 8, 4, 8))
       grid = _ggml_iq_grid(t.device, _ggml.iq3xxs_grid, (256, 4))[blocks[:, 2:66]].reshape((-1, 8, 4, 8))
       return (db * grid * signs).flatten(-3)
@@ -102,7 +119,7 @@ def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
       db = d * (qs_u32[:, :, 1].rshift(28).cast(dtypes.float32) + 0.5).reshape((-1, 8, 1, 1)) * 0.25
       sign_idx = qs_u32[:, :, 1].unsqueeze(-1).rshift(Tensor.const((0, 7, 14, 21), dtypes.uint32))
       sign_idx = sign_idx.bitwise_and(0x7F).reshape((-1, 32)).cast(dtypes.int32)
-      even_signs = Tensor([i | (0x80 if i.bit_count() % 2 else 0) for i in range(128)], dtype=dtypes.uint8, device=t.device)
+      even_signs = _ggml_even_signs(t.device)
       signs = (q_to_uint8(even_signs[sign_idx].reshape((-1, 32, 1)), 1) == 0).where(1.0, -1.0).reshape((-1, 8, 4, 8))
       grid = _ggml_iq_grid(t.device, _ggml.iq2xxs_grid, (256, 8))[blocks[:, 2:].reshape((-1, 8, 8))[:, :, :4]].reshape((-1, 8, 4, 8))
       return (db * grid * signs).flatten(-3)
@@ -112,7 +129,7 @@ def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
       db = d * (q_to_uint8(blocks[:, 66:74].reshape((-1, 8, 1)), 4).reshape((-1, 16)).cast(dtypes.float32) + 0.5).reshape((-1, 16, 1, 1)) * 0.25
       qs = blocks[:, 2:66].bitcast(dtypes.uint16)
       sign_idx = qs.rshift(9).cast(dtypes.int32)
-      even_signs = Tensor([i | (0x80 if i.bit_count() % 2 else 0) for i in range(128)], dtype=dtypes.uint8, device=t.device)
+      even_signs = _ggml_even_signs(t.device)
       signs = (q_to_uint8(even_signs[sign_idx].reshape((-1, 32, 1)), 1) == 0).where(1.0, -1.0).reshape((-1, 16, 2, 8))
       grid = _ggml_iq_grid(t.device, _ggml.iq2xs_grid, (512, 8))[qs.bitwise_and(511)].reshape((-1, 16, 2, 8))
       return (db * grid * signs).flatten(-3)
@@ -194,9 +211,10 @@ readers: dict[int, Callable[[io.BufferedIOBase], Any]] = { 8: read_str, 9: read_
     [ (0,"c",1), (1,"b",1), (2,"H",2), (3,"h",2), (4,"I",4), (5,"i",4), (6,"f",4), (7,"?",1), (10,"Q",8), (11,"q",8), (12,"d",8) ] } }
 read_uint32, read_int32, read_uint64, read_int64 = readers[4], readers[5], readers[10], readers[11]
 
-def _gguf_parse(tensor: Tensor) -> tuple[dict, dict[str, Tensor]]:
+def _gguf_parse(tensor: Tensor, stream:bool=False) -> tuple[dict, dict[str, Tensor]]:
   # TODO: remove the need for copy to default device
-  tensor = tensor.to(None).realize()
+  # stream keeps the tensor on its own (typically DISK) device so only the sharded slices are ever realized
+  if not stream: tensor = tensor.to(None).realize()
   r = io.BufferedReader(TensorIO(tensor), 1_000_000)
   magic, version, n_tensors, n_kv = r.read(4), read_int32(r), read_int64(r), read_int64(r)
   if magic != b"GGUF" or version not in [2, 3]: raise ValueError("Invalid GGUF format!")
@@ -210,7 +228,33 @@ def _gguf_parse(tensor: Tensor) -> tuple[dict, dict[str, Tensor]]:
   alignment, pos = kv_data.get("general.alignment", 32), r.tell()
   data_start = round_up(pos, alignment)
 
-  state_dict = {name: ggml_data_to_tensor(tensor[data_start + off:], prod(dims), typ).reshape(*reversed(dims)) for name, dims, typ, off in t_infos}
+  # Coalesce adjacent CPU-bound weights into bounded reads. The decoded tensors share views of these buffers;
+  # large packed weights remain on DISK, and gaps between tensors are never pulled into an unbounded allocation.
+  staged: dict[str, Tensor] = {}
+  if stream and isinstance(tensor.device, str) and tensor.device.startswith("DISK"):
+    spans = sorted((off, off + _ggml_nbytes(prod(dims), typ), name) for name, dims, typ, off in t_infos
+                   if typ not in _STREAM_PACKED or _ggml_nbytes(prod(dims), typ) < 64 << 20)
+    i = 0
+    while i < len(spans):
+      start, end, _ = spans[i]
+      j = i + 1
+      while j < len(spans) and 0 <= spans[j][0] - end <= alignment and spans[j][1] - start <= 64 << 20:
+        end = spans[j][1]
+        j += 1
+      batch = tensor[data_start + start:data_start + end].to('CPU').realize()
+      for s, e, name in spans[i:j]: staged[name] = batch[s-start:e-start]
+      i = j
+
+  state_dict = {}
+  for name, dims, typ, off in t_infos:
+    n, nbytes = prod(dims), _ggml_nbytes(prod(dims), typ)
+    raw = tensor[data_start + off:data_start + off + nbytes]
+    if name in staged: raw = staged.pop(name)
+    decoded = ggml_data_to_tensor(raw, n, typ).reshape(*reversed(dims))
+    # stash the raw packed bytes: the dequant is exactly this tensor, so the sharder can recover it without walking
+    # the (huge) decode graph and comparing keys again
+    if typ in _PACKED_HANDLE_TYPES: setattr(decoded, '_packed_raw', (typ, raw))
+    state_dict[name] = decoded
   return kv_data, state_dict
 
 def _gguf_split_paths(path: pathlib.Path, kv: dict) -> list[pathlib.Path]:
@@ -219,7 +263,7 @@ def _gguf_split_paths(path: pathlib.Path, kv: dict) -> list[pathlib.Path]:
   if not (m := re.match(r"^(.*)-00001-of-\d{5}\.gguf$", str(path))): raise ValueError(f"first split path must end with -00001-of-NNNNN.gguf: {path}")
   return [pathlib.Path(f"{m.group(1)}-{i:05d}-of-{total:05d}.gguf") for i in range(1, total+1)]
 
-def gguf_load(fn: Tensor|str|pathlib.Path) -> tuple[dict, dict[str, Tensor]]:
+def gguf_load(fn: Tensor|str|pathlib.Path, stream:bool=False) -> tuple[dict, dict[str, Tensor]]:
   """
   Loads a .gguf file, returning the `kv_data` and `state_dict`. Multi-part splits are auto-merged when loaded by path.
 
@@ -234,8 +278,8 @@ def gguf_load(fn: Tensor|str|pathlib.Path) -> tuple[dict, dict[str, Tensor]]:
 
   NOTE: The provided tensor must be on a device that supports execution.
   """
-  kv, sd = _gguf_parse(fn if isinstance(fn, Tensor) else Tensor(pathlib.Path(fn)))
+  kv, sd = _gguf_parse(fn if isinstance(fn, Tensor) else Tensor(pathlib.Path(fn)), stream)
   if kv.get('split.count', 1) <= 1: return kv, sd
   if isinstance(fn, Tensor): raise ValueError("multi-part GGUF requires a path argument (got Tensor)")
-  for pp in _gguf_split_paths(pathlib.Path(fn), kv)[1:]: sd.update(_gguf_parse(Tensor(pp))[1])
+  for pp in _gguf_split_paths(pathlib.Path(fn), kv)[1:]: sd.update(_gguf_parse(Tensor(pp), stream)[1])
   return kv, sd

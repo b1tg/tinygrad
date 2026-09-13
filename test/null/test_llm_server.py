@@ -1,6 +1,34 @@
 import unittest, threading, time, json
 from unittest.mock import Mock, patch
 
+class TestGLMToolCalls(unittest.TestCase):
+  def test_tool_handoff_token(self):
+    from tinygrad.llm.cli import SimpleTokenizer
+    tok = SimpleTokenizer.from_gguf_kv({'tokenizer.ggml.tokens':['a', '<|endoftext|>', '<|user|>', '<|observation|>'],
+      'tokenizer.ggml.token_type':[1, 3, 3, 3], 'tokenizer.ggml.pre':'glm4', 'tokenizer.ggml.eos_token_id':1,
+      'tokenizer.ggml.eot_token_id':2, 'tokenizer.ggml.eom_token_id':3})
+    self.assertFalse(tok.is_end(0))
+    for token in (1, 2, 3): self.assertTrue(tok.is_end(token))
+
+  def test_arguments(self):
+    from tinygrad.llm.serve import parse_tool_call
+    self.assertEqual(parse_tool_call('write<arg_key>path</arg_key><arg_value>result.txt</arg_value>'
+                                    '<arg_key>content</arg_key><arg_value>\nhello\n</arg_value>'),
+                     ('write', {'path':'result.txt', 'content':'\nhello\n'}))
+    self.assertEqual(parse_tool_call('run<arg_key>count</arg_key><arg_value>3</arg_value>'
+                                    '<arg_key>options</arg_key><arg_value>{"ok":true}</arg_value>'),
+                     ('run', {'count':3, 'options':{'ok':True}}))
+    self.assertEqual(parse_tool_call('noop'), ('noop', {}))
+    self.assertIsNone(parse_tool_call('write<arg_key>path</arg_key><arg_value>truncated'))
+
+  def test_json_file_content_stays_a_string(self):
+    from tinygrad.llm.serve import parse_tool_call
+    tools = [{'type':'function', 'function':{'name':'write', 'parameters':{'type':'object',
+      'properties':{'content':{'type':'string'}, 'count':{'type':'integer'}}}}}]
+    self.assertEqual(parse_tool_call('write<arg_key>content</arg_key><arg_value>{"ok":true}</arg_value>'
+                                    '<arg_key>count</arg_key><arg_value>3</arg_value>', tools),
+                     ('write', {'content':'{"ok":true}', 'count':3}))
+
 class TestLLMServer(unittest.TestCase):
   """Integration tests using the real OpenAI client."""
 
@@ -49,6 +77,26 @@ class TestLLMServer(unittest.TestCase):
     self.assertGreater(len(chunks), 0)
     self.assertEqual(chunks[0].choices[0].delta.role, "assistant")
     self.assertEqual(chunks[-1].choices[0].finish_reason, "stop")
+
+  def test_glm_tool_call_stream(self):
+    pieces = {300:'<tool_ca', 301:'ll>read<arg_key>path</arg_key><arg_value>input.txt</arg_value></tool_call>'}
+    with patch.object(self.mock_model, 'generate', side_effect=lambda ids, **kwargs: iter([300, 301, 999])), \
+         patch.object(self.mock_tok, 'stream_decoder', side_effect=lambda: lambda tid=None: pieces.get(tid, '')):
+      chunks = list(self.client.chat.completions.create(model='test', messages=[{'role':'user', 'content':'Read input.txt'}], stream=True))
+    calls = [tc for c in chunks for choice in c.choices for tc in choice.delta.tool_calls or []]
+    self.assertEqual(len(calls), 1)
+    self.assertEqual(calls[0].function.name, 'read')
+    self.assertEqual(json.loads(calls[0].function.arguments), {'path':'input.txt'})
+    self.assertEqual(chunks[-1].choices[0].finish_reason, 'tool_calls')
+
+  def test_reasoning_effort_template(self):
+    template = Mock()
+    template.render.return_value = 'prompt'
+    with patch.object(self.server, 'template', template):
+      self.client.chat.completions.create(model='test', messages=[{'role':'user', 'content':'Hello'}], reasoning_effort='low',
+                                         extra_body={'chat_template_kwargs':{'clear_thinking':True}})
+    self.assertEqual(template.render.call_args.kwargs['reasoning_effort'], 'low')
+    self.assertTrue(template.render.call_args.kwargs['clear_thinking'])
 
   def test_openai_response_structure(self):
     stream = self.client.chat.completions.create(

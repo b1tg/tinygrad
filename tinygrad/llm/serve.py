@@ -7,7 +7,7 @@ if TYPE_CHECKING:
   from tinygrad.llm.cli import SimpleTokenizer
   from tinygrad.llm.model import Transformer
 
-def parse_tool_call(s:str) -> tuple[str, typing.Any]|None:
+def parse_tool_call(s:str, tools:list[dict]|None=None) -> tuple[str, typing.Any]|None:
   s = s.strip()
   if s.startswith("{"):  # hermes JSON format: {"name": ..., "arguments": {...}}
     try:
@@ -22,6 +22,18 @@ def parse_tool_call(s:str) -> tuple[str, typing.Any]|None:
       try: args[pm.group(1)] = json.loads(value)
       except json.JSONDecodeError: args[pm.group(1)] = value
     return fm.group(1), args
+  # GLM format: name<arg_key>key</arg_key><arg_value>value</arg_value>...
+  if (gm := re.fullmatch(r"([\w.-]+)\s*((?:<arg_key>.*?</arg_key>\s*<arg_value>.*?</arg_value>\s*)*)", s, re.DOTALL)):
+    args = {}
+    schema: dict = next((f.get('parameters', {}) for t in tools or [] if (f:=t.get('function', t)).get('name') == gm.group(1)), {})
+    for key, value in re.findall(r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>", gm.group(2), re.DOTALL):
+      try:
+        decoded = json.loads(value)
+        # GLM emits string arguments verbatim, including file contents that happen to be valid JSON.
+        string_arg = schema.get('properties', {}).get(key.strip(), {}).get('type') == 'string'
+        args[key.strip()] = value if string_arg and not isinstance(decoded, str) else decoded
+      except json.JSONDecodeError: args[key.strip()] = value
+    return gm.group(1), args
   return None
 
 def normalize_messages(messages:list[dict]) -> None:
@@ -68,7 +80,7 @@ class Handler(VizHandler):
     elif self.path.startswith("/assets/"): super().do_GET()
     else: self.send_data((pathlib.Path(__file__).parent / "chat.html").read_bytes(), content_type="text/html")
   def run_model(self, ids:list[int], model_name:str, include_usage=False, max_tokens:int|None=None, temperature:float=0.0,
-                reasoning:bool=False):
+                reasoning:bool=False, tools:list[dict]|None=None):
     model, tok = self.server.model, self.server.tok
     prompt_tokens = len(ids)
     cache_start_pos = model.get_start_pos(ids)
@@ -100,7 +112,7 @@ class Handler(VizHandler):
       for field, delta in router.route(dec(), final=True): yield chunk({field:delta})
       tool_calls: list[dict] = []
       for m in re.finditer(r"<tool_call>\s*(.*?)\s*(?:</tool_call>|$)", router.buf, re.DOTALL):
-        if (parsed := parse_tool_call(m.group(1))) is None:
+        if (parsed := parse_tool_call(m.group(1), tools)) is None:
           stderr_log(f"failed to parse tool call: {m.group(1)[:200]}")
           yield chunk({"content":m.group(0)})  # don't silently drop output the client can't use
         else:
@@ -129,7 +141,10 @@ class Handler(VizHandler):
     if self.path == "/v1/chat/completions":
       # render and tokenize
       normalize_messages(body["messages"])
-      rendered = self.server.template.render(messages=body["messages"], tools=body.get("tools"), add_generation_prompt=True, preserve_thinking=True)
+      template_args = dict(body.get("chat_template_kwargs") or {})
+      if "reasoning_effort" in body: template_args["reasoning_effort"] = body["reasoning_effort"]
+      template_args.update(messages=body["messages"], tools=body.get("tools"), add_generation_prompt=True, preserve_thinking=True)
+      rendered = self.server.template.render(**template_args)
       ids: list[int] = self.server.tok.encode(rendered)
       stderr_log(f"prep:{(time.perf_counter()-request_st)*1e3:5.0f} ms  {colored('--', 'BLACK')}  ")
       if len(ids) >= self.server.model.max_context:
@@ -142,7 +157,7 @@ class Handler(VizHandler):
       max_tokens = body.get("max_completion_tokens") or body.get("max_tokens")
       chunks = self.run_model(ids, body["model"], not body.get("stream") or body.get("stream_options",{}).get("include_usage", False),
                               max_tokens=max_tokens, temperature=float(body.get("temperature", 0.0)),
-                              reasoning=rendered.rstrip().endswith("<think>"))
+                              reasoning=rendered.rstrip().endswith("<think>"), tools=body.get('tools'))
       if body.get("stream"): self.stream_json(chunks)
       else:
         out, reasoning, tool_calls, finish_reason = [], [], [], "stop"
