@@ -1084,3 +1084,31 @@ def topk_bias_256_8(x:Tensor, bias:Tensor) -> Tensor:
   probs = Tensor.empty(1, 1, 8, device=x.device, dtype=dtypes.float32)
   sel = Tensor.empty(1, 1, 8, device=x.device, dtype=dtypes.int32)
   return Tensor.custom_kernel(probs, sel, x.contiguous(), bias, fxn=_topk_softmax_256_8_kernel)[1]
+
+
+@functools.cache
+def _topk_bias_kernel(sel:UOp, x:UOp, bias:UOp, *, n:int, per_lane:int) -> UOp:
+  # single-wave selection of the top-8 (scores+bias), one lane per expert residue class. Works for any
+  # multiple of 32 experts (GLM-5.3 uses 288), letting the router skip the O(n^2) pairwise_topk fallback.
+  x, bias = x.reshape(n), bias.reshape(n)
+  lane = UOp.range(32, 0, AxisType.LOCAL)
+  ids = [lane+j*32 for j in range(per_lane)]
+  values = [x[i].load() + bias[i].float() for i in ids]
+  stores = []
+  for j in range(8):
+    maximum = warp_reduce(functools.reduce(UOp.maximum, values), maximum=True, full_wave=True)
+    # prefer the lower expert index on ties, matching pairwise_topk
+    candidate = functools.reduce(UOp.maximum, [v.eq(maximum).where(-i.float(), -1e30) for i,v in zip(ids, values)])
+    winner = -warp_reduce(candidate, maximum=True, full_wave=True)
+    slot = UOp.const(7-j).valid(lane.eq(0))
+    stores.append(sel.reshape(8)[slot].store(winner.cast(dtypes.int32)))
+    values = [i.eq(winner.cast(dtypes.int32)).where(float('-inf'), v) for i,v in zip(ids, values)]
+  return UOp.group(*stores).end(lane).sink(arg=KernelInfo(name=f"topk_bias_{n}_8", opts_to_apply=()))
+
+
+def topk_bias(x:Tensor, bias:Tensor) -> Tensor:
+  n = x.shape[-1]
+  assert x.shape == (1, 1, n) and x.dtype == dtypes.float32 and bias.shape == (n,) and n % 32 == 0
+  sel = Tensor.empty(1, 1, 8, device=x.device, dtype=dtypes.int32)
+  return Tensor.custom_kernel(sel, x.contiguous(), bias.contiguous(),
+                              fxn=functools.partial(_topk_bias_kernel, n=n, per_lane=n//32))[0]

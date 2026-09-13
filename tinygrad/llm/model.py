@@ -3,7 +3,8 @@ import enum, functools, itertools, pathlib
 from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Context
 from tinygrad.llm.kernels.amd import Linear, ExpertWeights, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
-from tinygrad.llm.kernels.amd import topk_softmax_256_8, topk_bias_256_8, q8_0_gemv_fused, f16_gemv_fused, ssm_conv_decode
+from tinygrad.llm.kernels.amd import topk_softmax_256_8, topk_bias, q8_0_gemv_fused, f16_gemv, f16_gemv_fused, ssm_conv_decode, WARP_SIZE
+from tinygrad.helpers import prod
 from tinygrad.llm.kernels.amd import packed_ggml_raw
 from tinygrad.llm.gguf import ggml_data_to_tensor, gguf_load
 from tinygrad.uop.ops import KernelInfo, resolve
@@ -189,10 +190,26 @@ class HyperConnection:
     self.hc, self.norm_eps = config.hc_mult, config.norm_eps
     self.eps, self.iters = config.hc_eps, config.hc_sinkhorn_iters
 
+  def _mix(self, flat:Tensor) -> Tensor:
+    # 16384->24 projection. A plain matmul lowers to a 1-output-per-row reduction that is ~10x slower than this
+    # fp16 gemv (the weight is stored fp16); fall back to the generic path for unusual dtypes/shapes.
+    w = self.fn["weight"]
+    if w.dtype == dtypes.half and w.shape[0] <= 2048 and w.shape[1] % (WARP_SIZE*4) == 0 and amd_custom_kernels_supported(flat.device):
+      if not hasattr(self, "_mix_linear"):
+        lay = Linear(w.shape[1], w.shape[0], bias=False)
+        lay.weight = w
+        self._mix_linear = lay
+      lay, tokens = self._mix_linear, prod(flat.shape[:-1])
+      if isinstance(tokens, int):
+        return f16_gemv(lay, flat)
+      out = f16_gemv(lay, flat.pad_to(flat.max_shape))
+      return out.shrink(tuple((0, s) for s in (*flat.shape[:-1], lay.out_features)))
+    return flat @ w.float().T
+
   def prepare(self, x:Tensor) -> tuple[Tensor, Tensor, Tensor]:
     flat = x.flatten(2).float()
     flat = flat * (flat.square().mean(-1, keepdim=True) + self.norm_eps).rsqrt()
-    mixes = flat @ self.fn["weight"].float().T
+    mixes = self._mix(flat)
     scale, base = self.scale["weight"].float(), self.base["weight"].float()
     B, T, _ = mixes.shape
     pre = (mixes[..., :self.hc] * scale[0] + base[:self.hc]).sigmoid() + self.eps
@@ -262,8 +279,9 @@ class FFNBlock:
         probs, sel = topk_softmax_256_8(scores)
       else:
         if gating == ExpertGating.SIGMOID and bias is not None and normalize_topk and self.config.num_experts_per_tok == 8 \
-          and scores.shape == (1, 1, 256) and scores.dtype == dtypes.float32 and amd_custom_kernels_supported(scores.device):
-          sel = topk_bias_256_8(scores, bias)
+          and len(scores.shape) == 3 and scores.shape[0] == 1 and scores.shape[1] == 1 and scores.shape[2] % 32 == 0 \
+          and scores.dtype == dtypes.float32 and amd_custom_kernels_supported(scores.device):
+          sel = topk_bias(scores, bias)
         else:
           _, sel = pairwise_topk(scores if bias is None else scores + bias, self.config.num_experts_per_tok)
         probs = scores.gather(-1, sel)
@@ -437,6 +455,9 @@ class AttentionIndexer:
     pool_valid = key_valid.all(2)
 
     scores = (q.float().unsqueeze(-2) * pool_keys.float().reshape(B, 1, 1, pool_count, ic.head_dim)).sum(-1)
+    # materialize the per-head scores before the head-weighted reduction: the scheduler otherwise fuses both
+    # reductions into one LDS-bound kernel that is ~15x slower at prefill chunk sizes (head_dim x pool_count)
+    scores = scores.transpose(-3, -2).contiguous().transpose(-3, -2)
     scores = (scores * (ic.head_dim**-0.5)).relu()
     weights = self.proj(hidden_states).float() * (ic.n_heads**-0.5)
     index_scores = (weights.unsqueeze(-1) * scores).sum(-2)
