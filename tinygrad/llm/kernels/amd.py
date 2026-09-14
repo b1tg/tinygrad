@@ -70,6 +70,59 @@ def _reg(shape:tuple[int, ...], slot:int, value:float, dep:UOp|None=None) -> UOp
   ret = UOp.placeholder(shape, dtypes.float, slot=slot, addrspace=AddrSpace.REG)
   return ret.after((ret if dep is None else ret.after(dep)).store(ret.const_like(value)))
 
+# ******** stable top-k: keep the sorting network in shared memory ********
+
+@functools.cache
+def _topk_bitonic_kernel(values:UOp, indices:UOp, x:UOp, k:int) -> UOp:
+  rows, n = cast(tuple[int, int], x.shape)
+  size = 1 << (n-1).bit_length()
+  threads = min(size, 256)
+  row, lane = UOp.range(rows, 0, AxisType.GLOBAL), UOp.range(threads, 1, AxisType.LOCAL)
+  vals = UOp.placeholder((2, size), dtypes.float32, slot=0, addrspace=AddrSpace.LOCAL)
+  ids = UOp.placeholder((2, size), dtypes.int32, slot=1, addrspace=AddrSpace.LOCAL)
+  r = UOp.range(size//threads, 2)
+  i = lane + r*threads
+  init = UOp.group(vals[0, i].store((i < n).where(x[row, i.minimum(n-1)].load(), -math.inf)),
+                   ids[0, i].store(i.cast(dtypes.int32))).end(r)
+  dep, side, step = UOp.barrier(init), 0, 0
+  for stage in range(1, size.bit_length()):
+    for sub in range(stage-1, -1, -1):
+      r = UOp.range(size//threads, 3+step)
+      i = lane + r*threads
+      j = i ^ (1 << sub)
+      av, bv = vals.after(dep)[side, i].load(), vals.after(dep)[side, j].load()
+      ai, bi = ids.after(dep)[side, i].load(), ids.after(dep)[side, j].load()
+      before = (av > bv) | (av.eq(bv) & (ai < bi))
+      high = (i & (1 << stage)).eq(0).eq((i & (1 << sub)).eq(0))
+      own = before.eq(high)
+      # Ping-pong buffers prevent a lane from overwriting a partner that has not read its old value yet.
+      stores = UOp.group(vals.after(dep)[1-side, i].store(own.where(av, bv)),
+                         ids.after(dep)[1-side, i].store(own.where(ai, bi))).end(r)
+      dep, side, step = UOp.barrier(stores), 1-side, step+1
+  r = UOp.range((k+threads-1)//threads, 100)
+  i = lane + r*threads
+  return UOp.group(values[row, i.valid(i < k)].store(vals.after(dep)[side, i].load()),
+                   indices[row, i.valid(i < k)].store(ids.after(dep)[side, i].load())).end(r, lane, row) \
+    .sink(arg=KernelInfo(name="topk_bitonic", opts_to_apply=()))
+
+def amd_topk(x:Tensor, k:int) -> tuple[Tensor, Tensor]:
+  """Descending float32 top-k, breaking ties by the smaller original index."""
+  shape, n = x.shape, x.shape[-1]
+  if x.dtype != dtypes.float32 or not isinstance(n, int) or not 0 < k <= n <= 4096:
+    raise ValueError(f"unsupported top-k: {x.shape=}, {x.dtype=}, {k=}")
+  symbolic = any(not isinstance(s, int) for s in shape)
+  if symbolic: x = x.pad_to(x.max_shape)
+  padded_shape = x.shape
+  x = x.reshape(-1, n).contiguous()
+  values = Tensor.empty(x.shape[0], k, dtype=x.dtype, device=x.device)
+  indices = Tensor.empty(x.shape[0], k, dtype=dtypes.int32, device=x.device)
+  values, indices = Tensor.custom_kernel(values, indices, x, fxn=functools.partial(_topk_bitonic_kernel, k=k))[:2]
+  values, indices = values.reshape(*padded_shape[:-1], k), indices.reshape(*padded_shape[:-1], k)
+  if symbolic:
+    bounds = tuple((0, s) for s in (*shape[:-1], k))
+    values, indices = values.shrink(bounds), indices.shrink(bounds)
+  return values, indices
+
 # ******** quant linear: q8-activation kernels over packed ggml weights (Q4_K/Q5_K/Q6_K/IQ4_XS) ********
 
 class Linear(nn.Linear):
@@ -219,9 +272,14 @@ def iq2_grid_lut(device:str) -> Tensor:
   return Tensor(words, dtype=dtypes.uint32, device=device).contiguous()
 
 @functools.cache
-def iq3s_grid_lut(device:str) -> Tensor:
+def iq3s_grid_lut(device:str, signed:bool=False) -> Tensor:
   from tinygrad.runtime.autogen.ggml_common import iq3s_grid
-  return Tensor([int(w) for w in iq3s_grid], dtype=dtypes.uint32, device=device).contiguous()
+  words = [int(w) for w in iq3s_grid]
+  if signed:
+    # Nonzero magnitudes let packed two's-complement negation add one without carrying between bytes.
+    assert all((w >> (i*8)) & 255 for w in words for i in range(4))
+    words += [sum((255 if signs & (1 << i) else 0) << (i*8) for i in range(4)) for signs in range(16)]
+  return Tensor(words, dtype=dtypes.uint32, device=device).contiguous()
 
 @functools.cache
 def _q8_quantize_kernel(q:UOp, scale:UOp, xsum:UOp, x:UOp, tokens:int, in_features:int) -> UOp:
@@ -262,9 +320,25 @@ def _decode_linear(out:UOp, out_features:int, group_count:int, group_dot, name:s
   return out[token, output, chunk.valid(lane.eq(0))].store(total.cast(out.dtype)).end(token_output, chunk, lane).sink(
     arg=KernelInfo(name=name, opts_to_apply=()))
 
+def _decode_linear_grouped(out:UOp, out_features:int, group_count:int, group_dot, name:str) -> UOp:
+  # Accumulate up to 4096 input features before writing a partial, keeping long reductions split across independent chunks.
+  block = UOp.range(out.shape[0]*out_features//4, 0, AxisType.GLOBAL)
+  chunk = UOp.range(out.shape[2], 1, AxisType.GLOBAL)
+  lane, row = UOp.range(32, -1, AxisType.WARP), UOp.range(4, 3, AxisType.LOCAL)
+  token_output = block*4+row
+  token, output = token_output//out_features, token_output%out_features
+  value = UOp.const(0, dtypes.float32)
+  for i in range((min(group_count, 128)+31)//32):
+    group = lane+chunk*128+i*32
+    value = value + (group < group_count).where(group_dot(token, output, group.minimum(group_count-1)), 0)
+  total = warp_reduce(value, full_wave=True)
+  return out[token, output, chunk.valid(lane.eq(0))].store(total).end(lane, row, chunk, block) \
+    .sink(arg=KernelInfo(name=name+"_grouped", opts_to_apply=()))
+
 @functools.cache
 def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, *extra:UOp, out_features:int, in_features:int, ggml_type:int,
-                         rdna3:bool) -> UOp:
+                         rdna3:bool, grouped:bool=False) -> UOp:
+  assert not grouped or ggml_type == Q8_0
   grid_lut = extra[0] if extra else None
   group_count = in_features // Q8_GROUP_SIZE
   def group_dot(token:UOp, output:UOp, group:UOp) -> UOp:
@@ -386,21 +460,23 @@ def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, *extra:UOp, o
     Q5_K: "linear_q5_k", IQ4_XS: "linear_iq4_xs", Q6_K: "linear_q6",
     IQ2_XS: "linear_iq2_xs", IQ3_XXS: "linear_iq3_xxs"
   }
-  return _decode_linear(out, out_features, group_count, group_dot, names[ggml_type])
+  return (_decode_linear_grouped if grouped else _decode_linear)(out, out_features, group_count, group_dot, names[ggml_type])
 
 
 @functools.cache
 def _expert_quant_decode_kernel(out:UOp, raw:UOp, sel:UOp, xq:UOp, xd:UOp, *extra:UOp,
                                 out_features:int, in_features:int, routes_per_token:int,
-                                shared_input:bool, ggml_type:int, rdna3:bool) -> UOp:
+                                shared_input:bool, ggml_type:int, rdna3:bool,
+                                fuse_swiglu:bool=False, swiglu_limit:float=0.0) -> UOp:
   """Fused routed-expert matmul: dynamically select packed expert rows without gathering or fully decoding weights."""
   assert ggml_type in (IQ2_XS, IQ3_XXS, IQ3_S, IQ4_XS)
-  grid_lut = extra[0] if extra else None
+  assert not fuse_swiglu or ggml_type == IQ3_S
+  grid_lut = extra[-1] if extra else None
   group_count, blocks_per_row = in_features // Q8_GROUP_SIZE, in_features // GGML_BLOCK_SIZE
   block_units = IQ4_WORDS if ggml_type == IQ4_XS else \
     {IQ2_XS: IQ2_XS_BYTES, IQ3_XXS: IQ3_XXS_BYTES, IQ3_S: IQ3_S_BYTES}[ggml_type]
 
-  def group_dot(route:UOp, output:UOp, group:UOp) -> UOp:
+  def group_dot(route:UOp, output:UOp, group:UOp, raw:UOp=raw) -> UOp:
     input_row = route // routes_per_token if shared_input else route
     expert = sel[route].load()
     xwords = _amd_load(xq[input_row, group, 0], 8)
@@ -427,12 +503,17 @@ def _expert_quant_decode_kernel(out:UOp, raw:UOp, sel:UOp, xq:UOp, xd:UOp, *extr
       for word_idx in range(8):
         # values 4*word_idx..+3 of the subgroup share one grid entry
         q9 = raw[base + 2 + subgroup*8 + word_idx].cast(dtypes.uint32) | (((qh_byte >> word_idx) & 1) << 8)
-        g = grid_lut[q9.cast(dtypes.weakint)]
         sign_bits = raw[base + 74 + subgroup*4 + word_idx//2] >> (4*(word_idx%2))
-        def q_val3s(i:int) -> UOp:
-          val = ((g >> (i*8)) & 255).cast(dtypes.uint8).bitcast(dtypes.int8)
-          return ((sign_bits >> i) & 1).ne(0).where(-val, val)
-        word = sum((q_val3s(i).cast(dtypes.uint8).cast(dtypes.uint32) << (i*8) for i in range(4)), UOp.const(0, dtypes.uint32))
+        if grid_lut.shape[0] == 528:
+          g = grid_lut[q9.cast(dtypes.weakint)].load()
+          mask = grid_lut[512+(sign_bits & 15).cast(dtypes.weakint)].load()
+          word = (g ^ mask)+(mask & 0x01010101)
+        else:
+          g = grid_lut[q9.cast(dtypes.weakint)]
+          def q_val3s(i:int) -> UOp:
+            val = ((g >> (i*8)) & 255).cast(dtypes.uint8).bitcast(dtypes.int8)
+            return ((sign_bits >> i) & 1).ne(0).where(-val, val)
+          word = sum((q_val3s(i).cast(dtypes.uint8).cast(dtypes.uint32) << (i*8) for i in range(4)), UOp.const(0, dtypes.uint32))
         dot = _amd_dp4a(word, xwords[word_idx], dot, rdna3)
       return dot.float() * xd[input_row, group] * d * scale
 
@@ -480,20 +561,48 @@ def _expert_quant_decode_kernel(out:UOp, raw:UOp, sel:UOp, xq:UOp, xd:UOp, *extr
     scale0, scale1 = (sc_byte & 15).float() + 0.5, ((sc_byte >> 4) & 15).float() + 0.5
     return (dots[0].float() * scale0 + dots[1].float() * scale1) * 0.25 * d * xd[input_row, group]
 
-  route_output = UOp.range(out.shape[0]*out_features, 0, axis_type=AxisType.GLOBAL)
-  lane = UOp.range(32, 1, axis_type=AxisType.LOCAL)
-  route, output = route_output // out_features, route_output % out_features
+  route_output = UOp.range(out.shape[0]*out_features//(4 if fuse_swiglu else 1), 0, axis_type=AxisType.GLOBAL)
+  row = UOp.range(4, 2, axis_type=AxisType.LOCAL)
+  lane = UOp.range(32, -1, axis_type=AxisType.WARP) if fuse_swiglu else UOp.range(32, 1, axis_type=AxisType.LOCAL)
+  output_index = route_output*4+row if fuse_swiglu else route_output
+  route, output = output_index // out_features, output_index % out_features
   value = UOp.const(0, dtypes.float32)
+  up_value = UOp.const(0, dtypes.float32)
   for i in range((group_count+31)//32):
     group = (lane + i*32).minimum(group_count-1)
     part = group_dot(route, output, group)
     value = value + (part if group_count % 32 == 0 or i != group_count//32 else
                      (lane + i*32 < group_count).where(part, UOp.const(0, dtypes.float32)))
+    if fuse_swiglu:
+      up_part = group_dot(route, output, group, extra[0])
+      up_value = up_value + (lane+i*32 < group_count).where(up_part, 0)
   total = warp_reduce(value, full_wave=True)
   name = {IQ2_XS: "expert_linear_iq2_xs", IQ3_XXS: "expert_linear_iq3_xxs", IQ3_S: "expert_linear_iq3_s",
           IQ4_XS: "expert_linear_iq4_xs"}[ggml_type]
+  if fuse_swiglu:
+    up = warp_reduce(up_value, full_wave=True)
+    if swiglu_limit: total, up = total.minimum(swiglu_limit), up.clip(-swiglu_limit, swiglu_limit)
+    total = total.silu()*up
+    return out[route, output.valid(lane.eq(0))].store(total).end(route_output, row, lane) \
+      .sink(arg=KernelInfo(name="expert_gate_up_silu_iq3_s", opts_to_apply=()))
   return out[route, output.valid(lane.eq(0))].store(total).end(route_output, lane).sink(arg=KernelInfo(name=name, opts_to_apply=()))
 
+
+def expert_gate_up_silu(gate:Tensor, up:Tensor, sel:Tensor, x:Tensor,
+                       out_features:int, in_features:int, swiglu_limit:float) -> Tensor:
+  """Shared activation quantization and fused IQ3_S gate/up projections, clipping and SiLU."""
+  if gate.dtype != dtypes.uint8 or up.dtype != dtypes.uint8 or in_features % 256 or out_features % 4 \
+    or sel.ndim != 3 or x.ndim != 4 or x.shape[-2:] != (1, in_features) \
+    or not all(isinstance(s, int) for s in (*sel.shape, *x.shape)):
+    raise ValueError(f"unsupported fused expert shapes: {sel.shape=}, {x.shape=}, {out_features=}, {in_features=}")
+  B, T, K = cast(tuple[int, int, int], sel.shape)
+  q, d, _ = q8_quantize(x.reshape(B*T, in_features), B*T, in_features)
+  out = Tensor.empty(B*T*K, out_features, dtype=dtypes.float32, device=x.device)
+  fxn = functools.partial(_expert_quant_decode_kernel, out_features=out_features, in_features=in_features,
+                          routes_per_token=K, shared_input=True, ggml_type=IQ3_S, rdna3=amd_wmma_kernels_supported(x.device),
+                          fuse_swiglu=True, swiglu_limit=swiglu_limit)
+  return Tensor.custom_kernel(out, gate.flatten(), sel.cast(dtypes.int32).reshape(-1).contiguous(), q, d,
+                              up.flatten(), iq3s_grid_lut(str(x.device), signed=True), fxn=fxn)[0].reshape(B, T, K, out_features)
 
 def expert_quant_linear(weight:Tensor, ggml_type:int, sel:Tensor, x:Tensor, out_features:int, in_features:int) -> Tensor:
   """Multiply routed activations by dynamically selected packed IQ expert matrices."""
@@ -517,6 +626,46 @@ def expert_quant_linear(weight:Tensor, ggml_type:int, sel:Tensor, x:Tensor, out_
   result = Tensor.custom_kernel(out, raw, sel.cast(dtypes.int32).reshape(routes), xq, xd, *extra, fxn=fxn)[0]
   result = result.reshape(B, T, K, out_features)
   return result if not symbolic else result.shrink(tuple((0, s) for s in (*orig_shape, out_features)))
+
+@functools.cache
+def _expert_q6_f16_kernel(out:UOp, raw:UOp, sel:UOp, x:UOp, in_features:int, out_features:int,
+                         routes_per_token:int, shared_input:bool) -> UOp:
+  block_row = UOp.range(out.shape[0]*out_features//4, 0, AxisType.GLOBAL)
+  row, lane = UOp.range(4, 1, AxisType.LOCAL), UOp.range(32, -1, AxisType.WARP)
+  route, output = (block_row*4+row)//out_features, (block_row*4+row)%out_features
+  expert = sel[route].load()
+  input_row = route//routes_per_token if shared_input else route
+  block = UOp.range(in_features//256, 3, AxisType.REDUCE)
+  base = ((expert*out_features+output)*(in_features//256)+block)*Q6_BYTES
+  def byte(offset:UOp|int) -> UOp: return raw[base+offset].load().cast(dtypes.uint32)
+  d = _half(byte(208) | (byte(209) << 8))
+  acc = _reg((1,), 0, 0)
+  value = acc.after(block)[0].load()
+  for j in range(8):
+    element = lane*8+j
+    low = (byte(element//128*64+element%64) >> (element%128//64*4)) & 15
+    high = (byte(128+element//128*32+element%32) >> (element%128//32*2)) & 3
+    quant = (low | (high << 4)).cast(dtypes.int32)-32
+    scale = byte(192+element//16).cast(dtypes.uint8).bitcast(dtypes.int8).float()
+    # Keep the loader's cast in the fused expression, as in the generic routed matmul.
+    weight = (d*quant.float()*scale).cast(dtypes.half).float()
+    value = value + weight*x[input_row, block*256+element].load().float()
+  acc = acc.after(acc[0].store(value).end(block))
+  total = warp_reduce(acc[0].load(), full_wave=True)
+  return out[route, output.valid(lane.eq(0))].store(total).end(lane, row, block_row) \
+    .sink(arg=KernelInfo(name="expert_linear_q6_f16", opts_to_apply=()))
+
+def expert_q6_f16_linear(weight:Tensor, sel:Tensor, x:Tensor, out_features:int, in_features:int) -> Tensor:
+  """Fused routed Q6_K decode using the loader's weight cast and original activations."""
+  if in_features % 256 or out_features % 4 or sel.ndim != 3 or x.ndim != 4 or x.shape[-1] != in_features \
+    or x.shape[-2] not in (1, sel.shape[-1]) or not all(isinstance(s, int) for s in (*sel.shape, *x.shape)):
+    raise ValueError(f"unsupported Q6 expert shapes: {sel.shape=}, {x.shape=}, {out_features=}, {in_features=}")
+  B, T, K = cast(tuple[int, int, int], sel.shape)
+  out = Tensor.empty(B*T*K, out_features, dtype=dtypes.float32, device=x.device)
+  fxn = functools.partial(_expert_q6_f16_kernel, in_features=in_features, out_features=out_features,
+                          routes_per_token=K, shared_input=x.shape[-2] == 1)
+  return Tensor.custom_kernel(out, weight.flatten(), sel.cast(dtypes.int32).reshape(-1).contiguous(),
+                              x.reshape(-1, in_features).contiguous(), fxn=fxn)[0].reshape(B, T, K, out_features)
 
 def _wmma_layout(out:UOp, out_features:int, token_tile:int, output_tiles:int):
   # output_waves is derived from the *final* output_tiles: falling back to 1 tile changes what
@@ -896,8 +1045,10 @@ def q8_linear(layer:Linear, x:Tensor) -> Tensor:
       (iq3_grid_lut(str(x.device)).uop,) if layer.ggml_type == IQ3_XXS else ()
     return run(fxn, out, raw, x.cast(dtypes.float16).contiguous().uop, *extra)
   xq_, xd, xs = q8_quantize(x, tokens, in_features)
-  decode = functools.partial(_quant_decode_kernel, ggml_type=layer.ggml_type, rdna3=not cdna)
-  out = Tensor.empty(tokens, out_features, (in_features+1023)//1024, dtype=dtypes.float32, device=x.device).uop
+  grouped = cdna and layer.ggml_type == Q8_0 and tokens == 1 and in_features >= 1024 and out_features >= 2048 and out_features % 4 == 0
+  decode = functools.partial(_quant_decode_kernel, ggml_type=layer.ggml_type, rdna3=not cdna, grouped=grouped)
+  chunk_size = 4096 if grouped else 1024
+  out = Tensor.empty(tokens, out_features, (in_features+chunk_size-1)//chunk_size, dtype=dtypes.float32, device=x.device).uop
   extra = (iq2_grid_lut(str(x.device)).uop,) if layer.ggml_type == IQ2_XS else \
     (iq3_grid_lut(str(x.device)).uop,) if layer.ggml_type == IQ3_XXS else ()
   return run(decode, out, raw, xq_.uop, xd.uop, xs.uop, *extra)

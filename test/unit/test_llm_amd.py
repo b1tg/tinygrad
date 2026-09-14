@@ -3,11 +3,212 @@ from unittest.mock import patch
 import numpy as np
 from tinygrad import Tensor, TinyJit, UOp, dtypes, nn, function
 from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported, q8_quantize, flash_attention, gated_delta_prefill
-from tinygrad.llm.kernels.amd import hc_prepare, dsa_decode
+from tinygrad.llm.kernels.amd import hc_prepare, dsa_decode, amd_topk
 from tinygrad.llm.gguf import ggml_data_to_tensor
 from tinygrad.llm.model import ExpertWeights
 
+class TestTopK(unittest.TestCase):
+  def setUp(self):
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("AMD custom kernels required")
+
+  def test_stable_masked_topk(self):
+    rng = np.random.default_rng(53)
+    for n, k in ((1, 1), (7, 4), (288, 8), (1024, 512), (2048, 512), (4096, 512)):
+      with self.subTest(n=n, k=k):
+        data = rng.integers(-8, 9, (2, 3, n)).astype(np.float32)
+        data[0, 1] = -np.inf
+        data[1, 1] = np.finfo(np.float32).min
+        values, indices = amd_topk(Tensor(data), k)
+        expected = np.argsort(-data, axis=-1, kind="stable")[..., :k]
+        np.testing.assert_array_equal(indices.numpy(), expected)
+        np.testing.assert_array_equal(values.numpy(), np.take_along_axis(data, expected, axis=-1))
+
+  def test_router_order(self):
+    from tinygrad.llm.model import pairwise_topk
+    data = np.random.default_rng(54).integers(-4, 5, (2, 1, 288)).astype(np.float32)
+    values, indices = pairwise_topk(Tensor(data), 8)
+    expected = np.argsort(-data, axis=-1, kind="stable")[..., :8][..., ::-1]
+    np.testing.assert_array_equal(indices.numpy(), expected)
+    np.testing.assert_array_equal(values.numpy(), np.take_along_axis(data, expected, axis=-1))
+
+  def test_jit_symbolic_rows(self):
+    @TinyJit
+    def run(x, rows):
+      values, indices = amd_topk(x[:, :rows], 8)
+      values, indices = values.pad_to(values.max_shape).contiguous(), indices.pad_to(indices.max_shape).contiguous()
+      Tensor.realize(values, indices)
+      return values, indices
+    rng = np.random.default_rng(55)
+    for count in (1, 3, 2, 4, 1):
+      data = rng.standard_normal((1, 4, 288)).astype(np.float32)
+      rows = UOp.variable("topk_rows", 1, 4).bind(count)
+      values, indices = run(Tensor(data).realize(), rows)
+      expected = np.argsort(-data[:, :count], axis=-1, kind="stable")[..., :8]
+      np.testing.assert_array_equal(indices.numpy()[:, :count], expected)
+      np.testing.assert_array_equal(values.numpy()[:, :count], np.take_along_axis(data[:, :count], expected, axis=-1))
+
+class TestExpertGateUp(unittest.TestCase):
+  def setUp(self):
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("AMD custom kernels required")
+
+  @staticmethod
+  def make_block(width, limit, formats=(21, 21)):
+    from tinygrad.llm.model import FFNBlock, TransformerConfig
+    block = FFNBlock(TransformerConfig(num_blocks=1, dim=width, hidden_dim=16, n_heads=1, n_kv_heads=1,
+      norm_eps=1e-5, vocab_size=1, head_dim=1, rope_theta=1., rope_dim=0, v_head_dim=1,
+      num_experts=3, num_experts_per_tok=2, swiglu_limit=limit))
+    rng = np.random.default_rng(31)
+    for weight, typ in zip((block.ffn_gate_exps, block.ffn_up_exps), formats):
+      size = {21:110, 23:136}[typ]
+      packed = rng.integers(0, 256, (3*16*width//256, size), dtype=np.uint8)
+      packed[:, :2] = np.array([0.001], dtype=np.float16).view(np.uint8)
+      raw = Tensor(np.pad(packed.flatten(), (4, 0))).realize()[4:]
+      weight.weight = ggml_data_to_tensor(raw, 3*16*width, typ).reshape(3, 16, width).half()
+    return block
+
+  @staticmethod
+  def reference(block, sel, x): return block._swiglu(block.ffn_gate_exps(sel, x), block.ffn_up_exps(sel, x)).contiguous()
+
+  def test_jit_clipping_and_routing(self):
+    rng = np.random.default_rng(32)
+    for width in (256, 768, 1024, 4096):
+      for limit in (0., 10.):
+        with self.subTest(width=width, limit=limit):
+          block = self.make_block(width, limit)
+          run = TinyJit(lambda sel, x: block._expert_swiglu(sel, x).realize())
+          for magnitude in (0.1, 1., 20., 0.):
+            sel = Tensor(rng.integers(0, 3, (2, 1, 2), dtype=np.int32)).realize()
+            x = Tensor((rng.normal(size=(2, 1, 1, width))*magnitude).astype(np.float32)).realize()
+            expected = self.reference(block, sel, x).numpy()
+            np.testing.assert_allclose(run(sel, x).numpy(), expected, rtol=1e-4, atol=1e-4)
+          self.assertEqual(block.ffn_gate_exps.ggml_type, 21)
+          self.assertEqual(block.ffn_up_exps.ggml_type, 21)
+
+  def test_prefill_and_mixed_formats(self):
+    selected = Tensor(np.array([[[2, 0], [1, 1]]], dtype=np.int32)).realize()
+    x = Tensor(np.random.default_rng(33).normal(size=(1, 2, 1, 256)).astype(np.float32)).realize()
+    with patch("tinygrad.llm.model.expert_gate_up_silu", side_effect=AssertionError("unexpected fused gate/up")):
+      for formats, tokens in (((21, 21), 2), ((21, 23), 1)):
+        block = self.make_block(256, 10., formats)
+        sel, inp = selected[:, :tokens], x[:, :tokens]
+        expected = self.reference(block, sel, inp).numpy()
+        np.testing.assert_array_equal(block._expert_swiglu(sel, inp).numpy(), expected)
+      block = self.make_block(256, 10.)
+      tokens = UOp.variable("gate_up_prefill_tokens", 1, 2).bind(1)
+      sel, inp = selected[:, :tokens], x[:, :tokens]
+      np.testing.assert_array_equal(block._expert_swiglu(sel, inp)[:, :1].numpy(), self.reference(block, sel, inp)[:, :1].numpy())
+
+class TestQ6Experts(unittest.TestCase):
+  def setUp(self):
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("AMD custom kernels required")
+
+  @staticmethod
+  def make_weight(width, dtype=dtypes.half):
+    packed = np.random.default_rng(14).integers(0, 256, (3*16*width//256, 210), dtype=np.uint8)
+    packed[:, 208:] = np.array([0.001], dtype=np.float16).view(np.uint8)
+    raw = Tensor(np.pad(packed.flatten(), (4, 0))).realize()[4:]
+    weight = ExpertWeights(3, width, 16)
+    weight.weight = ggml_data_to_tensor(raw, 3*16*width, 14).reshape(3, 16, width).cast(dtype)
+    low = ((packed[:, :128].reshape(-1, 2, 1, 64) >> np.array([0, 4])[None, None, :, None]) & 15).reshape(-1, 256)
+    high = ((packed[:, 128:192].reshape(-1, 2, 1, 32) >> np.array([0, 2, 4, 6])[None, None, :, None]) & 3).reshape(-1, 256)
+    scales = np.repeat(packed[:, 192:208].view(np.int8), 16, axis=1).astype(np.float32)
+    d = packed[:, 208:].copy().view(np.float16).astype(np.float32)
+    reference = (d*((low | (high << 4))-32).astype(np.float32)*scales).reshape(3, 16, width)
+    # The inline GPU dequantization/matmul retains fp32 intermediates; materializing fp16 weights separately changes its rounding.
+    return weight, reference
+
+  def test_decode_jit_routes_and_activations(self):
+    rng = np.random.default_rng(15)
+    for width in (256, 2048):
+      for shared in (True, False):
+        with self.subTest(width=width, shared=shared):
+          weight, reference = self.make_weight(width)
+          run = TinyJit(lambda sel, x: weight(sel, x).realize())
+          for _ in range(4):
+            selected = rng.integers(0, 3, (2, 1, 2), dtype=np.int32)
+            x = rng.normal(size=(2, 1, 1 if shared else 2, width)).astype(np.float32)
+            expected = np.matmul(x[..., None, :], reference[selected].swapaxes(-1, -2)).squeeze(-2)
+            actual = run(Tensor(selected).realize(), Tensor(x).realize()).numpy()
+            np.testing.assert_allclose(actual, expected, rtol=2e-4, atol=2e-4)
+          self.assertEqual(weight.ggml_type, 14)
+          self.assertEqual(weight.weight.dtype, dtypes.half)
+          self.assertEqual(weight._packed_q6.dtype, dtypes.uint8)
+          self.assertEqual(weight._packed_q6.nbytes(), 3*16*width//256*210)
+
+  def test_prefill_and_float_weights_keep_generic_path(self):
+    rng = np.random.default_rng(16)
+    selected = np.array([[[2, 0], [1, 1]]], dtype=np.int32)
+    x = rng.normal(size=(1, 2, 2, 256)).astype(np.float32)
+    for dtype in (dtypes.half, dtypes.float32):
+      weight, reference = self.make_weight(256, dtype)
+      original = weight.weight
+      expected = np.matmul(x[..., None, :], reference[selected].swapaxes(-1, -2)).squeeze(-2)
+      with patch("tinygrad.llm.model.expert_q6_f16_linear", side_effect=AssertionError("unexpected fused decode")):
+        np.testing.assert_allclose(weight(Tensor(selected), Tensor(x)).numpy(), expected, rtol=2e-4, atol=2e-4)
+        count = UOp.variable("q6_prefill_tokens", 1, 2).bind(1)
+        actual = weight(Tensor(selected)[:, :count], Tensor(x)[:, :count])[:, :1].numpy()
+        np.testing.assert_allclose(actual, expected[:, :1], rtol=2e-4, atol=2e-4)
+        if dtype == dtypes.float32:
+          np.testing.assert_allclose(weight(Tensor(selected[:, :1]), Tensor(x[:, :1])).numpy(), expected[:, :1], rtol=2e-4, atol=2e-4)
+        else:
+          self.assertEqual(weight(Tensor(selected[:, :1]), Tensor(x[:, :1]).half()).realize().dtype, dtypes.half)
+      self.assertIs(weight.weight, original)
+
+class TestQ8Grouped(unittest.TestCase):
+  def setUp(self):
+    from tinygrad.llm.kernels.amd import amd_wmma_kernels_supported
+    device = Tensor.empty(1).device
+    if not amd_custom_kernels_supported(device) or amd_wmma_kernels_supported(device): self.skipTest("CDNA custom kernels required")
+
+  @staticmethod
+  def make_linear(width, outputs):
+    packed = np.random.default_rng(8).integers(0, 256, (outputs*width//32, 34), dtype=np.uint8)
+    packed[:, :2] = np.array([0.001], dtype=np.float16).view(np.uint8)
+    raw = Tensor(np.pad(packed.flatten(), (4, 0))).realize()[4:]
+    linear = Linear(width, outputs, bias=False)
+    linear.weight = ggml_data_to_tensor(raw, outputs*width, 8).reshape(outputs, width).half()
+    reference = (packed[:, 2:].view(np.int8).astype(np.float32) * packed[:, :2].copy().view(np.float16).astype(np.float32))
+    return linear, reference.reshape(outputs, width)
+
+  def test_chunk_boundaries_and_jit(self):
+    rng = np.random.default_rng(9)
+    for width, outputs in ((1024, 2048), (1568, 2052), (4096, 2048), (8192, 2048), (16384, 2048)):
+      with self.subTest(width=width, outputs=outputs):
+        linear, weights = self.make_linear(width, outputs)
+        run = TinyJit(lambda x: linear(x).realize())
+        for step in range(4):
+          x = rng.normal(size=(1, width)).astype(np.float32) if step != 2 else np.zeros((1, width), dtype=np.float32)
+          groups = x.reshape(1, width//32, 32)
+          scale = np.maximum(np.abs(groups).max(-1, keepdims=True)/127, 1e-8)
+          quantized = (np.clip(np.rint(groups/scale), -127, 127)*scale).reshape(1, width)
+          expected = quantized @ weights.T
+          np.testing.assert_allclose(run(Tensor(x).realize()).numpy(), expected, rtol=2e-4, atol=2e-4)
+        self.assertEqual(linear.ggml_type, 8)
+
+  def test_prefill_and_small_shapes_use_original_path(self):
+    with patch("tinygrad.llm.kernels.amd._decode_linear_grouped", side_effect=AssertionError("unexpected grouped decode")):
+      for width, outputs, tokens in ((4096, 2048, 2), (16384, 24, 1), (128, 8192, 1), (4096, 2050, 1)):
+        linear, _ = self.make_linear(width, outputs)
+        out = linear(Tensor.zeros(tokens, width)).numpy()
+        np.testing.assert_array_equal(out, np.zeros((tokens, outputs)))
+      linear, _ = self.make_linear(4096, 2048)
+      count = UOp.variable("q8_prefill_tokens", 1, 2).bind(1)
+      np.testing.assert_array_equal(linear(Tensor.zeros(2, 4096)[:count])[:1].numpy(), np.zeros((1, 2048)))
+
 class TestQ8Quantize(unittest.TestCase):
+  def test_iq3s_signed_table_exhaustive(self):
+    from tinygrad.llm.kernels.amd import iq3s_grid_lut
+    base = iq3s_grid_lut("CPU").numpy().view(np.int8).reshape(512, 4).astype(np.int16)
+    signs = np.where((np.arange(16)[:, None] >> np.arange(4)) & 1, -1, 1)
+    expected = (base[:, None, :] * signs[None]).astype(np.int8)
+    table = iq3s_grid_lut("CPU", signed=True)
+    words = table.numpy()
+    magnitudes, masks = words[:512, None], words[None, 512:]
+    packed = (magnitudes ^ masks)+(masks & 0x01010101)
+    np.testing.assert_array_equal(packed.view(np.int8).reshape(512, 16, 4), expected)
+    self.assertTrue(np.all(words[:512].view(np.uint8) != 0))
+    self.assertEqual(table.nbytes(), 2112)
+
   def test_quant_weights_share_storage(self):
     for ggml_type, type_size in ((12, 144), (13, 176), (14, 210), (23, 136)):
       with self.subTest(ggml_type=ggml_type):

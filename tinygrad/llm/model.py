@@ -5,7 +5,7 @@ from typing import cast
 from tinygrad import Device, Tensor, nn, UOp, TinyJit, getenv, function, dtypes
 from tinygrad.device import Buffer
 from tinygrad.llm.kernels.amd import Linear, expert_quant_linear, gated_delta_prefill, flash_attention, hc_prepare, dsa_decode
-from tinygrad.llm.kernels.amd import amd_custom_kernels_supported
+from tinygrad.llm.kernels.amd import amd_custom_kernels_supported, amd_topk, expert_q6_f16_linear, expert_gate_up_silu
 from tinygrad.llm.gguf import ggml_data_to_tensor, gguf_load
 from tinygrad.uop.ops import KernelInfo, Ops, resolve
 
@@ -28,7 +28,7 @@ def _device_arange(end:int, device:str) -> Tensor:
 
 class ExpertWeights:
   """Like Linear but with num_experts dimension. Weight shape: (num_experts, out_features, in_features)."""
-  _PACKED_BLOCK_BYTES = {17: 74, 18: 98, 21: 110, 23: 136}  # IQ2_XS, IQ3_XXS, IQ3_S, IQ4_XS
+  _PACKED_BLOCK_BYTES = {14: 210, 17: 74, 18: 98, 21: 110, 23: 136}  # Q6_K, IQ2_XS, IQ3_XXS, IQ3_S, IQ4_XS
   use_custom_quant = True
   def __init__(self, num_experts:int, in_features:int, out_features:int):
     self.num_experts, self.in_features, self.out_features = num_experts, in_features, out_features
@@ -56,12 +56,20 @@ class ExpertWeights:
     raw_offset = raw.contiguous_view_offset()
     assert raw_offset is not None and raw_offset % 4 == 0 and raw.buf_uop.dtype == dtypes.uint8
     packed_dtype = dtypes.uint32 if ggml_type == 23 else dtypes.uint8  # IQ4_XS kernels read word-aligned u32
-    self.weight = Tensor(UOp.from_buffer(cast(Buffer, raw.buf_uop.buffer)
+    packed = Tensor(UOp.from_buffer(cast(Buffer, raw.buf_uop.buffer)
       .view(raw.max_numel() // packed_dtype.itemsize, packed_dtype, raw_offset)))
+    if ggml_type == 14: self._packed_q6 = packed  # keep the original fp16 expression for prefill and the generic fallback
+    else: self.weight = packed
 
   def __call__(self, sel:Tensor, x:Tensor) -> Tensor:
     # sel: (B, T, k), x: (B, T, 1, in) or (B, T, k, in) -> output: (B, T, k, out)
     if self.ggml_type is None: self._set_quantized()
+    if self.ggml_type == 14:
+      if self.use_custom_quant and self.weight.dtype == dtypes.half and x.dtype == dtypes.float32 and resolve(x.shape[1] == 1, False) \
+        and all(isinstance(s, int) for s in (*sel.shape, *x.shape)) and self.in_features % 256 == 0 and self.out_features % 4 == 0 \
+        and amd_custom_kernels_supported(self.weight.device):
+        return expert_q6_f16_linear(self._packed_q6, sel, x, self.out_features, self.in_features)
+      return (x.unsqueeze(-2) @ self.weight[sel].transpose(-1, -2)).contiguous().squeeze(-2)
     if self.ggml_type is not None and self.use_custom_quant and amd_custom_kernels_supported(self.weight.device):
       return expert_quant_linear(self.weight, self.ggml_type, sel, x, self.out_features, self.in_features)
     if self.ggml_type is not None:
@@ -85,6 +93,10 @@ def apply_rope(x:Tensor, freqs_cis:Tensor) -> Tensor:
 def pairwise_topk(x: Tensor, k: int) -> tuple[Tensor, Tensor]:
   n = x.shape[-1]
   assert isinstance(x.device, str)
+  if isinstance(n, int) and 128 <= n <= 4096 and x.dtype == dtypes.float32 and resolve(x.shape[1] == 1, False) \
+    and amd_custom_kernels_supported(x.device):
+    values, indices = amd_topk(x, k)
+    return values.flip(-1), indices.flip(-1)  # preserve the router's ascending order among the selected entries
   indices = _device_arange(n, x.device)
   vals = indices.reshape(1,1,n).cast(x.dtype).expand(x.shape)
   cmp = (x.unsqueeze(-1) > x.unsqueeze(-2)) | ((x.unsqueeze(-1) == x.unsqueeze(-2)) & \
@@ -99,6 +111,8 @@ def bitonic_topk(x:Tensor, k:int) -> tuple[Tensor, Tensor]:
   if not 0 < k <= n: raise ValueError(f"selected index k={k} is out of range for {n}")
   if not isinstance(x.device, str): raise ValueError("top-k requires a concrete device")
   if n == 1: return x, x.const_like(0, dtypes.int32)
+  if n <= 4096 and x.dtype == dtypes.float32 and (x.ndim == 1 or resolve(x.shape[-2] == 1, False)) \
+    and amd_custom_kernels_supported(x.device): return amd_topk(x, k)
   stages, padded = (n-1).bit_length(), 1 << (n-1).bit_length()
   idx = _device_arange(n, x.device).reshape((1,)*(x.ndim-1)+(n,)).expand(x.shape)
   if padded != n:
@@ -273,6 +287,17 @@ class FFNBlock:
       up = up.clip(-self.config.swiglu_limit, self.config.swiglu_limit)
     return gate.silu() * up
 
+  def _expert_swiglu(self, sel:Tensor, x:Tensor) -> Tensor:
+    gate, up = self.ffn_gate_exps, self.ffn_up_exps
+    if resolve(x.shape[1] == 1, False) and x.dtype == dtypes.float32 and all(isinstance(s, int) for s in (*sel.shape, *x.shape)) \
+      and gate.use_custom_quant and up.use_custom_quant and gate.in_features % 256 == 0 and gate.out_features % 4 == 0 \
+      and amd_custom_kernels_supported(x.device):
+      for weight in (gate, up):
+        if weight.ggml_type is None: weight._set_quantized()
+      if gate.ggml_type == up.ggml_type == 21:
+        return expert_gate_up_silu(gate.weight, up.weight, sel, x, gate.out_features, gate.in_features, self.config.swiglu_limit)
+    return self._swiglu(gate(sel, x), up(sel, x))
+
   def _feed_forward(self, x:Tensor) -> Tensor:
     if hasattr(self, 'ffn_gate_exps'):
       h = x.unsqueeze(2)  # (B, T, 1, D) - add expert dim for broadcasting
@@ -293,7 +318,7 @@ class FFNBlock:
       if gating == ExpertGating.SOFTMAX_WEIGHT: probs = probs.softmax(-1)
       if normalize_topk: probs = probs / probs.sum(axis=-1, keepdim=True)
       probs = probs * self.config.routed_scaling_factor
-      x_down = self.ffn_down_exps(sel, self._swiglu(self.ffn_gate_exps(sel, h), self.ffn_up_exps(sel, h)).contiguous())  # (B, T, k, D)
+      x_down = self.ffn_down_exps(sel, self._expert_swiglu(sel, h).contiguous())  # (B, T, k, D)
       out = (x_down * probs.unsqueeze(-1)).sum(axis=2)  # (B, T, D)
       if hasattr(self, 'ffn_gate_shexp'):
         shexp = self.ffn_down_shexp(self._swiglu(self.ffn_gate_shexp(x), self.ffn_up_shexp(x)).contiguous())
