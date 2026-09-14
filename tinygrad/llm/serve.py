@@ -7,6 +7,8 @@ if TYPE_CHECKING:
   from tinygrad.llm.cli import SimpleTokenizer
   from tinygrad.llm.model import Transformer
 
+KIMI_TOOL_SECTION_BEGIN, KIMI_TOOL_SECTION_END = "<|tool_calls_section_begin|>", "<|tool_calls_section_end|>"
+
 def parse_tool_call(s:str) -> tuple[str, typing.Any]|None:
   s = s.strip()
   if s.startswith("{"):  # hermes JSON format: {"name": ..., "arguments": {...}}
@@ -37,28 +39,34 @@ class StreamRouter:
   def __init__(self, reasoning:bool=False):
     self.buf = ""
     self.mode = "reasoning" if reasoning else "undecided"  # output inside a think block is sent as reasoning_content
-  def split(self, tag:str, final:bool) -> tuple[str, bool]:
+  def split(self, tags:str|tuple[str, ...], final:bool) -> tuple[str, str|None]:
     # split buf on the first full tag, holding back a partial tag at the end unless final
-    if tag in self.buf:
-      before, self.buf = self.buf.split(tag, 1)
-      return before, True
-    hold = max((i for i in range(1, min(len(self.buf), len(tag))+1) if tag.startswith(self.buf[-i:])), default=0) if not final else 0
+    tags = (tags,) if isinstance(tags, str) else tags
+    found = min(((pos, tag) for tag in tags if (pos := self.buf.find(tag)) != -1), default=None)
+    if found is not None:
+      pos, tag = found
+      before, self.buf = self.buf[:pos], self.buf[pos+len(tag):]
+      return before, tag
+    hold = max((i for tag in tags for i in range(1, min(len(self.buf), len(tag))+1) if tag.startswith(self.buf[-i:])), default=0) if not final else 0
     emit, self.buf = self.buf[:len(self.buf)-hold], self.buf[len(self.buf)-hold:]
-    return emit, False
+    return emit, None
   def route(self, piece:str, final:bool=False) -> typing.Iterator[tuple[str, str]]:
     self.buf += piece
     if self.mode == "undecided":  # decide whether the output starts with a think block
       if not final and len(self.buf) < len("<think>") and "<think>".startswith(self.buf): return
       self.mode, self.buf = ("reasoning", self.buf[len("<think>"):]) if self.buf.startswith("<think>") else ("content", self.buf)
     if self.mode == "reasoning":
-      emit, done = self.split("</think>", final)
+      emit, found = self.split(("</think>", KIMI_TOOL_SECTION_BEGIN), final)
       if emit: yield "reasoning_content", emit
-      if not done: return
+      if found is None: return
+      if found != "</think>":
+        self.mode, self.buf = "tool", found + self.buf
+        return
       self.mode = "content"
     if self.mode == "tool": return
-    emit, found = self.split("<tool_call>", final)
+    emit, found = self.split(("<tool_call>", KIMI_TOOL_SECTION_BEGIN), final)
     if emit: yield "content", emit
-    if found: self.mode, self.buf = "tool", "<tool_call>" + self.buf
+    if found is not None: self.mode, self.buf = "tool", found + self.buf
 
 class Handler(VizHandler):
   server: LLMServer
@@ -99,14 +107,29 @@ class Handler(VizHandler):
           break
       for field, delta in router.route(dec(), final=True): yield chunk({field:delta})
       tool_calls: list[dict] = []
-      for m in re.finditer(r"<tool_call>\s*(.*?)\s*(?:</tool_call>|$)", router.buf, re.DOTALL):
-        if (parsed := parse_tool_call(m.group(1))) is None:
+      kimi = router.buf.startswith(KIMI_TOOL_SECTION_BEGIN)
+      if kimi:
+        body = router.buf[len(KIMI_TOOL_SECTION_BEGIN):-len(KIMI_TOOL_SECTION_END)] if router.buf.endswith(KIMI_TOOL_SECTION_END) else ""
+        pattern = r"<\|tool_call_begin\|>\s*(functions\.([^:\s]+):\d+)\s*<\|tool_call_argument_begin\|>\s*(.*?)\s*<\|tool_call_end\|>"
+        calls = list(re.finditer(pattern, body, re.DOTALL))
+        valid = bool(calls) and not re.sub(pattern, "", body, flags=re.DOTALL).strip()
+        try: [json.loads(m.group(3)) for m in calls]
+        except json.JSONDecodeError: valid = False
+        if not valid:
+          stderr_log(f"failed to parse Kimi tool calls: {router.buf[:200]}")
+          yield chunk({"content":router.buf})
+          calls = []
+      else:
+        calls = list(re.finditer(r"<tool_call>\s*(.*?)\s*(?:</tool_call>|$)", router.buf, re.DOTALL))
+      for m in calls:
+        if kimi: tool_id, name, args = m.groups()
+        elif (parsed := parse_tool_call(m.group(1))) is not None: tool_id, (name, args) = f"call_{uuid.uuid4().hex[:24]}", parsed
+        else:
           stderr_log(f"failed to parse tool call: {m.group(1)[:200]}")
           yield chunk({"content":m.group(0)})  # don't silently drop output the client can't use
-        else:
-          name, args = parsed
-          tool_calls.append({"index":len(tool_calls), "id":f"call_{uuid.uuid4().hex[:24]}", "type":"function",
-                             "function":{"name":name, "arguments":args if isinstance(args, str) else json.dumps(args)}})
+          continue
+        tool_calls.append({"index":len(tool_calls), "id":tool_id, "type":"function",
+                           "function":{"name":name, "arguments":args if isinstance(args, str) else json.dumps(args)}})
       if tool_calls:
         yield chunk({"tool_calls":tool_calls})
         if finish_reason == "stop": finish_reason = "tool_calls"

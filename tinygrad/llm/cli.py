@@ -164,7 +164,7 @@ def main():
   if not args.no_chat_template and (ct := kv.get('tokenizer.chat_template')) is not None:
     try:
       import jinja2
-      env = jinja2.Environment()
+      env = jinja2.Environment(extensions=["jinja2.ext.loopcontrols"])
       env.filters['tojson'] = lambda obj, **kwargs: json.dumps(obj, **kwargs)  # jinja2's tojson escapes <>& for HTML safety
       env.globals['raise_exception'] = lambda msg: (_ for _ in ()).throw(RuntimeError(msg))
       env.globals['strftime_now'] = lambda fmt: time.strftime(fmt)
@@ -211,4 +211,6 @@ def main():
       sys.stdout.flush()
     messages.append({"role":"assistant", "content":reply})
 
-if __name__ == "__main__": main()
+if __name__ == "__main__":
+  try: main()
+  except KeyboardInterrupt: sys.exit(1)

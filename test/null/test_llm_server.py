@@ -252,6 +252,32 @@ class TestLLMToolCalls(unittest.TestCase):
     self.assertEqual([json.loads(tc.function.arguments)["path"] for tc in response.choices[0].message.tool_calls], ["a", "b"])
     self.assertEqual(response.choices[0].finish_reason, "tool_calls")
 
+  def test_streaming_kimi_tool_call(self):
+    self.set_output("before<|tool_calls_section_begin|><|tool_call_begin|>functions.read:5"
+                    '<|tool_call_argument_begin|>{"path":"a"}<|tool_call_end|><|tool_call_begin|>functions.read:6'
+                    '<|tool_call_argument_begin|>{"path":"b"}<|tool_call_end|><|tool_calls_section_end|>')
+    chunks = list(self.client.chat.completions.create(model="tool-model", messages=[{"role":"user", "content":"Read a and b"}],
+                                                     tools=self.tools(), stream=True))
+    self.assertEqual("".join(c.choices[0].delta.content or "" for c in chunks if c.choices), "before")
+    calls = [tc for c in chunks if c.choices for tc in c.choices[0].delta.tool_calls or []]
+    self.assertEqual([(tc.id, tc.function.name, json.loads(tc.function.arguments)["path"]) for tc in calls],
+                     [("functions.read:5", "read", "a"), ("functions.read:6", "read", "b")])
+    self.assertEqual(chunks[-1].choices[0].finish_reason, "tool_calls")
+
+  def test_malformed_kimi_tool_calls_become_content(self):
+    calls = [
+      '<|tool_calls_section_begin|><|tool_call_begin|>functions.read:0<|tool_call_argument_begin|>{"path":"a"}<|tool_call_end|>',
+      '<|tool_calls_section_begin|><|tool_call_begin|>functions.read:0<|tool_call_argument_begin|>{bad}<|tool_call_end|>'
+      '<|tool_calls_section_end|>',
+    ]
+    for call in calls:
+      with self.subTest(call=call):
+        self.set_output(call)
+        response = self.client.chat.completions.create(model="tool-model", messages=[{"role":"user", "content":"Read a"}], tools=self.tools())
+        self.assertEqual(response.choices[0].message.content, call)
+        self.assertIsNone(response.choices[0].message.tool_calls)
+        self.assertEqual(response.choices[0].finish_reason, "stop")
+
   def test_multiline_tool_argument_preserves_trailing_newline(self):
     self.set_output("<tool_call>\n<function=write>\n<parameter=content>\nfirst\nsecond\n\n</parameter>\n"
                     "<parameter=filePath>\nout.txt\n</parameter>\n</function>\n</tool_call>")

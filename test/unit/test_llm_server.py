@@ -63,6 +63,13 @@ class TestTransformerGenerate(unittest.TestCase):
     self.assertEqual(list(router.route("reasoning</think>answer")),
                      [("reasoning_content", "reasoning"), ("content", "answer")])
 
+  def test_template_starts_reasoning_then_kimi_tool_call(self):
+    router = StreamRouter(reasoning=True)
+    tool = ('<|tool_calls_section_begin|><|tool_call_begin|>functions.read:0'
+            '<|tool_call_argument_begin|>{"path":"a"}<|tool_call_end|><|tool_calls_section_end|>')
+    self.assertEqual(list(router.route("reasoning" + tool)), [("reasoning_content", "reasoning")])
+    self.assertEqual(router.buf, tool)
+
   def test_kv_cache_reuse(self):
     """Test that generate reuses the KV cache when tokens extend the cached prefix."""
     model = Transformer(TEST_CONFIG)
