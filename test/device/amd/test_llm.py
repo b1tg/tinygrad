@@ -258,6 +258,47 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
         x = rng.normal(size=(tokens, 128)).astype(np.float16)
         np.testing.assert_allclose(linear(Tensor(x)).numpy(), x.astype(np.float32) @ w.astype(np.float32).T + bias, rtol=2e-3, atol=2e-3)
 
+  def _test_quant_linear(self, ggml_type, block_bytes, in_features=2048, out_features=64, token_counts=(1, 3, 32, 64, 128)):
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
+    rng = np.random.default_rng(42)
+    packed = rng.integers(0, 256, (out_features*in_features//256, block_bytes), dtype=np.uint8)
+    if ggml_type == 14: packed[:, -2:] = np.array([0.001], dtype=np.float16).view(np.uint8)
+    else: packed[:, :2] = np.array([0.001], dtype=np.float16).view(np.uint8)
+    if ggml_type in (12, 13): packed[:, 2:4] = np.array([0.0002], dtype=np.float16).view(np.uint8)
+    raw = Tensor(np.pad(packed.flatten(), (4, 0))).contiguous().realize()[4:]
+    decoded = ggml_data_to_tensor(raw, out_features*in_features, ggml_type).reshape(out_features, in_features)
+    weight = decoded.numpy()
+    linear = Linear(in_features, out_features, bias=False)
+    linear.weight = decoded
+    for tokens in token_counts:
+      with self.subTest(tokens=tokens):
+        x = rng.normal(size=(tokens, in_features)).astype(np.float32 if tokens == 3 else np.float16)
+        reference_x = x.astype(np.float32)
+        if tokens < 16 or ggml_type == 14:
+          grouped = reference_x.reshape(tokens, -1, 32)
+          scale = np.maximum(np.abs(grouped).max(-1, keepdims=True) / 127, 1e-8)
+          reference_x = (np.clip(np.rint(grouped/scale), -127, 127)*scale).reshape(tokens, in_features)
+        reference_w = weight if tokens < 16 or ggml_type == 14 else weight.astype(np.float16).astype(np.float32)
+        np.testing.assert_allclose(linear(Tensor(x)).numpy(), reference_x @ reference_w.T, rtol=3e-3, atol=2e-2)
+    self.assertEqual(linear.ggml_type, ggml_type)
+
+  def test_q4_k_linear_batch_matches_single(self):
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
+    rng = np.random.default_rng(42)
+    in_features, out_features = 2048, 16
+    packed = rng.integers(0, 256, (out_features*in_features//256, 144), dtype=np.uint8)
+    packed[:, :2] = np.array([0.001], dtype=np.float16).view(np.uint8)
+    packed[:, 2:4] = np.array([0.0002], dtype=np.float16).view(np.uint8)
+    raw = Tensor(np.pad(packed.flatten(), (4, 0))).contiguous().realize()[4:]
+    decoded = ggml_data_to_tensor(raw, out_features*in_features, 12).reshape(out_features, in_features)
+    linear = Linear(in_features, out_features, bias=False)
+    linear.weight = decoded
+    x = rng.normal(size=(3, in_features)).astype(np.float32)
+    # Speculative verification must not change a row's quantized GEMV arithmetic with the batch size.
+    batch = linear(Tensor(x)).numpy()
+    single = np.concatenate([linear(Tensor(row[None])).numpy() for row in x], axis=0)
+    np.testing.assert_array_equal(batch, single)
+
   def test_q6_linear_multiple_tokens(self):
     if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
     rng = np.random.default_rng(42)
@@ -274,6 +315,9 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
     xq = np.clip(np.rint(x.reshape(3, in_features//32, 32) / scale), -127, 127) * scale
     np.testing.assert_allclose(linear(Tensor(x)).numpy(), xq.reshape(3, in_features) @ weight.T, rtol=2e-3, atol=2e-2)
     self.assertEqual(linear.ggml_type, 14)
+    batch = linear(Tensor(x)).numpy()
+    single = np.concatenate([linear(Tensor(row[None])).numpy() for row in x], axis=0)
+    np.testing.assert_array_equal(batch, single)
 
     # symbolic token counts take the padded kernel path and give the same results
     generic = Linear(in_features, 16, bias=False)
@@ -294,6 +338,47 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
         q = Tensor.zeros(1, 2, tokens, dim, dtype=dtypes.half)
         expected = np.broadcast_to(np.arange(valid-tokens, valid)[None, None, :, None]/2, q.shape)
         np.testing.assert_allclose(flash_attention(q, Tensor(cache), valid).numpy(), expected, rtol=1e-3, atol=1e-3)
+
+  def test_gated_delta_history(self):
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
+    rng = np.random.default_rng(19)
+    q, k = (rng.normal(size=(1, 2, 4, 32)).astype(np.float32)*0.1 for _ in range(2))
+    v = rng.normal(size=(1, 2, 4, 32)).astype(np.float32)
+    beta = rng.uniform(0, 1, (1, 2, 4)).astype(np.float32)
+    alpha = rng.uniform(0.5, 1, (1, 2, 4, 1)).astype(np.float32)
+    state = rng.normal(size=(1, 2, 32, 32)).astype(np.float32)
+    device_state = Tensor(state.copy()).realize()
+    history = Tensor.full((8, *state.shape), -123.).contiguous().realize()
+    core = gated_delta_prefill(*(Tensor(x) for x in (q, k, v, beta, alpha)), device_state, history=history).numpy()
+    expected, outputs = [], []
+    for t in range(4):
+      decayed = state*alpha[:, :, t, :, None]
+      delta = (v[:, :, t] - (decayed*k[:, :, t, None, :]).sum(-1))*beta[:, :, t, None]
+      state = decayed+delta[..., None]*k[:, :, t, None, :]
+      expected.append(state.copy())
+      outputs.append((state*q[:, :, t, None, :]).sum(-1))
+    np.testing.assert_allclose(core, np.stack(outputs, axis=2), atol=2e-6, rtol=2e-5)
+    np.testing.assert_allclose(history.numpy()[:4], expected, atol=2e-6, rtol=2e-5)
+    np.testing.assert_allclose(device_state.numpy(), state, atol=2e-6, rtol=2e-5)
+    np.testing.assert_array_equal(history.numpy()[4:], -123.)
+    # Resume from an intermediate checkpoint and replay its suffix, including the recurrent carry.
+    resume = Tensor(expected[1].copy()).realize()
+    suffix = gated_delta_prefill(*(Tensor(x[:, :, 2:]) for x in (q, k, v, beta, alpha)), resume).numpy()
+    np.testing.assert_allclose(suffix, core[:, :, 2:], atol=2e-6, rtol=2e-5)
+    np.testing.assert_allclose(resume.numpy(), state, atol=2e-6, rtol=2e-5)
+
+  def test_flash_attention_verify_causal(self):
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
+    Tensor.manual_seed(42)
+    q = Tensor.randn(1, 4, 4, 128, dtype=dtypes.half).realize()
+    cache = Tensor.randn(2, 1, 2, 256, 128, dtype=dtypes.half).realize()
+    # Cross a KV tile boundary: early queries must ignore both future rows and wholly masked tiles.
+    for end in (65, 128):
+      out = flash_attention(q, cache, end).numpy()
+      mask = Tensor.full((4, end), float("-inf")).triu(end-3)
+      expected = q.float().scaled_dot_product_attention(cache[0, :, :, :end].float(), cache[1, :, :, :end].float(),
+        attn_mask=mask, enable_gqa=True).numpy()
+      np.testing.assert_allclose(out, expected, rtol=2e-2, atol=2e-3)
 
   def test_attention_uses_physical_cache_length(self):
     if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
