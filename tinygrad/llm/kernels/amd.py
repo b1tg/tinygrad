@@ -168,17 +168,21 @@ def q8_quantize(x:Tensor, tokens:int, in_features:int) -> tuple[Tensor, Tensor, 
   return q, scale, xsum
 
 def _decode_linear(out:UOp, out_features:int, group_count:int, group_dot, name:str) -> UOp:
-  chunks = out.shape[2]
-  # two-dim global grid instead of one flat grid: no div/mods needed to decompose the gid
-  token_output = UOp.range(out.shape[0]*out_features, 0, axis_type=AxisType.GLOBAL)
-  chunk, lane = UOp.range(chunks, 1, axis_type=AxisType.GLOBAL), UOp.range(32, 2, axis_type=AxisType.LOCAL)
-  token, output = token_output // out_features, token_output % out_features
+  chunks, tokens = out.shape[2], out.shape[0]
+  # one block per (output, chunk) with the token loop inside: the packed weight block is read once and reused
+  # for every token instead of being re-read from DRAM once per token (the previous token-major grid did that).
+  output_chunk = UOp.range(out_features*chunks, 0, axis_type=AxisType.GLOBAL)
+  output, chunk = output_chunk // chunks, output_chunk % chunks
+  lane = UOp.range(32, 1, axis_type=AxisType.LOCAL)
   group = (lane+chunk*32).minimum(group_count-1)
-  value = group_dot(token, output, group) if chunks*32 == group_count else \
-    (lane+chunk*32 < group_count).where(group_dot(token, output, group), UOp.const(0, dtypes.float32))
-  total = warp_reduce(value, full_wave=True)
-  return out[token, output, chunk.valid(lane.eq(0))].store(total.cast(out.dtype)).end(token_output, chunk, lane).sink(
-    arg=KernelInfo(name=name, opts_to_apply=()))
+  active = lane+chunk*32 < group_count
+  stores = []
+  for token in range(tokens):
+    value = group_dot(token, output, group)
+    if chunks*32 != group_count: value = active.where(value, UOp.const(0, dtypes.float32))
+    total = warp_reduce(value, full_wave=True)
+    stores.append(out[token, output, chunk.valid(lane.eq(0))].store(total.cast(out.dtype)))
+  return UOp.group(*stores).end(output_chunk, lane).sink(arg=KernelInfo(name=name, opts_to_apply=()))
 
 @functools.cache
 def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, out_features:int, in_features:int, ggml_type:int) -> UOp:
@@ -384,18 +388,19 @@ def _vec_load(ptr:UOp, lanes:int) -> tuple[UOp, ...]:
 def _amd_flash_attention_decode_partial(out, stats, q, cache_kv, valid_kv_len, max_kv_len, block_n, waves=4):
   valid_kv_len = _unbind(valid_kv_len)
   _, B, H_KV, N, D = cast(tuple[int, int, int, int, int], cache_kv.shape)
-  _, H, M, _ = cast(tuple[int, int, int, int], q.shape)
-  assert M == 1 and H % H_KV == 0 and D % WARP_SIZE == 0 and max_kv_len <= N and max_kv_len % block_n == 0
+  _, H, T, _ = cast(tuple[int, int, int, int], q.shape)
+  assert H % H_KV == 0 and D % WARP_SIZE == 0 and max_kv_len <= N and max_kv_len % block_n == 0
   G, CHUNK, DPL, WAVES, PARTIALS = H // H_KV, block_n, D // WARP_SIZE, waves, out.shape[2]
   assert CHUNK % WAVES == 0
   SEC = CHUNK // WAVES  # keys each wave scans independently
   total_chunks = (valid_kv_len+CHUNK-1)//CHUNK
   live_chunks = min(total_chunks, PARTIALS) if isinstance(total_chunks, int) else total_chunks.minimum(PARTIALS)
-  block_bhkv, block_chunk = UOp.range(B*H_KV, 0, AxisType.GLOBAL), UOp.range(live_chunks, 1, AxisType.GLOBAL)
+  block_bhkv, block_chunk = UOp.range(B*T*H_KV, 0, AxisType.GLOBAL), UOp.range(live_chunks, 1, AxisType.GLOBAL)
   lane, wave = UOp.range(WARP_SIZE, -1, axis_type=AxisType.WARP), UOp.range(WAVES, 3, axis_type=AxisType.LOCAL)
-  b, kv_head = block_bhkv // H_KV, block_bhkv % H_KV
+  bt, kv_head = block_bhkv // H_KV, block_bhkv % H_KV
+  b, qt = bt // T, bt % T
   # per-lane query fragments for every GQA head, kept packed in registers; unpacked at use
-  qf = tuple(_vec_load(q[b, kv_head*G+h, 0, lane*DPL], DPL) for h in range(G))
+  qf = tuple(_vec_load(q[b, kv_head*G+h, qt, lane*DPL], DPL) for h in range(G))
   zerof = UOp.const(0, dtypes.float)
   # Each block scans every PARTIALS-th chunk, keeping an online softmax across rounds.
   chunk_round = UOp.range((total_chunks-1-block_chunk)//PARTIALS+1, 4, AxisType.REDUCE)
@@ -405,7 +410,7 @@ def _amd_flash_attention_decode_partial(out, stats, q, cache_kv, valid_kv_len, m
   vfrags: list[tuple[UOp, ...]] = [()]*SEC
   for j in range(SEC):
     key = chunk_id*CHUNK + wave*SEC + j
-    valid = key < valid_kv_len
+    valid = key < valid_kv_len-T+qt+1
     valids.append(valid)
     kfrag = _vec_load(cache_kv[0, b, kv_head, key, lane*DPL], DPL)
     # V is prefetched in the score pass so both streams are in flight together
@@ -449,14 +454,14 @@ def _amd_flash_attention_decode_partial(out, stats, q, cache_kv, valid_kv_len, m
     # LDS holds normalized values; restore each wave's sum before combining.
     val = sum((((ml_lds[w, h, 0].load()-M)*LOG2E).exp2() * ml_lds[w, h, 1].load() * acc_lds[w, h, d].load().float()
                for w in range(WAVES)), zerof)
-    oidx = out[b, kv_head*G + h, block_chunk, d]
-    if G*D % (WAVES*WARP_SIZE): oidx = out[b, (kv_head*G + h).valid(flat < G*D), block_chunk, d]
+    oidx = out[bt, kv_head*G + h, block_chunk, d]
+    if G*D % (WAVES*WARP_SIZE): oidx = out[bt, (kv_head*G + h).valid(flat < G*D), block_chunk, d]
     final_stores.append(oidx.store(val))
   hstat = tid
   M = functools.reduce(UOp.maximum, (ml_lds[w, hstat, 0].load() for w in range(WAVES)))
   L = sum((((ml_lds[w, hstat, 0].load()-M)*LOG2E).exp2() * ml_lds[w, hstat, 1].load() for w in range(WAVES)), zerof)
   q_head = (kv_head*G + hstat).valid(hstat < G) if WAVES*WARP_SIZE > G else kv_head*G + hstat
-  final_stores += [stats[b, q_head, block_chunk, 0].store(M), stats[b, q_head, block_chunk, 1].store(L)]
+  final_stores += [stats[bt, q_head, block_chunk, 0].store(M), stats[bt, q_head, block_chunk, 1].store(L)]
   return UOp.group(*final_stores).end(lane, wave, block_chunk, block_bhkv).sink(arg=KernelInfo(name="flash_decode_partial", opts_to_apply=()))
 
 @functools.cache
@@ -490,10 +495,10 @@ def _amd_flash_decode_combine(o:UOp, partial:UOp, stats:UOp, live:int|UOp) -> UO
     .end(lane, block_dt, block_bh).sink(arg=KernelInfo(name="flash_decode_combine", opts_to_apply=()))
 
 def amd_flash_attention_decode(q:Tensor, cache_kv:Tensor, valid_kv_len:int|UOp, max_kv_len:int) -> Tensor:
-  B, H, D = cache_kv.shape[1], q.shape[1], cache_kv.shape[4]
+  B, H, T, D = q.shape
   chunks = min(48, max_kv_len // 64)
-  partial = Tensor.empty(B, H, chunks, D, dtype="float32", device=q.device)
-  stats = Tensor.empty(B, H, chunks, 2, dtype="float32", device=q.device)
+  partial = Tensor.empty(B*T, H, chunks, D, dtype="float32", device=q.device)
+  stats = Tensor.empty(B*T, H, chunks, 2, dtype="float32", device=q.device)
   waves, group = 16, H // cache_kv.shape[2]
   while waves * group * ((D+LDS_PAD)*2 + 8) > 65536: waves //= 2
   assert waves > 0, "attention head group exceeds shared memory capacity"
@@ -501,9 +506,14 @@ def amd_flash_attention_decode(q:Tensor, cache_kv:Tensor, valid_kv_len:int|UOp, 
   partial, stats = Tensor.custom_kernel(partial, stats, q, cache_kv, fxn=fxn)[:2]
   live = (valid_kv_len+63)//64
   live = min(live, chunks) if isinstance(live, int) else live.minimum(chunks)
-  out = Tensor.empty(B, H, 1, D, dtype="float32", device=q.device)
-  fxn = functools.partial(_amd_flash_decode_combine, live=live)
-  return Tensor.custom_kernel(out, partial, stats, fxn=fxn)[0]
+  # combine in plain tensor ops: the custom-kernel form trips a renderer CSE/LICM bug when the MTP graph
+  # traces several decode calls (a loop-invariant value is declared inside the reduce loop but used after it)
+  stats_l, partial_l = stats[:, :, :live, :], partial[:, :, :live, :]
+  m = stats_l[..., 0].max(-1, keepdim=True)
+  w = ((stats_l[..., 0] - m) * LOG2E).exp2()
+  acc = (w.unsqueeze(-1) * partial_l).sum(2)
+  l = (w * stats_l[..., 1]).sum(2, keepdim=True)
+  return (acc / l).reshape(B, T, H, D).transpose(1, 2)
 
 @functools.cache
 def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:int|UOp|None=None) -> UOp:
@@ -593,15 +603,20 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
   # cached flash attention on the half KV cache (already written through assigned_kv); valid_end stays bound at the graph level
   T_real, q_start = q.shape[2], None
   D, N, group = q.shape[3], assigned_kv.shape[3], q.shape[1] // assigned_kv.shape[2]
-  decode = resolve(T_real == 1, False)
+  # small token counts (MTP verify / short chunks) use the split-K decode kernel; larger ones the WMMA prefill
+  decode = resolve(T_real <= 8, False)
+  # arbitrary chunk sizes still take the WMMA kernel by padding the query tile to a multiple of BLOCK_M
+  T_pad = (T_real+BLOCK_M-1)//BLOCK_M*BLOCK_M if isinstance(T_real, int) else q.max_shape[2]
   # Non-power-of-two decode dimensions can lose tail-store masks. Q/P, K, and V use separate LDS allocations.
   supported = D % 32 == 0 and (D & (D-1) == 0 and N % 64 == 0 and group*((D+LDS_PAD)*2+8) <= 65536 if decode else
-    D >= 64 and 2*(2*BLOCK_M*(D+LDS_PAD) + D*(BLOCK_N+LDS_PAD)) <= 65536 and N % BLOCK_N == 0 and q.max_shape[2] % BLOCK_M == 0)
+    D >= 64 and 2*(2*BLOCK_M*(D+LDS_PAD) + D*(BLOCK_N+LDS_PAD)) <= 65536 and N % BLOCK_N == 0 and T_pad % BLOCK_M == 0)
   if not supported:
     k, v = (assigned_kv[i, :, :, :valid_end].float() for i in range(2))
     mask = None if decode else Tensor.full((T_real, valid_end), -math.inf, dtype=dtypes.float32, device=q.device).triu(valid_end-T_real+1)
     return q.float().scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)
   if decode: return amd_flash_attention_decode(q.half(), assigned_kv, valid_end, cast(int, N))
+  if isinstance(T_real, int) and T_real % BLOCK_M:
+    q, q_start = q.pad_to((*q.shape[:2], T_pad, q.shape[3])), valid_end-T_real
   if isinstance(T_real, UOp):
     # symbolic chunk: pad the queries to the static tile; garbage rows are sliced off
     T_pad = q.max_shape[2]
@@ -616,7 +631,8 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
 # ******** gated delta net: fused recurrent scan ********
 
 @functools.cache
-def _gated_delta_prefill_kernel(core:UOp, q:UOp, k:UOp, v:UOp, beta:UOp, alpha:UOp, state:UOp, kq:UOp, start_pos:UOp|None=None) -> UOp:
+def _gated_delta_prefill_kernel(core:UOp, q:UOp, k:UOp, v:UOp, beta:UOp, alpha:UOp, state:UOp, kq:UOp,
+                                history:UOp|None=None, start_pos:UOp|None=None) -> UOp:
   batch, heads, tokens, value_dim, row_tile = *core.shape, 4
   key_dim, alpha_dim = q.shape[-1], alpha.shape[-1] if len(alpha.shape) == 4 else 1
   assert all(isinstance(x, int) for x in (batch, heads, tokens, value_dim, key_dim)) and key_dim % 32 == 0 and value_dim % row_tile == 0
@@ -644,12 +660,17 @@ def _gated_delta_prefill_kernel(core:UOp, q:UOp, k:UOp, v:UOp, beta:UOp, alpha:U
     delta = (v[bh, token, row].load() - state_k*av) * bv
     updates += [x*av + delta*y for x,y in zip(previous, keys)]
     stores.append(core[bh, token, row.valid(lane.eq(0))].store(state_q*av + delta*kq[bh, token]))
+  if history is not None:
+    history = history.reshape(history.shape[0], batch*heads, value_dim, key_dim)
+    stores += [history[token, bh, row, col].store(updates[ri*key_dim//32+ci].cast(history.dtype))
+               for ri,row in enumerate(rows) for ci,col in enumerate(cols)]
   step = UOp.group(*stores, current.store(UOp.stack(*updates))).end(token)
   state_stores = (state[bh, row, col].store(current.after(step)[row_idx*key_dim//32+i].load().cast(state.dtype))
                   for row_idx,row in enumerate(rows) for i,col in enumerate(cols))
   return UOp.group(*state_stores).end(lane, bh_row).sink(arg=KernelInfo(name="gated_delta_prefill", opts_to_apply=()))
 
-def gated_delta_prefill(q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:Tensor, state:Tensor, start_pos:Tensor|None=None) -> Tensor:
+def gated_delta_prefill(q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:Tensor, state:Tensor,
+                        start_pos:Tensor|None=None, history:Tensor|None=None) -> Tensor:
   batch, heads, tokens, key_dim = q.shape
   value_dim = v.shape[-1]
   assert q.shape == k.shape and v.shape[:3] == beta.shape == (batch, heads, tokens) and state.shape == (batch, heads, value_dim, key_dim)
@@ -661,8 +682,10 @@ def gated_delta_prefill(q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:Tensor,
     assert start_pos.uop.is_bound_var
     state = Tensor(state.uop.after(start_pos.uop))
   core, kq = Tensor.empty_like(v), (q*k).sum(-1).contiguous()
-  srcs = (core, q.contiguous(), k.contiguous(), v.contiguous(), beta.contiguous(), alpha.contiguous(), state, kq)
+  srcs:tuple[Tensor, ...] = (core, q.contiguous(), k.contiguous(), v.contiguous(), beta.contiguous(), alpha.contiguous(), state, kq)
+  if history is not None: srcs += (history,)
   contig = tuple(x.uop if x.uop.op is Ops.AFTER else x.uop.contiguous() for x in srcs)
   params = tuple(UOp.placeholder_like(x, slot=i) for i,x in enumerate(contig))
-  call = _gated_delta_prefill_kernel(*params, None if start_pos is None else kernel_var(start_pos.uop.src[0])).call(*contig)
+  # the bound start_pos reaches the graph through the state AFTER chain, like the flash kernels' valid_end
+  call = _gated_delta_prefill_kernel(*params, start_pos=None if start_pos is None else kernel_var(start_pos.uop.src[0])).call(*contig)
   return Tensor(contig[0].after(call))

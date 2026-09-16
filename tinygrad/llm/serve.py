@@ -1,7 +1,7 @@
 from __future__ import annotations
 import json, pathlib, re, time, typing, uuid
 from typing import TYPE_CHECKING
-from tinygrad.helpers import DEBUG, colored, stderr_log
+from tinygrad.helpers import DEBUG, colored, stderr_log, getenv
 from tinygrad.viz.serve import TCPServerWithReuse, Handler as VizHandler
 if TYPE_CHECKING:
   from tinygrad.llm.cli import SimpleTokenizer
@@ -140,8 +140,12 @@ class Handler(VizHandler):
 
       # reply
       max_tokens = body.get("max_completion_tokens") or body.get("max_tokens")
+      # clients like pi send no temperature; defaulting to 0 (greedy) makes the model loop. Match llama.cpp's
+      # sampling default instead. MTP still requires greedy, so keep 0 there.
+      req_temp = body.get("temperature")
+      temperature = float(req_temp) if req_temp is not None else (0.0 if getenv("MTP", 0) else 0.8)
       chunks = self.run_model(ids, body["model"], not body.get("stream") or body.get("stream_options",{}).get("include_usage", False),
-                              max_tokens=max_tokens, temperature=float(body.get("temperature", 0.0)),
+                              max_tokens=max_tokens, temperature=temperature,
                               reasoning=rendered.rstrip().endswith("<think>"))
       if body.get("stream"): self.stream_json(chunks)
       else:
