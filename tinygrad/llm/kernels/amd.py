@@ -169,20 +169,20 @@ def q8_quantize(x:Tensor, tokens:int, in_features:int) -> tuple[Tensor, Tensor, 
 
 def _decode_linear(out:UOp, out_features:int, group_count:int, group_dot, name:str) -> UOp:
   chunks, tokens = out.shape[2], out.shape[0]
-  # one block per (output, chunk) with the token loop inside: the packed weight block is read once and reused
-  # for every token instead of being re-read from DRAM once per token (the previous token-major grid did that).
+  # one block per (output, chunk) with a runtime token loop: the packed weight block is loaded once and reused for
+  # every token instead of being streamed again per token (the previous token-major grid did that). A real range loop
+  # (not a Python unroll) keeps the kernel size independent of the token count, so prefill (large T) is not slowed.
   output_chunk = UOp.range(out_features*chunks, 0, axis_type=AxisType.GLOBAL)
   output, chunk = output_chunk // chunks, output_chunk % chunks
   lane = UOp.range(32, 1, axis_type=AxisType.LOCAL)
   group = (lane+chunk*32).minimum(group_count-1)
   active = lane+chunk*32 < group_count
-  stores = []
-  for token in range(tokens):
-    value = group_dot(token, output, group)
-    if chunks*32 != group_count: value = active.where(value, UOp.const(0, dtypes.float32))
-    total = warp_reduce(value, full_wave=True)
-    stores.append(out[token, output, chunk.valid(lane.eq(0))].store(total.cast(out.dtype)))
-  return UOp.group(*stores).end(output_chunk, lane).sink(arg=KernelInfo(name=name, opts_to_apply=()))
+  token = UOp.range(tokens, 2, AxisType.REDUCE)
+  value = group_dot(token, output, group)
+  if chunks*32 != group_count: value = active.where(value, UOp.const(0, dtypes.float32))
+  total = warp_reduce(value, full_wave=True)
+  store = out[token, output, chunk.valid(lane.eq(0))].store(total.cast(out.dtype))
+  return UOp.group(store).end(token).end(output_chunk, lane).sink(arg=KernelInfo(name=name, opts_to_apply=()))
 
 @functools.cache
 def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, out_features:int, in_features:int, ggml_type:int) -> UOp:
