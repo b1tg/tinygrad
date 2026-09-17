@@ -1,5 +1,5 @@
 """Compare warmed greedy decoding with and without Qwen3.5 speculative decoding."""
-import argparse, itertools, json, os, statistics, time
+import argparse, itertools, json, statistics, time
 from tinygrad import Device
 from tinygrad.llm.cli import SimpleTokenizer
 from tinygrad.llm.model import Transformer
@@ -71,8 +71,8 @@ if __name__ == '__main__':
   ]
   if args.prompt_tokens is not None: prompts = [f'synthetic:{args.prompt_tokens}']
   report = dict(model=args.model, device=Device.DEFAULT, target=str(Device[Device.DEFAULT].target),
-                lookup=bool(int(os.environ.get('MTP_LOOKUP', '0'))), max_context=args.max_context,
-                decode_tokens=args.decode_tokens, draft_tokens=args.draft_tokens, repeat=args.repeat, results=[])
+                max_context=args.max_context, decode_tokens=args.decode_tokens, draft_tokens=args.draft_tokens,
+                repeat=args.repeat, results=[])
   print(json.dumps({k:v for k,v in report.items() if k != 'results'}), flush=True)
   for prompt in prompts:
     tokens = tokenizer.encode('<|im_start|>user\n'+prompt+'<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n')

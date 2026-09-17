@@ -544,11 +544,6 @@ class Transformer:
     hidden = self.mtp[0].draft(embedding, hidden, start_pos).contiguous()
     return self.output(hidden[:, -1:]).argmax(-1).contiguous(), hidden[:, -1:].contiguous()
 
-  @staticmethod
-  def _mtp_input(x:Tensor) -> Tensor:
-    # Normalize JIT views without copying: slices and generated outputs otherwise have different input signatures.
-    return Tensor(UOp.from_buffer(x._buffer())).reshape(x.shape)
-
   def _mtp_restore(self, index:Tensor) -> list[Tensor]:
     ret = []
     for block in self.blk:
