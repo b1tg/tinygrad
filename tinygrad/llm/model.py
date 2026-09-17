@@ -625,8 +625,12 @@ class Transformer:
       # Keep the first prompt row too, using a zero hidden state at the sequence boundary.
       if previous is None: previous = Tensor.zeros_like(hidden[:, :1])
       shifted = previous.cat(hidden[:, :-1], dim=1).contiguous()
-      draft_prefill = self.mtp_draft_prefill_jit.setdefault(n, TinyJit(functools.partial(self._mtp_draft, project=False)))
-      Tensor.realize(*draft_prefill(chunk, shifted, sp.bind(pos)))
+      # pad to chunk_size with a symbolic token count so the draft-prefill JIT is keyed by chunk_size, not n.
+      # keying by n recompiled the MTP block for every distinct partial-chunk length, i.e. on nearly every request.
+      draft_chunk = chunk.pad_to((1, chunk_size))[:, :vt.bind(n)].contiguous()
+      draft_hidden = shifted.pad_to((1, chunk_size, shifted.shape[-1]))[:, :vt.bind(n)].contiguous()
+      draft_prefill = self.mtp_draft_prefill_jit.setdefault(chunk_size, TinyJit(functools.partial(self._mtp_draft, project=False)))
+      Tensor.realize(*draft_prefill(draft_chunk, draft_hidden, sp.bind(pos)))
       previous = hidden[:, -1:].clone().realize()
     assert previous is not None
     pos = len(tokens)
