@@ -37,8 +37,11 @@ class TestMTP(unittest.TestCase):
     _, h = m._mtp_target(Tensor([tokens[:4]], dtype=dtypes.int32), sp.bind(0), verify=True)
     np.testing.assert_allclose(h.numpy(), np.concatenate(ref[:4], axis=1), atol=2e-3, rtol=2e-3)
     for accepted in range(4):
-      Tensor.realize(*m._mtp_restore(Tensor([accepted], dtype=dtypes.int32)))
-      _, h = m._mtp_target(Tensor([[tokens[accepted+1]]], dtype=dtypes.int32), sp.bind(accepted+1))
+      restored = m._mtp_restore(Tensor([accepted], dtype=dtypes.int32))
+      restore_deps = tuple(t.uop for t in restored)
+      Tensor.realize(*restored)
+      _, h = m._mtp_target(Tensor([[tokens[accepted+1]]], dtype=dtypes.int32), sp.bind(accepted+1),
+                           restore_deps=restore_deps)
       np.testing.assert_allclose(h.numpy(), ref[accepted+1], atol=2e-3, rtol=2e-3)
 
   def test_greedy_generation(self):
