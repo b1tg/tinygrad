@@ -1,6 +1,6 @@
 from __future__ import annotations
 import enum, functools, itertools, pathlib
-from typing import Callable, cast
+from typing import Callable
 from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes
 from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
@@ -263,6 +263,9 @@ class GatedDeltaNetBlock(FFNBlock):
   capture_state = False
   state_history:Tensor
   conv_history:Tensor
+  # in-place stores that rewrote recurrent_state/conv_state from the MTP history; the next graph must be ordered after
+  # them (a plain buffer side effect isn't enough for the async multi-queue backend, so carry the AFTER edge forward)
+  restore_deps:tuple[UOp, ...] = ()
   def __init__(self, config:TransformerConfig, ssm:SSMConfig):
     super().__init__(config)
     self.head_k_dim, self.num_k_heads, self.num_v_heads = ssm.state_size, ssm.group_count, ssm.time_step_rank
@@ -302,7 +305,7 @@ class GatedDeltaNetBlock(FFNBlock):
 
     capture = self.capture_state
     # qkv conv, conv_state is reset when starting from position 0
-    conv_state = initial.where(0, self.conv_state)
+    conv_state = initial.where(0, self.conv_state.uop.after(*self.restore_deps) if self.restore_deps else self.conv_state)
     # assemble the conv window in a static-size buffer: [conv_state | qkv rows | zero-pad].
     # padded steps are exact no-ops: beta=0 (delta rule off), log_alpha=0 (decay 1 after exp)
     win = Tensor.zeros(B, self.ssm_conv_kernel-1 + T_pad, self.conv_channels).uop
@@ -332,7 +335,7 @@ class GatedDeltaNetBlock(FFNBlock):
     alpha = log_alpha.transpose(1, 2).exp()  # per-channel decay for kda, per-head otherwise (B, H, T, V|1)
 
     # recurrent: scan over the (padded) tokens, updating the recurrent state. collect the per-step outputs
-    state = Tensor(self.recurrent_state.uop.after(conv_state_store))  # carry the conv write into this graph
+    state = Tensor(self.recurrent_state.uop.after(conv_state_store, *self.restore_deps))  # carry conv + restore writes
     if self.head_k_dim % 32 == 0 and self.head_v_dim % 4 == 0 and amd_custom_kernels_supported(x.device):
       # one fused kernel for the whole scan; it resets and updates the recurrent state in place (RDNA3)
       core = gated_delta_prefill(q, k, v, beta, alpha, state, Tensor(start_pos), self.state_history if capture else None).transpose(1, 2)
@@ -387,7 +390,7 @@ class MTPBlock(TransformerBlock):
     k = self.attn_k_norm(k)
     k = apply_rope(k[..., :self.config.rope_dim], self.freqs_cis[start_pos:start_pos+T]).cat(k[..., self.config.rope_dim:], dim=-1)
     store = self.cache_kv[:, :, :, start_pos:start_pos+T, :].uop.store(Tensor.stack(k, v).cast(dtypes.half).uop)
-    return Tensor(hidden[:, -1:].contiguous().uop.after(store))
+    return Tensor(hidden.uop.after(store))
 
 class Transformer:
   def __init__(self, config:TransformerConfig):
@@ -407,6 +410,7 @@ class Transformer:
     # persistent MTP round inputs (created lazily on first use) and the target hidden that seeds a resumed request
     self._mtp_pending_buf: Tensor|None = None
     self._mtp_prev_buf: Tensor|None = None
+    self._mtp_target_buf: dict[int, Tensor] = {}
     self._mtp_prev_hidden: Tensor|None = None
     # we specialize the JIT for prefill and rollout
     self.prefill_jit = TinyJit(self.forward)
@@ -529,12 +533,15 @@ class Transformer:
     prefix_len = sum(1 for _ in itertools.takewhile(lambda ab: ab[0] == ab[1], zip(tokens[:-1], self._cached_tokens)))
     return min(block._reusable_prefix_len(prefix_len, len(self._cached_tokens)) for block in self.blk)
 
-  def _mtp_target(self, tokens:Tensor, start_pos:int|UOp, verify:bool=False) -> tuple[Tensor, Tensor]:
+  def _mtp_target(self, tokens:Tensor, start_pos:int|UOp, verify:bool=False,
+                  restore_deps:tuple[UOp, ...]=()) -> tuple[Tensor, Tensor]:
+    # a replay right after _mtp_restore must be explicitly ordered after the in-place state stores (a bare buffer side
+    # effect can race across realizations on the async backend). generate_mtp keeps verify+restore in one graph instead.
     x = self.token_embd(tokens).float()
     for block in self.blk:
-      if isinstance(block, GatedDeltaNetBlock): block.capture_state = verify
+      if isinstance(block, GatedDeltaNetBlock): block.capture_state, block.restore_deps = verify, restore_deps
       x = block(x, start_pos)
-      if isinstance(block, GatedDeltaNetBlock): block.capture_state = False
+      if isinstance(block, GatedDeltaNetBlock): block.capture_state, block.restore_deps = False, ()
     hidden = self.output_norm(x).contiguous()
     return self.output(hidden if verify else hidden[:, -1:]).argmax(-1).contiguous(), hidden.pad_to(hidden.max_shape).contiguous()
 
@@ -553,19 +560,17 @@ class Transformer:
           ret.append(Tensor(state.uop.after(state.uop.store(value.uop))))
     return ret
 
-  def _mtp_round(self, start_pos:UOp, count:int) -> tuple[Tensor, Tensor, Tensor]:
-    # read the live pending token / hidden from the persistent buffers and write the next round's values back in
-    # the same graph: keeping the JIT's tensor inputs fixed lets tinygrad reuse the captured exec (~0.6ms) instead
-    # of re-resolving it for freshly allocated inputs every round (~4.7ms measured).
-    pending, previous = cast(Tensor, self._mtp_pending_buf), cast(Tensor, self._mtp_prev_buf)
+  def _mtp_round(self, pending:Tensor, previous:Tensor, target:Tensor, start_pos:UOp, count:int) -> tuple[Tensor, Tensor, Tensor]:
+    # the persistent buffers are explicit JIT inputs so the captured graph reads/writes them in place across execs
     draft, hidden = [pending], previous
     for i in range(count):
       token, hidden = self._mtp_draft(draft[-1], hidden, start_pos+i)
       draft.append(token)
     inputs = Tensor.cat(*draft, dim=1).contiguous()
-    return self._mtp_finish(inputs, previous, start_pos, pending)
+    return self._mtp_finish(inputs, previous, start_pos, pending, target)
 
-  def _mtp_finish(self, inputs:Tensor, previous:Tensor, start_pos:UOp, pending:Tensor) -> tuple[Tensor, Tensor, Tensor]:
+  def _mtp_finish(self, inputs:Tensor, previous:Tensor, start_pos:UOp, pending:Tensor,
+                  target:Tensor) -> tuple[Tensor, Tensor, Tensor]:
     predicted, hidden = self._mtp_target(inputs, start_pos, verify=True)
     accepted = (inputs[:, 1:] == predicted[:, :-1]).cast(dtypes.int32).cumprod(1).sum(1).reshape(1)
     restored = self._mtp_restore(accepted)
@@ -573,17 +578,21 @@ class Transformer:
     repair_tokens, repair_hidden = predicted[:, :-1], hidden[:, :-1]
     _, updated = self._mtp_draft(repair_tokens, repair_hidden, start_pos+1, project=False)
     chosen = hidden.gather(1, accepted.reshape(1, 1, 1).expand(1, 1, hidden.shape[-1])).contiguous()
-    output = predicted.contiguous()
     deps = [t.uop for t in restored] + [updated.uop]
+    # write the round's emitted tokens into a persistent buffer: a freshly allocated return buffer is not guaranteed
+    # to be the one the captured JIT rewrites, which made the round return the capture-time tokens on exec
+    deps.append(target.uop.store(predicted.reshape(target.shape).cast(target.dtype).uop))
     deps.append(pending.uop.store(predicted.gather(1, accepted.reshape(1, 1)).reshape(pending.shape).cast(pending.dtype).uop))
     deps.append(previous.uop.store(chosen.reshape(previous.shape).cast(previous.dtype).uop))
-    return Tensor(output.uop.after(*deps)), chosen, accepted
+    return Tensor(target.uop.after(*deps)), chosen, accepted
 
   def generate_mtp(self, tokens:list[int], chunk_size:int=32, draft_tokens:int=3):
     if not 1 <= draft_tokens <= 7: raise ValueError("MTP draft count must be between 1 and 7")
     if not tokens: raise ValueError("MTP requires a nonempty prompt")
     self.mtp_stats = {"drafted": 0, "accepted": 0, "rounds": 0}
     if len(tokens) >= self.max_context: return
+    # the MTP jits persist on the model, so the bound variable they captured must persist too: a fresh variable each
+    # request leaves the replayed graph bound to the first request's variable
     sp = UOp.variable("start_pos", 0, self.max_context-1)
     if self.has_recurrent_block and not amd_custom_kernels_supported(self.token_embd.weight.device): chunk_size = 1
     for block in self.blk:
@@ -651,7 +660,8 @@ class Transformer:
         self._cached_tokens, self._mtp_prev_hidden = [], None
         break
       run = self.mtp_round_jit.setdefault(count, TinyJit(functools.partial(self._mtp_round, count=count)))
-      target_tensor, _, accepted_tensor = run(sp.bind(pos))
+      target_buf = self._mtp_target_buf.setdefault(count, Tensor.empty(1, count+1, dtype=dtypes.int32, device=dev).realize())
+      target_tensor, _, accepted_tensor = run(self._mtp_pending_buf, self._mtp_prev_buf, target_buf, sp.bind(pos))
       target = target_tensor.tolist()[0]
       accepted = int(accepted_tensor.item())
       draft = target[:accepted]
