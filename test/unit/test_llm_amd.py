@@ -789,4 +789,116 @@ class TestQ8Quantize(unittest.TestCase):
     want = p @ rows[:, :LORA].astype(np.float64)
     np.testing.assert_allclose(got, want[None], rtol=1e-3, atol=1e-3)
 
+class TestKDAConvNorm(unittest.TestCase):
+  def setUp(self):
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("AMD custom kernels required")
+
+  def test_matches_generic_conv(self):
+    from tinygrad.llm.kernels.amd import kda_conv_norm
+    B, H, D = 1, 4, 128
+    C = 3*H*D
+    rng = np.random.default_rng(5)
+    qkv_np = rng.normal(size=(B, 1, C)).astype(np.float32)
+    st_np = rng.normal(size=(B, 3, C)).astype(np.float32)
+    wt_np = rng.normal(size=(C, 4)).astype(np.float16)
+    eps, q_scale = 1e-6, D**-0.5
+    for pos in (0, 7):
+      with self.subTest(pos=pos):
+        state = Tensor(st_np.copy()).realize()
+        q, k, v, _ = kda_conv_norm(Tensor(qkv_np.copy()), state, Tensor(wt_np.copy()), pos, H, D, eps, q_scale)
+        Tensor.realize(q, k, v)  # the kernel runs once per schedule; realize all outputs together (in-place state write included)
+        win = np.concatenate([np.zeros((B, 3, C), np.float32) if pos == 0 else st_np, qkv_np], axis=1)
+        conv = sum(win[:, i] * wt_np[:, i].astype(np.float32) for i in range(3)) + win[:, 3] * wt_np[:, 3].astype(np.float32)
+        conv = conv / (1 + np.exp(-conv))
+        np.testing.assert_allclose(state.numpy(), np.stack([win[:, 1], win[:, 2], win[:, 3]], axis=1), rtol=1e-6, atol=1e-6)
+        def heads(sl): return conv[0, sl].reshape(1, H, D)
+        def normed(a, s=1.0): return a / np.maximum(np.sqrt((a**2).sum(-1, keepdims=True)), eps) * s
+        np.testing.assert_allclose(q.numpy().reshape(B, H, D), normed(heads(slice(0, H*D)), q_scale), rtol=1e-5, atol=1e-6)
+        np.testing.assert_allclose(k.numpy().reshape(B, H, D), normed(heads(slice(H*D, 2*H*D))), rtol=1e-5, atol=1e-6)
+        np.testing.assert_allclose(v.numpy().reshape(B, H, D), heads(slice(2*H*D, C)), rtol=1e-5, atol=1e-6)
+
+class TestHCMixes(unittest.TestCase):
+  def setUp(self):
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("AMD custom kernels required")
+
+  def test_matches_normed_linear(self):
+    from tinygrad.llm.kernels.amd import hc_mixes
+    width, outputs = 16384, 24
+    linear, weights = TestQ8Grouped.make_linear(width, outputs)
+    linear.set_quantized(linear.weight)
+    self.assertEqual(linear.ggml_type, 8)
+    x = Tensor(np.random.default_rng(7).normal(size=(1, 1, 4, 4096)).astype(np.float32)).realize()
+    got = hc_mixes(x, linear.weight, outputs, 1e-5).numpy()
+    flat = x.numpy().reshape(1, -1)
+    normed = flat / np.sqrt((flat**2).mean(-1, keepdims=True) + 1e-5)
+    expected = linear(Tensor(normed).realize()).numpy()  # the unfused path: q8 quantize + packed linear
+    np.testing.assert_allclose(got.reshape(1, outputs), expected, rtol=5e-3, atol=2e-3)
+
+  def test_fuse_q8_linears(self):
+    from tinygrad.llm.model import fuse_q8_linears
+    l1, _ = TestQ8Grouped.make_linear(1024, 512)
+    l2, _ = TestQ8Grouped.make_linear(1024, 256)
+    fused = fuse_q8_linears(l1, l2)
+    self.assertIsNotNone(fused)
+    x = Tensor(np.random.default_rng(3).normal(size=(1, 1, 1024)).astype(np.float32)).realize()
+    np.testing.assert_allclose(fused(x).numpy(), np.concatenate([l1(x).numpy(), l2(x).numpy()], axis=-1), rtol=1e-4, atol=1e-4)
+
+class TestFusedDecodeKernels(unittest.TestCase):
+  def setUp(self):
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("AMD custom kernels required")
+
+  def test_gumbel_argmax(self):
+    from tinygrad.llm.kernels.amd import gumbel_argmax
+    rng = np.random.default_rng(12)
+    logits = Tensor(rng.normal(size=(1, 1024)).astype(np.float32)).realize()
+    got = gumbel_argmax(logits, Tensor([0.7])).numpy()
+    self.assertEqual(got.shape, (1, 1))
+    # temperature near zero is argmax of logits
+    got0 = gumbel_argmax(logits, Tensor([0.0])).numpy()
+    np.testing.assert_array_equal(got0, logits.numpy().argmax(-1, keepdims=True))
+
+  def test_router_probs(self):
+    from tinygrad.llm.kernels.amd import router_probs
+    rng = np.random.default_rng(13)
+    logits = rng.normal(size=(3, 32)).astype(np.float32)
+    sel = rng.integers(0, 32, (3, 4)).astype(np.int32)
+    got = router_probs(Tensor(logits).realize(), Tensor(sel).realize(), 2.5).numpy()
+    p = 1/(1+np.exp(-np.take_along_axis(logits, sel, axis=-1)))
+    np.testing.assert_allclose(got, p/p.sum(-1, keepdims=True)*2.5, rtol=1e-5, atol=1e-6)
+
+  def test_hc_mix(self):
+    from tinygrad.llm.kernels.amd import hc_mix
+    rng = np.random.default_rng(14)
+    B, T, HC, D = 1, 2, 4, 256
+    x = Tensor(rng.normal(size=(B, T, D)).astype(np.float32)).realize()
+    res = Tensor(rng.normal(size=(B, T, HC, D)).astype(np.float32)).realize()
+    post = Tensor(rng.normal(size=(B, T, HC)).astype(np.float32)).realize()
+    comb = Tensor(rng.uniform(size=(B, T, HC, HC)).astype(np.float32)).realize()
+    x_np, res_np, post_np, comb_np = x.numpy(), res.numpy(), post.numpy(), comb.numpy()
+    got = hc_mix(x, res, post, comb).numpy()
+    exp = post_np[..., None]*x_np[:, :, None, :] + np.einsum('btij,btid->btjd', comb_np, res_np)
+    np.testing.assert_allclose(got, exp, rtol=1e-5, atol=1e-5)
+
+  def test_kda_gates_and_out(self):
+    from tinygrad.llm.kernels.amd import kda_gates, kda_out
+    rng = np.random.default_rng(15)
+    B, H, K, lb = 1, 4, 32, -5.0
+    beta_raw = rng.normal(size=(B, H)).astype(np.float32)
+    alpha_raw = rng.normal(size=(B, H, K)).astype(np.float32)
+    dt = rng.normal(size=H*K).astype(np.float32)
+    a_log = rng.uniform(0.1, 1, size=H).astype(np.float32)
+    beta, alpha = kda_gates(Tensor(beta_raw).realize(), Tensor(alpha_raw).realize(), Tensor(dt).realize(), Tensor(a_log).realize(), lb, H, K)
+    Tensor.realize(beta, alpha)
+    exp_beta = 1/(1+np.exp(-beta_raw))
+    exp_alpha = np.exp(lb / (1+np.exp((alpha_raw.reshape(B, H*K) + dt).reshape(B, H, K) * a_log[None, :, None])))
+    np.testing.assert_allclose(beta.numpy(), exp_beta.reshape(B, H, 1), rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(alpha.numpy(), exp_alpha.reshape(B, H, 1, K), rtol=1e-4, atol=1e-6)
+    core = rng.normal(size=(B, H, 1, K)).astype(np.float32)
+    gate = rng.normal(size=(B, 1, H, K)).astype(np.float32)
+    w = rng.normal(size=K).astype(np.float32)
+    z = kda_out(Tensor(core).realize(), Tensor(gate).realize(), Tensor(w).realize(), 1e-5, dtypes.float32).numpy()
+    nf = np.sqrt((core**2).mean(-1, keepdims=True) + 1e-5)
+    exp = core/nf * w[None, None, None, :] * (1/(1+np.exp(-gate.transpose(0, 2, 1, 3))))
+    np.testing.assert_allclose(z, exp, rtol=1e-4, atol=1e-5)
+
 if __name__ == "__main__": unittest.main()

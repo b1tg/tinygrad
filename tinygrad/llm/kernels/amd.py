@@ -37,6 +37,10 @@ def kernel_var(x:UOp) -> UOp:
 
 def _unbind(v:int|UOp) -> int|UOp: return kernel_var(v.unbind_all()[0]) if isinstance(v, UOp) else v
 
+def _unbind_const(v:int|UOp) -> UOp:
+  v = _unbind(v)
+  return v if isinstance(v, UOp) else UOp.const(v, dtypes.int)
+
 @functools.cache
 def amd_custom_kernels_supported(device:str|tuple[str, ...]|None) -> bool:
   if getenv("DISABLE_AMD_KERNELS"): return False
@@ -71,6 +75,75 @@ def _reg(shape:tuple[int, ...], slot:int, value:float, dep:UOp|None=None) -> UOp
   return ret.after((ret if dep is None else ret.after(dep)).store(ret.const_like(value)))
 
 # ******** stable top-k: keep the sorting network in shared memory ********
+
+# ******** stable top-k: register/swizzle bitonic; LDS only for cross-warp strides ********
+
+def _swizzle_xor(v:UOp, offset:int, dtype) -> UOp:
+  if dtype == dtypes.float32:
+    return UOp(Ops.CUSTOM, src=(v,), arg=
+      (f"__builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, {{0}}), {0x1f | offset<<10}))", dtypes.float))
+  return UOp(Ops.CUSTOM, src=(v,), arg=(f"__builtin_amdgcn_ds_swizzle({{0}}, {0x1f | offset<<10})", dtype))
+
+@functools.cache
+def _topk_register_kernel(values:UOp, indices:UOp, x:UOp, k:int) -> UOp:
+  # Bitonic top-k with the data held in registers: element i lives at warp (i//CW), lane ((i%CW)//E), slot (i%E).
+  # Strides below E are register swaps, below CW are ds_swizzle lane exchanges, beyond CW go through LDS.
+  rows, n = cast(tuple[int, int], x.shape)
+  size = 1 << (n-1).bit_length()
+  T = max(32, min(size, 1024))
+  E = max(1, size // T)
+  WARPS, CW = T // 32, 32 * E
+  row = UOp.range(rows, 0, AxisType.GLOBAL)
+  lane, warp = UOp.range(32, -1, AxisType.WARP), UOp.range(WARPS, 1, AxisType.LOCAL)
+  i0 = warp*CW + lane*E
+  vals = [((i0+r) < n).where(x[row, (i0+r).minimum(n-1)].load(), -math.inf) for r in range(E)]
+  ids = [(i0 + r).cast(dtypes.int32) for r in range(E)]
+  lds_v = UOp.placeholder((2, size), dtypes.float32, slot=0, addrspace=AddrSpace.LOCAL)
+  lds_i = UOp.placeholder((2, size), dtypes.int32, slot=1, addrspace=AddrSpace.LOCAL)
+  side, step = 0, 0
+  for stage in range(1, size.bit_length()):
+    for sub in range(stage-1, -1, -1):
+      d = 1 << sub
+      if d < CW:  # register swap or in-warp lane exchange
+        pv = vals if d < E else [_swizzle_xor(vals[r], d // E, dtypes.float32) for r in range(E)]
+        pi = ids if d < E else [_swizzle_xor(ids[r], d // E, dtypes.int32) for r in range(E)]
+        new_vals, new_ids = [], []
+        for r in range(E):
+          i, rp = i0 + r, (r ^ d) if d < E else r
+          av, ai, bv, bi = vals[r], ids[r], pv[rp], pi[rp]
+          before = (av > bv) | (av.eq(bv) & (ai < bi))
+          own = before.eq((i & (1 << stage)).eq(0).eq((i & d).eq(0)))
+          new_vals.append(own.where(av, bv))
+          new_ids.append(own.where(ai, bi))
+        vals, ids = new_vals, new_ids
+      else:  # cross-warp: ping-pong through LDS
+        # stage the registers through a REG buffer so the LDS writes live in a range body (no duplicate flat stores)
+        rv = UOp.placeholder((E,), dtypes.float32, slot=10, addrspace=AddrSpace.REG)
+        ri = UOp.placeholder((E,), dtypes.int32, slot=11, addrspace=AddrSpace.REG)
+        rv = rv.after(rv.store(UOp.stack(*vals)))
+        ri = ri.after(ri.store(UOp.stack(*ids)))
+        rr = UOp.range(E, 900+step)
+        dep = UOp.barrier(UOp.group(lds_v[side, i0+rr].store(rv[rr].load()),
+                                    lds_i[side, i0+rr].store(ri[rr].load())).end(rr))
+        lv, li = lds_v.after(dep), lds_i.after(dep)
+        new_vals, new_ids = [], []
+        for r in range(E):
+          i = i0 + r
+          av, ai = vals[r], ids[r]
+          bv, bi = lv[side, i ^ d].load(), li[side, i ^ d].load()
+          before = (av > bv) | (av.eq(bv) & (ai < bi))
+          own = before.eq((i & (1 << stage)).eq(0).eq((i & d).eq(0)))
+          new_vals.append(own.where(av, bv))
+          new_ids.append(own.where(ai, bi))
+        vals, ids = new_vals, new_ids
+        side = 1 - side
+      step += 1
+  stores = []
+  for r in range(E):
+    i = i0 + r
+    stores.append(values[row, i.valid(i < k)].store(vals[r]))
+    stores.append(indices[row, i.valid(i < k)].store(ids[r]))
+  return UOp.group(*stores).end(warp, lane, row).sink(arg=KernelInfo(name="topk_register", opts_to_apply=()))
 
 @functools.cache
 def _topk_bitonic_kernel(values:UOp, indices:UOp, x:UOp, k:int) -> UOp:
@@ -116,12 +189,16 @@ def amd_topk(x:Tensor, k:int) -> tuple[Tensor, Tensor]:
   x = x.reshape(-1, n).contiguous()
   values = Tensor.empty(x.shape[0], k, dtype=x.dtype, device=x.device)
   indices = Tensor.empty(x.shape[0], k, dtype=dtypes.int32, device=x.device)
-  values, indices = Tensor.custom_kernel(values, indices, x, fxn=functools.partial(_topk_bitonic_kernel, k=k))[:2]
+  size = 1 << (n-1).bit_length()
+  # the register kernel needs >= 2 elements per thread; small sorts stay on the shared-memory bitonic kernel
+  fxn = _topk_register_kernel if size >= 2048 else _topk_bitonic_kernel
+  values, indices = Tensor.custom_kernel(values, indices, x, fxn=functools.partial(fxn, k=k))[:2]
   values, indices = values.reshape(*padded_shape[:-1], k), indices.reshape(*padded_shape[:-1], k)
   if symbolic:
     bounds = tuple((0, s) for s in (*shape[:-1], k))
     values, indices = values.shrink(bounds), indices.shrink(bounds)
   return values, indices
+
 
 # ******** quant linear: q8-activation kernels over packed ggml weights (Q4_K/Q5_K/Q6_K/IQ4_XS) ********
 
@@ -133,7 +210,7 @@ class Linear(nn.Linear):
     self.in_features, self.out_features = in_features, out_features
   def set_quantized(self, decoded:Tensor):
     topo = decoded.uop.toposort()
-    match = next(((raw, typ) for raw in topo if raw.op is Ops.SHRINK and raw.dtype == dtypes.uint8
+    match = next(((raw, typ) for raw in topo if raw.op in (Ops.SHRINK, Ops.BUFFER) and raw.dtype == dtypes.uint8
                   for typ, (block_size, type_size) in QUANT_FORMATS.items()
                   if self.in_features % block_size == 0 and raw.numel() == decoded.numel() // block_size * type_size
                   and any(u.op is Ops.RESHAPE and u.src[0] is raw and u.shape[-1] == type_size for u in topo)), None)
@@ -149,6 +226,7 @@ class Linear(nn.Linear):
     if unwrapped(decoded.uop).key != unwrapped(expected.uop).key: return
     self.ggml_type = ggml_type
     raw_offset = raw.contiguous_view_offset()
+    if raw_offset is None and raw.op is Ops.BUFFER: raw_offset = 0
     packed_dtype = dtypes.uint16 if ggml_type == Q6_K else \
       dtypes.uint8 if ggml_type in (Q4_0, Q8_0, IQ2_XS, IQ3_XXS) else dtypes.uint32
     assert raw_offset is not None and raw_offset % packed_dtype.itemsize == 0 and raw.buf_uop.dtype == dtypes.uint8
@@ -299,13 +377,29 @@ def _q8_quantize_kernel(q:UOp, scale:UOp, xsum:UOp, x:UOp, tokens:int, in_featur
             xsum[token, group, (lane//16).valid((lane%16).eq(0))].store(warp_reduce(quant.float())))
   return UOp.group(*stores).end(token_group, lane).sink(arg=KernelInfo(name="q8_quantize", opts_to_apply=()))
 
-def q8_quantize(x:Tensor, tokens:int, in_features:int) -> tuple[Tensor, Tensor, Tensor]:
+def _q8_quantize_fresh(x:UOp, tokens:int, in_features:int, device:str) -> tuple[Tensor, Tensor, Tensor]:
   groups = in_features//Q8_GROUP_SIZE
-  q = Tensor.empty(tokens, groups, 8, dtype=dtypes.uint32, device=x.device)
-  scale = Tensor.empty(tokens, groups, dtype=dtypes.float32, device=x.device)
-  xsum = Tensor.empty(tokens, groups, 2, dtype=dtypes.float32, device=x.device)
-  q, scale, xsum = Tensor.custom_kernel(q, scale, xsum, x, fxn=functools.partial(_q8_quantize_kernel, tokens=tokens, in_features=in_features))[:3]
+  q = Tensor.empty(tokens, groups, 8, dtype=dtypes.uint32, device=device)
+  scale = Tensor.empty(tokens, groups, dtype=dtypes.float32, device=device)
+  xsum = Tensor.empty(tokens, groups, 2, dtype=dtypes.float32, device=device)
+  fxn = functools.partial(_q8_quantize_kernel, tokens=tokens, in_features=in_features)
+  q, scale, xsum = Tensor.custom_kernel(q, scale, xsum, Tensor(x), fxn=fxn)[:3]
   return q, scale, xsum
+
+_q8_quantize_cache: dict = {}
+def q8_quantize(x:Tensor, tokens:int, in_features:int) -> tuple[Tensor, Tensor, Tensor]:
+  # projections sharing one activation (q/k/v, gate/up, the MLA projections) reuse a single quantization
+  if getenv("Q8_DEDUP", 1) == 0 or any(u.op is Ops.AFTER for u in x.uop.toposort()):  # side-effecting inputs must re-quantize
+    return _q8_quantize_fresh(x.uop, tokens, in_features, cast(str, x.device))
+  key = (x.uop, tokens, in_features, cast(str, x.device))
+  # entries from an earlier (already executed) graph are stale: only share within the graph being built
+  if (ent := _q8_quantize_cache.get(key)) is not None and all(not t.uop.base.is_realized for t in ent): return ent
+  _q8_cache_trim()
+  _q8_quantize_cache[key] = ent = _q8_quantize_fresh(x.uop, tokens, in_features, cast(str, x.device))
+  return ent
+
+def _q8_cache_trim() -> None:
+  if len(_q8_quantize_cache) > 4096: _q8_quantize_cache.clear()
 
 def _decode_linear(out:UOp, out_features:int, group_count:int, group_dot, name:str) -> UOp:
   chunks = out.shape[2]
@@ -338,7 +432,7 @@ def _decode_linear_grouped(out:UOp, out_features:int, group_count:int, group_dot
 @functools.cache
 def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, *extra:UOp, out_features:int, in_features:int, ggml_type:int,
                          rdna3:bool, grouped:bool=False) -> UOp:
-  assert not grouped or ggml_type == Q8_0
+  assert not grouped or ggml_type in (Q8_0, Q6_K)
   grid_lut = extra[0] if extra else None
   group_count = in_features // Q8_GROUP_SIZE
   def group_dot(token:UOp, output:UOp, group:UOp) -> UOp:
@@ -472,6 +566,19 @@ def _expert_quant_decode_kernel(out:UOp, raw:UOp, sel:UOp, xq:UOp, xd:UOp, *extr
   assert ggml_type in (IQ2_XS, IQ3_XXS, IQ3_S, IQ4_XS)
   assert not fuse_swiglu or ggml_type == IQ3_S
   grid_lut = extra[-1] if extra else None
+  route_output = UOp.range(out.shape[0]*out_features//(4 if fuse_swiglu else 1), 0, axis_type=AxisType.GLOBAL)
+  row = UOp.range(4, 2, axis_type=AxisType.LOCAL)
+  lane = UOp.range(32, -1, axis_type=AxisType.WARP) if fuse_swiglu else UOp.range(32, 1, axis_type=AxisType.LOCAL)
+  if grid_lut is not None:
+    # stage the grid lookup table in shared memory: every value dequantization gathers from it
+    lut_size, threads = cast(int, grid_lut.shape[0]), 128 if fuse_swiglu else 32
+    tid = row*32+lane if fuse_swiglu else lane
+    local_lut = UOp.placeholder((lut_size,), dtypes.uint32, slot=30, addrspace=AddrSpace.LOCAL)
+    lut_stores = []
+    for i in range((lut_size+threads-1)//threads):
+      j = tid + i*threads
+      lut_stores.append(local_lut[j.valid(j < lut_size)].store(grid_lut[j.minimum(lut_size-1)].load()))
+    grid_lut = local_lut.after(UOp.barrier(UOp.group(*lut_stores)))
   group_count, blocks_per_row = in_features // Q8_GROUP_SIZE, in_features // GGML_BLOCK_SIZE
   block_units = IQ4_WORDS if ggml_type == IQ4_XS else \
     {IQ2_XS: IQ2_XS_BYTES, IQ3_XXS: IQ3_XXS_BYTES, IQ3_S: IQ3_S_BYTES}[ggml_type]
@@ -561,9 +668,6 @@ def _expert_quant_decode_kernel(out:UOp, raw:UOp, sel:UOp, xq:UOp, xd:UOp, *extr
     scale0, scale1 = (sc_byte & 15).float() + 0.5, ((sc_byte >> 4) & 15).float() + 0.5
     return (dots[0].float() * scale0 + dots[1].float() * scale1) * 0.25 * d * xd[input_row, group]
 
-  route_output = UOp.range(out.shape[0]*out_features//(4 if fuse_swiglu else 1), 0, axis_type=AxisType.GLOBAL)
-  row = UOp.range(4, 2, axis_type=AxisType.LOCAL)
-  lane = UOp.range(32, -1, axis_type=AxisType.WARP) if fuse_swiglu else UOp.range(32, 1, axis_type=AxisType.LOCAL)
   output_index = route_output*4+row if fuse_swiglu else route_output
   route, output = output_index // out_features, output_index % out_features
   value = UOp.const(0, dtypes.float32)
@@ -1045,13 +1149,285 @@ def q8_linear(layer:Linear, x:Tensor) -> Tensor:
       (iq3_grid_lut(str(x.device)).uop,) if layer.ggml_type == IQ3_XXS else ()
     return run(fxn, out, raw, x.cast(dtypes.float16).contiguous().uop, *extra)
   xq_, xd, xs = q8_quantize(x, tokens, in_features)
-  grouped = cdna and layer.ggml_type == Q8_0 and tokens == 1 and in_features >= 1024 and out_features >= 2048 and out_features % 4 == 0
+  grouped = cdna and layer.ggml_type in (Q8_0, Q6_K) and tokens == 1 and in_features >= 1024 and in_features <= 4096 \
+    and out_features >= 2048 and out_features % 4 == 0
   decode = functools.partial(_quant_decode_kernel, ggml_type=layer.ggml_type, rdna3=not cdna, grouped=grouped)
   chunk_size = 4096 if grouped else 1024
   out = Tensor.empty(tokens, out_features, (in_features+chunk_size-1)//chunk_size, dtype=dtypes.float32, device=x.device).uop
   extra = (iq2_grid_lut(str(x.device)).uop,) if layer.ggml_type == IQ2_XS else \
     (iq3_grid_lut(str(x.device)).uop,) if layer.ggml_type == IQ3_XXS else ()
   return run(decode, out, raw, xq_.uop, xd.uop, xs.uop, *extra)
+
+def _kinput(t:Tensor) -> Tensor:
+  # custom-kernel params must be dense views of storage; contiguous() on an AFTER-chained or dense view would force a copy
+  if t.uop.op is Ops.AFTER or t.uop.contiguous_view_offset() == 0: return t
+  return t.contiguous()
+
+# ******** MLA decode: per-head batched Q8_0 gemv for the k_b/v_b projections ********
+
+@functools.cache
+def _q8_head_gemv_kernel(out:UOp, raw:UOp, x:UOp, in_features:int) -> UOp:
+  # out[bh, o] = x[bh] @ dequant(raw[bh*out_features + o]): one warp per output row, 4 values per lane per step
+  out_features = cast(int, out.shape[-1])
+  bho, lane = UOp.range(out.shape[0]*out_features, 0, AxisType.GLOBAL), UOp.range(32, 1, AxisType.LOCAL)
+  bh, o = bho // out_features, bho % out_features
+  groups = in_features // 32
+  base = (bh * out_features + o) * groups * Q8_0_BYTES
+  acc = UOp.const(0, dtypes.float32)
+  for i in range(in_features // 128):
+    g, off = i*4 + lane//8, (lane%8)*4
+    d = _half(raw[base + g*Q8_0_BYTES].cast(dtypes.uint32) | (raw[base + g*Q8_0_BYTES + 1].cast(dtypes.uint32) << 8))
+    for j in range(4):
+      w = raw[base + g*Q8_0_BYTES + 2 + off + j].cast(dtypes.uint8).bitcast(dtypes.int8).float()
+      acc = acc + w * d * x[bh, i*128 + lane*4 + j].load().float()
+  total = warp_reduce(acc, full_wave=True)
+  return out[bh, o.valid(lane.eq(0))].store(total).end(bho, lane).sink(arg=KernelInfo(name="q8_head_gemv", opts_to_apply=()))
+
+@functools.cache
+def _packed_q8_raw(weight:UOp, numel:int) -> UOp|None:
+  # the packed uint8 source of an exact Q8_0 dequantization expression, like Linear.set_quantized
+  topo = weight.toposort()
+  raw = next((u for u in topo if u.op in (Ops.BUFFER, Ops.SHRINK) and u.dtype == dtypes.uint8
+              and u.max_numel() == numel // 32 * Q8_0_BYTES
+              and any(v.op is Ops.RESHAPE and v.src[0] is u and v.shape[-1] == Q8_0_BYTES for v in topo)), None)
+  if raw is None: return None
+  def unwrapped(u:UOp) -> UOp:
+    while u.op in (Ops.RESHAPE, Ops.CONTIGUOUS) or (u.op is Ops.CAST and dtypes.is_float(u.dtype) and dtypes.is_float(u.src[0].dtype)):
+      u = u.src[0]
+    return u
+  if unwrapped(weight).key != unwrapped(ggml_data_to_tensor(Tensor(raw), numel, Q8_0).uop).key: return None
+  offset = raw.contiguous_view_offset()
+  if offset is None and raw.op is Ops.BUFFER: offset = 0
+  assert offset is not None and offset % 4 == 0 and raw.buf_uop.dtype == dtypes.uint8
+  return UOp.from_buffer(cast(Buffer, raw.buf_uop.buffer).view(raw.max_numel(), dtypes.uint8, offset))
+
+def head_q8_gemv(weight:Tensor, x:Tensor, heads:int, out_features:int, in_features:int) -> Tensor|None:
+  """Per-head Q8_0 gemv for decode: weight (heads, out_features, in_features), x flat (B, heads*in_features) f32."""
+  if x.dtype != dtypes.float32 or in_features % 128 or not amd_custom_kernels_supported(weight.device): return None
+  raw = _packed_q8_raw(weight.uop, heads*out_features*in_features)
+  if raw is None: return None
+  B = x.shape[0]
+  out = Tensor.empty(B*heads, out_features, dtype=dtypes.float32, device=x.device)
+  fxn = functools.partial(_q8_head_gemv_kernel, in_features=in_features)
+  return Tensor.custom_kernel(out, Tensor(raw), x.reshape(B*heads, in_features), fxn=fxn)[0].reshape(B, heads, out_features)
+
+# ******** fused sampling: gumbel noise + argmax over the vocab ********
+
+def _argmax_reduce(val:UOp, idx:UOp, lane:UOp) -> tuple[UOp, UOp]:
+  # max-reduce (val, idx) pairs across the warp, ties keep the smaller index
+  for offset in (16, 8, 4, 2, 1):
+    other_v = UOp(Ops.CUSTOM, src=(val,), arg=
+      (f"__builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, {{0}}), {0x1f | offset<<10}))", dtypes.float))
+    other_i = UOp(Ops.CUSTOM, src=(idx,), arg=(f"__builtin_amdgcn_ds_swizzle({{0}}, {0x1f | offset<<10})", dtypes.int32))
+    take = (other_v > val) | (other_v.eq(val) & (other_i < idx))
+    val, idx = take.where(other_v, val), take.where(other_i, idx)
+  return val, idx
+
+@functools.cache
+def _gumbel_argmax_partial_kernel(part_v:UOp, part_i:UOp, logits:UOp, rand:UOp, temp:UOp) -> UOp:
+  B, V = cast(tuple[int, int], logits.shape)
+  BLOCK = 256
+  blocks = V // BLOCK
+  b_blk = UOp.range(B*blocks, 0, AxisType.GLOBAL)
+  lane = UOp.range(32, -1, AxisType.WARP)
+  w8 = UOp.range(BLOCK//32, 1, AxisType.LOCAL)
+  b, blk = b_blk // blocks, b_blk % blocks
+  tid = w8*32 + lane
+  i = blk*BLOCK + tid
+  t = temp[0].load().maximum(1e-12)
+  r = rand[b, i].load().maximum(1e-12)
+  score = logits[b, i].load() / t - r.log().neg().log()
+  val, idx = _argmax_reduce(score, i, lane)
+  # exchange warp partials through LDS (8 warps per block)
+  lds_v = UOp.placeholder((BLOCK//32,), dtypes.float32, slot=0, addrspace=AddrSpace.LOCAL)
+  lds_i = UOp.placeholder((BLOCK//32,), dtypes.int32, slot=1, addrspace=AddrSpace.LOCAL)
+  exch = UOp.group(lds_v[w8.valid(lane.eq(0))].store(val), lds_i[w8.valid(lane.eq(0))].store(idx))
+  lds_v, lds_i = lds_v.after(UOp.barrier(exch)), lds_i.after(UOp.barrier(exch))
+  val2 = lds_v[lane % (BLOCK//32)].load()
+  idx2 = lds_i[lane % (BLOCK//32)].load()
+  val2, idx2 = _argmax_reduce(val2, idx2, lane % 32)
+  return UOp.group(part_v[b, blk.valid(w8.eq(0) & lane.eq(0))].store(val2), part_i[b, blk.valid(w8.eq(0) & lane.eq(0))].store(idx2)) \
+    .end(b_blk, lane, w8).sink(arg=KernelInfo(name="gumbel_argmax_partial", opts_to_apply=()))
+
+@functools.cache
+def _argmax_final_kernel(out:UOp, part_v:UOp, part_i:UOp) -> UOp:
+  B, blocks = cast(tuple[int, int], part_v.shape)
+  b = UOp.range(B, 0, AxisType.GLOBAL)
+  lane = UOp.range(32, -1, AxisType.WARP)
+  jj = UOp.range((blocks+31)//32, 2, AxisType.REDUCE)
+  j = lane + jj*32
+  in_range = j < blocks
+  v_j = in_range.where(part_v[b, j.minimum(blocks-1)].load(), UOp.const(-math.inf, dtypes.float32))
+  i_j = in_range.where(part_i[b, j.minimum(blocks-1)].load(), UOp.const(0, dtypes.int32))
+  vreg = UOp.placeholder((1,), dtypes.float32, slot=0, addrspace=AddrSpace.REG)
+  ireg = UOp.placeholder((1,), dtypes.int32, slot=1, addrspace=AddrSpace.REG)
+  vreg_i = vreg.after(vreg.store(UOp.const(-math.inf, dtypes.float32)))
+  ireg_i = ireg.after(ireg.store(UOp.const(0, dtypes.int32)))
+  cur_v, cur_i = vreg_i.after(jj)[0].load(), ireg_i.after(jj)[0].load()
+  take = (v_j > cur_v) | (v_j.eq(cur_v) & (i_j < cur_i))
+  upd = UOp.group(vreg_i.store(take.where(v_j, cur_v)), ireg_i.store(take.where(i_j, cur_i))).end(jj)
+  val, idx = _argmax_reduce(vreg_i.after(upd)[0].load(), ireg_i.after(upd)[0].load(), lane)
+  return out[b, (lane*0).valid(lane.eq(0))].store(idx).end(b, lane).sink(arg=KernelInfo(name="argmax_final", opts_to_apply=()))
+
+def gumbel_argmax(logits:Tensor, temperature:Tensor) -> Tensor|None:
+  """argmax(logits/temp - log(-log(rand))) with the elementwise chain fused into a two-stage argmax."""
+  B, V = cast(tuple[int, int], logits.shape)
+  if V % 256: return None
+  rand = Tensor.rand_like(logits)
+  blocks = V // 256
+  part_v = Tensor.empty(B, blocks, dtype=dtypes.float32, device=logits.device)
+  part_i = Tensor.empty(B, blocks, dtype=dtypes.int32, device=logits.device)
+  part_v, part_i = Tensor.custom_kernel(part_v, part_i, _kinput(logits), rand, _kinput(temperature),
+                                        fxn=_gumbel_argmax_partial_kernel)[:2]
+  out = Tensor.empty(B, 1, dtype=dtypes.int32, device=logits.device)
+  return Tensor.custom_kernel(out, part_v, part_i, fxn=_argmax_final_kernel)[0]
+
+# ******** hyper-connection output mix: post*x + comb^T @ residual ********
+
+@functools.cache
+def _hc_mix_kernel(out:UOp, x:UOp, residual:UOp, post:UOp, comb:UOp) -> UOp:
+  B, T, HC, D = cast(tuple[int, int, int, int], residual.shape)
+  x, post, comb = x.reshape(B*T, D), post.reshape(B*T, HC), comb.reshape(B*T, HC, HC)
+  residual = residual.reshape(B*T, HC, D)
+  total = B*T*HC*D
+  threads = next(t for t in (256, 128, 64, 32, 16, 8, 4, 2, 1) if total % t == 0)
+  blk = UOp.range(total // threads, 0, AxisType.GLOBAL)
+  tid = UOp.range(threads, 1, AxisType.LOCAL)
+  i = blk*threads + tid
+  d, j, bt = i % D, (i // D) % HC, i // (D*HC)
+  val = post[bt, j].load() * x[bt, d].load().float()
+  for i2 in range(HC): val = val + comb[bt, i2, j].load() * residual[bt, i2, d].load().float()
+  return out.reshape(-1)[i].store(val.cast(out.dtype)).end(blk, tid).sink(arg=KernelInfo(name="hc_mix", opts_to_apply=()))
+
+def hc_mix(x:Tensor, residual:Tensor, post:Tensor, comb:Tensor) -> Tensor:
+  """out[b,t,j] = post[j]*x[b,t] + sum_i comb[b,t,i,j]*residual[b,t,i], one kernel."""
+  B, T, HC, D = cast(tuple[int, int, int, int], residual.shape)
+  out = Tensor.empty(B, T, HC, D, dtype=residual.dtype, device=residual.device)
+  return Tensor.custom_kernel(out, *[_kinput(t) for t in (x, residual, post, comb)], fxn=_hc_mix_kernel)[0]
+
+# ******** MoE router: fused sigmoid(+bias) scores and top-k probability normalization ********
+
+@functools.cache
+def _router_probs_kernel(out:UOp, logits:UOp, sel:UOp, scale:float) -> UOp:
+  # probs = sigmoid(logits[sel]); probs /= sum; probs *= scale  (one warp per token row)
+  rows, K = cast(tuple[int, int], sel.shape)
+  r = UOp.range(rows, 0, AxisType.GLOBAL)
+  lane = UOp.range(32, -1, AxisType.WARP)
+  p = logits[r, sel[r, lane % K].load()].load().sigmoid()
+  s = warp_reduce((lane < K).where(p, UOp.const(0, dtypes.float32)), full_wave=True)
+  return out[r, (lane % K).valid(lane < K)].store(p / s * scale).end(r, lane) \
+    .sink(arg=KernelInfo(name="router_probs", opts_to_apply=()))
+
+def router_probs(logits:Tensor, sel:Tensor, scale:float) -> Tensor:
+  rows, K = cast(tuple[int, int], sel.shape)
+  out = Tensor.empty(rows, K, dtype=dtypes.float32, device=logits.device)
+  return Tensor.custom_kernel(out, _kinput(logits), _kinput(sel),
+                              fxn=functools.partial(_router_probs_kernel, scale=scale))[0].reshape(*sel.shape[:-1], K)
+
+# ******** KDA decode: fused beta/alpha gate computation and output normalization ********
+
+@functools.cache
+def _kda_gates_kernel(beta_out:UOp, alpha_out:UOp, beta_raw:UOp, alpha_raw:UOp, dt:UOp, a_log:UOp,
+                      lower_bound:float) -> UOp:
+  # beta = sigmoid(beta_raw); alpha = exp(lower_bound * sigmoid(-a_log[h] * (alpha_raw + dt)))
+  B, H, K = cast(tuple[int, int, int], alpha_raw.shape)
+  total = B*H*(K+1)
+  threads = next(t for t in (256, 128, 64, 32, 16, 8, 4, 2, 1) if total % t == 0)
+  blk = UOp.range(total // threads, 0, AxisType.GLOBAL)
+  tid = UOp.range(threads, 1, AxisType.LOCAL)
+  i = blk*threads + tid
+  b, h, d = i // (H*(K+1)), (i // (K+1)) % H, i % (K+1)
+  a = alpha_raw[b, h, d.minimum(K-1)].load().float() + dt[h*K + d.minimum(K-1)].load().float()
+  alpha_v = ((a * -a_log[h].load().float()).sigmoid() * lower_bound).exp()
+  beta_v = beta_raw[b, h].load().sigmoid()
+  return UOp.group(alpha_out[b, h, 0, d.valid(d < K)].store(alpha_v),
+                   beta_out[b, h, (d*0).valid(d.eq(K))].store(beta_v)) \
+    .end(blk, tid).sink(arg=KernelInfo(name="kda_gates", opts_to_apply=()))
+
+def kda_gates(beta_raw:Tensor, alpha_raw:Tensor, dt:Tensor, a_log:Tensor, lower_bound:float,
+              num_heads:int, head_k_dim:int) -> tuple[Tensor, Tensor]:
+  B = alpha_raw.shape[0]
+  device = cast(str, alpha_raw.device)
+  beta_out = Tensor.empty(B, num_heads, 1, dtype=dtypes.float32, device=device)
+  alpha_out = Tensor.empty(B, num_heads, 1, head_k_dim, dtype=dtypes.float32, device=device)
+  fxn = functools.partial(_kda_gates_kernel, lower_bound=lower_bound)
+  beta_out, alpha_out = Tensor.custom_kernel(beta_out, alpha_out, beta_raw.reshape(B, num_heads).contiguous(),
+                                             _kinput(alpha_raw.reshape(B, num_heads, head_k_dim)),
+                                             _kinput(dt), _kinput(a_log), fxn=fxn)[:2]
+  return beta_out, alpha_out
+
+@functools.cache
+def _kda_out_kernel(out:UOp, core:UOp, gate:UOp, weight:UOp, eps:float) -> UOp:
+  # z = rmsnorm(core) * sigmoid(gate), cast to the output dtype
+  B, H, _, D = cast(tuple[int, int, int, int], core.shape)
+  bh = UOp.range(B*H, 0, AxisType.GLOBAL)
+  lane = UOp.range(32, -1, AxisType.WARP)
+  b, h = bh // H, bh % H
+  DPL = D // 32
+  vals = [core[b, h, 0, lane*DPL + i].load().float() for i in range(DPL)]
+  ssq = warp_reduce(sum((v*v for v in vals), UOp.const(0, dtypes.float32)), full_wave=True)
+  nf = (ssq / D + eps).sqrt()
+  stores = []
+  for i in range(DPL):
+    d = lane*DPL + i
+    z = vals[i] / nf * weight[d].load().float() * gate[b, 0, h, d].load().float().sigmoid()
+    stores.append(out[b, h, 0, d].store(z.cast(out.dtype)))
+  return UOp.group(*stores).end(bh, lane).sink(arg=KernelInfo(name="kda_out", opts_to_apply=()))
+
+def kda_out(core:Tensor, gate:Tensor, weight:Tensor, eps:float, out_dtype) -> Tensor:
+  B, H, _, D = cast(tuple[int, int, int, int], core.shape)
+  out = Tensor.empty(B, H, 1, D, dtype=out_dtype, device=core.device)
+  return Tensor.custom_kernel(out, *[_kinput(t) for t in (core, gate, weight)], fxn=functools.partial(_kda_out_kernel, eps=eps))[0]
+
+# ******** hyper-connection input projection: fused rms-norm + Q8_0 dot products ********
+
+@functools.cache
+def _hc_mixes_kernel(out:UOp, x:UOp, raw:UOp, eps:float) -> UOp:
+  # mixes[bt, o] = (dequant(raw row o) . x[bt]) * rsqrt(mean(x[bt]^2) + eps), x flat (BT, N)
+  BT, N = cast(int, x.shape[0]), cast(int, x.shape[1])
+  O = cast(int, out.shape[-1])
+  THREADS, GROUPS_PER_THREAD = 512, 1
+  assert N % (THREADS*32*GROUPS_PER_THREAD) == 0
+  bto = UOp.range(BT*O, 0, AxisType.GLOBAL)
+  lane = UOp.range(32, -1, AxisType.WARP)
+  w8 = UOp.range(THREADS//32, 1, AxisType.LOCAL)
+  tid = w8*32 + lane
+  bt, o = bto // O, bto % O
+  base = o * (N//32) * Q8_0_BYTES
+  dot, ssq = UOp.const(0, dtypes.float32), UOp.const(0, dtypes.float32)
+  for gi in range(GROUPS_PER_THREAD):
+    g = tid*GROUPS_PER_THREAD + gi
+    d = _half(raw[base + g*Q8_0_BYTES].cast(dtypes.uint32) | (raw[base + g*Q8_0_BYTES + 1].cast(dtypes.uint32) << 8))
+    # quantize x's group exactly like q8_quantize: the gates must see the same values as the unfused path
+    xs = [x[bt, g*32 + j].load().float() for j in range(32)]
+    xd = (functools.reduce(lambda a, b: a.maximum(b), (xv.abs() for xv in xs)) / 127).maximum(1e-8)
+    xq = [UOp(Ops.CUSTOM, src=(xv/xd,), arg=("__builtin_nearbyintf({0})", dtypes.float)).clip(-127, 127).cast(dtypes.int8) for xv in xs]
+    gdot = UOp.const(0, dtypes.int32)
+    for wj in range(8):
+      word_w = sum((raw[base + g*Q8_0_BYTES + 2 + wj*4 + j].cast(dtypes.uint32) << (j*8) for j in range(4)), UOp.const(0, dtypes.uint32))
+      word_x = sum((xq[wj*4 + j].cast(dtypes.uint8).cast(dtypes.uint32) << (j*8) for j in range(4)), UOp.const(0, dtypes.uint32))
+      gdot = _amd_dp4a(word_w, word_x, gdot, False)
+    dot = dot + gdot.float() * xd * d
+    ssq = ssq + sum((xv*xv for xv in xs), UOp.const(0, dtypes.float32))
+  # block reduce: warp reduce, then exchange the 8 warp partials through LDS
+  dot, ssq = warp_reduce(dot, full_wave=True), warp_reduce(ssq, full_wave=True)
+  part_lds = UOp.placeholder((2, THREADS//32), dtypes.float32, slot=31, addrspace=AddrSpace.LOCAL)
+  exch = UOp.group(part_lds[0, w8.valid(lane.eq(0))].store(dot), part_lds[1, w8.valid(lane.eq(0))].store(ssq))
+  part = part_lds.after(UOp.barrier(exch))
+  dot_t = sum((part[0, w].load() for w in range(THREADS//32)), UOp.const(0, dtypes.float32))
+  ssq_t = sum((part[1, w].load() for w in range(THREADS//32)), UOp.const(0, dtypes.float32))
+  scale = (ssq_t / N + eps).sqrt()
+  return out[bt, o.valid(w8.eq(0) & lane.eq(0))].store(dot_t / scale).end(bto, lane, w8) \
+    .sink(arg=KernelInfo(name="hc_mixes", opts_to_apply=()))
+
+def hc_mixes(x:Tensor, weight:Tensor, out_features:int, eps:float) -> Tensor:
+  """Fused rms-norm + packed Q8_0 projection for the hyper-connection gate input. x: (B, T, ...) row-major."""
+  N = x.shape[-1] * (x.shape[-2] if x.ndim > 3 else 1)
+  flat = x.reshape(-1, N)
+  out = Tensor.empty(flat.shape[0], out_features, dtype=dtypes.float32, device=x.device)
+  B, T = cast(tuple[int, int], x.shape[:2])
+  fxn = functools.partial(_hc_mixes_kernel, eps=eps)
+  return Tensor.custom_kernel(out, _kinput(flat), weight, fxn=fxn)[0].reshape(B, T, out_features)
 
 # ******** hyper-connection gates: sigmoid/softmax + sinkhorn on the tiny (hc,hc) mix matrix ********
 
@@ -1487,11 +1863,161 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
   out = Tensor.custom_kernel(out, q.half().reshape(B*H, T, D), assigned_kv, fxn=fxn)[0].reshape(B, H, T, D)
   return out if q_start is None else out[:, :, :T_real]
 
+# ******** KDA decode: fused causal-conv + state shift + q/k normalization ********
+
+@functools.cache
+def _kda_conv_norm_kernel(out_q:UOp, out_k:UOp, out_v:UOp, qkv:UOp, state:UOp, wt:UOp,
+                          start_pos:int|UOp, head_dim:int, eps:float, q_scale:float) -> UOp:
+  # conv_out = silu([state0, state1, state2, qkv] . w); state shifts left; q/k heads are L2-normalized
+  B, C = cast(int, qkv.shape[0]), cast(int, qkv.shape[-1])
+  groups = C // head_dim
+  q_groups = groups // 3
+  assert groups % 3 == 0 and head_dim % 32 == 0
+  start_pos = _unbind_const(start_pos)
+  bg = UOp.range(B*groups, 0, AxisType.GLOBAL)
+  lane = UOp.range(32, -1, AxisType.WARP)
+  b, g = bg // groups, bg % groups
+  initial = start_pos.eq(0)
+  DPL = head_dim // 32
+  cs = [g*head_dim + lane*DPL + i for i in range(DPL)]
+  # stage the previous conv state in registers: the in-place shift below must not race the reads
+  st = UOp.placeholder((3, DPL), dtypes.float32, slot=0, addrspace=AddrSpace.REG)
+  st = st.after(st.store(UOp.stack(*[initial.where(UOp.const(0, dtypes.float32), state[b, r, c].load().float())
+                                     for r in range(3) for c in cs]).reshape(3, DPL)))
+  conv = []
+  for i, c in enumerate(cs):
+    co = sum((st[r, i].load() * wt[c, r].load().float() for r in range(3)), qkv[b, c].load().float() * wt[c, 3].load().float())
+    conv.append(co.silu())
+  ssq = warp_reduce(sum((co*co for co in conv), UOp.const(0, dtypes.float32)), full_wave=True)
+  nf = ssq.sqrt().maximum(eps)
+  is_q, is_k = g < q_groups, (g >= q_groups) & (g < 2*q_groups)
+  outs = []
+  for i in range(DPL):
+    outs.append(out_q[b, g.valid(is_q), 0, lane*DPL + i].store(conv[i] * (q_scale / nf)))
+    outs.append(out_k[b, (g - q_groups).valid(is_k), 0, lane*DPL + i].store(conv[i] / nf))
+    outs.append(out_v[b, (g - 2*q_groups).valid(g >= 2*q_groups), 0, lane*DPL + i].store(conv[i]))
+  out_group = UOp.group(*outs)
+  st2 = st.after(out_group)
+  st_stores = [state[b, 0, c].store(st2[1, i].load().cast(state.dtype)) for i, c in enumerate(cs)] + \
+              [state[b, 1, c].store(st2[2, i].load().cast(state.dtype)) for i, c in enumerate(cs)] + \
+              [state[b, 2, c].store(qkv[b, c].load().cast(state.dtype)) for i, c in enumerate(cs)]
+  return UOp.group(out_group, *st_stores).end(lane, bg).sink(arg=KernelInfo(name="kda_conv_norm", opts_to_apply=()))
+
+def kda_conv_norm(qkv:Tensor, conv_state:Tensor, weight:Tensor, start_pos:int|UOp,
+                  num_heads:int, head_dim:int, eps:float, q_scale:float) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+  """Fused decode-time KDA input prep. Returns q, k, v (B, num_heads, 1, head_dim) f32 and the shifted state."""
+  B, C = cast(int, qkv.shape[0]), cast(int, qkv.shape[-1])
+  assert C == 3*num_heads*head_dim and conv_state.dtype == dtypes.float32
+  device = cast(str, qkv.device)
+  outs = [Tensor.empty(B, num_heads, 1, head_dim, dtype=dtypes.float32, device=device) for _ in range(3)]
+  fxn = functools.partial(_kda_conv_norm_kernel, start_pos=start_pos, head_dim=head_dim, eps=eps, q_scale=q_scale)
+  q, k, v, _, state_after, _ = Tensor.custom_kernel(*outs, _kinput(qkv.reshape(B, C)), conv_state, _kinput(weight), fxn=fxn)
+  return q, k, v, state_after
+
+# ******** DSA indexer decode: incremental pooled-key maintenance + scoring ********
+
+@functools.cache
+def _dsa_pool_update_kernel(pool_cache:UOp, cache:UOp, ape:UOp, start_pos:int|UOp, kpool:int) -> UOp:
+  # Refresh the just-completed pool's compressed key. One warp per batch; a no-op store mask on other steps.
+  B, pool_count, D = cast(tuple[int, int, int], pool_cache.shape)
+  start_pos = _unbind_const(start_pos)
+  b = UOp.range(B, 0, AxisType.GLOBAL)
+  lane = UOp.range(32, -1, AxisType.WARP)
+  p_cur = start_pos // kpool
+  complete = (start_pos % kpool).eq(kpool-1)
+  DPL = D // 32
+  stores = []
+  for i in range(DPL):
+    d = lane + 32*i
+    logits = [cache[b, p_cur*kpool + r, D+d].load().float() + ape[r, d].load().float() for r in range(kpool)]
+    mx = functools.reduce(UOp.maximum, logits)
+    exps = [(l - mx).exp() for l in logits]
+    s = sum(exps, UOp.const(0, dtypes.float32))
+    key = sum(((e/s).cast(dtypes.half).float() * cache[b, p_cur*kpool + r, d].load().float()
+               for r, e in enumerate(exps)), UOp.const(0, dtypes.float32))
+    stores.append(pool_cache[b, p_cur, d.valid(complete)].store(key.cast(pool_cache.dtype)))
+  return UOp.group(*stores).end(b, lane).sink(arg=KernelInfo(name="dsa_pool_update", opts_to_apply=()))
+
+@functools.cache
+def _dsa_indexer_score_kernel(out:UOp, pool_cache:UOp, q:UOp, weights:UOp, start_pos:int|UOp, kpool:int, scale:float) -> UOp:
+  # index_scores[p] = sum_h weights[h] * relu(q[h] . pool_key[p]) * scale, masked to complete pools
+  B, pool_count, D = cast(tuple[int, int, int], pool_cache.shape)
+  H = cast(int, q.shape[1])
+  assert H == 32
+  start_pos = _unbind_const(start_pos)
+  b_pool = UOp.range(B*pool_count, 0, AxisType.GLOBAL)
+  lane = UOp.range(32, -1, AxisType.WARP)
+  b, pool = b_pool // pool_count, b_pool % pool_count
+  key_lds = UOp.placeholder((D,), dtypes.half, slot=0, addrspace=AddrSpace.LOCAL)
+  DPL = D // 32
+  key_stores = UOp.group(*[key_lds[lane + 32*i].store(pool_cache[b, pool, lane + 32*i]) for i in range(DPL)])
+  keys = key_lds.after(UOp.barrier(key_stores))
+  acc = UOp.const(0, dtypes.float32)
+  for d in range(D): acc = acc + q[b, lane, d].load().float() * keys[d].load().float()
+  s = (acc * scale).relu() * weights[b, lane].load().float()
+  total = warp_reduce(s, full_wave=True)
+  candidate = pool*kpool + (kpool-1) <= start_pos
+  f32_min = UOp.const(dtypes.float32.min, dtypes.float32)
+  return out[b, pool.valid(lane.eq(0))].store(candidate.where(total, f32_min)).end(b_pool, lane) \
+    .sink(arg=KernelInfo(name="dsa_indexer_score", opts_to_apply=()))
+
+@functools.cache
+def _dsa_indexer_expand_kernel(out:UOp, selected:UOp, scores:UOp, start_pos:int|UOp, kpool:int, top_k:int) -> UOp:
+  # expand the selected pools to token indices and append the incomplete current-pool tail
+  B = out.shape[0]
+  k_total = cast(int, out.shape[-1])
+  start_pos = _unbind_const(start_pos)
+  i = UOp.range(B*k_total, 0, AxisType.GLOBAL)
+  b, j = i // k_total, i % k_total
+  in_main = j < top_k
+  sel_idx = (j // kpool).minimum(top_k//kpool - 1)
+  main = selected[b, sel_idx].load() * kpool + j % kpool
+  main_valid = scores[b, sel_idx].load() != UOp.const(dtypes.float32.min, dtypes.float32)
+  tail_j = j - top_k
+  tail_count = (start_pos + 1) % kpool
+  tail = start_pos + 1 - tail_count + tail_j
+  valid = in_main.where(main_valid, tail_j < tail_count)
+  idx = in_main.where(main, tail)
+  return out[b, j].store(valid.where(idx, -1).cast(dtypes.int32)).end(i).sink(arg=KernelInfo(name="dsa_indexer_expand", opts_to_apply=()))
+
+def dsa_indexer_decode(q:Tensor, pool_cache:Tensor, cache:Tensor, ape:Tensor, weights:Tensor,
+                       start_pos:int|UOp, kpool:int, top_k:int, select_k:int) -> Tensor:
+  """Decode-time indexer: maintain pooled keys incrementally, score pools, expand the top-k selection."""
+  B, pool_count, D = cast(tuple[int, int, int], pool_cache.shape)
+  device = cast(str, q.device)
+  if isinstance(start_pos, UOp):  # keep the bound cursor in the tensor graph; downstream kernels inherit the dependency
+    cache = Tensor(cache.uop.after(Tensor(start_pos, device=device).uop))
+  pool_cache = Tensor.custom_kernel(pool_cache, cache, _kinput(ape),
+                                    fxn=functools.partial(_dsa_pool_update_kernel, start_pos=start_pos, kpool=kpool))[0]
+  scores = Tensor.empty(B, pool_count, dtype=dtypes.float32, device=device)
+  scores = Tensor.custom_kernel(scores, pool_cache, _kinput(q), _kinput(weights),
+                                fxn=functools.partial(_dsa_indexer_score_kernel, start_pos=start_pos, kpool=kpool,
+                                                      scale=D**-0.5))[0]
+  # the top-k kernel caps at 4096 entries: chunk large pool counts and re-rank. chunk order matches the
+  # global index order, so ties resolve exactly like one big stable sort.
+  if pool_count <= 4096:
+    selected_scores, selected = amd_topk(scores.reshape(B, 1, pool_count), select_k)
+  else:
+    vals, ids = [], []
+    for c0 in range(0, pool_count, 4096):
+      n_c = min(4096, pool_count - c0)
+      v, i = amd_topk(scores.reshape(B, 1, pool_count)[:, :, c0:c0+n_c], min(select_k, n_c))
+      vals.append(v)
+      ids.append(i + c0)
+    selected_scores, sel_i = amd_topk(Tensor.cat(*vals, dim=-1).reshape(B, 1, -1), select_k)
+    selected = Tensor.cat(*ids, dim=-1).gather(-1, sel_i)
+  out = Tensor.empty(B, top_k + kpool - 1, dtype=dtypes.int32, device=device)
+  fxn = functools.partial(_dsa_indexer_expand_kernel, start_pos=start_pos, kpool=kpool, top_k=top_k)
+  return Tensor.custom_kernel(out, _kinput(selected.reshape(B, select_k)),
+                              _kinput(selected_scores.reshape(B, select_k)), fxn=fxn)[0].reshape(B, 1, -1)
+
 # ******** DSA decode: sparse attention over indexer-selected latent cache rows ********
 
 @functools.cache
-def _dsa_decode_kernel(out:UOp, stats:UOp, q:UOp, cache:UOp, idx:UOp, scale:float, prefix:int|UOp, tail:int|UOp, tail_start:int) -> UOp:
+def _dsa_decode_kernel(out:UOp, stats:UOp, q:UOp, cache:UOp, idx:UOp, scale:float, prefix:int|UOp, tail:int|UOp,
+                       tail_start:int, row_stride:int, row_count:int) -> UOp:
   # Split the effective selection across blocks; each block writes an unnormalized softmax numerator and (max, sum).
+  # cache is the flat latent cache buffer (power-of-two padded so the gather's bounds mask lowers to an AND)
   B, H, D = q.shape
   K, kv_lora, WAVES = 128, cast(int, out.shape[3]), 4
   prefix, tail = _unbind(prefix), _unbind(tail)
@@ -1504,21 +2030,30 @@ def _dsa_decode_kernel(out:UOp, stats:UOp, q:UOp, cache:UOp, idx:UOp, scale:floa
   scores = UOp.placeholder((K,), dtypes.float32, slot=0, addrspace=AddrSpace.LOCAL)
   ml_lds = UOp.placeholder((WAVES, 2), dtypes.float32, slot=1, addrspace=AddrSpace.LOCAL)
   part_lds = UOp.placeholder((WAVES, kv_lora), dtypes.float32, slot=2, addrspace=AddrSpace.LOCAL)
-  # scores: one selected row per wave per pass; the dot over D is a warp reduction of D/32-wide lane partials
+  # scores: GROUP selected rows per wave per pass; each row's dot over D is a warp reduction of D/32-wide lane
+  # partials. All GROUP row loads are issued before the first reduce so their latencies overlap.
   DPL = D // 32
   qf = tuple(q[b, h, lane*DPL + i].load().float() for i in range(DPL))
-  jj = UOp.range(-(-K // WAVES), 1000, AxisType.REDUCE)
-  k_i, in_range = wave + jj*WAVES, wave + jj*WAVES < K
+  GROUP = 4
+  jj = UOp.range(-(-K // (WAVES*GROUP)), 1000, AxisType.REDUCE)
   def selection(pos:UOp) -> tuple[UOp, UOp]:
     logical = chunk*K + pos
     physical = (logical < prefix).where(logical, tail_start + logical - prefix).minimum(idx.shape[1]-1)
     sel = idx[b, physical].load()
     valid = (logical < live) & (sel >= 0)
     return valid, valid.where(sel, 0)
-  valid, row = selection(k_i)
-  part = sum((qf[i] * cache[b, row, lane*DPL + i].load().float() for i in range(DPL)), UOp.const(0, dtypes.float32))
-  dot = warp_reduce(part, full_wave=True)
-  dot_store = scores[k_i.valid(in_range)].store(valid.where(dot * scale, UOp.const(-math.inf, dtypes.float32))).end(jj)
+  loaded = []
+  for g in range(GROUP):
+    k_i = wave + (jj*GROUP + g)*WAVES
+    valid_g, row_g = selection(k_i)
+    row_base = (b*row_count + row_g) * row_stride
+    loaded.append((k_i, valid_g, [cache[row_base + lane*DPL + i].load() for i in range(DPL)]))
+  stores = []
+  for k_i, valid_g, data_g in loaded:
+    part = sum((qf[i] * data_g[i].float() for i in range(DPL)), UOp.const(0, dtypes.float32))
+    dot = warp_reduce(part, full_wave=True)
+    stores.append(scores[k_i.valid(k_i < K)].store(valid_g.where(dot * scale, UOp.const(-math.inf, dtypes.float32))))
+  dot_store = UOp.group(*stores).end(jj)
   scores = scores.after(UOp.barrier(dot_store))
   # softmax stats: per-wave strided max/sum, exchanged through LDS and rescaled like the flash decode combine
   # A finite initial max keeps fully masked waves from computing exp(-inf - -inf).
@@ -1536,15 +2071,21 @@ def _dsa_decode_kernel(out:UOp, stats:UOp, q:UOp, cache:UOp, idx:UOp, scale:floa
   ml = ml_lds.after(UOp.barrier(ml_store))
   m = functools.reduce(UOp.maximum, (ml[w, 0].load() for w in range(WAVES)))
   s = sum((((ml[w, 0].load() - m)*LOG2E).exp2() * ml[w, 1].load() for w in range(WAVES)), UOp.const(0, dtypes.float32))
-  # PV: each wave strides its quarter of the selection; per-lane dpl latent dims, then combine through LDS
+  # PV: each wave strides its quarter of the selection, GROUP rows' loads in flight; per-lane dpl latent dims
   dpl = kv_lora // 32
   accv = _reg((dpl,), 102, 0)
-  k2 = UOp.range(-(-K // WAVES), 3000, AxisType.REDUCE)
-  kk, inb2 = wave + k2*WAVES, wave + k2*WAVES < K
-  valid2, row2 = selection(kk)
-  a = (inb2 & valid2).where(((scores[kk.minimum(K-1)].load() - m)*LOG2E).exp2(), UOp.const(0, dtypes.float32))
-  upd2 = UOp.group(*[accv[i].store(accv.after(k2)[i].load() + a * valid2.where(cache[b, row2, lane*dpl+i].load().float(), 0))
-                     for i in range(dpl)]).end(k2)
+  k2 = UOp.range(-(-K // (WAVES*GROUP)), 3000, AxisType.REDUCE)
+  loaded2 = []
+  for g in range(GROUP):
+    kk = wave + (k2*GROUP + g)*WAVES
+    valid2, row2 = selection(kk)
+    a = ((kk < K) & valid2).where(((scores[kk.minimum(K-1)].load() - m)*LOG2E).exp2(), UOp.const(0, dtypes.float32))
+    row_base = (b*row_count + row2) * row_stride
+    loaded2.append((a, valid2, [cache[row_base + lane*dpl + i].load() for i in range(dpl)]))
+  new_vals = [accv.after(k2)[i].load() for i in range(dpl)]
+  for a, valid2, vdata in loaded2:
+    new_vals = [nv + a * valid2.where(vd.float(), UOp.const(0, dtypes.float32)) for nv, vd in zip(new_vals, vdata)]
+  upd2 = UOp.group(*[accv[i].store(new_vals[i]) for i in range(dpl)]).end(k2)
   part_store = UOp.group(*[part_lds[wave, lane*dpl+i].store(accv.after(upd2)[i].load()) for i in range(dpl)])
   part = part_lds.after(UOp.barrier(part_store))
   cpb = kv_lora // (32*WAVES)
@@ -1554,11 +2095,12 @@ def _dsa_decode_kernel(out:UOp, stats:UOp, q:UOp, cache:UOp, idx:UOp, scale:floa
   return UOp.group(*stores).end(lane, wave, chunk, bh).sink(arg=KernelInfo(name="dsa_decode_partial", opts_to_apply=()))
 
 def dsa_decode(q:Tensor, cache:Tensor, idx:Tensor, scale:float, kv_lora:int,
-               valid_tokens:int|UOp|None=None, pool_size:int=4) -> Tensor:
+               valid_tokens:int|UOp|None=None, pool_size:int=4, cache_flat:Tensor|None=None) -> Tensor:
   """Sparse decode. Optional valid_tokens describes the indexer's sorted complete pools followed by its fixed-width tail."""
   if q.ndim != 3 or cache.ndim != 3 or idx.ndim != 2 or q.shape[0] != cache.shape[0] or cache.shape[0] != idx.shape[0]:
     raise ValueError(f"expected q(B,H,D), cache(B,N,D), idx(B,K), got {q.shape=} {cache.shape=} {idx.shape=}")
   B, H, D = cast(tuple[int, int, int], q.shape)
+  N = cast(int, cache.shape[1])
   K = cast(int, idx.shape[1])
   prefix: int|UOp = K
   tail: int|UOp = 0
@@ -1569,13 +2111,17 @@ def dsa_decode(q:Tensor, cache:Tensor, idx:Tensor, scale:float, kv_lora:int,
     complete = valid_tokens//pool_size*pool_size
     prefix = complete.minimum(tail_start) if isinstance(complete, UOp) else min(complete, tail_start)
     tail = valid_tokens % pool_size
+  # flat addressing: a power-of-two flat cache lowers the gather's per-load bounds mask to an AND
+  flat = cache_flat if cache_flat is not None else cache.reshape(B*N*D)
+  assert len(flat.shape) == 1
   # Keep the bound cursor in the tensor graph even when the caller supplies an already-realized cache.
-  if isinstance(valid_tokens, UOp): cache = Tensor(cache.contiguous().uop.after(Tensor(valid_tokens, device=cache.device).uop))
+  if isinstance(valid_tokens, UOp): flat = Tensor(flat.uop.after(Tensor(valid_tokens, device=cache.device).uop))
   live = (prefix+tail+127)//128
   partial = Tensor.empty(B, H, (K+127)//128, kv_lora, dtype=dtypes.float32, device=q.device)
   stats = Tensor.empty(B, H, (K+127)//128, 2, dtype=dtypes.float32, device=q.device)
-  fxn = functools.partial(_dsa_decode_kernel, scale=scale, prefix=prefix, tail=tail, tail_start=tail_start)
-  partial, stats = Tensor.custom_kernel(partial, stats, q.contiguous(), cache, idx.contiguous(), fxn=fxn)[:2]
+  fxn = functools.partial(_dsa_decode_kernel, scale=scale, prefix=prefix, tail=tail, tail_start=tail_start,
+                          row_stride=D, row_count=N)
+  partial, stats = Tensor.custom_kernel(partial, stats, _kinput(q), flat, _kinput(idx), fxn=fxn)[:2]
   out = Tensor.empty(B, H, 1, kv_lora, dtype=dtypes.float32, device=q.device)
   return Tensor.custom_kernel(out, partial, stats, fxn=functools.partial(_amd_flash_decode_combine, live=live))[0].reshape(B, H, kv_lora)
 

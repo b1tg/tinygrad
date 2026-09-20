@@ -6,6 +6,7 @@ from tinygrad import Device, Tensor, nn, UOp, TinyJit, getenv, function, dtypes
 from tinygrad.device import Buffer
 from tinygrad.llm.kernels.amd import Linear, expert_quant_linear, gated_delta_prefill, flash_attention, hc_prepare, dsa_decode
 from tinygrad.llm.kernels.amd import amd_custom_kernels_supported, amd_topk, expert_q6_f16_linear, expert_gate_up_silu
+from tinygrad.llm.kernels.amd import head_q8_gemv, dsa_indexer_decode, kda_conv_norm, kda_gates, kda_out, gumbel_argmax
 from tinygrad.llm.gguf import ggml_data_to_tensor, gguf_load
 from tinygrad.uop.ops import KernelInfo, Ops, resolve
 
@@ -14,6 +15,62 @@ class ExpertGating(enum.IntEnum):
   SIGMOID = 2
   SOFTMAX_WEIGHT = 3  # softmax over the top-k selected logits
   SQRT_SOFTPLUS = 4
+
+def fuse_q8_linears(*linears:Linear) -> Linear|None:
+  """Stack same-input Q8_0 packed weights into one Linear: one quantize + one matmul kernel instead of many."""
+  from tinygrad.llm.kernels.amd import Q8_0
+  in_f = linears[0].in_features
+  for lin in linears:
+    if lin.in_features != in_f or lin.bias is not None: return None
+    if lin.ggml_type is None: lin.set_quantized(lin.weight)
+    if lin.ggml_type != Q8_0: return None
+  raw = Tensor.cat(*[lin.weight for lin in linears]).contiguous().realize()  # packed rows are self-contained
+  fused = Linear(in_f, sum(lin.out_features for lin in linears), bias=False)
+  fused.weight = ggml_data_to_tensor(raw, fused.in_features*fused.out_features, Q8_0).reshape(fused.out_features, fused.in_features)
+  fused.set_quantized(fused.weight)
+  return fused if fused.ggml_type == Q8_0 else None
+
+def _mcontig(t:Tensor) -> Tensor:
+  # contiguous() on an already-materialized custom-kernel output would force a full copy
+  return t if t.uop.op is Ops.AFTER else t.contiguous()
+
+def _realize_dense_params(model:Transformer) -> None:
+  # Params feeding custom kernels must be realized buffers: a lazy cast/bitcast over the GGUF file would
+  # otherwise be recomputed by a separate kernel on every decode step.
+  ps: list[Tensor] = []
+  for block in model.blk:
+    if isinstance(block, GatedDeltaNetBlock):
+      ps += [block.ssm_conv1d["weight"], block.ssm_dt["bias"], block.ssm_a, cast(Tensor, block.ssm_norm.weight)]
+    if isinstance(block, MLATransformerBlock) and hasattr(block, "indexer"): ps.append(block.indexer.compressor_ape)
+    if model.hc_mult:
+      for hc in (block.hc_attn, block.hc_ffn):
+        for d in (hc.base, hc.scale): d["weight"].replace(d["weight"].float().contiguous())  # prepare() reads them as float
+        ps += [hc.base["weight"], hc.scale["weight"]]
+    for lin in ([block.ffn_gate_inp] if hasattr(block, 'ffn_gate_inp') else []) + \
+               ([block.indexer.proj] if isinstance(block, MLATransformerBlock) and hasattr(block, 'indexer') else []):
+      if lin.ggml_type is None: lin.set_quantized(lin.weight)
+      if lin.ggml_type is None: ps.append(lin.weight)  # dense (unquantized): realize once
+  for p in ps: p.replace(p.contiguous())
+  Tensor.realize(*ps)
+
+def _fuse_shared_input_linears(model:Transformer) -> None:
+  """Fuse Q8_0 projections that share one input activation into single packed matmuls (decode kernel count)."""
+  for block in model.blk:
+    if isinstance(block, GatedDeltaNetBlock):
+      if hasattr(block, "attn_q") and (fused := fuse_q8_linears(block.attn_q, block.attn_k, block.attn_v)) is not None:
+        setattr(block, "attn_qkv", fused)
+        del block.attn_q, block.attn_k, block.attn_v
+      if hasattr(block, "ssm_g_a") and (fused := fuse_q8_linears(block.ssm_g_a, block.ssm_f_a, block.ssm_beta)) is not None:
+        setattr(block, "ssm_gab", fused)  # keep the originals: is_kda is detected via ssm_g_a
+    if isinstance(block, MLATransformerBlock):
+      if block.config.q_lora_rank > 0 and (fused := fuse_q8_linears(block.attn_q_a, block.attn_kv_a_mqa)) is not None:
+        setattr(block, "attn_a_fused", fused)
+      if hasattr(block, "indexer") and \
+        (fused := fuse_q8_linears(block.attn_q_b, block.indexer.attn_q_b)) is not None: setattr(block, "attn_qb_fused", fused)
+    if hasattr(block, "ffn_gate_shexp") and \
+      (fused := fuse_q8_linears(block.ffn_gate_shexp, block.ffn_up_shexp)) is not None: setattr(block, "ffn_gu_shexp", fused)
+    if hasattr(block, "ffn_gate") and (fused := fuse_q8_linears(block.ffn_gate, block.ffn_up)) is not None:
+      setattr(block, "ffn_gu", fused)
 
 @functools.cache
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, device:str|None=None) -> Tensor:
@@ -231,6 +288,16 @@ class HyperConnection:
     self.eps, self.iters = config.hc_eps, config.hc_sinkhorn_iters
 
   def prepare(self, x:Tensor) -> tuple[Tensor, Tensor, Tensor]:
+    if amd_custom_kernels_supported(x.device) and all(isinstance(s, int) for s in x.shape) \
+        and (x.shape[-1]*x.shape[-2]) % 16384 == 0:
+      from tinygrad.llm.kernels.amd import Q8_0, hc_mixes
+      if self.fn.ggml_type is None: self.fn.set_quantized(self.fn.weight)
+      if self.fn.ggml_type == Q8_0:
+        # one fused kernel for the rms-norm + projection, then the fused sinkhorn gate kernel
+        mixes = hc_mixes(x, self.fn.weight, self.fn.out_features, self.norm_eps)
+        pre, post, comb = hc_prepare(mixes, self.base["weight"].float(), self.scale["weight"].float(),
+                                     self.hc, self.eps, self.iters)
+        return (pre.unsqueeze(-1) * x).sum(2).cast(x.dtype), post, comb
     flat = x.flatten(2).float()
     flat = flat * (flat.square().mean(-1, keepdim=True) + self.norm_eps).rsqrt()
     mixes = self.fn(flat)
@@ -251,6 +318,9 @@ class HyperConnection:
 
   @staticmethod
   def mix(x:Tensor, residual:Tensor, post:Tensor, comb:Tensor) -> Tensor:
+    if amd_custom_kernels_supported(residual.device) and all(isinstance(s, int) for s in residual.shape):
+      from tinygrad.llm.kernels.amd import hc_mix
+      return hc_mix(x, residual, post, comb)
     return (post.unsqueeze(-1) * x.unsqueeze(-2) + comb.transpose(-1, -2).cast(x.dtype) @ residual).cast(x.dtype)
 
 class FFNBlock:
@@ -313,18 +383,32 @@ class FFNBlock:
       elif gating == ExpertGating.SQRT_SOFTPLUS:  scores = logits.softplus().sqrt()
 
       _, sel = pairwise_topk(scores if bias is None else scores + bias, self.config.num_experts_per_tok)
-      probs = scores.gather(-1, sel)
-      # SOFTMAX_WEIGHT applies softmax after top-k selection
-      if gating == ExpertGating.SOFTMAX_WEIGHT: probs = probs.softmax(-1)
-      if normalize_topk: probs = probs / probs.sum(axis=-1, keepdim=True)
-      probs = probs * self.config.routed_scaling_factor
-      x_down = self.ffn_down_exps(sel, self._expert_swiglu(sel, h).contiguous())  # (B, T, k, D)
+      if gating == ExpertGating.SIGMOID and bias is not None and normalize_topk and amd_custom_kernels_supported(x.device) \
+          and all(isinstance(s, int) for s in logits.shape):
+        # fused: sigmoid gather + normalize + scale in one kernel
+        from tinygrad.llm.kernels.amd import router_probs
+        probs = router_probs(logits.reshape(-1, logits.shape[-1]), sel.reshape(-1, sel.shape[-1]),
+                             self.config.routed_scaling_factor).reshape(*sel.shape)
+      else:
+        probs = scores.gather(-1, sel)
+        # SOFTMAX_WEIGHT applies softmax after top-k selection
+        if gating == ExpertGating.SOFTMAX_WEIGHT: probs = probs.softmax(-1)
+        if normalize_topk: probs = probs / probs.sum(axis=-1, keepdim=True)
+        probs = probs * self.config.routed_scaling_factor
+      x_down = self.ffn_down_exps(sel, _mcontig(self._expert_swiglu(sel, h)))  # (B, T, k, D)
       out = (x_down * probs.unsqueeze(-1)).sum(axis=2)  # (B, T, D)
       if hasattr(self, 'ffn_gate_shexp'):
-        shexp = self.ffn_down_shexp(self._swiglu(self.ffn_gate_shexp(x), self.ffn_up_shexp(x)).contiguous())
+        if hasattr(self, 'ffn_gu_shexp'):
+          gate, up = self.ffn_gu_shexp(x).split([self.config.shared_expert_dim]*2, dim=-1)
+          shexp = self.ffn_down_shexp(_mcontig(self._swiglu(gate, up)))
+        else:
+          shexp = self.ffn_down_shexp(self._swiglu(self.ffn_gate_shexp(x), self.ffn_up_shexp(x)).contiguous())
         if hasattr(self, 'ffn_gate_inp_shexp'): shexp = shexp * (x * self.ffn_gate_inp_shexp["weight"]).sum(axis=-1, keepdim=True).sigmoid()
         out = out + shexp
       return out
+    if hasattr(self, 'ffn_gu'):
+      gate, up = self.ffn_gu(x).split([self.ffn_down.in_features]*2, dim=-1)
+      return self.ffn_down(self._swiglu(gate, up).contiguous())
     # TODO: remove the need for this contiguous
     return self.ffn_down(self._swiglu(self.ffn_gate(x), self.ffn_up(x)).contiguous())
 
@@ -344,7 +428,7 @@ class FFNBlock:
         x = self.hc_attn.mix(self._attention(self.attn_norm(h), start_pos), residual, post, comb)
         residual = x
         h, post, comb = self.hc_ffn.prepare(x)
-        return self.hc_ffn.mix(self._feed_forward(self.ffn_norm(h)), residual, post, comb).contiguous()
+        return _mcontig(self.hc_ffn.mix(self._feed_forward(self.ffn_norm(h)), residual, post, comb))
       h =     x + self._attention(self.attn_norm(x), start_pos)
       return (h + self._feed_forward(self.ffn_norm(h))).contiguous()
     return _run(x, start_pos)
@@ -429,14 +513,17 @@ class AttentionIndexer:
     if not hasattr(self, "cache"):
       ic = self.index_config
       self.cache = Tensor.zeros(x.shape[0], self.config.max_context, 2*ic.head_dim+1, dtype=dtypes.half, device=x.device).clone()
+      pool_count = (self.config.max_context + ic.kpool - 1) // ic.kpool
+      # pooled keys persist across decode steps; only the pool the current token lands in is refreshed
+      self.pool_cache = Tensor.zeros(x.shape[0], pool_count, ic.head_dim, dtype=dtypes.half, device=x.device).clone()
 
-  def __call__(self, hidden_states:Tensor, q_resid:Tensor, start_pos:int|UOp) -> Tensor:
+  def __call__(self, hidden_states:Tensor, q_resid:Tensor, start_pos:int|UOp, q_override:Tensor|None=None) -> Tensor:
     self._init_state(hidden_states)
     B, T, _ = hidden_states.shape
     ic, device = self.index_config, hidden_states.device
     assert isinstance(device, str)
 
-    q = self.attn_q_b(q_resid).reshape(B, T, ic.n_heads, ic.head_dim)
+    q = (q_override if q_override is not None else self.attn_q_b(q_resid)).reshape(B, T, ic.n_heads, ic.head_dim)
     k = self.k_norm(self.attn_k(hidden_states))
     gate_scores = self.compressor_gate(hidden_states)
     valid = Tensor.ones(B, T, 1, dtype=hidden_states.dtype, device=device)
@@ -445,6 +532,13 @@ class AttentionIndexer:
     cached = Tensor(self.cache.uop.after(store))
 
     pool_count = (self.config.max_context + ic.kpool - 1) // ic.kpool
+    select_k = min(ic.top_k // ic.kpool, pool_count)
+    if resolve(T == 1, False) and select_k < pool_count and ic.head_dim % 32 == 0 and ic.n_heads == 32 \
+        and getattr(self, "_pool_warm", False) and amd_custom_kernels_supported(device):
+      weights = (self.proj(hidden_states).float() * (ic.n_heads**-0.5)).reshape(B, ic.n_heads)
+      return dsa_indexer_decode(q.reshape(B, ic.n_heads, ic.head_dim), self.pool_cache, cached,
+                                self.compressor_ape, weights, start_pos, ic.kpool, ic.top_k, select_k)
+
     padded_len = pool_count * ic.kpool
     if padded_len != self.config.max_context: cached = cached.pad((None, (0, padded_len-self.config.max_context), None))
     grouped = cached.reshape(B, pool_count, ic.kpool, 2*ic.head_dim+1)
@@ -453,6 +547,10 @@ class AttentionIndexer:
     probabilities = logits.softmax(2).cast(keys.dtype)
     pool_keys = (probabilities * keys * key_valid.unsqueeze(-1)).sum(2)
     pool_valid = key_valid.all(2)
+    if amd_custom_kernels_supported(device):
+      # keep the incremental decode cache warm: store, then read the pooled keys back through the cache buffer
+      self._pool_warm = True
+      pool_keys = Tensor(self.pool_cache.uop.after(self.pool_cache.uop.store(pool_keys.cast(self.pool_cache.dtype).uop)))
 
     scores = (q.float().unsqueeze(-2) * pool_keys.float().reshape(B, 1, 1, pool_count, ic.head_dim)).sum(-1)
     scores = (scores * (ic.head_dim**-0.5)).relu()
@@ -509,41 +607,62 @@ class MLATransformerBlock(FFNBlock):
   def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
     B, T, _ = x.shape
     q_nope_head_dim = self.config.head_dim - self.config.rope_dim
-    q_resid = self.attn_q_a_norm(self.attn_q_a(x)) if self.config.q_lora_rank > 0 else None
-    q_proj = self.attn_q_b(q_resid) if q_resid is not None else self.attn_q(x)
+    if hasattr(self, "attn_a_fused"):
+      q_a, kv_a = self.attn_a_fused(x).split([self.config.q_lora_rank, self.config.kv_lora_rank + self.config.rope_dim], dim=-1)
+    else:
+      q_a, kv_a = (self.attn_q_a(x) if self.config.q_lora_rank > 0 else None), self.attn_kv_a_mqa(x)
+    q_resid = self.attn_q_a_norm(q_a) if q_a is not None else None
+    idx_q = None
+    if hasattr(self, "attn_qb_fused"):
+      q_proj, idx_q = self.attn_qb_fused(q_resid).split([self.config.n_heads * self.config.head_dim,
+        self.indexer.index_config.n_heads * self.indexer.index_config.head_dim], dim=-1)
+    else:
+      q_proj = self.attn_q_b(q_resid) if q_resid is not None else self.attn_q(x)
     q = q_proj.reshape(B, T, self.config.n_heads, self.config.head_dim).transpose(1, 2)
     q_nope, q_rope = q[..., :q_nope_head_dim], q[..., q_nope_head_dim:]
     if self.config.rope_dim and (not self.config.ssm or not self.config.ssm.kda):
       q_rope = apply_rope(q_rope, self.freqs_cis[start_pos:start_pos+T])
-    q = (q_nope @ self.attn_k_b["weight"].transpose(-1, -2)).cat(q_rope, dim=-1)
+    if resolve(T == 1, False) and not self.config.rope_dim and \
+      (q_gemv := head_q8_gemv(self.attn_k_b["weight"], q_proj, self.config.n_heads,
+                              self.config.kv_lora_rank, q_nope_head_dim)) is not None:
+      q = q_gemv.reshape(B, self.config.n_heads, T, self.config.kv_lora_rank)
+    else:
+      q = (q_nope @ self.attn_k_b["weight"].transpose(-1, -2)).cat(q_rope, dim=-1)
 
-    kv_a = self.attn_kv_a_mqa(x)
     c_kv = self.attn_kv_a_norm(kv_a[..., :self.config.kv_lora_rank])
     k_rope = kv_a[..., self.config.kv_lora_rank:].reshape(B, T, 1, self.config.rope_dim).transpose(1, 2)
     if self.config.rope_dim and (not self.config.ssm or not self.config.ssm.kda):
       k_rope = apply_rope(k_rope, self.freqs_cis[start_pos:start_pos+T])
 
     k_store = c_kv.reshape(B, 1, T, self.config.kv_lora_rank).cat(k_rope.reshape(B, 1, T, self.config.rope_dim), dim=-1)
-    cached = Tensor(self.cache_k.uop.after(self.cache_k[:, :, start_pos:start_pos+T, :].uop.store(k_store.cast(self.cache_k.dtype).uop)))
+    store = self.cache_k[:, :, start_pos:start_pos+T, :].uop.store(k_store.cast(self.cache_k.dtype).uop)
+    cached = Tensor(self.cache_k.uop.after(store))
+    cached_flat = Tensor(self.cache_k_flat.uop.after(store)) if hasattr(self, "cache_k_flat") else None
 
     if hasattr(self, "indexer"):
       assert q_resid is not None
-      indices = self.indexer(x, q_resid, start_pos)
+      indices = self.indexer(x, q_resid, start_pos, q_override=idx_q)
       q_selected = q.transpose(1, 2)
       if resolve(T == 1) and amd_custom_kernels_supported(x.device):
         # fused decode: scores + softmax + latent accumulation over the selected rows in one kernel per head
         latent = dsa_decode(q_selected[:, 0], cached[:, 0], indices[:, 0], self.config.head_dim ** -0.5,
                             self.config.kv_lora_rank, valid_tokens=start_pos+1,
-                            pool_size=self.indexer.index_config.kpool).reshape(B, T, self.config.n_heads, self.config.kv_lora_rank)
+                            pool_size=self.indexer.index_config.kpool,
+                            cache_flat=cached_flat).reshape(B, T, self.config.n_heads, self.config.kv_lora_rank)
       else:
         valid = indices >= 0
         selected = gather_rows(cached[:, 0], indices.clip(0, self.config.max_context-1))
         attn = (q_selected.unsqueeze(-2) * selected.unsqueeze(2)).sum(-1) * (1.0 / self.config.head_dim ** 0.5)
         attn = valid.unsqueeze(2).where(attn, attn.const_like(float("-inf"))).softmax(-1)
         latent = (attn.unsqueeze(-2) @ selected[..., :self.config.kv_lora_rank].unsqueeze(2)).squeeze(-2)
-      value_weight = self.attn_v_b["weight"].transpose(-1, -2).reshape(1, 1, self.config.n_heads,
-                                                                 self.config.kv_lora_rank, self.config.v_head_dim)
-      out = (latent.unsqueeze(-2) @ value_weight).squeeze(-2).reshape(B, T, -1)
+      v_gemv = head_q8_gemv(self.attn_v_b["weight"], latent.reshape(B, -1), self.config.n_heads,
+                            self.config.v_head_dim, self.config.kv_lora_rank) \
+        if resolve(T == 1, False) else None
+      if v_gemv is not None: out = v_gemv.reshape(B, T, -1)
+      else:
+        value_weight = self.attn_v_b["weight"].transpose(-1, -2).reshape(1, 1, self.config.n_heads,
+                                                                     self.config.kv_lora_rank, self.config.v_head_dim)
+        out = (latent.unsqueeze(-2) @ value_weight).squeeze(-2).reshape(B, T, -1)
       return self.attn_output(out)
 
     k = cached[:, :, 0:start_pos+T, :]
@@ -559,8 +678,13 @@ class MLATransformerBlock(FFNBlock):
 
   def _init_state(self, x:Tensor):
     if not hasattr(self, "cache_k"):
-      self.cache_k = Tensor.empty(x.shape[0], 1, self.config.max_context, self.config.kv_lora_rank + self.config.rope_dim,
-                                  dtype=dtypes.half, device=x.device)
+      # pad the flat cache allocation to a power of two: dsa_decode's gathered loads are masked by the buffer
+      # size, and a power-of-two size lowers the per-load mask from an integer modulo to an AND
+      n = x.shape[0] * self.config.max_context * (self.config.kv_lora_rank + self.config.rope_dim)
+      assert isinstance(n, int)
+      n_pow2 = 1 << (n-1).bit_length()
+      self.cache_k_flat = Tensor.empty(n_pow2, dtype=dtypes.half, device=x.device)
+      self.cache_k = self.cache_k_flat[:n].reshape(x.shape[0], 1, self.config.max_context, self.config.kv_lora_rank + self.config.rope_dim)
       if self.config.rope_dim:
         self.freqs_cis = precompute_freqs_cis(self.config.rope_dim, self.config.max_context, self.config.rope_theta, device=x.device)
 
@@ -598,11 +722,33 @@ class GatedDeltaNetBlock(FFNBlock):
 
     # input processing
     x = x.half()
-    out_gate = self.ssm_g_b(self.ssm_g_a(x)) if is_kda else self.attn_gate(x)
-    out_gate = out_gate.reshape(B, T, self.num_v_heads, self.head_v_dim)
-    beta = self.ssm_beta(x).sigmoid().reshape(B, T, self.num_v_heads)
-    alpha = (self.ssm_f_b(self.ssm_f_a(x)) if is_kda else self.ssm_alpha(x)).float() + self.ssm_dt["bias"]
-    alpha = alpha.reshape(B, T, self.num_v_heads, -1)
+    if is_kda:
+      if hasattr(self, "ssm_gab"): g_a, f_a, beta_raw = self.ssm_gab(x).split([self.head_v_dim, self.head_k_dim, self.num_v_heads], dim=-1)
+      else: g_a, f_a, beta_raw = self.ssm_g_a(x), self.ssm_f_a(x), self.ssm_beta(x)
+      out_gate = self.ssm_g_b(g_a).reshape(B, T, self.num_v_heads, self.head_v_dim)
+      alpha_raw = self.ssm_f_b(f_a)
+    else:
+      out_gate = self.attn_gate(x).reshape(B, T, self.num_v_heads, self.head_v_dim)
+      beta_raw, alpha_raw = self.ssm_beta(x), self.ssm_alpha(x)
+    qk_eps = self.config.ssm.norm_eps if self.config.ssm and is_kda else 1e-6
+
+    if is_kda and not symbolic and T == 1 and hasattr(self, "attn_qkv") and self.num_k_heads == self.num_v_heads \
+        and self.conv_channels == 3*self.q_dim and self.head_k_dim == self.head_v_dim and self.head_k_dim % 32 == 0 \
+        and self.ssm_conv_kernel == 4 and self.config.ssm is not None and self.config.ssm.gate_lower_bound is not None \
+        and amd_custom_kernels_supported(x.device):
+      # fused decode path: one kernel for the causal conv, state shift, and q/k normalization
+      qkv = self.attn_qkv(x)
+      q, k, v, conv_state_after = kda_conv_norm(qkv, self.conv_state, self.ssm_conv1d["weight"], start_pos,
+                                                self.num_v_heads, self.head_k_dim, qk_eps, self.head_k_dim**-0.5)
+      beta, alpha = kda_gates(beta_raw, alpha_raw, self.ssm_dt["bias"], self.ssm_a, self.config.ssm.gate_lower_bound,
+                              self.num_v_heads, self.head_k_dim)
+      state = Tensor(self.recurrent_state.uop.after(conv_state_after.uop))
+      core = gated_delta_prefill(q, k, v, beta, alpha, state, Tensor(start_pos, device=x.device))
+      z = kda_out(core, out_gate, cast(Tensor, self.ssm_norm.weight), self.config.norm_eps, x.dtype)
+      return self.ssm_out(z.reshape(B, T, -1))
+
+    beta = beta_raw.sigmoid().reshape(B, T, self.num_v_heads)
+    alpha = (alpha_raw.float() + self.ssm_dt["bias"]).reshape(B, T, self.num_v_heads, -1)
     log_alpha = _kda_log_decay(alpha, self.ssm_a.reshape(self.num_v_heads, -1), self.config.ssm.gate_lower_bound if self.config.ssm else None)
 
     # qkv conv, conv_state is reset when starting from position 0
@@ -623,7 +769,6 @@ class GatedDeltaNetBlock(FFNBlock):
       out_gate = out_gate.pad_to((B, T_pad, self.num_v_heads, self.head_v_dim))
       beta, log_alpha = beta.pad_to((B, T_pad, self.num_v_heads)), log_alpha.pad_to((B, T_pad, *log_alpha.shape[2:]))
     q, k, v = conv_out.split([self.q_dim, self.q_dim, self.conv_channels - 2*self.q_dim], dim=-1)
-    qk_eps = self.config.ssm.norm_eps if self.config.ssm and is_kda else 1e-6
     q, k = (z.reshape(B, T_pad, self.num_k_heads, self.head_k_dim).normalize(dim=-1, eps=qk_eps)
             .repeat(1, 1, self.num_v_heads//self.num_k_heads, 1) for z in (q, k))
     v = v.reshape(B, T_pad, self.num_v_heads, self.head_v_dim)
@@ -677,7 +822,8 @@ class Transformer:
     self.hc_mult = config.hc_mult
     # Selected-expert decoding keeps GLM's prefill scratch roughly linear in tokens. Eight tokens stays below
     # the headroom of the fullest 24 GiB pipeline stage while avoiding dozens of two-token pipeline passes.
-    self.prefill_chunk_size = 8 if config.num_experts and config.hc_mult else 32
+    # Single-device models have no such stage headroom constraint; larger chunks amortize the per-chunk cost.
+    self.prefill_chunk_size = 32
     self.devices: tuple[str, ...]|None = None
     self.has_recurrent_block = any(isinstance(b, GatedDeltaNetBlock) for b in self.blk)
     self._cached_tokens: list[int] = []
@@ -700,6 +846,9 @@ class Transformer:
     # only run the output projection on the last token
     logits = self.output(self.output_norm(x[:, -1:]))[:, -1, :]
     temperature = temperature.to(logits.device).realize()
+    if amd_custom_kernels_supported(logits.device) and isinstance(logits.shape[-1], int) and \
+      (sampled := gumbel_argmax(logits, temperature)) is not None:
+      return sampled
     # Gumbel-max trick: argmax(logits/temp - log(-log(uniform))) is equivalent to sampling from softmax(logits/temp)
     return (logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1, keepdim=True)
 
@@ -802,6 +951,8 @@ class Transformer:
     model = Transformer(config)
     if devices is not None:
       model.devices = devices
+      # keep the multi-GPU pipeline-stage headroom: scratch must fit beside a 20 GiB stage on a 24 GiB card
+      if config.num_experts and config.hc_mult: model.prefill_chunk_size = 8
       # Move placeholders to the device holding their packed GGUF source before loading. Otherwise load_state_dict
       # would silently copy every decoded layer back to device zero.
       for name, param in nn.state.get_state_dict(model).items():
@@ -816,10 +967,14 @@ class Transformer:
     if realize:
       for s in (params:=nn.state.get_parameters(model)): s.replace(s.contiguous())
       Tensor.realize(*params)
+    if amd_custom_kernels_supported(model.token_embd.weight.device):
+      _realize_dense_params(model)
+      _fuse_shared_input_linears(model)
     return model, kv
 
   def warmup(self):
-    for _ in range(2): list(zip(range(2), self.generate([0])))
+    # chunk+1 prompt tokens: the last token captures the decode graph with the indexer pool cache already warm
+    for _ in range(2): list(zip(range(2), self.generate([0] * (self.prefill_chunk_size + 1))))
 
   def get_start_pos(self, tokens:list[int]) -> int:
     # recurrent state can't be partially reused after divergence: reuse it only when tokens extend the cached prefix
