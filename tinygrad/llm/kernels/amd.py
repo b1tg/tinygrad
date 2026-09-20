@@ -1192,7 +1192,7 @@ def _packed_q8_raw(weight:UOp, numel:int) -> UOp|None:
               and any(v.op is Ops.RESHAPE and v.src[0] is u and v.shape[-1] == Q8_0_BYTES for v in topo)), None)
   if raw is None: return None
   def unwrapped(u:UOp) -> UOp:
-    while u.op in (Ops.RESHAPE, Ops.CONTIGUOUS) or (u.op is Ops.CAST and dtypes.is_float(u.dtype) and dtypes.is_float(u.src[0].dtype)):
+    while u.op in (Ops.RESHAPE, Ops.STAGE) or (u.op is Ops.CAST and dtypes.is_float(u.dtype) and dtypes.is_float(u.src[0].dtype)):
       u = u.src[0]
     return u
   if unwrapped(weight).key != unwrapped(ggml_data_to_tensor(Tensor(raw), numel, Q8_0).uop).key: return None

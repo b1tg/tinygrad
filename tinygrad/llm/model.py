@@ -102,7 +102,7 @@ class ExpertWeights:
     ggml_type = packed_sizes[raw.max_numel()]
     # Q3_K and IQ3_S share the 110-byte block size: require the exact dequantization expression, like Linear does.
     def unwrapped(u:UOp) -> UOp:
-      while u.op in (Ops.RESHAPE, Ops.CONTIGUOUS) or (u.op is Ops.CAST and dtypes.is_float(u.dtype) and dtypes.is_float(u.src[0].dtype)):
+      while u.op in (Ops.RESHAPE, Ops.STAGE) or (u.op is Ops.CAST and dtypes.is_float(u.dtype) and dtypes.is_float(u.src[0].dtype)):
         u = u.src[0]
       return u
     expected = ggml_data_to_tensor(Tensor(raw), self.weight.numel(), ggml_type)

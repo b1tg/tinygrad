@@ -113,7 +113,11 @@ class TestQ6Experts(unittest.TestCase):
     high = ((packed[:, 128:192].reshape(-1, 2, 1, 32) >> np.array([0, 2, 4, 6])[None, None, :, None]) & 3).reshape(-1, 256)
     scales = np.repeat(packed[:, 192:208].view(np.int8), 16, axis=1).astype(np.float32)
     d = packed[:, 208:].copy().view(np.float16).astype(np.float32)
-    reference = (d*((low | (high << 4))-32).astype(np.float32)*scales).reshape(3, 16, width)
+    # the fused decode kernel rounds dequantized weights to half (the loader's cast); the generic path rounds only
+    # when the weight itself is cast to half
+    reference = (d*((low | (high << 4))-32).astype(np.float32)*scales)
+    if dtype == dtypes.half: reference = reference.astype(np.float16).astype(np.float32)
+    reference = reference.reshape(3, 16, width)
     # The inline GPU dequantization/matmul retains fp32 intermediates; materializing fp16 weights separately changes its rounding.
     return weight, reference
 
