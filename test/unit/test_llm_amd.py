@@ -176,7 +176,8 @@ class TestQ8Grouped(unittest.TestCase):
 
   def test_chunk_boundaries_and_jit(self):
     rng = np.random.default_rng(9)
-    for width, outputs in ((1024, 2048), (1568, 2052), (4096, 2048), (8192, 2048), (16384, 2048)):
+    for width, outputs in ((1024, 2048), (1568, 2052), (4096, 2048), (8192, 2048), (16384, 2048),
+                           (4096, 256), (2048, 512), (32768, 256)):
       with self.subTest(width=width, outputs=outputs):
         linear, weights = self.make_linear(width, outputs)
         run = TinyJit(lambda x: linear(x).realize())
@@ -200,6 +201,30 @@ class TestQ8Grouped(unittest.TestCase):
       np.testing.assert_array_equal(linear(Tensor.zeros(2, 4096)[:count])[:1].numpy(), np.zeros((1, 2048)))
 
 class TestQ8Quantize(unittest.TestCase):
+  def test_grouped_expert_decode(self):
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("AMD custom kernels required")
+    from tinygrad.llm.kernels.amd import expert_quant_linear
+    rng = np.random.default_rng(82)
+    E, O, I = 3, 256, 768
+    for typ, size in ((23, 136), (21, 110), (18, 98), (17, 74)):
+      with self.subTest(typ=typ):
+        packed = rng.integers(0, 256, (E*O*I//256, size), dtype=np.uint8)
+        packed[:, :2] = np.array([0.001], dtype=np.float16).view(np.uint8)
+        raw = Tensor(packed.flatten()).realize()
+        weights = ggml_data_to_tensor(raw, E*O*I, typ).numpy().reshape(E, O, I)
+        w = Tensor(packed.flatten().view(np.uint32)).realize() if typ == 23 else raw
+        for shared in (False, True):
+          run = TinyJit(lambda sel, x: expert_quant_linear(w, typ, sel, x, O, I).realize())
+          for magnitude in (1., 0., 10., 0.1):
+            sel = rng.integers(0, E, (2, 1, 2), dtype=np.int32)
+            data = (rng.normal(size=(2, 1, 1 if shared else 2, I))*magnitude).astype(np.float32)
+            groups = data.reshape(*data.shape[:-1], I//32, 32)
+            d = np.maximum(np.abs(groups).max(-1, keepdims=True)/127, 1e-8)
+            quantized = (np.clip(np.rint(groups/d), -127, 127)*d).reshape(data.shape)
+            expected = np.einsum('btki,btkoi->btko', np.broadcast_to(quantized, (2, 1, 2, I)), weights[sel])
+            actual = run(Tensor(sel).realize(), Tensor(data).realize()).numpy()
+            np.testing.assert_allclose(actual, expected, rtol=2e-4, atol=2e-4)
+
   def test_iq3s_signed_table_exhaustive(self):
     from tinygrad.llm.kernels.amd import iq3s_grid_lut
     base = iq3s_grid_lut("CPU").numpy().view(np.int8).reshape(512, 4).astype(np.int16)
@@ -745,9 +770,15 @@ class TestQ8Quantize(unittest.TestCase):
     np.testing.assert_allclose(got.numpy(), want[None], rtol=1e-3, atol=1e-3)
 
   def test_dsa_decode_effective_selection(self):
+    self._test_dsa_decode_effective_selection(160, 128)
+
+  def test_dsa_latent_decode_effective_selection(self):
+    self._test_dsa_decode_effective_selection(512, 512)
+
+  def _test_dsa_decode_effective_selection(self, D, LORA):
     if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("custom kernels required")
     rng = np.random.default_rng(42)
-    B, H, D, LORA, N, K = 2, 4, 160, 128, 512, 259
+    B, H, N, K = 2, 4, 512, 259
     q_np = rng.normal(size=(B, H, D)).astype(np.float16)
     cache_np = rng.normal(size=(B, N, D)).astype(np.float16)
     q = Tensor(q_np).realize()
@@ -847,6 +878,53 @@ class TestHCMixes(unittest.TestCase):
     x = Tensor(np.random.default_rng(3).normal(size=(1, 1, 1024)).astype(np.float32)).realize()
     np.testing.assert_allclose(fused(x).numpy(), np.concatenate([l1(x).numpy(), l2(x).numpy()], axis=-1), rtol=1e-4, atol=1e-4)
 
+  def test_hc_mixes_jit_replay(self):
+    from tinygrad.llm.kernels.amd import hc_mixes
+    linear, _ = TestQ8Grouped.make_linear(16384, 24)
+    linear.set_quantized(linear.weight)
+    linear.weight.realize()
+    rng = np.random.default_rng(71)
+    run = TinyJit(lambda x: hc_mixes(x, linear.weight, 24, 1e-5).realize())
+    for scale in (1., 0., 0.01, 100., 1.):
+      with self.subTest(scale=scale):
+        data = (rng.normal(size=(2, 1, 4, 4096))*scale).astype(np.float32)
+        got = run(Tensor(data).realize()).numpy().reshape(2, 24)
+        flat = data.reshape(2, -1)
+        groups = flat.reshape(2, -1, 32)
+        d = np.maximum(np.abs(groups).max(-1, keepdims=True)/127, 1e-8)
+        quantized = (np.clip(np.rint(groups/d), -127, 127)*d).reshape(2, -1)
+        weights = ggml_data_to_tensor(linear.weight, 24*16384, 8).numpy().reshape(24, 16384)
+        expected = (quantized @ weights.T) / np.sqrt((flat**2).mean(-1, keepdims=True)+1e-5)
+        np.testing.assert_allclose(got, expected, rtol=2e-4, atol=2e-4)
+
+  def test_reduce_norm_jit_replay(self):
+    from tinygrad.llm.kernels.amd import hc_reduce_norm
+    rng = np.random.default_rng(72)
+    weight = rng.normal(size=(4096,)).astype(np.float16)
+    w = Tensor(weight).realize()
+    run = TinyJit(lambda x, pre: hc_reduce_norm(x, pre, w, 1e-6).realize())
+    for scale in (1., 0., 0.01, 100., 1.):
+      data = (rng.normal(size=(2, 1, 4, 4096))*scale).astype(np.float32)
+      pre = rng.uniform(0, 1, size=(2, 1, 4)).astype(np.float32)
+      got = run(Tensor(data).realize(), Tensor(pre).realize()).numpy()
+      h = (data*pre[..., None]).sum(2)
+      expected = h / np.sqrt((h*h).mean(-1, keepdims=True)+1e-6)*weight.astype(np.float32)
+      np.testing.assert_allclose(got, expected, rtol=2e-5, atol=2e-6)
+
+  def test_head_q8_vector_loads(self):
+    from tinygrad.llm.kernels.amd import head_q8_gemv
+    rng = np.random.default_rng(73)
+    for width, outputs in ((128, 256), (512, 128)):
+      heads = 4
+      linear, weight = TestQ8Grouped.make_linear(width, heads*outputs)
+      w = linear.weight.reshape(heads, outputs, width)
+      run = TinyJit(lambda x: head_q8_gemv(w, x, heads, outputs, width).realize())
+      for _ in range(4):
+        data = rng.normal(size=(1, heads*width)).astype(np.float32)
+        got = run(Tensor(data).realize()).numpy()
+        expected = np.einsum('bhi,hoi->bho', data.reshape(1, heads, width), weight.reshape(heads, outputs, width))
+        np.testing.assert_allclose(got, expected, rtol=2e-4, atol=2e-4)
+
 class TestFusedDecodeKernels(unittest.TestCase):
   def setUp(self):
     if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("AMD custom kernels required")
@@ -860,6 +938,30 @@ class TestFusedDecodeKernels(unittest.TestCase):
     # temperature near zero is argmax of logits
     got0 = gumbel_argmax(logits, Tensor([0.0])).numpy()
     np.testing.assert_array_equal(got0, logits.numpy().argmax(-1, keepdims=True))
+
+  def test_router_topk_probs_jit(self):
+    from tinygrad.llm.kernels.amd import router_topk_probs
+    rng = np.random.default_rng(86)
+    for n, k in ((128, 1), (288, 8), (511, 8), (512, 8)):
+      @TinyJit
+      def run(x, bias):
+        sel, probs = router_topk_probs(x, bias, k, 2.5)
+        Tensor.realize(sel, probs)
+        return sel, probs
+      for step in range(5):
+        with self.subTest(n=n, k=k, step=step):
+          logits = rng.normal(size=(2, n)).astype(np.float32) * (1 if step < 3 else 10)
+          bias = rng.normal(size=n).astype(np.float32)
+          if step in (1, 4):
+            logits.fill(0)  # stable ties, including captured/replayed inputs
+            bias.fill(0)
+          scores = 1 / (1 + np.exp(-logits))
+          want_sel = np.argsort(-(scores + bias), axis=-1, kind="stable")[:, :k][:, ::-1]
+          want_probs = np.take_along_axis(scores, want_sel, -1)
+          want_probs = want_probs / want_probs.sum(-1, keepdims=True) * 2.5
+          sel, probs = run(Tensor(logits).realize(), Tensor(bias).realize())
+          np.testing.assert_array_equal(sel.numpy(), want_sel)
+          np.testing.assert_allclose(probs.numpy(), want_probs, rtol=2e-6, atol=1e-6)
 
   def test_router_probs(self):
     from tinygrad.llm.kernels.amd import router_probs

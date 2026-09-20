@@ -56,6 +56,22 @@ class TestMLA(unittest.TestCase):
     # Cover both capture and replay: rebuilding a layer output from its raw Buffer loses its JIT identity.
     self.assertEqual(generate(0), generate(1))
 
+  def test_hyper_connection_prepare_with_norm(self):
+    hc = HyperConnection(self._make_config(dim=256, hc_mult=4, hc_eps=1e-6, hc_sinkhorn_iters=20))
+    Tensor.realize(*nn.state.get_parameters(hc))
+    x = Tensor(np.random.default_rng(81).normal(size=(2, 1, 4, 256)).astype(np.float32)).realize()
+    for affine in (True, False):
+      with self.subTest(affine=affine):
+        norm = nn.RMSNorm(256, eps=1e-5, elementwise_affine=affine)
+        if norm.weight is not None: norm.weight.realize()
+        h, post, comb = hc.prepare(x)
+        expected = norm(h).numpy()
+        actual, new_post, new_comb = hc.prepare(x, norm)
+        Tensor.realize(actual, new_post, new_comb)
+        np.testing.assert_allclose(actual.numpy(), expected, rtol=2e-5, atol=2e-6)
+        np.testing.assert_array_equal(new_post.numpy(), post.numpy())
+        np.testing.assert_array_equal(new_comb.numpy(), comb.numpy())
+
   def test_mla_attention_matches_naive(self):
     config = self._make_config(max_context=16)
 

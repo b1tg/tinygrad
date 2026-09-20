@@ -1,7 +1,7 @@
-import argparse, time
+import argparse, sys, time
 from tinygrad.llm.model import Transformer
 
-if __name__ == "__main__":
+def main():
   parser = argparse.ArgumentParser()
   parser.add_argument("--model", required=True, help="path to gguf model")
   parser.add_argument("--max-context", type=int, default=8192, help="max context length (default: %(default)s)")
@@ -11,7 +11,8 @@ if __name__ == "__main__":
   args = parser.parse_args()
 
   st = time.perf_counter()
-  model, _ = Transformer.from_gguf(args.model, args.max_context)
+  model, metadata = Transformer.from_gguf(args.model, args.max_context)
+  del metadata  # tokenizer metadata destruction must not be charged to the first decode-loop iteration
   print(f"load {time.perf_counter()-st:.3f}s", flush=True)
 
   st = time.perf_counter()
@@ -26,6 +27,11 @@ if __name__ == "__main__":
   pt = time.perf_counter()
   print(f"prefill {args.prompt_tokens/(pt-st):.3f} tok/s", flush=True)
 
+  dt = time.perf_counter()
   for _ in range(args.decode_tokens): output.append(next(gen))
   et = time.perf_counter()
-  print(f"decode {args.decode_tokens/(et-pt):.3f} tok/s output {output}", flush=True)
+  print(f"decode {args.decode_tokens/(et-dt):.3f} tok/s output {output}", flush=True)
+
+if __name__ == "__main__":
+  try: main()
+  except KeyboardInterrupt: sys.exit(1)

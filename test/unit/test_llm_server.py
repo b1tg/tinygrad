@@ -14,17 +14,30 @@ V_TOKS = UOp.variable("toks", 1, 32)  # 32 is the default chunk_size in generate
 
 class TestTransformerGenerate(unittest.TestCase):
   def test_warmup(self):
-    model, calls = Transformer(TEST_CONFIG), []
+    model, calls, yielded = Transformer(TEST_CONFIG), [], []
     def generate(tokens, **kwargs):
       calls.append(tokens)
-      yield from (1, 2)
+      for i in range(10):
+        yielded.append(i)
+        yield i
     with patch.object(model, "generate", generate): model.warmup()
     self.assertEqual(calls, [[0], [0]])
+    self.assertEqual(yielded, [0, 1, 2] * 2)
+
+  def test_indexer_warmup_prompt_fits_context(self):
+    model, calls = Transformer(TEST_CONFIG), []
+    model.blk[0].indexer = object()
+    def generate(tokens, **kwargs):
+      calls.append(len(tokens))
+      yield from range(3)
+    with patch.object(model, "generate", generate): model.warmup()
+    self.assertEqual(calls, [TEST_CONFIG.max_context - 3] * 2)
 
   def test_warmup_then_generate_with_default_chunk(self):
     # warmup must not capture JIT graphs that generate()'s default chunk_size then rejects
     model = Transformer(TEST_CONFIG)
     model.warmup()
+    self.assertGreaterEqual(model.rollout_jit.cnt, 3)
     self.assertIsInstance(next(model.generate([5, 6, 7, 8])), int)
 
   def test_first_recurrent_generate_before_state_init(self):

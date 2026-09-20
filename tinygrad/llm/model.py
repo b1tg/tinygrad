@@ -43,6 +43,7 @@ def _realize_dense_params(model:Transformer) -> None:
       ps += [block.ssm_conv1d["weight"], block.ssm_dt["bias"], block.ssm_a, cast(Tensor, block.ssm_norm.weight)]
     if isinstance(block, MLATransformerBlock) and hasattr(block, "indexer"): ps.append(block.indexer.compressor_ape)
     if model.hc_mult:
+      ps += [cast(Tensor, block.attn_norm.weight), cast(Tensor, block.ffn_norm.weight)]
       for hc in (block.hc_attn, block.hc_ffn):
         for d in (hc.base, hc.scale): d["weight"].replace(d["weight"].float().contiguous())  # prepare() reads them as float
         ps += [hc.base["weight"], hc.scale["weight"]]
@@ -287,7 +288,14 @@ class HyperConnection:
     self.hc, self.norm_eps = config.hc_mult, config.norm_eps
     self.eps, self.iters = config.hc_eps, config.hc_sinkhorn_iters
 
-  def prepare(self, x:Tensor) -> tuple[Tensor, Tensor, Tensor]:
+  def prepare(self, x:Tensor, norm:nn.RMSNorm|None=None) -> tuple[Tensor, Tensor, Tensor]:
+    def finish(pre:Tensor, post:Tensor, comb:Tensor) -> tuple[Tensor, Tensor, Tensor]:
+      if norm is not None and norm.weight is not None and x.dtype == dtypes.float32 and all(isinstance(s, int) for s in x.shape) \
+          and x.shape[-1] % 256 == 0 and amd_custom_kernels_supported(x.device):
+        from tinygrad.llm.kernels.amd import hc_reduce_norm
+        return hc_reduce_norm(x, pre, norm.weight, norm.eps), post, comb
+      h = (pre.unsqueeze(-1) * x).sum(2).cast(x.dtype)
+      return norm(h) if norm is not None else h, post, comb
     if amd_custom_kernels_supported(x.device) and all(isinstance(s, int) for s in x.shape) \
         and (x.shape[-1]*x.shape[-2]) % 16384 == 0:
       from tinygrad.llm.kernels.amd import Q8_0, hc_mixes
@@ -297,7 +305,7 @@ class HyperConnection:
         mixes = hc_mixes(x, self.fn.weight, self.fn.out_features, self.norm_eps)
         pre, post, comb = hc_prepare(mixes, self.base["weight"].float(), self.scale["weight"].float(),
                                      self.hc, self.eps, self.iters)
-        return (pre.unsqueeze(-1) * x).sum(2).cast(x.dtype), post, comb
+        return finish(pre, post, comb)
     flat = x.flatten(2).float()
     flat = flat * (flat.square().mean(-1, keepdim=True) + self.norm_eps).rsqrt()
     mixes = self.fn(flat)
@@ -305,7 +313,7 @@ class HyperConnection:
     if amd_custom_kernels_supported(mixes.device):
       # the (hc, hc) sinkhorn iterations are dozens of tiny dependent kernels: one fused kernel instead
       pre, post, comb = hc_prepare(mixes, base, scale, self.hc, self.eps, self.iters)
-      return (pre.unsqueeze(-1) * x).sum(2).cast(x.dtype), post, comb
+      return finish(pre, post, comb)
     B, T, _ = mixes.shape
     pre = (mixes[..., :self.hc] * scale[0] + base[:self.hc]).sigmoid() + self.eps
     post = (mixes[..., self.hc:2*self.hc] * scale[1] + base[self.hc:2*self.hc]).sigmoid() * 2
@@ -314,7 +322,7 @@ class HyperConnection:
     for _ in range(1, self.iters):
       comb = comb / (comb.sum(-1, keepdim=True) + self.eps)
       comb = comb / (comb.sum(-2, keepdim=True) + self.eps)
-    return (pre.unsqueeze(-1) * x).sum(2).cast(x.dtype), post, comb
+    return finish(pre, post, comb)
 
   @staticmethod
   def mix(x:Tensor, residual:Tensor, post:Tensor, comb:Tensor) -> Tensor:
@@ -382,19 +390,26 @@ class FFNBlock:
       elif gating == ExpertGating.SIGMOID:        scores = logits.sigmoid()
       elif gating == ExpertGating.SQRT_SOFTPLUS:  scores = logits.softplus().sqrt()
 
-      _, sel = pairwise_topk(scores if bias is None else scores + bias, self.config.num_experts_per_tok)
-      if gating == ExpertGating.SIGMOID and bias is not None and normalize_topk and amd_custom_kernels_supported(x.device) \
-          and all(isinstance(s, int) for s in logits.shape):
-        # fused: sigmoid gather + normalize + scale in one kernel
-        from tinygrad.llm.kernels.amd import router_probs
-        probs = router_probs(logits.reshape(-1, logits.shape[-1]), sel.reshape(-1, sel.shape[-1]),
-                             self.config.routed_scaling_factor).reshape(*sel.shape)
+      fast_sigmoid = gating == ExpertGating.SIGMOID and bias is not None and normalize_topk and amd_custom_kernels_supported(x.device) \
+          and all(isinstance(s, int) for s in logits.shape)
+      if fast_sigmoid and bias is not None and logits.shape[1] == 1 and 128 <= logits.shape[-1] <= 512 \
+          and self.config.num_experts_per_tok <= 8 and logits.dtype == bias.dtype == dtypes.float32:
+        from tinygrad.llm.kernels.amd import router_topk_probs
+        sel, probs = router_topk_probs(logits.reshape(-1, logits.shape[-1]), bias, self.config.num_experts_per_tok,
+                                      self.config.routed_scaling_factor)
+        sel, probs = sel.reshape(*logits.shape[:-1], -1), probs.reshape(*logits.shape[:-1], -1)
       else:
-        probs = scores.gather(-1, sel)
-        # SOFTMAX_WEIGHT applies softmax after top-k selection
-        if gating == ExpertGating.SOFTMAX_WEIGHT: probs = probs.softmax(-1)
-        if normalize_topk: probs = probs / probs.sum(axis=-1, keepdim=True)
-        probs = probs * self.config.routed_scaling_factor
+        _, sel = pairwise_topk(scores if bias is None else scores + bias, self.config.num_experts_per_tok)
+        if fast_sigmoid:
+          from tinygrad.llm.kernels.amd import router_probs
+          probs = router_probs(logits.reshape(-1, logits.shape[-1]), sel.reshape(-1, sel.shape[-1]),
+                               self.config.routed_scaling_factor).reshape(*sel.shape)
+        else:
+          probs = scores.gather(-1, sel)
+          # SOFTMAX_WEIGHT applies softmax after top-k selection
+          if gating == ExpertGating.SOFTMAX_WEIGHT: probs = probs.softmax(-1)
+          if normalize_topk: probs = probs / probs.sum(axis=-1, keepdim=True)
+          probs = probs * self.config.routed_scaling_factor
       x_down = self.ffn_down_exps(sel, _mcontig(self._expert_swiglu(sel, h)))  # (B, T, k, D)
       out = (x_down * probs.unsqueeze(-1)).sum(axis=2)  # (B, T, D)
       if hasattr(self, 'ffn_gate_shexp'):
@@ -424,11 +439,11 @@ class FFNBlock:
     def _run(x:Tensor, start_pos:int|UOp):
       if self.config.hc_mult:
         residual = x
-        h, post, comb = self.hc_attn.prepare(x)
-        x = self.hc_attn.mix(self._attention(self.attn_norm(h), start_pos), residual, post, comb)
+        h, post, comb = self.hc_attn.prepare(x, self.attn_norm)
+        x = self.hc_attn.mix(self._attention(h, start_pos), residual, post, comb)
         residual = x
-        h, post, comb = self.hc_ffn.prepare(x)
-        return _mcontig(self.hc_ffn.mix(self._feed_forward(self.ffn_norm(h)), residual, post, comb))
+        h, post, comb = self.hc_ffn.prepare(x, self.ffn_norm)
+        return _mcontig(self.hc_ffn.mix(self._feed_forward(h), residual, post, comb))
       h =     x + self._attention(self.attn_norm(x), start_pos)
       return (h + self._feed_forward(self.ffn_norm(h))).contiguous()
     return _run(x, start_pos)
@@ -973,8 +988,10 @@ class Transformer:
     return model, kv
 
   def warmup(self):
-    # chunk+1 prompt tokens: the last token captures the decode graph with the indexer pool cache already warm
-    for _ in range(2): list(zip(range(2), self.generate([0] * (self.prefill_chunk_size + 1))))
+    # Indexer decode requires a populated pool cache. Leave room for generated tokens even in small test models.
+    prompt_len = min(self.prefill_chunk_size + 1, max(1, self.max_context - 3)) if any(hasattr(b, "indexer") for b in self.blk) else 1
+    # Exercise capture AND replay with the previous output as input, including the alias-protection input copy.
+    for _ in range(2): list(zip(range(3), self.generate([0] * prompt_len)))
 
   def get_start_pos(self, tokens:list[int]) -> int:
     # recurrent state can't be partially reused after divergence: reuse it only when tokens extend the cached prefix
