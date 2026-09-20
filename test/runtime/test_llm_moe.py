@@ -117,6 +117,25 @@ class TestMoEFeedForward(unittest.TestCase):
     expected = moe_expected + shared_expected
     np.testing.assert_allclose(out.numpy(), expected, rtol=1e-2)
 
+  def test_moe_sigmoid_biased_router(self):
+    dim, hidden, num_experts, k = 8, 16, 128, 8
+    block = TransformerBlock(replace(_moe_config(dim, hidden, 2, num_experts, k), expert_gating_func=ExpertGating.SIGMOID,
+                                     norm_topk_prob=True, expert_bias=True, routed_scaling_factor=2.5))
+    logits = np.linspace(-3, 3, num_experts, dtype=np.float32)
+    bias = np.linspace(2, -2, num_experts, dtype=np.float32)
+    block.ffn_gate_exps.weight = Tensor(np.tile(np.eye(hidden, dim, dtype=np.float32), (num_experts, 1, 1)))
+    block.ffn_up_exps.weight = Tensor(np.eye(hidden, dim, dtype=np.float32)[None] *
+                                     np.arange(1, num_experts+1, dtype=np.float32)[:, None, None])
+    block.ffn_down_exps.weight = Tensor(np.tile(np.eye(dim, hidden, dtype=np.float32), (num_experts, 1, 1)))
+    block.ffn_gate_inp.weight = Tensor(np.repeat((logits / dim)[:, None], dim, axis=1))
+    block.exp_probs_b["bias"] = Tensor(bias)
+    out = block._feed_forward(Tensor.ones(2, 1, dim)).numpy()
+    scores = 1 / (1 + np.exp(-logits))
+    sel = np.argsort(-(scores + bias), kind="stable")[:k]
+    weights = scores[sel] / scores[sel].sum() * 2.5
+    expected = (weights * (sel + 1)).sum() / (1 + np.exp(-1))
+    np.testing.assert_allclose(out, expected, rtol=1e-4)
+
   def test_moe_feed_forward_gating_funcs(self):
     dim, hidden, n_heads = 8, 16, 2
     num_experts, k = 4, 2
