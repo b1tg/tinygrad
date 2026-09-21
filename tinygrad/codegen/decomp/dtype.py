@@ -104,7 +104,10 @@ def f2f(v, fr:DType, to:DType, sat=True):
     exp, norm = shr(nosign, fm), shl(nosign, tm - fm) + shl(tb - fb, tm)
     nan = shl(nosign, tm - fm) | shl((shl(1, te) - 1), tm)
     # e2m1 has no inf/nan: exp all ones is a finite value and there's no nan pattern
-    if fr in dtypes.fp4s: return (sign | exp.eq(0).where(0, norm)).bitcast(to)
+    if fr in dtypes.fp4s:
+      # the only subnormal is mantissa==1 -> 2^(1 - bias - fm); 0.5 for e2m1
+      subnorm = shl(tb + 1 - fb - fm, tm)
+      return (sign | exp.ne(0).where(norm, nosign.ne(0).where(subnorm, 0))).bitcast(to)
     if fr in dtypes.fp8_fnuz:
       fnuz_nan = sign.ne(0) & nosign.eq(0)
       qnan = shl(shl(1, te) - 1, tm) | shl(1, tm - 1)
@@ -132,6 +135,22 @@ def f2f_clamp(val:UOp, dt:DType, sat=True) -> UOp:
   sat = mx if dt in (*dtypes.fp4s, *dtypes.fp8s) and sat else val.const_like(float('inf'))
   # FIXME: CMPLT of nan is undefined
   return val.ne(val).where(val, (val < -mx).where(-sat, (mx < val).where(sat, val)))
+
+# the float comparison chain below rounds without a lossy fp4 subnormal flush; it mirrors dtype.float_to_fp4
+def f2f_fp4_bits(val:UOp, to:DType) -> UOp:
+  a = val.abs()
+  mag = (a > 0.25).where(a.const_like(0.5), a.const_like(0.0))
+  mag = (a >= 0.75).where(a.const_like(1.0), mag)
+  mag = (a > 1.25).where(a.const_like(1.5), mag)
+  mag = (a >= 1.75).where(a.const_like(2.0), mag)
+  mag = (a > 2.5).where(a.const_like(3.0), mag)
+  mag = (a >= 3.5).where(a.const_like(4.0), mag)
+  mag = (a > 5.0).where(a.const_like(6.0), mag)
+  bits = mag.eq(0.0).where(a.const_like(0), mag.eq(0.5).where(a.const_like(1), mag.eq(1.0).where(a.const_like(2),
+         mag.eq(1.5).where(a.const_like(3), mag.eq(2.0).where(a.const_like(4), mag.eq(3.0).where(a.const_like(5),
+         mag.eq(4.0).where(a.const_like(6), a.const_like(7))))))))
+  bits = val.ne(val).where(a.const_like(7), bits).cast(dtypes.uint8)  # nan saturates to the largest normal
+  return bits | shl(shr(val.bitcast(dtypes.uint32), 31).cast(dtypes.uint8), to.bitsize - 1)
 
 def f2f_load(x: UOp, fr:DType, to:DType) -> UOp:
   storage_idx = graph_rewrite(x.src[0], pm_float_decomp, ctx=(fr, to), bottom_up=True)
@@ -189,7 +208,7 @@ pm_float_decomp: PatternMatcher = PatternMatcher([
    graph_rewrite(ld.src[0], pm_float_decomp, ctx=ctx, bottom_up=True).load(*ld.src[1:]).bitcast(bc.dtype) if ld.dtype == ctx[0] else None),
   # bitcast from a sub-byte float exposes its raw storage bits (one byte per element)
   (UPat(Ops.BITCAST, src=(UPat.var("x", dtypes.floats),), name="bc"), lambda ctx,bc,x:
-   bc.replace(src=(f2f(x.bitcast(f2f_dt[ctx[1]]), ctx[1], ctx[0]).bitcast(f2f_dt[ctx[0]]),))
+   bc.replace(src=(f2f_fp4_bits(x, ctx[0]),))
    if ctx[0] in dtypes.fp4s and x.dtype == ctx[1] and bc.dtype.itemsize == 1 else None),
   # bitcast from
   (UPat(Ops.BITCAST, src=(UPat.var("x", dtypes.floats),), name="bc"), lambda ctx,bc,x:
