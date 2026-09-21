@@ -73,7 +73,8 @@ class DType(metaclass=DTypeMetaClass):
   @functools.cached_property
   def max(self):
     if dtypes.is_int(self): return 2**(self.bitsize)-1+self.min
-    # e4m3 and the fnuz fp8s have no inf: their largest value is the largest normal
+    # e2m1 and the no-inf fp8s have no inf: their largest value is the largest normal
+    if self in dtypes.fp4s: return fp4_to_float(_fp4_cfg[self][5], self)
     if self in dtypes.fp8s and self is not dtypes.fp8e5m2: return fp8_to_float(_fp8_cfg[self][5], self)
     return float("inf") if dtypes.is_float(self) else True
   def const(self, val: ConstType):
@@ -114,6 +115,7 @@ class DTypes:
     """(exponent, mantissa)"""
     if not dtypes.is_float(dtype): raise ValueError(f"{dtype} is not a floating point type")
     return {dtypes.float16: (5, 10), dtypes.bfloat16: (8, 7), dtypes.float32: (8, 23), dtypes.float64: (11, 52),
+            dtypes.fp4e2m1: (2, 1),
             dtypes.fp8e4m3: (4, 3), dtypes.fp8e5m2: (5, 2), dtypes.fp8e4m3fnuz: (4, 3), dtypes.fp8e5m2fnuz: (5, 2)}[dtype]
   void: Final[DType] = DType.new(-1, 0, "void", None)
   weakint: Final[DType] = DType.new(0, 800, "weakint", None)  # the weak int position in the promo lattice
@@ -127,6 +129,7 @@ class DTypes:
   int64: Final[DType] = DType.new(7, 64, "long", 'q')
   uint64: Final[DType] = DType.new(8, 64, "unsigned long", 'Q')
   weakfloat: Final[DType] = DType.new(9, 800, "weakfloat", None)
+  fp4e2m1: Final[DType] = DType.new(10, 4, "float4_e2m1", None)
   fp8e4m3: Final[DType] = DType.new(10, 8, "float8_e4m3", None)
   fp8e5m2: Final[DType] = DType.new(11, 8, "float8_e5m2", None)
   fp8e4m3fnuz: Final[DType] = DType.new(10, 8, "float8_e4m3fnuz", None)
@@ -146,10 +149,12 @@ class DTypes:
   @property
   def default_int(self) -> DType: return to_dtype(DEFAULT_INT.value)
 
+  fp4_ocp = (fp4e2m1,)
+  fp4s = fp4_ocp
   fp8_ocp = (fp8e4m3, fp8e5m2)
   fp8_fnuz = (fp8e4m3fnuz, fp8e5m2fnuz)
   fp8s = fp8_ocp + fp8_fnuz
-  floats = fp8s + (float16, bfloat16, float32, float64)
+  floats = fp4s + fp8s + (float16, bfloat16, float32, float64)
   int8s = (uint8, int8)
   int16s = (uint16, int16)
   int32s = (uint32, int32)
@@ -181,7 +186,8 @@ promo_lattice = { dtypes.bool: [dtypes.weakint], dtypes.weakint: [dtypes.int8, d
   dtypes.int8: [dtypes.int16], dtypes.int16: [dtypes.int32], dtypes.int32: [dtypes.int64],
   dtypes.int64: [dtypes.weakfloat], dtypes.uint8: [dtypes.int16, dtypes.uint16], dtypes.uint16: [dtypes.int32, dtypes.uint32],
   dtypes.uint32: [dtypes.int64, dtypes.uint64], dtypes.uint64: [dtypes.weakfloat],
-  dtypes.weakfloat: [dtypes.fp8e4m3, dtypes.fp8e5m2, dtypes.fp8e4m3fnuz, dtypes.fp8e5m2fnuz],
+  dtypes.weakfloat: [dtypes.fp4e2m1, dtypes.fp8e4m3, dtypes.fp8e5m2, dtypes.fp8e4m3fnuz, dtypes.fp8e5m2fnuz],
+  dtypes.fp4e2m1: [dtypes.fp8e4m3, dtypes.fp8e5m2, dtypes.fp8e4m3fnuz, dtypes.fp8e5m2fnuz, dtypes.float16, dtypes.bfloat16],
   dtypes.fp8e4m3: [dtypes.float16, dtypes.bfloat16], dtypes.fp8e5m2: [dtypes.float16, dtypes.bfloat16],
   dtypes.fp8e4m3fnuz: [dtypes.float16, dtypes.bfloat16], dtypes.fp8e5m2fnuz: [dtypes.float16, dtypes.bfloat16],
   dtypes.float16: [dtypes.float32], dtypes.bfloat16: [dtypes.float32], dtypes.float32: [dtypes.float64], }
@@ -205,10 +211,11 @@ def can_lossless_cast(dt0:DType, dt1:DType) -> bool:
   if dt0 == dt1 or dt0 == dtypes.bool: return True
   match dt1:
     case dtypes.weakint: return dt0 in dtypes.ints
-    case dtypes.double: return dt0 in (dtypes.float, dtypes.half, dtypes.bfloat16, *dtypes.fp8s,
+    case dtypes.double: return dt0 in (dtypes.float, dtypes.half, dtypes.bfloat16, *dtypes.fp4s, *dtypes.fp8s,
       dtypes.uint32, dtypes.uint16, dtypes.uint8, dtypes.int32, dtypes.int16, dtypes.int8)
-    case dtypes.float: return dt0 in (dtypes.half, dtypes.bfloat16, *dtypes.fp8s, dtypes.uint16, dtypes.uint8, dtypes.int16, dtypes.int8)
-    case dtypes.half: return dt0 in (*dtypes.fp8s, dtypes.uint8, dtypes.int8)
+    case dtypes.float: return dt0 in (dtypes.half, dtypes.bfloat16, *dtypes.fp4s, *dtypes.fp8s, dtypes.uint16, dtypes.uint8,
+      dtypes.int16, dtypes.int8)
+    case dtypes.half: return dt0 in (*dtypes.fp4s, *dtypes.fp8s, dtypes.uint8, dtypes.int8)
     case dtypes.uint64: return dt0 in (dtypes.uint32, dtypes.uint16, dtypes.uint8)
     case dtypes.uint32: return dt0 in (dtypes.uint16, dtypes.uint8)
     case dtypes.uint16: return dt0 in (dtypes.uint8,)
@@ -281,21 +288,60 @@ def fp8_to_float(x: int, dtype: DType) -> float:
   val = (mantissa / (mant_max + 1)) * 2 ** (1 - bias) if exp == 0 else (1 + mantissa / (mant_max + 1)) * 2 ** (exp - bias)
   return -val if sign else val
 
-def storage_fmt_for_dtype(dtype:DType): return 'H' if dtype == dtypes.bfloat16 else 'B' if dtype in dtypes.fp8s else dtype.fmt
+def storage_fmt_for_dtype(dtype:DType): return 'H' if dtype == dtypes.bfloat16 else 'B' if dtype in (*dtypes.fp4s, *dtypes.fp8s) else dtype.fmt
+
+# fp4-float conversions, e2m1 has no inf/nan so non-finite saturates to the largest normal
+# (bias, sig_bits, mant_mask, min_denorm_half, ovf_threshold, max_norm, min_norm)
+_fp4_cfg = {
+  dtypes.fp4e2m1: (1, 2, 0x1, 0x3FD0000000000000, 0x401C000000000000, 0x7, 0x3FF0000000000000),
+}
+
+def float_to_fp4(x: float, dtype: DType) -> int:
+  assert dtype in dtypes.fp4s, "Only for fp4s"
+  if not math.isfinite(x): return 0x7 | (0x8 if math.copysign(1, x) < 0 else 0)
+  bias, sig_bits, mant_mask, min_denorm_half, ovf_threshold, max_norm, min_norm = _fp4_cfg[dtype]
+  xbits, = struct.unpack('Q', struct.pack('d', x))
+  half_ulp = 1 << (52 - sig_bits)
+  sign, exp, mantissa, absx = ((xbits>>63)&1)<<3, ((xbits>>52)&0x7FF)-1023+bias, (xbits>>(53-sig_bits))&mant_mask, xbits&0x7FFFFFFFFFFFFFFF
+  if absx <= min_denorm_half: res = 0
+  elif absx > ovf_threshold: res = max_norm
+  elif absx >= min_norm:
+    res, round_bits = (exp << (sig_bits - 1)) | mantissa, xbits & ((half_ulp << 1) - 1)
+    if round_bits > half_ulp or (round_bits == half_ulp and mantissa & 1): res += 1
+  else:
+    shift = 1 - exp
+    mantissa |= 1 << (sig_bits - 1)
+    res, half = mantissa >> shift, half_ulp << shift
+    round_bits = (xbits | (1 << 52)) & ((half << 1) - 1)
+    if round_bits > half or (round_bits == half and res & 1): res += 1
+  return int(min(res, max_norm) | sign)  # rounding up past the largest normal saturates
+
+def fp4_to_float(x: int, dtype: DType) -> float:
+  assert dtype in dtypes.fp4s, "Only for fp4s"
+  if (x & 0x7) == 0: return -0.0 if x & 0x8 else 0.0
+  bias, sig_bits, *_ = _fp4_cfg[dtype]
+  mant_bits, exp_bits = sig_bits - 1, 4 - sig_bits
+  exp_max, mant_max = (1 << exp_bits) - 1, (1 << mant_bits) - 1
+  sign, exp, mantissa = (x >> 3) & 1, (x >> mant_bits) & exp_max, x & mant_max
+  val = (mantissa / (mant_max + 1)) * 2 ** (1 - bias) if exp == 0 else (1 + mantissa / (mant_max + 1)) * 2 ** (exp - bias)
+  return -val if sign else val
 
 def to_storage_scalar(x, dtype:DType):
   if dtype == dtypes.half: return float_to_fp16(x)
   if dtype == dtypes.bfloat16: return (struct.unpack('I', struct.pack('f', float_to_bf16(x)))[0] >> 16) & 0xFFFF
+  if dtype in dtypes.fp4s: return float_to_fp4(float(x), dtype)
   if dtype in dtypes.fp8s: return float_to_fp8(float(x), dtype)
   return x
 
 def from_storage_scalar(x, dtype:DType):
   if dtype == dtypes.bfloat16: return struct.unpack('f', struct.pack('I', (x & 0xFFFF) << 16))[0]
+  if dtype in dtypes.fp4s: return fp4_to_float(int(x), dtype)
   if dtype in dtypes.fp8s: return fp8_to_float(int(x), dtype)
   return x
 
 truncate: dict[DType, Callable] = {dtypes.bool: bool,
   dtypes.float16: float_to_fp16, dtypes.bfloat16: lambda x: float_to_bf16(float(x)),
+  **{fp4: (lambda x, dtype=fp4: fp4_to_float(float_to_fp4(x, dtype), dtype)) for fp4 in dtypes.fp4s},
   **{fp8: (lambda x, dtype=fp8: fp8_to_float(float_to_fp8(x, dtype), dtype)) for fp8 in dtypes.fp8s},
   **{getattr(dtypes, n): (lambda x, c=getattr(ctypes, f'c_{n}'): c(x).value)
      for n in ('float', 'double', 'int8', 'int16', 'int32', 'int64', 'uint8', 'uint16', 'uint32', 'uint64')}}
@@ -310,7 +356,7 @@ def bitcast(x, in_dtype:DType, out_dtype:DType):
 
 def _to_np_dtype(dtype:DType) -> type|None:
   import numpy as np
-  if dtype in { dtypes.bfloat16, *dtypes.fp8s }: return np.float32
+  if dtype in { dtypes.bfloat16, *dtypes.fp4s, *dtypes.fp8s }: return np.float32
   return np.dtype(dtype.fmt).type if dtype.fmt is not None else None
 def _from_np_dtype(npdtype:'np.dtype') -> DType: # type: ignore [name-defined] # noqa: F821
   import numpy as np
@@ -322,7 +368,7 @@ def _to_torch_dtype(dtype:DType) -> 'torch.dtype'|None:  # type: ignore [name-de
   dtype = strong_dtype(dtype)
   if dtype == dtypes.uint64: return torch.uint64
   if dtype == dtypes.bfloat16: return torch.bfloat16
-  if dtype in dtypes.fp8s: return torch.uint8
+  if dtype in (*dtypes.fp4s, *dtypes.fp8s): return torch.uint8
   # NOTE: torch doesn't expose this mapping with a stable API
   try: return torch.from_numpy(np.array([], dtype=_to_np_dtype(dtype))).dtype
   except TypeError: return None

@@ -1,6 +1,7 @@
 import unittest, math, struct, operator
 from tinygrad import Tensor, Device
-from tinygrad.dtype import DTYPES_DICT, dtypes, Invalid, truncate, float_to_fp16, float_to_bf16, _to_np_dtype, least_upper_dtype, least_upper_float
+from tinygrad.dtype import DTYPES_DICT, dtypes, Invalid, truncate, float_to_fp16, float_to_bf16, fp4_to_float, _to_np_dtype, \
+                            least_upper_dtype, least_upper_float
 
 from tinygrad.helpers import getenv, Context
 from hypothesis import given, settings, strategies as strat
@@ -16,6 +17,7 @@ dtype_floats = [dt for dt in core_dtypes if dtypes.is_float(dt) and dt in Device
 
 FP8E4M3_MAX = 448.0
 FP8E5M2_MAX = 57344.0
+FP4E2M1_MAX = 6.0
 
 def u32_to_f32(u): return struct.unpack('f', struct.pack('I', u))[0]
 def f32_to_u32(f): return struct.unpack('I', struct.pack('f', f))[0]
@@ -51,6 +53,9 @@ class TestHelpers(unittest.TestCase):
     assert dtypes.is_float(dtypes.fp8e4m3)
     assert dtypes.is_float(dtypes.fp8e5m2)
 
+  def test_fp4_is_float(self):
+    assert dtypes.is_float(dtypes.fp4e2m1)
+
   def test_from_py(self):
     assert dtypes.from_py(True) == dtypes.bool
     assert dtypes.from_py(Invalid) == dtypes.bool
@@ -71,8 +76,8 @@ class TestHelpers(unittest.TestCase):
   def test_dtype_range(self):
     for dt in core_dtypes:
       if dtypes.is_float(dt):
-        # e4m3 and the fnuz fp8s have no inf: their range ends at the largest normal
-        finite = {dtypes.fp8e4m3: FP8E4M3_MAX, dtypes.fp8e4m3fnuz: 240.0, dtypes.fp8e5m2fnuz: FP8E5M2_MAX}
+        # e2m1 and the no-inf fp8s have no inf: their range ends at the largest normal
+        finite = {dtypes.fp4e2m1: FP4E2M1_MAX, dtypes.fp8e4m3: FP8E4M3_MAX, dtypes.fp8e4m3fnuz: 240.0, dtypes.fp8e5m2fnuz: FP8E5M2_MAX}
         self.assertEqual(dt.min, -finite.get(dt, math.inf))
         self.assertEqual(dt.max, finite.get(dt, math.inf))
       elif dtypes.is_int(dt):
@@ -176,6 +181,16 @@ class TestHelpers(unittest.TestCase):
     elif x < -FP8E5M2_MAX: np.testing.assert_equal(truncate[dtypes.fp8e5m2](x), -FP8E5M2_MAX)
     else: np.testing.assert_equal(truncate[dtypes.fp8e5m2](x), torch.tensor(x, dtype=torch.float8_e5m2).float().item())
 
+  def test_truncate_fp4e2m1(self):
+    # e2m1 has no inf/nan, so non-finite saturates to the largest normal. rounds to nearest, ties to even.
+    case = [(0.0, 0.0), (-0.0, -0.0), (0.24, 0.0), (0.25, 0.0), (0.3, 0.5), (0.5, 0.5), (0.75, 1.0), (1.0, 1.0), (1.1, 1.0),
+            (1.25, 1.0), (1.5, 1.5), (1.75, 2.0), (2.0, 2.0), (3.0, 3.0), (4.0, 4.0), (5.0, 4.0), (6.0, 6.0), (6.9, 6.0),
+            (7.0, 6.0), (7.1, 6.0), (8.0, 6.0), (100.0, 6.0), (-0.3, -0.5), (-5.0, -4.0), (-100.0, -6.0),
+            (math.inf, 6.0), (-math.inf, -6.0), (math.nan, 6.0)]
+    for x, y in case: np.testing.assert_equal(truncate[dtypes.fp4e2m1](x), y, err_msg=f"truncate({x})")
+    # every bit pattern round trips
+    for i in range(16): np.testing.assert_equal(truncate[dtypes.fp4e2m1](fp4_to_float(i, dtypes.fp4e2m1)), fp4_to_float(i, dtypes.fp4e2m1))
+
   def test_finfo(self):
     for dt in [dtypes.float16, dtypes.float32, dtypes.float64]:
       info = np.finfo(_to_np_dtype(dt))
@@ -220,6 +235,12 @@ class TestTypePromotion(unittest.TestCase):
     assert least_upper_dtype(dtypes.fp8e4m3, dtypes.uint64) == dtypes.fp8e4m3
     assert least_upper_dtype(dtypes.fp8e5m2, dtypes.int64) == dtypes.fp8e5m2
     assert least_upper_dtype(dtypes.fp8e5m2, dtypes.uint64) == dtypes.fp8e5m2
+    assert least_upper_dtype(dtypes.fp4e2m1, dtypes.fp8e4m3) == dtypes.fp8e4m3
+    assert least_upper_dtype(dtypes.fp4e2m1, dtypes.fp8e5m2) == dtypes.fp8e5m2
+    assert least_upper_dtype(dtypes.fp4e2m1, dtypes.float16) == dtypes.float16
+    assert least_upper_dtype(dtypes.fp4e2m1, dtypes.bfloat16) == dtypes.bfloat16
+    assert least_upper_dtype(dtypes.fp4e2m1, dtypes.int64) == dtypes.fp4e2m1
+    assert least_upper_dtype(dtypes.fp4e2m1, dtypes.uint64) == dtypes.fp4e2m1
 
   def test_weakint_promo(self):
     assert least_upper_dtype(dtypes.weakint, dtypes.weakint) == dtypes.weakint
@@ -247,7 +268,7 @@ class TestTypeSpec(unittest.TestCase):
       with Context(DEFAULT_INT=default_int):
         assert dtypes.default_int == default_int
 
-    for default_float in [*dtypes.fp8s, dtypes.float16, dtypes.bfloat16, dtypes.float32, dtypes.float64]:
+    for default_float in [*dtypes.fp4s, *dtypes.fp8s, dtypes.float16, dtypes.bfloat16, dtypes.float32, dtypes.float64]:
       with Context(DEFAULT_FLOAT=default_float):
         assert dtypes.default_float == default_float
 
@@ -334,6 +355,7 @@ class TestAutoCastType(unittest.TestCase):
     assert (Tensor([0, 1], dtype=dtypes.uint64)).sum().dtype == dtypes.uint64
     assert (Tensor([0, 1], dtype=dtypes.fp8e4m3)).sum().dtype == dtypes.fp8e4m3
     assert (Tensor([0, 1], dtype=dtypes.fp8e5m2)).sum().dtype == dtypes.fp8e5m2
+    assert (Tensor([0, 1], dtype=dtypes.fp4e2m1)).sum().dtype == dtypes.fp4e2m1
     assert (Tensor([0, 1], dtype=dtypes.float16)).sum().dtype == dtypes.float16
     assert (Tensor([0, 1], dtype=dtypes.bfloat16)).sum().dtype == dtypes.bfloat16
     assert (Tensor([0, 1], dtype=dtypes.float32)).sum().dtype == dtypes.float32
@@ -351,6 +373,7 @@ class TestAutoCastType(unittest.TestCase):
     assert (Tensor([0, 1], dtype=dtypes.uint64)).mean().dtype == dtypes.float32
     assert (Tensor([0, 1], dtype=dtypes.fp8e4m3)).mean().dtype == dtypes.fp8e4m3
     assert (Tensor([0, 1], dtype=dtypes.fp8e5m2)).mean().dtype == dtypes.fp8e5m2
+    assert (Tensor([0, 1], dtype=dtypes.fp4e2m1)).mean().dtype == dtypes.fp4e2m1
     assert (Tensor([0, 1], dtype=dtypes.float16)).mean().dtype == dtypes.float16
     assert (Tensor([0, 1], dtype=dtypes.bfloat16)).mean().dtype == dtypes.bfloat16
     assert (Tensor([0, 1], dtype=dtypes.float32)).mean().dtype == dtypes.float32
@@ -368,6 +391,7 @@ class TestAutoCastType(unittest.TestCase):
     assert (Tensor([0, 1], dtype=dtypes.uint64)).cumsum(0).dtype == dtypes.uint64
     assert (Tensor([0, 1], dtype=dtypes.fp8e4m3)).cumsum(0).dtype == dtypes.fp8e4m3
     assert (Tensor([0, 1], dtype=dtypes.fp8e5m2)).cumsum(0).dtype == dtypes.fp8e5m2
+    assert (Tensor([0, 1], dtype=dtypes.fp4e2m1)).cumsum(0).dtype == dtypes.fp4e2m1
     assert (Tensor([0, 1], dtype=dtypes.float16)).cumsum(0).dtype == dtypes.float16
     assert (Tensor([0, 1], dtype=dtypes.bfloat16)).cumsum(0).dtype == dtypes.bfloat16
     assert (Tensor([0, 1], dtype=dtypes.float32)).cumsum(0).dtype == dtypes.float32

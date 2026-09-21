@@ -20,6 +20,7 @@ FP8E4M3_MAX = 448.0
 FP8E5M2_MAX = 57344.0
 FP8E4M3FNUZ_MAX = 240.0
 FP8E5M2FNUZ_MAX = 57344.0
+FP4E2M1_MAX = 6.0
 
 def _assert_eq(tensor:Tensor, target_dtype:DType, target, tol_target_dtype:float=1e-7):
   if DEBUG >= 2: print(tensor.numpy())

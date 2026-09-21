@@ -92,7 +92,7 @@ def split_l2i(ctx:dict, op: Ops, dt: DType, *uops:UOp):
   return ctx[key]
 
 # ***** floats *****
-f2f_dt = { f:getattr(dtypes, f"uint{f.bitsize}") for f in dtypes.floats }
+f2f_dt = { f:(getattr(dtypes, f"uint{f.bitsize}") if f.bitsize >= 8 else dtypes.uint8) for f in dtypes.floats }
 
 def rne(v: UOp, s) -> UOp: return shr(v, s) + ((shr(v, s - 1) & 1) & ((v & ((1 << (s - 1)) - 1)).ne(0) | (shr(v, s) & 1)))
 
@@ -103,11 +103,13 @@ def f2f(v, fr:DType, to:DType, sat=True):
     sign, nosign = shl((v & shl(1, fs-1)).cast(f2f_dt[to]), ts - fs), (v & (shl(1, fs-1) - 1)).cast(f2f_dt[to])
     exp, norm = shr(nosign, fm), shl(nosign, tm - fm) + shl(tb - fb, tm)
     nan = shl(nosign, tm - fm) | shl((shl(1, te) - 1), tm)
+    # e2m1 has no inf/nan: exp all ones is a finite value and there's no nan pattern
+    if fr in dtypes.fp4s: return (sign | exp.eq(0).where(0, norm)).bitcast(to)
     if fr in dtypes.fp8_fnuz:
       fnuz_nan = sign.ne(0) & nosign.eq(0)
       qnan = shl(shl(1, te) - 1, tm) | shl(1, tm - 1)
       return fnuz_nan.where(qnan, sign | exp.eq(0).where(0, norm)).bitcast(to)
-    # fp8e4m3 has only one nan
+    # fp8e4m3 and fp4 have only one nan
     is_nan = (nosign.eq(shl(1, fm + fe) - 1) if fr == dtypes.fp8e4m3 else exp.eq(shl(1, fe) - 1))
     return (sign | exp.eq(0).where(0, is_nan.where(nan, norm))).bitcast(to)
   elif fe >= te and fm > tm:
@@ -115,7 +117,7 @@ def f2f(v, fr:DType, to:DType, sat=True):
     sign, nosign = shr(v, fs - ts) & shl(1, ts - 1), v & (shl(1, fs - 1) - 1)
     norm = (rne(nosign, fm - tm) - shl(fb - tb, tm)).cast(f2f_dt[to])
     underflow = (shr(v, fm) & (shl(1, fe) - 1)) < (1 + fb - tb)
-    nan_mantissa = (shl(1, tm) - 1) if to == dtypes.fp8e4m3 else (shr(nosign, fm - tm) & (shl(1, tm) - 1))
+    nan_mantissa = (shl(1, tm) - 1) if to in (*dtypes.fp4s, dtypes.fp8e4m3) else (shr(nosign, fm - tm) & (shl(1, tm) - 1))
     nan = (sign | nan_mantissa | shl(shl(1, te) - 1, tm)).cast(f2f_dt[to])
     is_nan = (shr(v, fm) & (shl(1, fe) - 1)).eq(shl(1, fe) - 1)
     if to in dtypes.fp8_fnuz: return is_nan.where(shl(1, ts - 1), underflow.where(0, sign.cast(f2f_dt[to]) | norm))
@@ -124,10 +126,10 @@ def f2f(v, fr:DType, to:DType, sat=True):
 
 def f2f_clamp(val:UOp, dt:DType, sat=True) -> UOp:
   e, m = dtypes.finfo(dt)
-  if dt in dtypes.fp8_fnuz: max_exp, max_man = (1 << e) - 1, (1 << m) - 1
+  if dt in (*dtypes.fp4s, *dtypes.fp8_fnuz): max_exp, max_man = (1 << e) - 1, (1 << m) - 1
   else: max_exp, max_man = ((1 << e) - 1, (1 << m) - 2) if dt == dtypes.fp8e4m3 else ((1 << e) - 2, (1 << m) - 1)
   mx = val.const_like(2.0**(max_exp - exponent_bias(dt)) * (1.0 + max_man / (1 << m)))
-  sat = mx if dt in dtypes.fp8s and sat else val.const_like(float('inf'))
+  sat = mx if dt in (*dtypes.fp4s, *dtypes.fp8s) and sat else val.const_like(float('inf'))
   # FIXME: CMPLT of nan is undefined
   return val.ne(val).where(val, (val < -mx).where(-sat, (mx < val).where(sat, val)))
 
@@ -185,6 +187,10 @@ pm_float_decomp: PatternMatcher = PatternMatcher([
   # bitcasted load should just replace load
   (UPat(Ops.BITCAST, src=(UPat(Ops.LOAD, name="ld"),), name="bc"), lambda ctx,bc,ld:
    graph_rewrite(ld.src[0], pm_float_decomp, ctx=ctx, bottom_up=True).load(*ld.src[1:]).bitcast(bc.dtype) if ld.dtype == ctx[0] else None),
+  # bitcast from a sub-byte float exposes its raw storage bits (one byte per element)
+  (UPat(Ops.BITCAST, src=(UPat.var("x", dtypes.floats),), name="bc"), lambda ctx,bc,x:
+   bc.replace(src=(f2f(x.bitcast(f2f_dt[ctx[1]]), ctx[1], ctx[0]).bitcast(f2f_dt[ctx[0]]),))
+   if ctx[0] in dtypes.fp4s and x.dtype == ctx[1] and bc.dtype.itemsize == 1 else None),
   # bitcast from
   (UPat(Ops.BITCAST, src=(UPat.var("x", dtypes.floats),), name="bc"), lambda ctx,bc,x:
    bc.replace(src=(f2f(x.bitcast(f2f_dt[ctx[1]]), ctx[1], ctx[0]),)) if x.dtype == ctx[1] and bc.dtype.bitsize == ctx[0].bitsize else None),
@@ -213,7 +219,7 @@ def do_dtype_decomps(sink:UOp, ctx:tuple[set[DType], Renderer]) -> UOp:
 
 pm_dtype_decomps = PatternMatcher([
   # detect dtypes to decompose
-  (UPat(GroupOp.All, (*dtypes.fp8s, dtypes.bfloat16, dtypes.half, dtypes.long, dtypes.ulong), name="x"), lambda x,ctx:
+  (UPat(GroupOp.All, (*dtypes.fp4s, *dtypes.fp8s, dtypes.bfloat16, dtypes.half, dtypes.long, dtypes.ulong), name="x"), lambda x,ctx:
    ctx[0].add({dtypes.ulong:dtypes.long}.get(dt:=x.dtype, dt))),
   # do the rewrites
   (UPat(Ops.SINK, name="sink"), do_dtype_decomps),

@@ -420,7 +420,7 @@ class Tensor(RandMixin):
     ```
     """
     # TODO: remove half once minimum python supports it
-    if self.dtype in (dtypes.half, dtypes.bfloat16, *dtypes.fp8s): return self.cast(dtypes.float32).tolist()
+    if self.dtype in (dtypes.half, dtypes.bfloat16, *dtypes.fp4s, *dtypes.fp8s): return self.cast(dtypes.float32).tolist()
     if 0 in self.shape:
       assert all_int(self.shape), f"no data if shape is symbolic, {self.shape=}"
       def _tolist(shape:tuple[int, ...]): return [_tolist(shape[1:]) for _ in range(shape[0])]
@@ -439,7 +439,7 @@ class Tensor(RandMixin):
     if self.dtype in dtypes.weaks: return self.cast(self.commit_dtype()).numpy()
     assert all_int(self.shape), f"no data if shape is symbolic, {self.shape=}"
     import numpy as np
-    if self.dtype in { dtypes.bfloat16, *dtypes.fp8s }: return self.float().numpy()
+    if self.dtype in { dtypes.bfloat16, *dtypes.fp4s, *dtypes.fp8s }: return self.float().numpy()
     if 0 in self.shape: return np.empty(self.shape, dtype=_to_np_dtype(self.dtype))
     return self._buffer().numpy().reshape(self.shape)
 

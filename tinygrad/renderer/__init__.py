@@ -83,5 +83,5 @@ class Renderer:
   def render(self, uops:list[UOp]) -> str: raise NotImplementedError("needs a renderer")
   def asm(self, prg:UOp, lin:UOp) -> bytes: raise NotImplementedError("needs an assembler")
   def supported_dtypes(self) -> set[DType]:
-    # double can't be bitcast to anything without long support
-    return set(dtypes.all) - ({dtypes.double} if dtypes.long in EMULATED_DTYPES.tolist(dtypes) else set())
+    # fp4 is emulated everywhere but the PYTHON backend. double can't be bitcast to anything without long support
+    return set(dtypes.all) - set(dtypes.fp4s) - ({dtypes.double} if dtypes.long in EMULATED_DTYPES.tolist(dtypes) else set())

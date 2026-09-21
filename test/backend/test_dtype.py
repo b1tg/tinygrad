@@ -3,7 +3,8 @@ import numpy as np
 import torch
 from typing import Any, List
 from tinygrad.helpers import getenv, DEBUG, EMULATED_DTYPES, DEV
-from tinygrad.dtype import DType, DTYPES_DICT, least_upper_dtype, fp8_to_float, float_to_fp8, _to_np_dtype, _to_torch_dtype, truncate
+from tinygrad.dtype import DType, DTYPES_DICT, least_upper_dtype, fp8_to_float, float_to_fp8, float_to_fp4, fp4_to_float, \
+                            _to_np_dtype, _to_torch_dtype, truncate
 from tinygrad.renderer.ptx import PTXRenderer
 from tinygrad.renderer.nir import NIRRenderer
 from tinygrad import Context, Device, Tensor, dtypes
@@ -19,15 +20,16 @@ settings.load_profile("my_profile")
 supported_dtypes = Device[Device.DEFAULT].renderer.supported_dtypes()
 
 def get_available_cast_dtypes(dtype: DType) -> List[DType]:
-  emulatable = dtypes.fp8s+(dtypes.half,dtypes.bfloat16,dtypes.long)
+  emulatable = dtypes.fp4s+dtypes.fp8s+(dtypes.half,dtypes.bfloat16,dtypes.long)
   dts = [v for v in dict.fromkeys(DTYPES_DICT.values()) if v != dtype and (v in supported_dtypes or v in emulatable)]
   if dtype in (dtypes.long, dtypes.ulong) and (dtype not in supported_dtypes or dtypes.long in EMULATED_DTYPES.tolist(dtypes)):
     return [dt for dt in dts if dt != dtypes.double] # can't bitcast with no 64-bit support
-  if dtype not in supported_dtypes and dtype not in dtypes.fp8s+(dtypes.half,dtypes.bfloat16): return []
+  if dtype not in supported_dtypes and dtype not in dtypes.fp4s+dtypes.fp8s+(dtypes.half,dtypes.bfloat16): return []
   return dts
 
 def _to_torch_storage(a:Tensor) -> torch.Tensor:
-  # tolist() of an fp8 Tensor gives floats, so convert and store in uint8
+  # tolist() of an fp8/fp4 Tensor gives floats, so convert and store in uint8
+  if a.dtype in dtypes.fp4s: return torch.tensor([float_to_fp4(x, a.dtype) for x in a.flatten().tolist()], dtype=torch.uint8).reshape(a.shape)
   if a.dtype in dtypes.fp8s: return torch.tensor([float_to_fp8(x, a.dtype) for x in a.flatten().tolist()], dtype=torch.uint8).reshape(a.shape)
   return torch.tensor(a.tolist(), dtype=_to_torch_dtype(a.dtype))
 
@@ -52,10 +54,11 @@ def _test_cast(a:Tensor, target_dtype:DType):
     a = (a.abs() < mn).where(0, a)
 
   expected = list(a.numpy().astype(_to_np_dtype(target_dtype)))
-  if target_dtype in dtypes.fp8s: expected = [truncate[target_dtype](x) for x in expected]
+  if target_dtype in (*dtypes.fp4s, *dtypes.fp8s): expected = [truncate[target_dtype](x) for x in expected]
   _test_op(lambda: a.cast(target_dtype), target_dtype, expected)
 def _test_bitcast(a:Tensor, target_dtype:DType, target=None):
   expected = _to_torch_storage(a).view(_to_torch_dtype(target_dtype)).tolist()
+  if target_dtype in dtypes.fp4s: expected = [fp4_to_float(x, target_dtype) for x in expected]
   if target_dtype in dtypes.fp8s: expected = [fp8_to_float(x, target_dtype) for x in expected]
   _test_op(lambda: a.bitcast(target_dtype), target_dtype, target or expected)
 
@@ -65,7 +68,7 @@ class TestDType(unittest.TestCase):
   @classmethod
   def setUpClass(cls):
     if cls.DTYPE is None: raise unittest.SkipTest("base class")
-    cls.DATA = rand_for_dtype(cls.DTYPE, 0x10, allow_subnormal=cls.DTYPE in supported_dtypes and cls.DTYPE not in dtypes.fp8s)
+    cls.DATA = rand_for_dtype(cls.DTYPE, 0x10, allow_subnormal=cls.DTYPE in supported_dtypes and cls.DTYPE not in (*dtypes.fp4s, *dtypes.fp8s))
 
   def test_to_np(self):
     a = Tensor(self.DATA, dtype=self.DTYPE)
@@ -105,6 +108,9 @@ class TestDType(unittest.TestCase):
     if self.DTYPE == dtypes.bool: raise unittest.SkipTest("no bools in bitcast")
     for dtype in get_available_cast_dtypes(self.DTYPE):
       if dtype != dtypes.bool:
+        if self.DTYPE in dtypes.fp4s and dtype.itemsize != self.DTYPE.itemsize: continue  # size-changing bitcast of a sub-byte dtype is unsupported
+        if self.DTYPE in dtypes.fp4s and dtype in dtypes.fp8s: continue  # cross fp4/fp8 bitcast
+        if self.DTYPE in dtypes.fp8s and dtype in dtypes.fp4s: continue  # cross fp4/fp8 bitcast
         _test_bitcast(Tensor(self.DATA[:8], dtype=self.DTYPE), dtype)
 
   @unittest.skipIf(Device.DEFAULT == "PYTHON", "skip for now")
@@ -118,7 +124,10 @@ class TestDType(unittest.TestCase):
 def _test_ops(a_dtype:DType, b_dtype:DType, target_dtype=None):
   target_dtype = target_dtype or least_upper_dtype(a_dtype, b_dtype)
   if a_dtype == dtypes.bool or b_dtype == dtypes.bool: return
-  _assert_eq(Tensor([1,2,3,4], dtype=a_dtype)+Tensor([1,2,3,4], dtype=b_dtype), target_dtype, [2,4,6,8])
+  expected = [2,4,6,8]
+  # e2m1 can't represent 8, so the fp4 sum lands on 6
+  if target_dtype in dtypes.fp4s: expected = [truncate[target_dtype](x) for x in expected]
+  _assert_eq(Tensor([1,2,3,4], dtype=a_dtype)+Tensor([1,2,3,4], dtype=b_dtype), target_dtype, expected)
   _assert_eq(Tensor([[1,2],[3,4]], dtype=a_dtype)@Tensor.eye(2, dtype=b_dtype), target_dtype, [[1,2],[3,4]])
 
 class TestFp8sConversions(unittest.TestCase):
@@ -407,6 +416,42 @@ class TestEmulatedFp8e5m2(TestFp8e5m2):
 
 class TestFp8e4m3fnuz(TestDType): DTYPE = dtypes.fp8e4m3fnuz
 class TestFp8e5m2fnuz(TestDType): DTYPE = dtypes.fp8e5m2fnuz
+
+class TestFP4e2m1(TestDType): DTYPE = dtypes.fp4e2m1
+
+class TestEmulatedFP4e2m1(TestFP4e2m1):
+  @classmethod
+  def setUpClass(cls):
+    cls.stack = contextlib.ExitStack()
+    cls.stack.enter_context(Context(EMULATED_DTYPES="fp4e2m1"))
+    cls.DATA = rand_for_dtype(cls.DTYPE, 10, allow_subnormal=False)
+
+  @classmethod
+  def tearDownClass(cls): cls.stack.close()
+
+class TestFP4e2m1Conversions(unittest.TestCase):
+  # 0.5 is the only subnormal; emulated backends flush subnormals to zero
+  sub = dtypes.fp4e2m1 in supported_dtypes
+
+  def test_min_max_representable(self):
+    dt = dtypes.fp4e2m1
+    self.assertEqual(Tensor([dt.min, dt.max], dtype=dt).float().tolist(), [dt.min, dt.max])
+
+  def test_round_trip_representable(self):
+    vals = [0.0, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
+    if self.sub: vals += [0.5, -0.5]
+    np.testing.assert_equal(Tensor(vals, dtype=dtypes.fp4e2m1).float().numpy(), vals)
+
+  def test_float_to_fp4(self):
+    for x,y in [(0.0,0.0),(-0.0,-0.0),(0.25,0.0),(0.5,0.5),(0.75,1.0),(1.5,1.5),(5.0,4.0),(7.0,6.0),(100.0,6.0),
+                (math.inf,6.0),(-math.inf,-6.0),(math.nan,6.0),(-5.0,-4.0)]:
+      np.testing.assert_equal(truncate[dtypes.fp4e2m1](x), y)
+
+  def test_bitcast_patterns(self):
+    vals, pat = [0.0, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -6.0], [0, 2, 3, 4, 5, 6, 7, 15]
+    if self.sub: vals, pat = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -6.0], [0, 1, 2, 3, 4, 5, 6, 7, 15]
+    self.assertEqual(Tensor(vals, dtype=dtypes.fp4e2m1).bitcast(dtypes.uint8).tolist(), pat)
+    self.assertEqual(Tensor(pat, dtype=dtypes.uint8).bitcast(dtypes.fp4e2m1).tolist(), vals)
 
 class TestImplicitFunctionTypeChange(unittest.TestCase):
   def test_functions(self):

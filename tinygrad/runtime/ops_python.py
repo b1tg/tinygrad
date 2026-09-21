@@ -179,7 +179,8 @@ class PythonRenderer(Renderer):
 
   def render(self, uops:list[UOp]) -> str: return base64.b64encode(pickle.dumps(uops)).decode()
 
-  def supported_dtypes(self): return {d for d in super().supported_dtypes() if d != dtypes.half or sys.version_info >= (3, 12)}
+  def supported_dtypes(self):
+    return {d for d in super().supported_dtypes() if d != dtypes.half or sys.version_info >= (3, 12)} | set(dtypes.fp4s)
 
 class PythonDevice(Compiled):
   def __init__(self, device:str):
