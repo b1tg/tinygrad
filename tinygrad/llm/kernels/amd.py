@@ -763,16 +763,19 @@ def _expert_q6_f16_kernel(out:UOp, raw:UOp, sel:UOp, x:UOp, in_features:int, out
     .sink(arg=KernelInfo(name="expert_linear_q6_f16", opts_to_apply=()))
 
 def expert_q6_f16_linear(weight:Tensor, sel:Tensor, x:Tensor, out_features:int, in_features:int) -> Tensor:
-  """Fused routed Q6_K decode using the loader's weight cast and original activations."""
+  """Fused routed Q6_K projection using the loader's weight cast and original activations."""
   if in_features % 256 or out_features % 4 or sel.ndim != 3 or x.ndim != 4 or x.shape[-1] != in_features \
-    or x.shape[-2] not in (1, sel.shape[-1]) or not all(isinstance(s, int) for s in (*sel.shape, *x.shape)):
+    or x.shape[-2] not in (1, sel.shape[-1]) or x.shape[:2] != sel.shape[:2]:
     raise ValueError(f"unsupported Q6 expert shapes: {sel.shape=}, {x.shape=}, {out_features=}, {in_features=}")
+  symbolic, orig_shape = not all(isinstance(s, int) for s in (*sel.shape, *x.shape)), sel.shape
+  if symbolic: sel, x = sel.pad_to(sel.max_shape), x.pad_to(x.max_shape)
   B, T, K = cast(tuple[int, int, int], sel.shape)
   out = Tensor.empty(B*T*K, out_features, dtype=dtypes.float32, device=x.device)
   fxn = functools.partial(_expert_q6_f16_kernel, in_features=in_features, out_features=out_features,
                           routes_per_token=K, shared_input=x.shape[-2] == 1)
-  return Tensor.custom_kernel(out, weight.flatten(), sel.cast(dtypes.int32).reshape(-1).contiguous(),
-                              x.reshape(-1, in_features).contiguous(), fxn=fxn)[0].reshape(B, T, K, out_features)
+  result = Tensor.custom_kernel(out, weight.flatten(), sel.cast(dtypes.int32).reshape(-1).contiguous(),
+                                x.reshape(-1, in_features).contiguous(), fxn=fxn)[0].reshape(B, T, K, out_features)
+  return result if not symbolic else result.shrink(tuple((0, s) for s in (*orig_shape, out_features)))
 
 def _wmma_layout(out:UOp, out_features:int, token_tile:int, output_tiles:int):
   # output_waves is derived from the *final* output_tiles: falling back to 1 tile changes what
@@ -2243,6 +2246,85 @@ def dsa_decode(q:Tensor, cache:Tensor, idx:Tensor, scale:float, kv_lora:int,
   partial, stats = Tensor.custom_kernel(partial, stats, _kinput(q), flat, _kinput(idx), fxn=fxn)[:2]
   out = Tensor.empty(B, H, 1, kv_lora, dtype=dtypes.float32, device=q.device)
   return Tensor.custom_kernel(out, partial, stats, fxn=functools.partial(_amd_flash_decode_combine, live=live))[0].reshape(B, H, kv_lora)
+
+# ******** DSA prefill: one query/head per workgroup, sharing the latent cache across tokens ********
+
+@functools.cache
+def _dsa_prefill_kernel(out:UOp, q:UOp, cache:UOp, idx:UOp, tokens:int|UOp, row_count:int, scale:float,
+                       start_pos:int|UOp|None, pool_size:int) -> UOp:
+  B, _, H, D = cast(tuple[int, int, int, int], q.shape)
+  S, WAVES, GROUP = cast(int, idx.shape[-1]), 4, 4
+  bh = UOp.range(B*H, 0, AxisType.GLOBAL)
+  token = UOp.range(_unbind(tokens), 1, AxisType.GLOBAL)
+  lane, wave = UOp.range(32, -1, AxisType.WARP), UOp.range(WAVES, 3, AxisType.LOCAL)
+  b, h, dpl = bh//H, bh%H, D//32
+  if start_pos is None: prefix, tail, tail_start = UOp.const(S), UOp.const(0), S
+  else:
+    valid_tokens = _unbind(start_pos) + token + 1
+    tail_start = S-pool_size+1
+    prefix, tail = (valid_tokens//pool_size*pool_size).minimum(tail_start), valid_tokens%pool_size
+  live = prefix+tail
+  qf = [q[b, token, h, lane*dpl+i].load().float() for i in range(dpl)]
+  state, acc = _reg((2,), 100, 0), _reg((dpl,), 101, 0)
+  state = state.after(state[0].store(UOp.const(-1e30, dtypes.float32)))
+  jj = UOp.range((live+WAVES*GROUP-1)//(WAVES*GROUP), 1000, AxisType.REDUCE)
+  loaded, scores = [], []
+  for g in range(GROUP):
+    logical = wave+(jj*GROUP+g)*WAVES
+    physical = (logical < prefix).where(logical, tail_start+logical-prefix).minimum(S-1)
+    sel = idx[b, token, physical].load()
+    valid = (logical < live) & (sel >= 0) & (sel < row_count)
+    row = valid.where(sel, 0)
+    # cache is a one-dimensional buffer; only the batch, not the query token, selects a cache bank.
+    data = [cache[(b*row_count+row)*D+lane*dpl+i].load().float() for i in range(dpl)]
+    loaded.append((valid, data))
+  for valid, data in loaded:
+    dot = warp_reduce(sum((a*v for a, v in zip(qf, data)), UOp.const(0, dtypes.float32)), full_wave=True)*scale
+    scores.append(valid.where(dot, -1e30))
+  old_m, old_s = state.after(jj)[0].load(), state.after(jj)[1].load()
+  new_m = functools.reduce(UOp.maximum, scores, old_m)
+  correction = ((old_m-new_m)*LOG2E).exp2()
+  probs = [valid.where(((score-new_m)*LOG2E).exp2(), 0) for score, (valid, _) in zip(scores, loaded)]
+  new_s = old_s*correction + sum(probs, UOp.const(0, dtypes.float32))
+  vals = [acc.after(jj)[i].load()*correction +
+          sum((p*valid.where(data[i], 0) for p, (valid, data) in zip(probs, loaded)), UOp.const(0, dtypes.float32)) for i in range(dpl)]
+  update = UOp.group(state[0].store(new_m), state[1].store(new_s), *[acc[i].store(v) for i, v in enumerate(vals)]).end(jj)
+  ml = UOp.placeholder((WAVES, 2), dtypes.float32, slot=1, addrspace=AddrSpace.LOCAL)
+  partial = UOp.placeholder((WAVES, D), dtypes.float32, slot=2, addrspace=AddrSpace.LOCAL)
+  stores = [ml[wave, i.valid(lane.eq(0))].store(state.after(update)[i].load()) for i in (UOp.const(0), UOp.const(1))]
+  stores += [partial[wave, lane*dpl+i].store(acc.after(update)[i].load()) for i in range(dpl)]
+  barrier = UOp.barrier(UOp.group(*stores))
+  ml, partial = ml.after(barrier), partial.after(barrier)
+  m = functools.reduce(UOp.maximum, (ml[w, 0].load() for w in range(WAVES)))
+  corrections = [((ml[w, 0].load()-m)*LOG2E).exp2() for w in range(WAVES)]
+  s = sum((ml[w, 1].load()*corrections[w] for w in range(WAVES)), UOp.const(0, dtypes.float32))
+  tid, per = wave*32+lane, D//(32*WAVES)
+  # Nonempty softmax sums are >=1; return zero for an entirely masked query.
+  stores = [out[b, token, h, tid*per+i].store(
+    sum((partial[w, tid*per+i].load()*corrections[w] for w in range(WAVES)), UOp.const(0, dtypes.float32))/s.maximum(1)) for i in range(per)]
+  return UOp.group(*stores).end(lane, wave, token, bh).sink(arg=KernelInfo(name='dsa_prefill_online', opts_to_apply=()))
+
+def dsa_prefill(q:Tensor, cache:Tensor, idx:Tensor, scale:float, start_pos:int|UOp|None=None,
+                pool_size:int=4, cache_flat:Tensor|None=None) -> Tensor:
+  """Sparse latent K=V attention. Optional cursor enables the indexer's complete-pool prefix + fixed-width tail layout."""
+  if q.ndim != 4 or cache.ndim != 3 or idx.ndim != 3 or q.shape[:2] != idx.shape[:2] or q.shape[0] != cache.shape[0] \
+      or q.shape[-1] != cache.shape[-1] or q.dtype != dtypes.float32 or cache.dtype != dtypes.half or idx.dtype != dtypes.int32:
+    raise ValueError(f"unsupported DSA prefill: {q.shape=}, {cache.shape=}, {idx.shape=}, {q.dtype=}, {cache.dtype=}, {idx.dtype=}")
+  B, T, H, D = q.shape
+  N, S = cache.shape[1], idx.shape[-1]
+  assert all(isinstance(x, int) for x in (B, H, D, N, S)) and D % 128 == 0 and S > 0
+  if start_pos is not None: assert pool_size > 0 and S >= pool_size and (S-pool_size+1) % pool_size == 0
+  shape = q.shape
+  q, idx = q.pad_to(q.max_shape), idx.pad_to(idx.max_shape, value=-1)
+  flat = cache.reshape(-1) if cache_flat is None else cache_flat
+  assert flat.ndim == 1 and flat.numel() >= B*N*D and flat.dtype == cache.dtype
+  # Preserve symbolic argument bindings even when all supplied buffers are already realized.
+  for var in (T, start_pos):
+    if isinstance(var, UOp): flat = Tensor(flat.uop.after(Tensor(var, device=cache.device).uop))
+  out = Tensor.empty(*q.shape, dtype=dtypes.float32, device=q.device)
+  fxn = functools.partial(_dsa_prefill_kernel, tokens=T, row_count=N, scale=scale, start_pos=start_pos, pool_size=pool_size)
+  result = Tensor.custom_kernel(out, _kinput(q), flat, _kinput(idx), fxn=fxn)[0]
+  return result.shrink(tuple((0, s) for s in shape))
 
 # ******** gated delta net: fused recurrent scan ********
 

@@ -4,7 +4,7 @@ from dataclasses import dataclass, replace
 from typing import cast
 from tinygrad import Device, Tensor, nn, UOp, TinyJit, getenv, function, dtypes
 from tinygrad.device import Buffer
-from tinygrad.llm.kernels.amd import Linear, expert_quant_linear, gated_delta_prefill, flash_attention, hc_prepare, dsa_decode
+from tinygrad.llm.kernels.amd import Linear, expert_quant_linear, gated_delta_prefill, flash_attention, hc_prepare, dsa_decode, dsa_prefill
 from tinygrad.llm.kernels.amd import amd_custom_kernels_supported, amd_topk, expert_q6_f16_linear, expert_gate_up_silu
 from tinygrad.llm.kernels.amd import head_q8_gemv, dsa_indexer_decode, kda_conv_norm, kda_gates, kda_out, gumbel_argmax
 from tinygrad.llm.gguf import ggml_data_to_tensor, gguf_load
@@ -116,15 +116,15 @@ class ExpertWeights:
     packed_dtype = dtypes.uint32 if ggml_type == 23 else dtypes.uint8  # IQ4_XS kernels read word-aligned u32
     packed = Tensor(UOp.from_buffer(cast(Buffer, raw.buf_uop.buffer)
       .view(raw.max_numel() // packed_dtype.itemsize, packed_dtype, raw_offset)))
-    if ggml_type == 14: self._packed_q6 = packed  # keep the original fp16 expression for prefill and the generic fallback
+    if ggml_type == 14: self._packed_q6 = packed  # keep the original fp16 expression for the generic fallback
     else: self.weight = packed
 
   def __call__(self, sel:Tensor, x:Tensor) -> Tensor:
     # sel: (B, T, k), x: (B, T, 1, in) or (B, T, k, in) -> output: (B, T, k, out)
     if self.ggml_type is None: self._set_quantized()
     if self.ggml_type == 14:
-      if self.use_custom_quant and self.weight.dtype == dtypes.half and x.dtype == dtypes.float32 and resolve(x.shape[1] == 1, False) \
-        and all(isinstance(s, int) for s in (*sel.shape, *x.shape)) and self.in_features % 256 == 0 and self.out_features % 4 == 0 \
+      if self.use_custom_quant and self.weight.dtype == dtypes.half and x.dtype == dtypes.float32 \
+        and self.in_features % 256 == 0 and self.out_features % 4 == 0 \
         and amd_custom_kernels_supported(self.weight.device):
         return expert_q6_f16_linear(self._packed_q6, sel, x, self.out_features, self.in_features)
       return (x.unsqueeze(-2) @ self.weight[sel].transpose(-1, -2)).contiguous().squeeze(-2)
@@ -664,6 +664,10 @@ class MLATransformerBlock(FFNBlock):
                             self.config.kv_lora_rank, valid_tokens=start_pos+1,
                             pool_size=self.indexer.index_config.kpool,
                             cache_flat=cached_flat).reshape(B, T, self.config.n_heads, self.config.kv_lora_rank)
+      elif amd_custom_kernels_supported(x.device) and q_selected.shape[-1] == self.config.kv_lora_rank \
+          and self.config.kv_lora_rank % 128 == 0 and q_selected.dtype == dtypes.float32:
+        latent = dsa_prefill(q_selected, cached[:, 0], indices, self.config.head_dim ** -0.5,
+                             start_pos=start_pos, pool_size=self.indexer.index_config.kpool, cache_flat=cached_flat)
       else:
         valid = indices >= 0
         selected = gather_rows(cached[:, 0], indices.clip(0, self.config.max_context-1))
@@ -838,7 +842,7 @@ class Transformer:
     # Selected-expert decoding keeps GLM's prefill scratch roughly linear in tokens. Eight tokens stays below
     # the headroom of the fullest 24 GiB pipeline stage while avoiding dozens of two-token pipeline passes.
     # Single-device models have no such stage headroom constraint; larger chunks amortize the per-chunk cost.
-    self.prefill_chunk_size = 32
+    self.prefill_chunk_size = min(256, self.max_context) if config.hc_mult and config.indexer is not None else 32
     self.devices: tuple[str, ...]|None = None
     self.has_recurrent_block = any(isinstance(b, GatedDeltaNetBlock) for b in self.blk)
     self._cached_tokens: list[int] = []
@@ -987,11 +991,12 @@ class Transformer:
       _fuse_shared_input_linears(model)
     return model, kv
 
-  def warmup(self):
+  def warmup(self, chunk_size:int|None=None):
+    chunk_size = self.prefill_chunk_size if chunk_size is None else min(chunk_size, self.prefill_chunk_size)
     # Indexer decode requires a populated pool cache. Leave room for generated tokens even in small test models.
-    prompt_len = min(self.prefill_chunk_size + 1, max(1, self.max_context - 3)) if any(hasattr(b, "indexer") for b in self.blk) else 1
+    prompt_len = min(chunk_size + 1, max(1, self.max_context - 3)) if any(hasattr(b, "indexer") for b in self.blk) else 1
     # Exercise capture AND replay with the previous output as input, including the alias-protection input copy.
-    for _ in range(2): list(zip(range(3), self.generate([0] * prompt_len)))
+    for _ in range(2): list(zip(range(3), self.generate([0] * prompt_len, chunk_size=chunk_size)))
 
   def get_start_pos(self, tokens:list[int]) -> int:
     # recurrent state can't be partially reused after divergence: reuse it only when tokens extend the cached prefix
@@ -1001,9 +1006,9 @@ class Transformer:
     prefix_len = sum(1 for _ in itertools.takewhile(lambda ab: ab[0] == ab[1], zip(tokens[:-1], self._cached_tokens)))
     return min(block._reusable_prefix_len(prefix_len, len(self._cached_tokens)) for block in self.blk)
 
-  def generate(self, tokens:list[int], chunk_size:int=32, temperature:float=0.0):
+  def generate(self, tokens:list[int], chunk_size:int|None=None, temperature:float=0.0):
+    chunk_size = self.prefill_chunk_size if chunk_size is None else min(chunk_size, self.prefill_chunk_size)
     if self.has_recurrent_block and not amd_custom_kernels_supported(self.token_embd.weight.device): chunk_size = 1
-    chunk_size = min(chunk_size, self.prefill_chunk_size)
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
     v_toks = UOp.variable("toks", 1, chunk_size)
     # TODO: use UOp.variable for temperature once float variables are supported

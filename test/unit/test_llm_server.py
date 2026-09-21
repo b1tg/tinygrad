@@ -1,4 +1,5 @@
 import unittest
+from dataclasses import replace
 import numpy as np
 from unittest.mock import patch
 from tinygrad import Tensor, UOp
@@ -39,6 +40,27 @@ class TestTransformerGenerate(unittest.TestCase):
     model.warmup()
     self.assertGreaterEqual(model.rollout_jit.cnt, 3)
     self.assertIsInstance(next(model.generate([5, 6, 7, 8])), int)
+
+  def test_warmup_with_explicit_chunk(self):
+    model = Transformer(TEST_CONFIG)
+    model.prefill_chunk_size = 16
+    model.blk[0].indexer = object()
+    # Force fresh prompts so both warmup passes exercise the prefill JIT.
+    with patch.object(model, 'get_start_pos', return_value=0):
+      model.warmup(chunk_size=4)
+      self.assertGreaterEqual(model.prefill_jit.cnt, 2)
+      self.assertIsInstance(next(model.generate([5, 6, 7, 8], chunk_size=4)), int)
+
+  def test_generate_uses_model_chunk_default(self):
+    model = Transformer(replace(TEST_CONFIG, max_context=128))
+    model.prefill_chunk_size = 64
+    counts = []
+    def mock_call(self, tokens, start_pos, temperature):
+      n = tokens.shape[1]
+      counts.append(n if isinstance(n, int) else n.unbind()[1])
+      return Tensor([[42]])
+    with patch.object(Transformer, '__call__', mock_call): next(model.generate(list(range(70))))
+    self.assertEqual(counts, [64, 6])
 
   def test_first_recurrent_generate_before_state_init(self):
     model = Transformer(TEST_CONFIG)

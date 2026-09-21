@@ -103,12 +103,12 @@ class TestQ6Experts(unittest.TestCase):
     if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("AMD custom kernels required")
 
   @staticmethod
-  def make_weight(width, dtype=dtypes.half):
-    packed = np.random.default_rng(14).integers(0, 256, (3*16*width//256, 210), dtype=np.uint8)
+  def make_weight(width, dtype=dtypes.half, out_features=16):
+    packed = np.random.default_rng(14).integers(0, 256, (3*out_features*width//256, 210), dtype=np.uint8)
     packed[:, 208:] = np.array([0.001], dtype=np.float16).view(np.uint8)
     raw = Tensor(np.pad(packed.flatten(), (4, 0))).realize()[4:]
-    weight = ExpertWeights(3, width, 16)
-    weight.weight = ggml_data_to_tensor(raw, 3*16*width, 14).reshape(3, 16, width).cast(dtype)
+    weight = ExpertWeights(3, width, out_features)
+    weight.weight = ggml_data_to_tensor(raw, 3*out_features*width, 14).reshape(3, out_features, width).cast(dtype)
     low = ((packed[:, :128].reshape(-1, 2, 1, 64) >> np.array([0, 4])[None, None, :, None]) & 15).reshape(-1, 256)
     high = ((packed[:, 128:192].reshape(-1, 2, 1, 32) >> np.array([0, 2, 4, 6])[None, None, :, None]) & 3).reshape(-1, 256)
     scales = np.repeat(packed[:, 192:208].view(np.int8), 16, axis=1).astype(np.float32)
@@ -117,7 +117,7 @@ class TestQ6Experts(unittest.TestCase):
     # when the weight itself is cast to half
     reference = (d*((low | (high << 4))-32).astype(np.float32)*scales)
     if dtype == dtypes.half: reference = reference.astype(np.float16).astype(np.float32)
-    reference = reference.reshape(3, 16, width)
+    reference = reference.reshape(3, out_features, width)
     # The inline GPU dequantization/matmul retains fp32 intermediates; materializing fp16 weights separately changes its rounding.
     return weight, reference
 
@@ -139,12 +139,46 @@ class TestQ6Experts(unittest.TestCase):
           self.assertEqual(weight._packed_q6.dtype, dtypes.uint8)
           self.assertEqual(weight._packed_q6.nbytes(), 3*16*width//256*210)
 
-  def test_prefill_and_float_weights_keep_generic_path(self):
+  def test_prefill_symbolic_function_replay(self):
+    from tinygrad.llm.kernels.amd import expert_q6_f16_linear
+    rng = np.random.default_rng(17)
+    for shared, capacity in ((True, 32), (False, 32), (False, 64), (False, 128)):
+      with self.subTest(shared=shared, capacity=capacity):
+        weight, reference = self.make_weight(2048)
+        @function(precompile=True, allow_implicit=True)
+        def layer(sel, x): return weight(sel, x)
+        @TinyJit
+        def run(sel, x, tokens):
+          out = layer(sel[:, :tokens], x[:, :tokens])
+          return out.pad_to(out.max_shape).contiguous().realize()
+        with patch('tinygrad.llm.model.expert_q6_f16_linear', wraps=expert_q6_f16_linear) as dispatch:
+          for count in (capacity, 7, 1, capacity-1, capacity):
+            selected = rng.integers(0, 3, (2, capacity, 8), dtype=np.int32)
+            x = rng.normal(size=(2, capacity, 1 if shared else 8, 2048)).astype(np.float32)
+            expected = np.matmul(x[:, :count, :, None, :], reference[selected[:, :count]].swapaxes(-1, -2)).squeeze(-2)
+            actual = run(Tensor(selected).realize(), Tensor(x).realize(), UOp.variable('q6_tokens', 1, capacity).bind(count)).numpy()
+            np.testing.assert_allclose(actual[:, :count], expected, rtol=2e-4, atol=2e-4)
+          self.assertGreater(dispatch.call_count, 0)
+
+  def test_prefill_glm_down_shape(self):
+    weight, reference = self.make_weight(2048, out_features=4096)
+    rng = np.random.default_rng(18)
+    selected = rng.integers(0, 3, (1, 32, 8), dtype=np.int32)
+    x = rng.normal(size=(1, 32, 8, 2048)).astype(np.float32)
+    expected = np.empty((1, 32, 8, 4096), dtype=np.float32)
+    # Group the CPU reference by expert to avoid a 4 GiB selected-weight temporary.
+    for expert in range(3):
+      b, t, k = np.where(selected == expert)
+      expected[b, t, k] = x[b, t, k] @ reference[expert].T
+    np.testing.assert_allclose(weight(Tensor(selected), Tensor(x)).numpy(), expected, rtol=2e-4, atol=2e-4)
+
+  def test_float_weights_and_disabled_custom_keep_generic_path(self):
     rng = np.random.default_rng(16)
     selected = np.array([[[2, 0], [1, 1]]], dtype=np.int32)
     x = rng.normal(size=(1, 2, 2, 256)).astype(np.float32)
     for dtype in (dtypes.half, dtypes.float32):
       weight, reference = self.make_weight(256, dtype)
+      if dtype == dtypes.half: weight.use_custom_quant = False
       original = weight.weight
       expected = np.matmul(x[..., None, :], reference[selected].swapaxes(-1, -2)).squeeze(-2)
       with patch("tinygrad.llm.model.expert_q6_f16_linear", side_effect=AssertionError("unexpected fused decode")):
@@ -157,6 +191,123 @@ class TestQ6Experts(unittest.TestCase):
         else:
           self.assertEqual(weight(Tensor(selected[:, :1]), Tensor(x[:, :1]).half()).realize().dtype, dtypes.half)
       self.assertIs(weight.weight, original)
+
+class TestDSAPrefill(unittest.TestCase):
+  def setUp(self):
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("AMD custom kernels required")
+
+  @staticmethod
+  def indices(rng, batch, tokens, selected, start, pool=4):
+    indices = np.full((batch, tokens, selected), -1, dtype=np.int32)
+    slots = (selected-pool+1)//pool
+    for b in range(batch):
+      for t in range(tokens):
+        valid = start+t+1
+        pools = rng.permutation(valid//pool)[:slots]
+        rows = (pools[:, None]*pool+np.arange(pool)).reshape(-1)
+        indices[b, t, :len(rows)] = rows
+        tail = valid%pool
+        indices[b, t, slots*pool:slots*pool+tail] = np.arange(valid-tail, valid)
+    return indices
+
+  @staticmethod
+  def reference(q, cache, indices, scale):
+    out = np.zeros_like(q)
+    for b in range(q.shape[0]):
+      for t in range(q.shape[1]):
+        selected = indices[b, t]
+        selected = selected[(selected >= 0) & (selected < cache.shape[1])]
+        if not len(selected): continue
+        rows = cache[b, selected].astype(np.float32)
+        scores = q[b, t] @ rows.T * scale
+        probs = np.exp(scores-scores.max(axis=-1, keepdims=True))
+        out[b, t] = (probs/probs.sum(axis=-1, keepdims=True)) @ rows
+    return out
+
+  @staticmethod
+  def cache_tensor(cache):
+    flat = cache.reshape(-1)
+    # Poison the unused allocation tail to expose incorrect query/batch cache addressing.
+    flat = Tensor(np.pad(flat, (0, (1 << (len(flat)-1).bit_length())-len(flat)), constant_values=np.nan)).realize()
+    return flat[:cache.size].reshape(*cache.shape), flat
+
+  def test_masked_queries_and_cache_banks(self):
+    from tinygrad.llm.kernels.amd import dsa_prefill
+    rng = np.random.default_rng(60)
+    q = rng.normal(size=(2, 3, 2, 128)).astype(np.float32)
+    cache = rng.normal(size=(2, 37, 128)).astype(np.float16)
+    indices = rng.integers(0, 37, (2, 3, 11), dtype=np.int32)
+    indices[0, 1] = -1
+    indices[1, 2, ::2] = -1
+    indices[0, 2, 0] = 38
+    cached, flat = self.cache_tensor(cache)
+    tq, ti = Tensor(q), Tensor(indices)
+    actual = dsa_prefill(tq, cached, ti, 128**-0.5, cache_flat=flat).numpy()
+    np.testing.assert_allclose(actual, self.reference(q, cache, indices, 128**-0.5), rtol=2e-5, atol=2e-5)
+    with self.assertRaises(AssertionError): dsa_prefill(tq, cached, ti, 1.0, cache_flat=cached)
+
+  def test_symbolic_function_replay(self):
+    from tinygrad.llm.kernels.amd import dsa_prefill
+    B, CAP, H, D, N, S = 2, 32, 3, 128, 97, 31
+    rng = np.random.default_rng(61)
+    @function(precompile=True, allow_implicit=True)
+    def layer(q, flat, indices, start):
+      return dsa_prefill(q, flat[:B*N*D].reshape(B, N, D), indices, D**-0.5, start_pos=start, cache_flat=flat)
+    @TinyJit
+    def run(q, flat, indices, tokens, start):
+      out = layer(q[:, :tokens], flat, indices[:, :tokens], start)
+      return out.pad_to(out.max_shape).contiguous().realize()
+    for count, pos in ((32, 0), (7, 3), (1, 64), (31, 32), (32, 8)):
+      q = rng.normal(size=(B, CAP, H, D)).astype(np.float32)
+      cache = rng.normal(size=(B, N, D)).astype(np.float16)
+      indices = self.indices(rng, B, CAP, S, pos)
+      _, flat = self.cache_tensor(cache)
+      actual = run(Tensor(q).realize(), flat, Tensor(indices).realize(), UOp.variable('dsa_toks', 1, CAP).bind(count),
+                   UOp.variable('dsa_pos', 0, N-CAP).bind(pos)).numpy()[:, :count]
+      np.testing.assert_allclose(actual, self.reference(q[:, :count], cache, indices[:, :count], D**-0.5), rtol=2e-5, atol=2e-5)
+
+  def test_glm_shape_against_gather_attention(self):
+    from tinygrad.llm.kernels.amd import dsa_prefill
+    from tinygrad.llm.model import gather_rows
+    rng = np.random.default_rng(62)
+    q = Tensor(rng.normal(0, 0.3, (1, 128, 64, 512)).astype(np.float32)).realize()
+    cache, flat = self.cache_tensor(rng.normal(0, 0.1, (1, 8192, 512)).astype(np.float16))
+    indices = Tensor(self.indices(rng, 1, 128, 2051, 896)).realize()
+    selected = gather_rows(cache, indices.clip(0, 8191))
+    scores = (q.unsqueeze(-2)*selected.unsqueeze(2)).sum(-1)*128**-0.5
+    attn = (indices >= 0).unsqueeze(2).where(scores, float('-inf')).softmax(-1)
+    expected = (attn.unsqueeze(-2) @ selected.unsqueeze(2)).squeeze(-2).numpy()
+    actual = dsa_prefill(q, cache, indices, 128**-0.5, start_pos=896, cache_flat=flat).numpy()
+    np.testing.assert_allclose(actual, expected, rtol=2e-4, atol=2e-5)
+
+  def test_mla_block_cache_writes_and_replay(self):
+    from tinygrad.llm.model import MLATransformerBlock, gather_rows
+    from test.unit.test_llm_mla import TestGLMIndexer
+    config = TestGLMIndexer._config(kv_lora_rank=128, max_context=32)
+    candidate, reference = MLATransformerBlock(config), MLATransformerBlock(config)
+    rng = np.random.default_rng(64)
+    params = nn.state.get_state_dict(candidate)
+    for param in params.values(): param.replace(Tensor(rng.normal(0, 0.2, param.shape).astype(np.float32)).realize())
+    for name, param in nn.state.get_state_dict(reference).items(): param.replace(params[name])
+    def gathered(q, cache, idx, scale, **kwargs):
+      selected = gather_rows(cache, idx.clip(0, cache.shape[1]-1))
+      scores = (q.unsqueeze(-2)*selected.unsqueeze(2)).sum(-1)*scale
+      probs = (idx >= 0).unsqueeze(2).where(scores, float('-inf')).softmax(-1)
+      return (probs.unsqueeze(-2) @ selected.unsqueeze(2)).squeeze(-2)
+    def make_run(block):
+      @TinyJit
+      def run(x, tokens, pos):
+        out = block(x[:, :tokens], pos)
+        return out.pad_to(out.max_shape).contiguous().realize()
+      return run
+    new, old = make_run(candidate), make_run(reference)
+    for count, pos in ((4, 0), (4, 4), (3, 8), (2, 0), (7, 2)):
+      x = Tensor(rng.normal(size=(2, 8, config.dim)).astype(np.float32)).realize()
+      tokens, start = UOp.variable('mla_dsa_toks', 1, 8).bind(count), UOp.variable('mla_dsa_pos', 0, 24).bind(pos)
+      actual = new(x, tokens, start).numpy()[:, :count]
+      with patch('tinygrad.llm.model.dsa_prefill', gathered): expected = old(x, tokens, start).numpy()[:, :count]
+      np.testing.assert_allclose(actual, expected, rtol=2e-4, atol=2e-4)
+      np.testing.assert_array_equal(candidate.cache_k.numpy()[:, :, pos:pos+count], reference.cache_k.numpy()[:, :, pos:pos+count])
 
 class TestQ8Grouped(unittest.TestCase):
   def setUp(self):
