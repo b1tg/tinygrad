@@ -34,6 +34,7 @@ def parse_tool_call(s:str) -> tuple[str, typing.Any]|None:
 def normalize_messages(messages:list[dict]) -> None:
   # chat templates expect tool_call arguments as dicts (OpenAI clients send JSON strings)
   for m in messages:
+    if m.get("role") == "assistant" and m.get("tool_calls") and m.get("content") is None: m["content"] = ""
     for tc in m.get("tool_calls") or []:
       if "function" in tc and isinstance(args := tc["function"].get("arguments"), str):
         try: tc["function"]["arguments"] = json.loads(args)

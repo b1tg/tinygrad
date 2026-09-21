@@ -6,7 +6,7 @@ from tinygrad import Tensor, UOp
 from tinygrad.nn.state import get_state_dict
 from tinygrad.schedule import schedule_cache
 from tinygrad.llm.model import Transformer, TransformerConfig
-from tinygrad.llm.serve import StreamRouter
+from tinygrad.llm.serve import StreamRouter, normalize_messages
 
 TEST_CONFIG = TransformerConfig(num_blocks=1, dim=64, hidden_dim=128, n_heads=2, n_kv_heads=2,
                            norm_eps=1e-5, vocab_size=100, head_dim=32, rope_theta=10000.0, rope_dim=32, v_head_dim=32, max_context=32)
@@ -14,6 +14,13 @@ V_START_POS = UOp.variable("start_pos", 0, TEST_CONFIG.max_context-1)
 V_TOKS = UOp.variable("toks", 1, 32)  # 32 is the default chunk_size in generate
 
 class TestTransformerGenerate(unittest.TestCase):
+  def test_normalize_null_assistant_content(self):
+    messages = [{"role":"assistant", "content":None,
+                 "tool_calls":[{"function":{"name":"read", "arguments":"{\"path\":\"README.md\"}"}}]}]
+    normalize_messages(messages)
+    self.assertEqual(messages[0]["content"], "")
+    self.assertEqual(messages[0]["tool_calls"][0]["function"]["arguments"], {"path":"README.md"})
+
   def test_warmup(self):
     model, calls, yielded = Transformer(TEST_CONFIG), [], []
     def generate(tokens, **kwargs):
