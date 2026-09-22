@@ -506,14 +506,9 @@ def amd_flash_attention_decode(q:Tensor, cache_kv:Tensor, valid_kv_len:int|UOp, 
   partial, stats = Tensor.custom_kernel(partial, stats, q, cache_kv, fxn=fxn)[:2]
   live = (valid_kv_len+63)//64
   live = min(live, chunks) if isinstance(live, int) else live.minimum(chunks)
-  # combine in plain tensor ops: the custom-kernel form trips a renderer CSE/LICM bug when the MTP graph
-  # traces several decode calls (a loop-invariant value is declared inside the reduce loop but used after it)
-  stats_l, partial_l = stats[:, :, :live, :], partial[:, :, :live, :]
-  m = stats_l[..., 0].max(-1, keepdim=True)
-  w = ((stats_l[..., 0] - m) * LOG2E).exp2()
-  acc = (w.unsqueeze(-1) * partial_l).sum(2)
-  l = (w * stats_l[..., 1]).sum(2, keepdim=True)
-  return (acc / l).reshape(B, T, H, D).transpose(1, 2)
+  out = Tensor.empty(B*T, H, 1, D, dtype="float32", device=q.device)
+  fxn = functools.partial(_amd_flash_decode_combine, live=live)
+  return Tensor.custom_kernel(out, partial, stats, fxn=fxn)[0].reshape(B, T, H, D).transpose(1, 2)
 
 @functools.cache
 def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:int|UOp|None=None) -> UOp:
@@ -605,11 +600,9 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
   D, N, group = q.shape[3], assigned_kv.shape[3], q.shape[1] // assigned_kv.shape[2]
   # small token counts (MTP verify / short chunks) use the split-K decode kernel; larger ones the WMMA prefill
   decode = resolve(T_real <= 8, False)
-  # arbitrary chunk sizes still take the WMMA kernel by padding the query tile to a multiple of BLOCK_M
-  T_pad = (T_real+BLOCK_M-1)//BLOCK_M*BLOCK_M if isinstance(T_real, int) else q.max_shape[2]
   # Non-power-of-two decode dimensions can lose tail-store masks. Q/P, K, and V use separate LDS allocations.
   supported = D % 32 == 0 and (D & (D-1) == 0 and N % 64 == 0 and group*((D+LDS_PAD)*2+8) <= 65536 if decode else
-    D >= 64 and 2*(2*BLOCK_M*(D+LDS_PAD) + D*(BLOCK_N+LDS_PAD)) <= 65536 and N % BLOCK_N == 0 and T_pad % BLOCK_M == 0)
+    D >= 64 and 2*(2*BLOCK_M*(D+LDS_PAD) + D*(BLOCK_N+LDS_PAD)) <= 65536 and N % BLOCK_N == 0 and q.max_shape[2] % BLOCK_M == 0)
   if not supported:
     k, v = (assigned_kv[i, :, :, :valid_end].float() for i in range(2))
     mask = None if resolve(T_real == 1, False) else \
@@ -619,8 +612,6 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
     # Left padding keeps causal positions unchanged while giving the custom kernel a static query shape.
     pad = q.max_shape[2]-T_real
     return amd_flash_attention_decode(q.pad((None, None, (pad, 0), None)).half(), assigned_kv, valid_end, cast(int, N))[:, :, pad:]
-  if isinstance(T_real, int) and T_real % BLOCK_M:
-    q, q_start = q.pad_to((*q.shape[:2], T_pad, q.shape[3])), valid_end-T_real
   if isinstance(T_real, UOp):
     # symbolic chunk: pad the queries to the static tile; garbage rows are sliced off
     T_pad = q.max_shape[2]

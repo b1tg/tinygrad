@@ -143,12 +143,18 @@ class FFNBlock:
   def _init_state(self, x:Tensor): raise NotImplementedError
   def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor: raise NotImplementedError
 
-  def __call__(self, x: Tensor, start_pos: int|UOp, **kwargs):
+  # Append-only KV caches need no snapshots: start_pos bounds their readable prefix.
+  def _prepare_history(self, x:Tensor, length:int) -> bool: return False
+  def _restore_state(self, index:Tensor) -> list[UOp]: return []
+  def _attention_with_history(self, x:Tensor, start_pos:int|UOp) -> Tensor: return self._attention(x, start_pos)
+
+  def __call__(self, x: Tensor, start_pos: int|UOp, save_state:bool=False):
     self._init_state(x)
+    attention = self._attention_with_history if save_state else self._attention
     # we pass in the weights implicitly so we unpack the GGUF on the fly
     @function(precompile=True, allow_implicit=True)
     def _run(x:Tensor, start_pos:int|UOp):
-      h =     x + self._attention(self.attn_norm(x), start_pos, **kwargs)
+      h =     x + attention(self.attn_norm(x), start_pos)
       return (h + self._feed_forward(self.ffn_norm(h))).contiguous()
     return _run(x, start_pos)
 
@@ -170,7 +176,8 @@ class TransformerBlock(FFNBlock):
     B, T, _ = x.shape
     k, v = self.attn_k(x), self.attn_v(x)
     if self.config.qk_norm and self.config.qk_norm != self.config.head_dim: k = self.attn_k_norm(k)
-    k, v = (t.reshape(B, T, self.config.n_kv_heads, self.config.head_dim).transpose(1, 2) for t in (k, v))
+    k = k.reshape(B, T, self.config.n_kv_heads, self.config.head_dim).transpose(1, 2)  # (B,KvH,T,Hd)
+    v = v.reshape(B, T, self.config.n_kv_heads, self.config.head_dim).transpose(1, 2)  # (B,KvH,T,Hd)
     if self.config.qk_norm == self.config.head_dim: k = self.attn_k_norm(k)
     k = apply_rope(k[..., :self.config.rope_dim], self.freqs_cis[start_pos:start_pos+T]).cat(k[..., self.config.rope_dim:], dim=-1)
     # NOTE: we don't want to change self.cache_kv, the function API doesn't support this well
@@ -284,6 +291,19 @@ class GatedDeltaNetBlock(FFNBlock):
     self.ssm_a = Tensor.zeros(self.num_v_heads, 1) if ssm.kda else Tensor.zeros(self.num_v_heads)
     self.ssm_norm, self.ssm_out = nn.RMSNorm(self.head_v_dim, config.norm_eps), Linear(ssm.inner_size, config.dim, bias=False)
 
+  def _prepare_history(self, x:Tensor, length:int) -> bool:
+    self._init_state(x)
+    if hasattr(self, "state_history") and self.state_history.shape[0] >= length: return False
+    self.state_history = Tensor.empty(length, *self.recurrent_state.shape, dtype=dtypes.half, device=self.recurrent_state.device).realize()
+    self.conv_history = Tensor.empty(length, *self.conv_state.shape, dtype=dtypes.half, device=self.conv_state.device).realize()
+    return True
+
+  def _restore_state(self, index:Tensor) -> list[UOp]:
+    return [state.uop.store(history[index].reshape(state.shape).cast(state.dtype).uop)
+            for state, history in ((self.recurrent_state, self.state_history), (self.conv_state, self.conv_history))]
+
+  def _attention_with_history(self, x:Tensor, start_pos:int|UOp) -> Tensor: return self._attention(x, start_pos, capture=True)
+
   def _attention(self, x:Tensor, start_pos:int|UOp, capture:bool=False) -> Tensor:
     B, T, _ = x.shape
     # bind ints to a variable so the reset flag stays a runtime value (it toggles when generation restarts at position 0)
@@ -368,8 +388,10 @@ class GatedDeltaNetBlock(FFNBlock):
 class MTPBlock(TransformerBlock):
   def __init__(self, config:TransformerConfig):
     super().__init__(config)
-    self.nextn:dict[str, nn.RMSNorm|Linear] = {"enorm": nn.RMSNorm(config.dim, config.norm_eps), "hnorm": nn.RMSNorm(config.dim, config.norm_eps),
-                  "eh_proj": Linear(2*config.dim, config.dim, bias=False), "shared_head_norm": nn.RMSNorm(config.dim, config.norm_eps)}
+    self.nextn:dict[str, nn.RMSNorm|Linear] = {
+      "eh_proj": Linear(2*config.dim, config.dim, bias=False), "shared_head_norm": nn.RMSNorm(config.dim, config.norm_eps),
+      "enorm": nn.RMSNorm(config.dim, config.norm_eps), "hnorm": nn.RMSNorm(config.dim, config.norm_eps)
+    }
 
   def forward(self, embedding:Tensor, hidden:Tensor, start_pos:int|UOp, cache_only:bool=False) -> Tensor:
     x = self.nextn["eh_proj"](self.nextn["enorm"](embedding).cat(self.nextn["hnorm"](hidden), dim=-1))
@@ -402,7 +424,7 @@ class Transformer:
 
   def _hidden(self, tokens:Tensor, start_pos:int|UOp, verify:bool=False) -> Tensor:
     x = self.token_embd(tokens).float()                   # (B, T, D)
-    for block in self.blk: x = block(x, start_pos, **({"capture": verify} if isinstance(block, GatedDeltaNetBlock) else {}))
+    for block in self.blk: x = block(x, start_pos, save_state=verify)
     return x
 
   def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
@@ -509,8 +531,8 @@ class Transformer:
     for _ in range(2): list(zip(range(2), self.generate([0])))
 
   def get_start_pos(self, tokens:list[int]) -> int:
-    # recurrent state can't be partially reused after divergence: reuse it only when tokens extend the cached prefix
-    if self.has_recurrent_block:
+    # Recurrent state and the MTP hidden buffer describe the full cached prefix.
+    if self.has_recurrent_block or self._mtp_cached:
       return len(self._cached_tokens) if self._cached_tokens and len(self._cached_tokens) < len(tokens) \
         and tokens[:len(self._cached_tokens)] == self._cached_tokens else 0
     prefix_len = sum(1 for _ in itertools.takewhile(lambda ab: ab[0] == ab[1], zip(tokens[:-1], self._cached_tokens)))
@@ -519,16 +541,10 @@ class Transformer:
   def _mtp_target(self, tokens:Tensor, start_pos:int|UOp, verify:bool=False, hidden_out:Tensor|None=None) -> tuple[Tensor, Tensor]:
     hidden = self.output_norm(self._hidden(tokens, start_pos, verify))
     hidden = hidden.contiguous() if hidden_out is None else Tensor(hidden_out.uop.after(hidden_out.uop.store(hidden.uop)))
-    return self.output(hidden if verify else hidden[:, -1:]).argmax(-1).contiguous(), hidden.pad_to(hidden.max_shape).contiguous()
+    return self.output(hidden if verify else hidden[:, -1:]).argmax(-1).contiguous(), hidden
 
-  def _mtp_restore(self, index:Tensor) -> list[Tensor]:
-    ret = []
-    for block in self.blk:
-      if isinstance(block, GatedDeltaNetBlock):
-        for state, history in ((block.recurrent_state, block.state_history), (block.conv_state, block.conv_history)):
-          value = history[index].reshape(state.shape).cast(state.dtype)
-          ret.append(Tensor(state.uop.after(state.uop.store(value.uop))))
-    return ret
+  def _mtp_restore(self, index:Tensor) -> list[UOp]:
+    return [store for block in self.blk for store in block._restore_state(index)]
 
   def _mtp_round(self, pending:Tensor, previous:Tensor, target:Tensor, hidden_history:Tensor,
                  start_pos:UOp, count:int) -> tuple[Tensor, Tensor]:
@@ -544,16 +560,15 @@ class Transformer:
     # Commit target-conditioned draft KV rows. Extra speculative rows are overwritten on the next round.
     updated = self.mtp[0].forward(self.token_embd(predicted[:, :-1]).float(), hidden[:, :-1], start_pos+1, cache_only=True)
     chosen = hidden.gather(1, accepted.reshape(1, 1, 1).expand(1, 1, hidden.shape[-1])).contiguous()
-    deps = [t.uop for t in restored] + [updated.uop]
+    deps = restored + [updated.uop]
     # Persist emitted tokens so JIT replay returns updated values.
-    deps.append(target.uop.store(predicted.reshape(target.shape).cast(target.dtype).uop))
-    deps.append(pending.uop.store(predicted.gather(1, accepted.reshape(1, 1)).reshape(pending.shape).cast(pending.dtype).uop))
-    deps.append(previous.uop.store(chosen.reshape(previous.shape).cast(previous.dtype).uop))
+    deps.append(target.uop.store(predicted.uop))
+    deps.append(pending.uop.store(predicted.gather(1, accepted.reshape(1, 1)).uop))
+    deps.append(previous.uop.store(chosen.uop))
     return Tensor(target.uop.after(*deps)), accepted
 
   def _mtp_prefill(self, tokens:Tensor, start_pos:UOp, pending:Tensor, previous:Tensor) -> Tensor:
     out, hidden = self._mtp_target(tokens, start_pos)
-    hidden = hidden[:, :tokens.shape[1]]
     # Each prompt token uses the preceding target hidden; the sequence starts with a zero hidden state.
     shifted = Tensor(start_pos).eq(0).where(0, previous).cat(hidden[:, :-1], dim=1).contiguous()
     updated = self.mtp[0].forward(self.token_embd(tokens).float(), shifted, start_pos, cache_only=True)
@@ -567,7 +582,6 @@ class Transformer:
       if temperature != 0: raise ValueError("MTP currently requires greedy decoding (temperature=0)")
       if not 1 <= mtp <= 7: raise ValueError("MTP draft count must be between 1 and 7")
       if not tokens: raise ValueError("MTP requires a nonempty prompt")
-      self.mtp_stats = {"drafted": 0, "accepted": 0, "rounds": 0}
       if len(tokens) >= self.max_context: return
       if not self._mtp_cached: self._cached_tokens = []
       if self._mtp_inputs is None:
@@ -576,14 +590,7 @@ class Transformer:
                             Tensor.zeros(1, 1, dim, dtype=dtypes.float32, device=dev).realize())
       pending, previous = self._mtp_inputs
       for block in self.blk:
-        if not isinstance(block, GatedDeltaNetBlock): continue
-        block._init_state(previous)
-        if not hasattr(block, "state_history") or block.state_history.shape[0] < mtp+1:
-          block.state_history = Tensor.empty(mtp+1, *block.recurrent_state.shape, dtype=dtypes.half,
-                                             device=block.recurrent_state.device).realize()
-          block.conv_history = Tensor.empty(mtp+1, *block.conv_state.shape, dtype=dtypes.half,
-                                            device=block.conv_state.device).realize()
-          self.mtp_round_jit.clear()  # captured graphs must use the resized history buffers
+        if block._prepare_history(previous, mtp+1): self.mtp_round_jit.clear()  # history buffers changed
     else: self._mtp_cached = False
     if self.has_recurrent_block and not amd_custom_kernels_supported(self.token_embd.weight.device): chunk_size = 1
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
@@ -607,9 +614,6 @@ class Transformer:
         target, accepted = run(pending, previous, target, hidden_history, v_start_pos.bind(start_pos))
         emitted = target.tolist()[0][:int(accepted.item())+1]
         start_pos += len(emitted)
-        self.mtp_stats["rounds"] += 1
-        self.mtp_stats["drafted"] += count
-        self.mtp_stats["accepted"] += len(emitted)-1
       else:
         n_toks = min(chunk_size, len(tokens) - start_pos)
         sp, nt = v_start_pos.bind(start_pos), v_toks.bind(n_toks)
@@ -635,6 +639,6 @@ class Transformer:
           restored = self._mtp_restore(index)
           store = previous.uop.store(hidden_history[:, i:i+1].uop)
           # Complete rollback before publishing a reusable prefix for the next request.
-          ready = Tensor(previous.uop.after(store, *(s.uop for s in restored))).realize()
+          ready = Tensor(previous.uop.after(store, *restored)).realize()
           ready[0, 0, 0].item()
           self._cached_tokens, self._mtp_cached = tokens[:-1], True

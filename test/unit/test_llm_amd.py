@@ -172,25 +172,11 @@ class TestQ8Quantize(unittest.TestCase):
           scale = np.maximum(np.abs(grouped).max(-1, keepdims=True) / 127, 1e-8)
           reference_x = (np.clip(np.rint(grouped/scale), -127, 127)*scale).reshape(tokens, in_features)
         reference_w = weight if tokens < 16 or ggml_type == 14 else weight.astype(np.float16).astype(np.float32)
-        np.testing.assert_allclose(linear(Tensor(x)).numpy(), reference_x @ reference_w.T, rtol=3e-3, atol=2e-2)
+        batch = linear(Tensor(x)).numpy()
+        np.testing.assert_allclose(batch, reference_x @ reference_w.T, rtol=3e-3, atol=2e-2)
+        if tokens == 3:
+          np.testing.assert_array_equal(batch, np.concatenate([linear(Tensor(row[None])).numpy() for row in x]))
     self.assertEqual(linear.ggml_type, ggml_type)
-
-  def test_q4_k_linear_batch_matches_single(self):
-    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
-    rng = np.random.default_rng(42)
-    in_features, out_features = 2048, 16
-    packed = rng.integers(0, 256, (out_features*in_features//256, 144), dtype=np.uint8)
-    packed[:, :2] = np.array([0.001], dtype=np.float16).view(np.uint8)
-    packed[:, 2:4] = np.array([0.0002], dtype=np.float16).view(np.uint8)
-    raw = Tensor(np.pad(packed.flatten(), (4, 0))).contiguous().realize()[4:]
-    decoded = ggml_data_to_tensor(raw, out_features*in_features, 12).reshape(out_features, in_features)
-    linear = Linear(in_features, out_features, bias=False)
-    linear.weight = decoded
-    x = rng.normal(size=(3, in_features)).astype(np.float32)
-    # Speculative verification must not change a row's quantized GEMV arithmetic with the batch size.
-    batch = linear(Tensor(x)).numpy()
-    single = np.concatenate([linear(Tensor(row[None])).numpy() for row in x], axis=0)
-    np.testing.assert_array_equal(batch, single)
 
   def test_q6_linear_multiple_tokens(self):
     if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
@@ -208,9 +194,6 @@ class TestQ8Quantize(unittest.TestCase):
     xq = np.clip(np.rint(x.reshape(3, in_features//32, 32) / scale), -127, 127) * scale
     np.testing.assert_allclose(linear(Tensor(x)).numpy(), xq.reshape(3, in_features) @ weight.T, rtol=2e-3, atol=2e-2)
     self.assertEqual(linear.ggml_type, 14)
-    batch = linear(Tensor(x)).numpy()
-    single = np.concatenate([linear(Tensor(row[None])).numpy() for row in x], axis=0)
-    np.testing.assert_array_equal(batch, single)
 
     # symbolic token counts take the padded kernel path and give the same results
     generic = Linear(in_features, 16, bias=False)
@@ -222,7 +205,7 @@ class TestQ8Quantize(unittest.TestCase):
 
   def test_attention_fallback_shapes(self):
     if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
-    for tokens, capacity, dim in ((1, 65, 64), (32, 64, 32), (32, 64, 384), (32, 64, 512)):
+    for tokens, capacity, dim in ((1, 65, 64), (17, 64, 128), (32, 64, 32), (32, 64, 384), (32, 64, 512)):
       with self.subTest(tokens=tokens, capacity=capacity, dim=dim):
         valid = 33
         cache = np.full((2, 1, 1, capacity, dim), np.nan, dtype=np.float16)
