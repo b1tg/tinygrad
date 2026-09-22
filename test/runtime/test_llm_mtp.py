@@ -24,6 +24,17 @@ def model():
 
 
 class TestMTP(unittest.TestCase):
+  def test_attention_fallback_causal(self):
+    from tinygrad.llm.kernels.amd import flash_attention
+    # An unaligned cache takes the fallback path, which must still mask future verification tokens.
+    cache = Tensor.arange(65).reshape(1, 1, 65, 1).expand(1, 1, 65, 32)
+    cache = Tensor.stack(Tensor.zeros_like(cache), cache).contiguous()
+    for tokens in (1, 3):
+      q = Tensor.zeros(1, 1, tokens, 32)
+      for end in (5, 65):
+        expected = np.broadcast_to(np.arange(end-tokens, end).reshape(1, 1, tokens, 1)/2, q.shape)
+        np.testing.assert_allclose(flash_attention(q, cache, end).numpy(), expected, atol=1e-5)
+
   def test_verify_and_restore(self):
     Tensor.manual_seed(17)
     m = model()
