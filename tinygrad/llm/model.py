@@ -576,23 +576,74 @@ class Transformer:
     store = previous.uop.after(updated.uop).store(hidden[:, -1:].uop)
     return Tensor(pending.uop.after(store, pending.uop.store(out.uop)))
 
+  def _yield_mtp_round(self, tokens:list[int], values:list[int], previous:Tensor, hidden_history:Tensor):
+    delivered = 0
+    try:
+      for tok in values[:self.max_context-len(tokens)]:
+        tokens.append(tok)
+        delivered += 1
+        if delivered == len(values): self._cached_tokens, self._mtp_cached = tokens[:-1], True
+        yield tok
+    finally:
+      if 0 < delivered < len(values):
+        index = Tensor([delivered-1], dtype=dtypes.int32, device=previous.device).realize()
+        restored = self._mtp_restore(index)
+        store = previous.uop.store(hidden_history[:, delivered-1:delivered].uop)
+        # Complete rollback before publishing a reusable prefix for the next request.
+        ready = Tensor(previous.uop.after(store, *restored)).realize()
+        ready[0, 0, 0].item()
+        self._cached_tokens, self._mtp_cached = tokens[:-1], True
+
+  def _generate_mtp(self, tokens:list[int], chunk_size:int, draft_tokens:int):
+    if not self.mtp: raise ValueError("model does not contain supported MTP weights")
+    if not 1 <= draft_tokens <= 7: raise ValueError("MTP draft count must be between 1 and 7")
+    if not tokens: raise ValueError("MTP requires a nonempty prompt")
+    if len(tokens) >= self.max_context: return
+    if not self._mtp_cached: self._cached_tokens = []
+    if self._mtp_inputs is None:
+      dev, dim = self.token_embd.weight.device, self.token_embd.weight.shape[1]
+      self._mtp_inputs = (Tensor.zeros(1, 1, dtype=dtypes.int32, device=dev).realize(),
+                          Tensor.zeros(1, 1, dim, dtype=dtypes.float32, device=dev).realize())
+    pending, previous = self._mtp_inputs
+    for block in self.blk:
+      if block._prepare_history(previous, draft_tokens+1): self.mtp_round_jit.clear()  # history buffers changed
+
+    # Prefill both caches once, retaining the last target hidden state and first pending token.
+    if self.has_recurrent_block and not amd_custom_kernels_supported(self.token_embd.weight.device): chunk_size = 1
+    v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
+    v_toks = UOp.variable("toks", 1, chunk_size)
+    t = Tensor(tokens + [0] * (self.max_context - len(tokens)), dtype="int32").reshape(1, self.max_context)
+    start_pos = self.get_start_pos(tokens)
+    if chunk_size not in self.mtp_prefill_jit: self.mtp_prefill_jit[chunk_size] = TinyJit(self._mtp_prefill)
+    prefill = self.mtp_prefill_jit[chunk_size]
+    self._cached_tokens = []
+    for pos in range(start_pos, len(tokens), chunk_size):
+      sp, nt = v_start_pos.bind(pos), v_toks.bind(min(chunk_size, len(tokens)-pos))
+      out = prefill(t[:, sp:sp+nt].contiguous(), sp, pending, previous).realize()
+    tokens.append(int(out.item()))
+    self._cached_tokens, self._mtp_cached = tokens[:-1], True
+    yield tokens[-1]
+
+    # Each round starts at the last yielded token; delivery and cancellation belong to the emitter.
+    while len(tokens) < self.max_context:
+      count = min(draft_tokens, self.max_context-len(tokens))
+      self._cached_tokens = []
+      if count not in self.mtp_round_jit:
+        self.mtp_round_jit[count] = (TinyJit(functools.partial(self._mtp_round, count=count)),
+                                   Tensor.empty(1, count+1, dtype=dtypes.int32, device=t.device).realize(),
+                                   Tensor.empty(1, count+1, previous.shape[-1], dtype=previous.dtype, device=t.device).realize())
+      run, target, hidden_history = self.mtp_round_jit[count]
+      target, accepted = run(pending, previous, target, hidden_history, v_start_pos.bind(len(tokens)-1))
+      values = target.tolist()[0][:int(accepted.item())+1]
+      yield from self._yield_mtp_round(tokens, values, previous, hidden_history)
+
   def generate(self, tokens:list[int], chunk_size:int=32, temperature:float=0.0, mtp:int|None=None):
     mtp = getenv("MTP", 0) if mtp is None else mtp
     if mtp:
-      if not self.mtp: raise ValueError("model does not contain supported MTP weights")
       if temperature != 0: raise ValueError("MTP currently requires greedy decoding (temperature=0)")
-      if not 1 <= mtp <= 7: raise ValueError("MTP draft count must be between 1 and 7")
-      if not tokens: raise ValueError("MTP requires a nonempty prompt")
-      if len(tokens) >= self.max_context: return
-      if not self._mtp_cached: self._cached_tokens = []
-      if self._mtp_inputs is None:
-        dev, dim = self.token_embd.weight.device, self.token_embd.weight.shape[1]
-        self._mtp_inputs = (Tensor.zeros(1, 1, dtype=dtypes.int32, device=dev).realize(),
-                            Tensor.zeros(1, 1, dim, dtype=dtypes.float32, device=dev).realize())
-      pending, previous = self._mtp_inputs
-      for block in self.blk:
-        if block._prepare_history(previous, mtp+1): self.mtp_round_jit.clear()  # history buffers changed
-    else: self._mtp_cached = False
+      yield from self._generate_mtp(tokens, chunk_size, mtp)
+      return
+    self._mtp_cached = False
     if self.has_recurrent_block and not amd_custom_kernels_supported(self.token_embd.weight.device): chunk_size = 1
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
     v_toks = UOp.variable("toks", 1, chunk_size)
@@ -603,43 +654,14 @@ class Transformer:
     # recompute start_pos from what's currently valid in the caches
     start_pos = self.get_start_pos(tokens)
     out, prompt_len = None, len(tokens)
-    hidden_history:Tensor
     while len(tokens) < self.max_context:
       self._cached_tokens = []  # a failed forward may have updated only part of the cached state
-      if mtp and out is not None and start_pos >= prompt_len and (count:=min(mtp, self.max_context-start_pos-1)) > 0:
-        if count not in self.mtp_round_jit:
-          self.mtp_round_jit[count] = (TinyJit(functools.partial(self._mtp_round, count=count)),
-                                     Tensor.empty(1, count+1, dtype=dtypes.int32, device=t.device).realize(),
-                                     Tensor.empty(1, count+1, previous.shape[-1], dtype=previous.dtype, device=t.device).realize())
-        run, target, hidden_history = self.mtp_round_jit[count]
-        target, accepted = run(pending, previous, target, hidden_history, v_start_pos.bind(start_pos))
-        emitted = target.tolist()[0][:int(accepted.item())+1]
-        start_pos += len(emitted)
-      else:
-        n_toks = min(chunk_size, len(tokens) - start_pos)
-        sp, nt = v_start_pos.bind(start_pos), v_toks.bind(n_toks)
-        inputs = t[:, sp:sp+nt] if start_pos < prompt_len or out is None else out
-        if mtp:
-          run = self.mtp_prefill_jit.setdefault(chunk_size, TinyJit(self._mtp_prefill))
-          out = run(inputs.contiguous(), sp, pending, previous).realize()
-        else: out = self(inputs, sp, temp).realize()
-        start_pos += n_toks
-        # chunked prefill: keep processing until all prompt tokens are consumed
-        if start_pos < len(tokens): continue
-        emitted = [int(out.item())]
-      try:
-        for i, tok in enumerate(emitted[:self.max_context-len(tokens)]):
-          tokens.append(tok)
-          if len(tokens) == start_pos+1:
-            self._cached_tokens = tokens[:-1]
-            self._mtp_cached = bool(mtp)
-          yield tok
-      finally:
-        if mtp and len(tokens) < start_pos+1:
-          index = Tensor([i], dtype=dtypes.int32, device=previous.device).realize()
-          restored = self._mtp_restore(index)
-          store = previous.uop.store(hidden_history[:, i:i+1].uop)
-          # Complete rollback before publishing a reusable prefix for the next request.
-          ready = Tensor(previous.uop.after(store, *restored)).realize()
-          ready[0, 0, 0].item()
-          self._cached_tokens, self._mtp_cached = tokens[:-1], True
+      n_toks = min(chunk_size, len(tokens) - start_pos)
+      sp, nt = v_start_pos.bind(start_pos), v_toks.bind(n_toks)
+      out = self(t[:, sp:sp+nt] if start_pos < prompt_len or out is None else out, sp, temp).realize()
+      start_pos += n_toks
+      # chunked prefill: keep processing until all prompt tokens are consumed
+      if start_pos < len(tokens): continue
+      tokens.append(int(out.item()))
+      self._cached_tokens = tokens[:-1]
+      yield tokens[-1]
