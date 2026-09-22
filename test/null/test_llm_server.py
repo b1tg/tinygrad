@@ -109,6 +109,24 @@ class TestLLMServer(unittest.TestCase):
 
     self.assertGreater(len(contents), 0)
 
+  def test_generation_closed_on_stop(self):
+    for stop in ("eos", "limit", "disconnect"):
+      with self.subTest(stop=stop):
+        closed = []
+        def generate():
+          try: yield from (300, 999, 301)
+          finally: closed.append(True)
+        generation = generate()  # retain it so garbage collection cannot hide a missing close()
+        with patch.object(self.mock_model, "generate", return_value=generation):
+          stream = self.server.RequestHandlerClass.run_model(Mock(server=self.server), [200, 201, 202], "test",
+                                                            max_tokens=1 if stop == "limit" else None)
+          if stop == "disconnect":
+            next(stream)
+            next(stream)
+            stream.close()
+          else: list(stream)
+          self.assertEqual(closed, [True])
+
   def test_interrupted_stream_logs_tokens(self):
     with patch.object(self.mock_model, "generate", side_effect=lambda ids, **kwargs: iter([300, 301, 999])), \
          patch("tinygrad.llm.serve.stderr_log") as log, patch("tinygrad.llm.serve.colored", side_effect=lambda text, color: text) as color:

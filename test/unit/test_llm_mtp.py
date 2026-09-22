@@ -108,18 +108,33 @@ class TestMTP(unittest.TestCase):
       np.testing.assert_allclose(m.mtp[0].cache_kv.numpy()[:, :, :, :6], expected_cache, atol=2e-3, rtol=2e-3)
 
   def test_stop_mid_round(self):
-    from unittest.mock import patch
-    m, tokens = model(), [3, 5, 7]
-    # A verifier accepting both drafts advances state past the first token yielded to the consumer.
-    with patch.object(m, '_mtp_round', lambda *a, **kw: (Tensor([[11, 13, 17]]), Tensor([2]))):
-      gen = m.generate(tokens, mtp=2)
+    from itertools import islice
+    Tensor.manual_seed(23)
+    m = model()
+    # Make every draft accepted while retaining nontrivial recurrent and convolution states.
+    m.output.weight.replace(Tensor.zeros_like(m.output.weight).contiguous().realize())
+    def state():
+      tensors = [s for b in m.blk if isinstance(b, GatedDeltaNetBlock) for s in (b.recurrent_state, b.conv_state)]
+      return [s.numpy().copy() for s in [*tensors, m._mtp_inputs[1]]]
+    def prefill(prompt):
+      gen = m.generate(prompt.copy(), mtp=2)
       next(gen)
-      self.assertEqual(m.get_start_pos(tokens), 3)
-      self.assertEqual(next(gen), 11)
-      self.assertEqual(m.get_start_pos(tokens), 0)
-      self.assertEqual([next(gen), next(gen)], [13, 17])
-      self.assertEqual(m._cached_tokens, tokens[:-1])
       gen.close()
+      return state()
+    for offset, length in enumerate((2, 3, 4, 2)):
+      tokens = [3, 5, 7+offset]
+      gen = m.generate(tokens, mtp=2)
+      list(islice(gen, length))
+      self.assertEqual(m.mtp_stats['accepted'], 2)
+      gen.close()
+      self.assertEqual(m.get_start_pos(tokens+[17]), len(tokens)-1)
+      saved = state()
+      extended = tokens+[17, 19]
+      resumed = prefill(extended)
+      for prompt, expected in ((tokens[:-1], saved), (extended, resumed)):
+        m._cached_tokens = []
+        for actual, reference in zip(prefill(prompt), expected):
+          np.testing.assert_allclose(actual, reference, atol=2e-3, rtol=2e-3)
 
   def test_context_limit(self):
     Tensor.manual_seed(22)
@@ -132,6 +147,9 @@ class TestMTP(unittest.TestCase):
     self.assertEqual(list(m.generate([3]*64, mtp=2)), [])
     self.assertEqual(list(m.generate([3]*65, mtp=2)), [])
     with self.assertRaisesRegex(ValueError, 'nonempty'): next(m.generate([], mtp=2))
+    m.output.weight.replace(Tensor.zeros_like(m.output.weight).contiguous().realize())
+    m.mtp_round_jit.clear()
+    self.assertEqual(len(list(m.generate(prompt.copy(), mtp=2))), 6)
 
   def test_unsupported_sampling(self):
     m = model()

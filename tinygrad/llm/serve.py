@@ -88,15 +88,19 @@ class Handler(VizHandler):
     completed = False
     try:
       yield chunk({"role":"assistant", "content":""})
-      for next_id in model.generate(ids, temperature=temperature):
-        if len(out) == 0:
-          stderr_log(f"prefill:{(prompt_tokens-cache_start_pos)/((pt:=time.perf_counter())-st):4.0f} tok/s  {colored('--', 'BLACK')}  ")
-        if tok.is_end(next_id): break
-        out.append(next_id)
-        for field, delta in router.route(dec(next_id)): yield chunk({field:delta})
-        if max_tokens is not None and len(out) >= max_tokens:
-          finish_reason = "length"
-          break
+      generation = model.generate(ids, temperature=temperature)
+      try:
+        for next_id in generation:
+          if len(out) == 0:
+            stderr_log(f"prefill:{(prompt_tokens-cache_start_pos)/((pt:=time.perf_counter())-st):4.0f} tok/s  {colored('--', 'BLACK')}  ")
+          if tok.is_end(next_id): break
+          out.append(next_id)
+          for field, delta in router.route(dec(next_id)): yield chunk({field:delta})
+          if max_tokens is not None and len(out) >= max_tokens:
+            finish_reason = "length"
+            break
+      finally:
+        if close := getattr(generation, "close", None): close()
       for field, delta in router.route(dec(), final=True): yield chunk({field:delta})
       tool_calls: list[dict] = []
       for m in re.finditer(r"<tool_call>\s*(.*?)\s*(?:</tool_call>|$)", router.buf, re.DOTALL):

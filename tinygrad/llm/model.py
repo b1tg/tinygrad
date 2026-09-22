@@ -398,7 +398,7 @@ class Transformer:
     self.prefill_jit = TinyJit(self.forward)
     self.rollout_jit = TinyJit(self.forward)
     self.mtp_prefill_jit:dict[int, Callable] = {}
-    self.mtp_round_jit:dict[int, tuple[Callable, Tensor]] = {}
+    self.mtp_round_jit:dict[int, tuple[Callable, Tensor, Tensor]] = {}
 
   def _hidden(self, tokens:Tensor, start_pos:int|UOp, verify:bool=False) -> Tensor:
     x = self.token_embd(tokens).float()                   # (B, T, D)
@@ -516,8 +516,9 @@ class Transformer:
     prefix_len = sum(1 for _ in itertools.takewhile(lambda ab: ab[0] == ab[1], zip(tokens[:-1], self._cached_tokens)))
     return min(block._reusable_prefix_len(prefix_len, len(self._cached_tokens)) for block in self.blk)
 
-  def _mtp_target(self, tokens:Tensor, start_pos:int|UOp, verify:bool=False) -> tuple[Tensor, Tensor]:
-    hidden = self.output_norm(self._hidden(tokens, start_pos, verify)).contiguous()
+  def _mtp_target(self, tokens:Tensor, start_pos:int|UOp, verify:bool=False, hidden_out:Tensor|None=None) -> tuple[Tensor, Tensor]:
+    hidden = self.output_norm(self._hidden(tokens, start_pos, verify))
+    hidden = hidden.contiguous() if hidden_out is None else Tensor(hidden_out.uop.after(hidden_out.uop.store(hidden.uop)))
     return self.output(hidden if verify else hidden[:, -1:]).argmax(-1).contiguous(), hidden.pad_to(hidden.max_shape).contiguous()
 
   def _mtp_restore(self, index:Tensor) -> list[Tensor]:
@@ -529,14 +530,15 @@ class Transformer:
           ret.append(Tensor(state.uop.after(state.uop.store(value.uop))))
     return ret
 
-  def _mtp_round(self, pending:Tensor, previous:Tensor, target:Tensor, start_pos:UOp, count:int) -> tuple[Tensor, Tensor]:
+  def _mtp_round(self, pending:Tensor, previous:Tensor, target:Tensor, hidden_history:Tensor,
+                 start_pos:UOp, count:int) -> tuple[Tensor, Tensor]:
     # the persistent buffers are explicit JIT inputs so the captured graph reads/writes them in place across execs
     draft, hidden = [pending], previous
     for i in range(count):
       hidden = self.mtp[0].forward(self.token_embd(draft[-1]).float(), hidden, start_pos+i).contiguous()
       draft.append(self.output(hidden).argmax(-1).contiguous())
     inputs = Tensor.cat(*draft, dim=1).contiguous()
-    predicted, hidden = self._mtp_target(inputs, start_pos, verify=True)
+    predicted, hidden = self._mtp_target(inputs, start_pos, verify=True, hidden_out=hidden_history)
     accepted = (inputs[:, 1:] == predicted[:, :-1]).cast(dtypes.int32).cumprod(1).sum(1).reshape(1)
     restored = self._mtp_restore(accepted)
     # Commit target-conditioned draft KV rows. Extra speculative rows are overwritten on the next round.
@@ -593,14 +595,16 @@ class Transformer:
     # recompute start_pos from what's currently valid in the caches
     start_pos = self.get_start_pos(tokens)
     out, prompt_len = None, len(tokens)
+    hidden_history:Tensor
     while len(tokens) < self.max_context:
       if mtp and out is not None and start_pos >= prompt_len and (count:=min(mtp, self.max_context-start_pos-1)) > 0:
         self._cached_tokens = []  # state may advance past tokens yielded if the consumer stops mid-round
         if count not in self.mtp_round_jit:
           self.mtp_round_jit[count] = (TinyJit(functools.partial(self._mtp_round, count=count)),
-                                     Tensor.empty(1, count+1, dtype=dtypes.int32, device=t.device).realize())
-        run, target = self.mtp_round_jit[count]
-        target, accepted = run(pending, previous, target, v_start_pos.bind(start_pos))
+                                     Tensor.empty(1, count+1, dtype=dtypes.int32, device=t.device).realize(),
+                                     Tensor.empty(1, count+1, previous.shape[-1], dtype=previous.dtype, device=t.device).realize())
+        run, target, hidden_history = self.mtp_round_jit[count]
+        target, accepted = run(pending, previous, target, hidden_history, v_start_pos.bind(start_pos))
         emitted = target.tolist()[0][:int(accepted.item())+1]
         start_pos += len(emitted)
         self.mtp_stats["rounds"] += 1
@@ -618,9 +622,19 @@ class Transformer:
         # chunked prefill: keep processing until all prompt tokens are consumed
         if start_pos < len(tokens): continue
         emitted = [int(out.item())]
-      for tok in emitted:
-        tokens.append(tok)
-        if len(tokens) == start_pos+1:
-          self._cached_tokens = tokens[:-1]
-          self._mtp_cached = bool(mtp)
-        yield tok
+      try:
+        for i, tok in enumerate(emitted[:self.max_context-len(tokens)]):
+          tokens.append(tok)
+          if len(tokens) == start_pos+1:
+            self._cached_tokens = tokens[:-1]
+            self._mtp_cached = bool(mtp)
+          yield tok
+      finally:
+        if mtp and len(tokens) < start_pos+1:
+          index = Tensor([i], dtype=dtypes.int32, device=previous.device).realize()
+          restored = self._mtp_restore(index)
+          store = previous.uop.store(hidden_history[:, i:i+1].uop)
+          # Complete rollback before publishing a reusable prefix for the next request.
+          ready = Tensor(previous.uop.after(store, *(s.uop for s in restored))).realize()
+          ready[0, 0, 0].item()
+          self._cached_tokens, self._mtp_cached = tokens[:-1], True
