@@ -153,6 +153,69 @@ class TestMTP(unittest.TestCase):
         for actual, reference in zip(prefill(prompt), expected):
           np.testing.assert_allclose(actual, reference, atol=2e-3, rtol=2e-3)
 
+  def test_prefill_failure_invalidates_cache(self):
+    Tensor.manual_seed(23)
+    m, prompt = model(), [3, 5, 7]
+    gen = m.generate(prompt, mtp=2)
+    next(gen)
+    gen.close()
+    request = prompt+[17, 19]
+    self.assertGreater(m.get_start_pos(request), 0)
+    original = m._mtp_prefill
+    def fail_after_chunk(*args):
+      original(*args).realize()
+      raise RuntimeError("prefill failed after updating state")
+    m.mtp_prefill_jit.clear()
+    with patch.object(m, '_mtp_prefill', side_effect=fail_after_chunk):
+      with self.assertRaisesRegex(RuntimeError, 'prefill failed'): next(m.generate(request.copy(), mtp=2))
+    self.assertEqual(m.get_start_pos(request), 0)
+    m.mtp_prefill_jit.clear()  # discard the test's failing callable
+    gen = m.generate(request.copy(), mtp=2)
+    retried = next(gen)
+    gen.close()
+    retry_hidden = m._mtp_inputs[1].numpy().copy()
+    m._cached_tokens = []
+    gen = m.generate(request.copy(), mtp=2)
+    self.assertEqual(next(gen), retried)
+    gen.close()
+    np.testing.assert_array_equal(m._mtp_inputs[1].numpy(), retry_hidden)
+
+  def test_history_resize_failure(self):
+    b = next(b for b in model().blk if isinstance(b, GatedDeltaNetBlock))
+    x = Tensor.empty(1, 1, 32)
+    self.assertTrue(b._prepare_history(x, 2))
+    old_state, old_conv = b.state_history, b.conv_history
+    allocate = Tensor.empty
+    calls = []
+    def fail_second(*args, **kwargs):
+      calls.append(args)
+      if len(calls) == 2: raise MemoryError("history allocation failed")
+      return allocate(*args, **kwargs)
+    with patch.object(Tensor, 'empty', side_effect=fail_second):
+      with self.assertRaisesRegex(MemoryError, 'history allocation failed'): b._prepare_history(x, 8)
+    self.assertIs(b.state_history, old_state)
+    self.assertIs(b.conv_history, old_conv)
+    self.assertFalse(b._prepare_history(x, 2))
+    self.assertTrue(b._prepare_history(x, 8))
+    self.assertEqual((b.state_history.shape[0], b.conv_history.shape[0]), (8, 8))
+
+  def test_reject_separate_mtp_weights(self):
+    kv = {'general.architecture':'qwen35', 'tokenizer.ggml.tokens':['']*64}
+    kv.update({f'qwen35.{k}':v for k,v in {
+      'block_count':3, 'nextn_predict_layers':1, 'context_length':64, 'embedding_length':32, 'feed_forward_length':64,
+      'attention.head_count':1, 'attention.head_count_kv':1, 'attention.key_length':128, 'attention.value_length':128,
+      'attention.layer_norm_rms_epsilon':1e-6, 'rope.freq_base':10000, 'rope.dimension_count':16, 'full_attention_interval':2,
+      'ssm.conv_kernel':4, 'ssm.state_size':32, 'ssm.group_count':1, 'ssm.time_step_rank':1, 'ssm.inner_size':32}.items()})
+    weights = {k.replace('mtp.0.', 'blk.2.'):v for k,v in nn.state.get_state_dict(model()).items()}
+    with patch('tinygrad.llm.model.gguf_load', return_value=(kv, weights)):
+      loaded, _ = Transformer.from_gguf('test.gguf')
+      self.assertEqual(len(loaded.mtp), 1)
+    for name in ('embed_tokens', 'shared_head_head'):
+      with self.subTest(name=name):
+        separate = {**weights, f'blk.2.nextn.{name}.weight':Tensor.zeros(64, 32)}
+        with patch('tinygrad.llm.model.gguf_load', return_value=(kv, separate)):
+          with self.assertRaisesRegex(AssertionError, f'separate MTP {name}'): Transformer.from_gguf('test.gguf')
+
   def test_context_limit(self):
     Tensor.manual_seed(22)
     m = model()
