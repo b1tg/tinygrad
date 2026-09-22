@@ -45,11 +45,10 @@ class TestMTP(unittest.TestCase):
     states = [state for b in m.blk if isinstance(b, GatedDeltaNetBlock) for state in (b.recurrent_state, b.conv_state)]
     ref, snapshots = [], []
     for i,tok in enumerate(tokens):
-      out, h = m._mtp_target(Tensor([[tok]], dtype=dtypes.int32), sp.bind(i))
-      Tensor.realize(out, h)
+      h = m.output_norm(m._hidden(Tensor([[tok]], dtype=dtypes.int32), sp.bind(i)))
       ref.append(h.numpy())
       snapshots.append([state.numpy().copy() for state in states])
-    _, h = m._mtp_target(Tensor([tokens[:4]], dtype=dtypes.int32), sp.bind(0), verify=True)
+    h = m.output_norm(m._hidden(Tensor([tokens[:4]], dtype=dtypes.int32), sp.bind(0), save_state=True))
     np.testing.assert_allclose(h.numpy(), np.concatenate(ref[:4], axis=1), atol=2e-3, rtol=2e-3)
     for accepted in range(4):
       restored = m._mtp_restore(Tensor([accepted], dtype=dtypes.int32))

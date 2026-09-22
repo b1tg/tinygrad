@@ -422,9 +422,9 @@ class Transformer:
     self.mtp_prefill_jit:dict[int, Callable] = {}
     self.mtp_round_jit:dict[int, tuple[Callable, Tensor, Tensor]] = {}
 
-  def _hidden(self, tokens:Tensor, start_pos:int|UOp, verify:bool=False) -> Tensor:
+  def _hidden(self, tokens:Tensor, start_pos:int|UOp, save_state:bool=False) -> Tensor:
     x = self.token_embd(tokens).float()                   # (B, T, D)
-    for block in self.blk: x = block(x, start_pos, save_state=verify)
+    for block in self.blk: x = block(x, start_pos, save_state=save_state)
     return x
 
   def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
@@ -538,11 +538,6 @@ class Transformer:
     prefix_len = sum(1 for _ in itertools.takewhile(lambda ab: ab[0] == ab[1], zip(tokens[:-1], self._cached_tokens)))
     return min(block._reusable_prefix_len(prefix_len, len(self._cached_tokens)) for block in self.blk)
 
-  def _mtp_target(self, tokens:Tensor, start_pos:int|UOp, verify:bool=False, hidden_out:Tensor|None=None) -> tuple[Tensor, Tensor]:
-    hidden = self.output_norm(self._hidden(tokens, start_pos, verify))
-    hidden = hidden.contiguous() if hidden_out is None else Tensor(hidden_out.uop.after(hidden_out.uop.store(hidden.uop)))
-    return self.output(hidden if verify else hidden[:, -1:]).argmax(-1).contiguous(), hidden
-
   def _mtp_restore(self, index:Tensor) -> list[UOp]:
     return [store for block in self.blk for store in block._restore_state(index)]
 
@@ -554,7 +549,9 @@ class Transformer:
       hidden = self.mtp[0].forward(self.token_embd(draft[-1]).float(), hidden, start_pos+i).contiguous()
       draft.append(self.output(hidden).argmax(-1).contiguous())
     inputs = Tensor.cat(*draft, dim=1).contiguous()
-    predicted, hidden = self._mtp_target(inputs, start_pos, verify=True, hidden_out=hidden_history)
+    hidden = self.output_norm(self._hidden(inputs, start_pos, save_state=True))
+    hidden = Tensor(hidden_history.uop.after(hidden_history.uop.store(hidden.uop)))
+    predicted = self.output(hidden).argmax(-1).contiguous()
     accepted = (inputs[:, 1:] == predicted[:, :-1]).cast(dtypes.int32).cumprod(1).sum(1).reshape(1)
     restored = self._mtp_restore(accepted)
     # Commit target-conditioned draft KV rows. Extra speculative rows are overwritten on the next round.
@@ -568,7 +565,8 @@ class Transformer:
     return Tensor(target.uop.after(*deps)), accepted
 
   def _mtp_prefill(self, tokens:Tensor, start_pos:UOp, pending:Tensor, previous:Tensor) -> Tensor:
-    out, hidden = self._mtp_target(tokens, start_pos)
+    hidden = self.output_norm(self._hidden(tokens, start_pos)).contiguous()
+    out = self.output(hidden[:, -1:]).argmax(-1).contiguous()
     # Each prompt token uses the preceding target hidden; the sequence starts with a zero hidden state.
     shifted = Tensor(start_pos).eq(0).where(0, previous).cat(hidden[:, :-1], dim=1).contiguous()
     updated = self.mtp[0].forward(self.token_embd(tokens).float(), shifted, start_pos, cache_only=True)
