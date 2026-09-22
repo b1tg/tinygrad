@@ -36,8 +36,7 @@ def get_grouped_dims(prefix, dims:tuple[sint, ...], max_sizes:tuple[int, ...]|No
     if limited == dims: limited = _split_dims(dims, max_sizes)
   raw_idxs = [UOp.special(s, f"{prefix}{i}") for i,s in enumerate(limited)]
   flat = sum(idx * math.prod(limited[i+1:]) for i,idx in enumerate(raw_idxs))
-  return [(flat // math.prod(dims[i+1:])).simplify() if i == 0 else ((flat // math.prod(dims[i+1:])) % dims[i]).simplify()
-          for i in range(len(dims))]
+  return [ssimplify(flat // math.prod(dims[i+1:])) if i == 0 else ssimplify((flat // math.prod(dims[i+1:])) % dims[i]) for i in range(len(dims))]
 
 def add_gpudims(ctx:Renderer, s:UOp):
   if s.arg is None: return None

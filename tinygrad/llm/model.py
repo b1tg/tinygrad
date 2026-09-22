@@ -143,12 +143,12 @@ class FFNBlock:
   def _init_state(self, x:Tensor): raise NotImplementedError
   def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor: raise NotImplementedError
 
-  def __call__(self, x: Tensor, start_pos: int|UOp):
+  def __call__(self, x: Tensor, start_pos: int|UOp, **kwargs):
     self._init_state(x)
     # we pass in the weights implicitly so we unpack the GGUF on the fly
     @function(precompile=True, allow_implicit=True)
     def _run(x:Tensor, start_pos:int|UOp):
-      h =     x + self._attention(self.attn_norm(x), start_pos)
+      h =     x + self._attention(self.attn_norm(x), start_pos, **kwargs)
       return (h + self._feed_forward(self.ffn_norm(h))).contiguous()
     return _run(x, start_pos)
 
@@ -166,25 +166,28 @@ class TransformerBlock(FFNBlock):
     self.attn_output = Linear(config.head_dim * config.n_heads, config.dim, bias=False)
     if config.qk_norm: self.attn_q_norm, self.attn_k_norm = nn.RMSNorm(config.qk_norm, config.norm_eps), nn.RMSNorm(config.qk_norm, config.norm_eps)
 
-  def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
-    q, k, v = self.attn_q(x), self.attn_k(x), self.attn_v(x)
-    if self.config.qk_norm and self.config.qk_norm != self.config.head_dim: q, k = self.attn_q_norm(q), self.attn_k_norm(k)
+  def _cache_kv(self, x:Tensor, start_pos:int|UOp) -> Tensor:
+    B, T, _ = x.shape
+    k, v = self.attn_k(x), self.attn_v(x)
+    if self.config.qk_norm and self.config.qk_norm != self.config.head_dim: k = self.attn_k_norm(k)
+    k, v = (t.reshape(B, T, self.config.n_kv_heads, self.config.head_dim).transpose(1, 2) for t in (k, v))
+    if self.config.qk_norm == self.config.head_dim: k = self.attn_k_norm(k)
+    k = apply_rope(k[..., :self.config.rope_dim], self.freqs_cis[start_pos:start_pos+T]).cat(k[..., self.config.rope_dim:], dim=-1)
+    # NOTE: we don't want to change self.cache_kv, the function API doesn't support this well
+    store = self.cache_kv[:, :, :, start_pos:start_pos+T, :].uop.store(Tensor.stack(k, v).cast(self.cache_kv.dtype).uop)
+    return Tensor(self.cache_kv.uop.after(store))
 
+  def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
+    q = self.attn_q(x)
+    if self.config.qk_norm and self.config.qk_norm != self.config.head_dim: q = self.attn_q_norm(q)
     B, T, _ = x.shape
     if self.config.attn_output_gate:
       qg = q.reshape(B, T, self.config.n_heads, 2, self.config.head_dim)
       q, gate = qg[:, :, :, 0, :], qg[:, :, :, 1, :].reshape(B, T, self.config.n_heads * self.config.head_dim)
-    q = q.reshape(B, T, self.config.n_heads,    self.config.head_dim).transpose(1, 2)  # (B,H,T,Hd)
-    k = k.reshape(B, T, self.config.n_kv_heads, self.config.head_dim).transpose(1, 2)  # (B,KvH,T,Hd)
-    v = v.reshape(B, T, self.config.n_kv_heads, self.config.head_dim).transpose(1, 2)  # (B,KvH,T,Hd)
-    if self.config.qk_norm == self.config.head_dim: q, k = self.attn_q_norm(q), self.attn_k_norm(k)
-
+    q = q.reshape(B, T, self.config.n_heads, self.config.head_dim).transpose(1, 2)  # (B,H,T,Hd)
+    if self.config.qk_norm == self.config.head_dim: q = self.attn_q_norm(q)
     q = apply_rope(q[..., :self.config.rope_dim], self.freqs_cis[start_pos:start_pos+T]).cat(q[..., self.config.rope_dim:], dim=-1)
-    k = apply_rope(k[..., :self.config.rope_dim], self.freqs_cis[start_pos:start_pos+T]).cat(k[..., self.config.rope_dim:], dim=-1)
-
-    # NOTE: we don't want to change self.cache_kv, the function API doesn't support this well
-    store = self.cache_kv[:, :, :, start_pos:start_pos+T, :].uop.store(Tensor.stack(k, v).cast(self.cache_kv.dtype).uop)
-    assigned_kv = Tensor(self.cache_kv.uop.after(store))
+    assigned_kv = self._cache_kv(x, start_pos)
     # on RDNA3, hybrid models use custom flash attention kernels on the KV cache
     if amd_custom_kernels_supported(x.device) and self.config.ssm is not None:
       attn = flash_attention(q, assigned_kv, start_pos+T)
@@ -260,11 +263,8 @@ class MLATransformerBlock(FFNBlock):
       self.freqs_cis = precompute_freqs_cis(self.config.rope_dim, self.config.max_context, self.config.rope_theta, device=x.device)
 
 class GatedDeltaNetBlock(FFNBlock):
-  capture_state = False
   state_history:Tensor
   conv_history:Tensor
-  # Order state reads after in-place rollback stores.
-  restore_deps:tuple[UOp, ...] = ()
   def __init__(self, config:TransformerConfig, ssm:SSMConfig):
     super().__init__(config)
     self.head_k_dim, self.num_k_heads, self.num_v_heads = ssm.state_size, ssm.group_count, ssm.time_step_rank
@@ -284,7 +284,7 @@ class GatedDeltaNetBlock(FFNBlock):
     self.ssm_a = Tensor.zeros(self.num_v_heads, 1) if ssm.kda else Tensor.zeros(self.num_v_heads)
     self.ssm_norm, self.ssm_out = nn.RMSNorm(self.head_v_dim, config.norm_eps), Linear(ssm.inner_size, config.dim, bias=False)
 
-  def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
+  def _attention(self, x:Tensor, start_pos:int|UOp, capture:bool=False) -> Tensor:
     B, T, _ = x.shape
     # bind ints to a variable so the reset flag stays a runtime value (it toggles when generation restarts at position 0)
     start_pos = start_pos if isinstance(start_pos, UOp) else UOp.variable("start_pos", 0, self.config.max_context-1).bind(start_pos)
@@ -302,9 +302,8 @@ class GatedDeltaNetBlock(FFNBlock):
     log_alpha = ((alpha.float() + self.ssm_dt["bias"]).softplus().reshape(B, T, self.num_v_heads, -1) *
                  self.ssm_a.reshape(self.num_v_heads, -1))
 
-    capture = self.capture_state
     # qkv conv, conv_state is reset when starting from position 0
-    conv_state = initial.where(0, self.conv_state.uop.after(*self.restore_deps) if self.restore_deps else self.conv_state)
+    conv_state = initial.where(0, self.conv_state)
     # assemble the conv window in a static-size buffer: [conv_state | qkv rows | zero-pad].
     # padded steps are exact no-ops: beta=0 (delta rule off), log_alpha=0 (decay 1 after exp)
     win = Tensor.zeros(B, self.ssm_conv_kernel-1 + T_pad, self.conv_channels).uop
@@ -334,7 +333,7 @@ class GatedDeltaNetBlock(FFNBlock):
     alpha = log_alpha.transpose(1, 2).exp()  # per-channel decay for kda, per-head otherwise (B, H, T, V|1)
 
     # recurrent: scan over the (padded) tokens, updating the recurrent state. collect the per-step outputs
-    state = Tensor(self.recurrent_state.uop.after(conv_state_store, *self.restore_deps))  # carry conv + restore writes
+    state = Tensor(self.recurrent_state.uop.after(conv_state_store))  # carry the conv write into this graph
     if self.head_k_dim % 32 == 0 and self.head_v_dim % 4 == 0 and amd_custom_kernels_supported(x.device):
       # one fused kernel for the whole scan; it resets and updates the recurrent state in place (RDNA3)
       core = gated_delta_prefill(q, k, v, beta, alpha, state, Tensor(start_pos), self.state_history if capture else None).transpose(1, 2)
@@ -372,24 +371,11 @@ class MTPBlock(TransformerBlock):
     self.nextn:dict[str, nn.RMSNorm|Linear] = {"enorm": nn.RMSNorm(config.dim, config.norm_eps), "hnorm": nn.RMSNorm(config.dim, config.norm_eps),
                   "eh_proj": Linear(2*config.dim, config.dim, bias=False), "shared_head_norm": nn.RMSNorm(config.dim, config.norm_eps)}
 
-  def _mix(self, embedding:Tensor, hidden:Tensor) -> Tensor:
-    return self.nextn["eh_proj"](self.nextn["enorm"](embedding).cat(self.nextn["hnorm"](hidden), dim=-1))
-
-  def draft(self, embedding:Tensor, hidden:Tensor, start_pos:int|UOp) -> Tensor:
-    return self.nextn["shared_head_norm"](self(self._mix(embedding, hidden), start_pos))
-
-  def cache(self, embedding:Tensor, hidden:Tensor, start_pos:int|UOp) -> Tensor:
-    # Cache repair needs only K and V; attention, FFN and the vocabulary projection are unused.
-    x = self._mix(embedding, hidden)
+  def forward(self, embedding:Tensor, hidden:Tensor, start_pos:int|UOp, cache_only:bool=False) -> Tensor:
+    x = self.nextn["eh_proj"](self.nextn["enorm"](embedding).cat(self.nextn["hnorm"](hidden), dim=-1))
     self._init_state(x)
-    x = self.attn_norm(x)
-    B, T, _ = x.shape
-    k, v = (proj(x).reshape(B, T, self.config.n_kv_heads, self.config.head_dim).transpose(1, 2)
-            for proj in (self.attn_k, self.attn_v))
-    k = self.attn_k_norm(k)
-    k = apply_rope(k[..., :self.config.rope_dim], self.freqs_cis[start_pos:start_pos+T]).cat(k[..., self.config.rope_dim:], dim=-1)
-    store = self.cache_kv[:, :, :, start_pos:start_pos+T, :].uop.store(Tensor.stack(k, v).cast(dtypes.half).uop)
-    return Tensor(hidden.uop.after(store))
+    if cache_only: return self._cache_kv(self.attn_norm(x), start_pos)
+    return self.nextn["shared_head_norm"](self(x, start_pos))
 
 class Transformer:
   def __init__(self, config:TransformerConfig):
@@ -406,21 +392,21 @@ class Transformer:
     self.max_context = config.max_context
     self.has_recurrent_block = any(isinstance(b, GatedDeltaNetBlock) for b in self.blk)
     self._cached_tokens: list[int] = []
-    # persistent MTP round inputs (created lazily on first use) and the target hidden that seeds a resumed request
-    self._mtp_pending_buf: Tensor|None = None
-    self._mtp_prev_buf: Tensor|None = None
-    self._mtp_target_buf: dict[int, Tensor] = {}
-    self._mtp_prev_hidden: Tensor|None = None
+    self._mtp_inputs:tuple[Tensor, Tensor]|None = None  # stable token/hidden buffers shared by prefill and verification
+    self._mtp_cached = False
     # we specialize the JIT for prefill and rollout
     self.prefill_jit = TinyJit(self.forward)
     self.rollout_jit = TinyJit(self.forward)
     self.mtp_prefill_jit:dict[int, Callable] = {}
-    self.mtp_draft_prefill_jit:dict[int, Callable] = {}
-    self.mtp_round_jit:dict[int, Callable] = {}
+    self.mtp_round_jit:dict[int, tuple[Callable, Tensor]] = {}
+
+  def _hidden(self, tokens:Tensor, start_pos:int|UOp, verify:bool=False) -> Tensor:
+    x = self.token_embd(tokens).float()                   # (B, T, D)
+    for block in self.blk: x = block(x, start_pos, **({"capture": verify} if isinstance(block, GatedDeltaNetBlock) else {}))
+    return x
 
   def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
-    x = self.token_embd(tokens).float()                   # (B, T, D)
-    for block in self.blk: x = block(x, start_pos)
+    x = self._hidden(tokens, start_pos)
     # only run the output projection on the last token
     logits = self.output(self.output_norm(x[:, -1:]))[:, -1, :]
     # Gumbel-max trick: argmax(logits/temp - log(-log(uniform))) is equivalent to sampling from softmax(logits/temp)
@@ -530,22 +516,9 @@ class Transformer:
     prefix_len = sum(1 for _ in itertools.takewhile(lambda ab: ab[0] == ab[1], zip(tokens[:-1], self._cached_tokens)))
     return min(block._reusable_prefix_len(prefix_len, len(self._cached_tokens)) for block in self.blk)
 
-  def _mtp_target(self, tokens:Tensor, start_pos:int|UOp, verify:bool=False,
-                  restore_deps:tuple[UOp, ...]=()) -> tuple[Tensor, Tensor]:
-    # Explicit dependencies order replay after state rollback.
-    x = self.token_embd(tokens).float()
-    for block in self.blk:
-      if isinstance(block, GatedDeltaNetBlock): block.capture_state, block.restore_deps = verify, restore_deps
-      x = block(x, start_pos)
-      if isinstance(block, GatedDeltaNetBlock): block.capture_state, block.restore_deps = False, ()
-    hidden = self.output_norm(x).contiguous()
+  def _mtp_target(self, tokens:Tensor, start_pos:int|UOp, verify:bool=False) -> tuple[Tensor, Tensor]:
+    hidden = self.output_norm(self._hidden(tokens, start_pos, verify)).contiguous()
     return self.output(hidden if verify else hidden[:, -1:]).argmax(-1).contiguous(), hidden.pad_to(hidden.max_shape).contiguous()
-
-  def _mtp_draft(self, tokens:Tensor, hidden:Tensor, start_pos:int|UOp, project:bool=True) -> tuple[Tensor, Tensor]:
-    embedding = self.token_embd(tokens).float()
-    if not project: return tokens[:, -1:].contiguous(), self.mtp[0].cache(embedding, hidden, start_pos)
-    hidden = self.mtp[0].draft(embedding, hidden, start_pos).contiguous()
-    return self.output(hidden[:, -1:]).argmax(-1).contiguous(), hidden[:, -1:].contiguous()
 
   def _mtp_restore(self, index:Tensor) -> list[Tensor]:
     ret = []
@@ -560,15 +533,14 @@ class Transformer:
     # the persistent buffers are explicit JIT inputs so the captured graph reads/writes them in place across execs
     draft, hidden = [pending], previous
     for i in range(count):
-      token, hidden = self._mtp_draft(draft[-1], hidden, start_pos+i)
-      draft.append(token)
+      hidden = self.mtp[0].forward(self.token_embd(draft[-1]).float(), hidden, start_pos+i).contiguous()
+      draft.append(self.output(hidden).argmax(-1).contiguous())
     inputs = Tensor.cat(*draft, dim=1).contiguous()
     predicted, hidden = self._mtp_target(inputs, start_pos, verify=True)
     accepted = (inputs[:, 1:] == predicted[:, :-1]).cast(dtypes.int32).cumprod(1).sum(1).reshape(1)
     restored = self._mtp_restore(accepted)
     # Commit target-conditioned draft KV rows. Extra speculative rows are overwritten on the next round.
-    repair_tokens, repair_hidden = predicted[:, :-1], hidden[:, :-1]
-    _, updated = self._mtp_draft(repair_tokens, repair_hidden, start_pos+1, project=False)
+    updated = self.mtp[0].forward(self.token_embd(predicted[:, :-1]).float(), hidden[:, :-1], start_pos+1, cache_only=True)
     chosen = hidden.gather(1, accepted.reshape(1, 1, 1).expand(1, 1, hidden.shape[-1])).contiguous()
     deps = [t.uop for t in restored] + [updated.uop]
     # Persist emitted tokens so JIT replay returns updated values.
@@ -577,94 +549,40 @@ class Transformer:
     deps.append(previous.uop.store(chosen.reshape(previous.shape).cast(previous.dtype).uop))
     return Tensor(target.uop.after(*deps)), accepted
 
-  def generate_mtp(self, tokens:list[int], chunk_size:int=32, draft_tokens:int=3):
-    if not 1 <= draft_tokens <= 7: raise ValueError("MTP draft count must be between 1 and 7")
-    if not tokens: raise ValueError("MTP requires a nonempty prompt")
-    self.mtp_stats = {"drafted": 0, "accepted": 0, "rounds": 0}
-    if len(tokens) >= self.max_context: return
-    sp = UOp.variable("start_pos", 0, self.max_context-1)
-    if self.has_recurrent_block and not amd_custom_kernels_supported(self.token_embd.weight.device): chunk_size = 1
-    for block in self.blk:
-      if isinstance(block, GatedDeltaNetBlock):
-        block._init_state(Tensor.empty(1, 1, self.token_embd.weight.shape[1]))
-        # Half-precision snapshots limit recurrent-state memory usage.
-        if not hasattr(block, "state_history") or block.state_history.shape[0] < draft_tokens+1:
-          block.state_history = Tensor.empty(draft_tokens+1, *block.recurrent_state.shape, dtype=dtypes.half,
-                                             device=block.recurrent_state.device).realize()
-          block.conv_history = Tensor.empty(draft_tokens+1, *block.conv_state.shape, dtype=dtypes.half,
-                                            device=block.conv_state.device).realize()
-    # Resume with the cached target hidden state and aligned target/draft caches.
-    prefix = self.get_start_pos(tokens) if self._mtp_prev_hidden is not None else 0
-    if prefix == 0: self._cached_tokens = []
-    previous = self._mtp_prev_hidden if prefix > 0 else None
-    vt = UOp.variable("toks", 1, chunk_size)
-    for pos in range(prefix, len(tokens), chunk_size):
-      n = min(chunk_size, len(tokens)-pos)
-      chunk = Tensor([tokens[pos:pos+n]], dtype=dtypes.int32)
-      target_chunk = chunk.pad_to((1, chunk_size))[:, :vt.bind(n)].contiguous()
-      out, hidden = self.mtp_prefill_jit.setdefault(chunk_size, TinyJit(self._mtp_target))(target_chunk, sp.bind(pos))
-      Tensor.realize(out, hidden)
-      hidden = hidden[:, :n]
-      # The token at position p is paired with the target hidden state at p-1.
-      # Keep the first prompt row too, using a zero hidden state at the sequence boundary.
-      if previous is None: previous = Tensor.zeros_like(hidden[:, :1])
-      shifted = previous.cat(hidden[:, :-1], dim=1).contiguous()
-      # Symbolic lengths reuse the prefill JIT for partial chunks.
-      draft_hidden = shifted.pad_to((1, chunk_size, shifted.shape[-1]))[:, :vt.bind(n)].contiguous()
-      draft_prefill = self.mtp_draft_prefill_jit.setdefault(chunk_size, TinyJit(functools.partial(self._mtp_draft, project=False)))
-      Tensor.realize(*draft_prefill(target_chunk, draft_hidden, sp.bind(pos)))
-      previous = hidden[:, -1:].clone().realize()
-    assert previous is not None
-    pos = len(tokens)
-    pending = int(out.item())
-    tokens.append(pending)
-    yield pending
-    # Stable input buffers allow round JIT reuse across rounds and requests.
-    dev = self.token_embd.weight.device
-    if self._mtp_pending_buf is None:
-      self._mtp_pending_buf = Tensor.zeros(1, 1, dtype=dtypes.int32, device=dev).realize()
-      self._mtp_prev_buf = Tensor.empty(1, 1, previous.shape[-1], dtype=previous.dtype, device=dev).realize()
-    assert self._mtp_prev_buf is not None
-    self._mtp_pending_buf._buffer().copy_from(Tensor([[pending]], dtype=dtypes.int32, device=dev).realize()._buffer())
-    self._mtp_prev_buf._buffer().copy_from(previous.contiguous()._buffer())
-    while len(tokens) < self.max_context:
-      count = min(draft_tokens, self.max_context-pos-1)
-      if count < 1:
-        out, previous = self._mtp_target(Tensor([[pending]], dtype=dtypes.int32), sp.bind(pos))
-        pending = int(out.item())
-        tokens.append(pending)
-        yield pending
-        self._cached_tokens, self._mtp_prev_hidden = [], None
-        break
-      run = self.mtp_round_jit.setdefault(count, TinyJit(functools.partial(self._mtp_round, count=count)))
-      if count not in self._mtp_target_buf:
-        self._mtp_target_buf[count] = Tensor.empty(1, count+1, dtype=dtypes.int32, device=dev).realize()
-      target_tensor, accepted_tensor = run(self._mtp_pending_buf, self._mtp_prev_buf, self._mtp_target_buf[count], sp.bind(pos))
-      target = target_tensor.tolist()[0]
-      accepted = int(accepted_tensor.item())
-      pos += accepted+1
-      pending = target[accepted]
-      self.mtp_stats["rounds"] += 1
-      self.mtp_stats["drafted"] += count
-      self.mtp_stats["accepted"] += accepted
-      for tok in target[:accepted+1]:
-        if len(tokens) >= self.max_context: break
-        tokens.append(tok)
-        yield tok
-      # caches are now valid through `pos-1`; `_mtp_prev_buf` holds the target hidden there for the next round/request
-      if tokens and tokens[-1] == pending:
-        self._cached_tokens = tokens[:-1]
-        self._mtp_prev_hidden = self._mtp_prev_buf
+  def _mtp_prefill(self, tokens:Tensor, start_pos:UOp, pending:Tensor, previous:Tensor) -> Tensor:
+    out, hidden = self._mtp_target(tokens, start_pos)
+    hidden = hidden[:, :tokens.shape[1]]
+    # Each prompt token uses the preceding target hidden; the sequence starts with a zero hidden state.
+    shifted = Tensor(start_pos).eq(0).where(0, previous).cat(hidden[:, :-1], dim=1).contiguous()
+    updated = self.mtp[0].forward(self.token_embd(tokens).float(), shifted, start_pos, cache_only=True)
+    store = previous.uop.after(updated.uop).store(hidden[:, -1:].uop)
+    return Tensor(pending.uop.after(store, pending.uop.store(out.uop)))
 
   def generate(self, tokens:list[int], chunk_size:int=32, temperature:float=0.0, mtp:int|None=None):
     mtp = getenv("MTP", 0) if mtp is None else mtp
     if mtp:
       if not self.mtp: raise ValueError("model does not contain supported MTP weights")
       if temperature != 0: raise ValueError("MTP currently requires greedy decoding (temperature=0)")
-      yield from self.generate_mtp(tokens, chunk_size, mtp)
-      return
-    # a non-MTP decode leaves the main KV cache valid but not the MTP-aligned hidden; force an MTP rebuild if it runs next
-    self._mtp_prev_hidden = None
+      if not 1 <= mtp <= 7: raise ValueError("MTP draft count must be between 1 and 7")
+      if not tokens: raise ValueError("MTP requires a nonempty prompt")
+      self.mtp_stats = {"drafted": 0, "accepted": 0, "rounds": 0}
+      if len(tokens) >= self.max_context: return
+      if not self._mtp_cached: self._cached_tokens = []
+      if self._mtp_inputs is None:
+        dev, dim = self.token_embd.weight.device, self.token_embd.weight.shape[1]
+        self._mtp_inputs = (Tensor.zeros(1, 1, dtype=dtypes.int32, device=dev).realize(),
+                            Tensor.zeros(1, 1, dim, dtype=dtypes.float32, device=dev).realize())
+      pending, previous = self._mtp_inputs
+      for block in self.blk:
+        if not isinstance(block, GatedDeltaNetBlock): continue
+        block._init_state(previous)
+        if not hasattr(block, "state_history") or block.state_history.shape[0] < mtp+1:
+          block.state_history = Tensor.empty(mtp+1, *block.recurrent_state.shape, dtype=dtypes.half,
+                                             device=block.recurrent_state.device).realize()
+          block.conv_history = Tensor.empty(mtp+1, *block.conv_state.shape, dtype=dtypes.half,
+                                            device=block.conv_state.device).realize()
+          self.mtp_round_jit.clear()  # captured graphs must use the resized history buffers
+    else: self._mtp_cached = False
     if self.has_recurrent_block and not amd_custom_kernels_supported(self.token_embd.weight.device): chunk_size = 1
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
     v_toks = UOp.variable("toks", 1, chunk_size)
@@ -676,12 +594,33 @@ class Transformer:
     start_pos = self.get_start_pos(tokens)
     out, prompt_len = None, len(tokens)
     while len(tokens) < self.max_context:
-      n_toks = min(chunk_size, len(tokens) - start_pos)
-      sp, nt = v_start_pos.bind(start_pos), v_toks.bind(n_toks)
-      out = self(t[:, sp:sp+nt] if start_pos < prompt_len or out is None else out, sp, temp).realize()
-      start_pos += n_toks
-      # chunked prefill: keep processing until all prompt tokens are consumed
-      if start_pos < len(tokens): continue
-      tokens.append(int(out.item()))
-      self._cached_tokens = tokens[:-1]
-      yield tokens[-1]
+      if mtp and out is not None and start_pos >= prompt_len and (count:=min(mtp, self.max_context-start_pos-1)) > 0:
+        self._cached_tokens = []  # state may advance past tokens yielded if the consumer stops mid-round
+        if count not in self.mtp_round_jit:
+          self.mtp_round_jit[count] = (TinyJit(functools.partial(self._mtp_round, count=count)),
+                                     Tensor.empty(1, count+1, dtype=dtypes.int32, device=t.device).realize())
+        run, target = self.mtp_round_jit[count]
+        target, accepted = run(pending, previous, target, v_start_pos.bind(start_pos))
+        emitted = target.tolist()[0][:int(accepted.item())+1]
+        start_pos += len(emitted)
+        self.mtp_stats["rounds"] += 1
+        self.mtp_stats["drafted"] += count
+        self.mtp_stats["accepted"] += len(emitted)-1
+      else:
+        n_toks = min(chunk_size, len(tokens) - start_pos)
+        sp, nt = v_start_pos.bind(start_pos), v_toks.bind(n_toks)
+        inputs = t[:, sp:sp+nt] if start_pos < prompt_len or out is None else out
+        if mtp:
+          run = self.mtp_prefill_jit.setdefault(chunk_size, TinyJit(self._mtp_prefill))
+          out = run(inputs.contiguous(), sp, pending, previous).realize()
+        else: out = self(inputs, sp, temp).realize()
+        start_pos += n_toks
+        # chunked prefill: keep processing until all prompt tokens are consumed
+        if start_pos < len(tokens): continue
+        emitted = [int(out.item())]
+      for tok in emitted:
+        tokens.append(tok)
+        if len(tokens) == start_pos+1:
+          self._cached_tokens = tokens[:-1]
+          self._mtp_cached = bool(mtp)
+        yield tok

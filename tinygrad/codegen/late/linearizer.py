@@ -17,8 +17,7 @@ def linearize(sink:UOp) -> list[UOp]:
     for s in u.src: out_degree[s] += 1
 
     # we place UOps with higher run_counts later
-    # A runtime loop with at most one iteration still introduces a scope.
-    run_count = prod([max(2, int(r.vmax)+1) for r in u.ranges])
+    run_count = prod([int(r.vmax)+1 for r in u.ranges])
 
     # simple priority override. this is all bottom up now, smaller numbers will be closer to the top
     extra = None
