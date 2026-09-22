@@ -170,7 +170,8 @@ def copy_to_anon_store(x:UOp, copy:UOp):
 def stage_to_anon_store(x:UOp, stg:UOp):
   # the buffer created here is inside the call and is not persisted, like the buffers created for copies
   buf = UOp(Ops.ALLOC, arg=ParamArg(next(UOp.unique_num), stg.dtype, prod(x.max_shape), device=x.device)).reshape(x.max_shape)
-  return buf.after(buf.store(x.pad_to(x.max_shape))).shrink_to(stg.shape)
+  view = buf.shrink_to(stg.shape)
+  return view.after(view.store(x))
 
 def materialize_cross_device_src(dest:UOp, src:UOp):
   # cross-device copies must read a whole buffer (SDMA can't do offset copies)

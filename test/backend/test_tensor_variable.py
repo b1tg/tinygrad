@@ -79,6 +79,19 @@ class TestTensorVariable(unittest.TestCase):
         v = Variable("stage_v", 1, 4).bind(n)
         self.assertEqual(a[:, :v].flip(1).contiguous().sum().item(), n*(n+5))
 
+  def test_symbolic_contiguous_elementwise_jit(self):
+    for width in (127, 128, 130):
+      with self.subTest(width=width):
+        data = np.arange(32*width, dtype=np.float32).reshape(32, width)
+        a = Tensor(data).realize()
+        @TinyJit
+        def f(x): return (x+1).contiguous().pad_to((32, width)).contiguous().realize()
+        for n in (1, 3, 32, 31, 2, 32):
+          v = Variable("rows", 1, 32).bind(n)
+          expected = np.zeros_like(data)
+          expected[:n] = data[:n]+1
+          np.testing.assert_equal(f(a[:v]).numpy(), expected)
+
   def test_symbolic_shape_mul_variable_tensor(self):
     # NOTE: the buffer dim must cover the variable's vmax
     vv = Variable("a", 1, 10).bind(2)

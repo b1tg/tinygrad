@@ -1,13 +1,27 @@
 import unittest
 from tinygrad import Device, Tensor, dtypes
 from tinygrad.codegen.opt import Opt, OptOps, KernelOptError
-from tinygrad.uop.ops import AxisType
+from tinygrad.uop.ops import AxisType, UOp, Ops
 from tinygrad.codegen.opt.postrange import Scheduler
+from tinygrad.helpers import Target
+from tinygrad.renderer import Renderer
+from test.helpers import get_uops
 
 # TODO: write a clean version of this
 from test.backend.test_linearizer import helper_linearizer_opt
 
 class TestKernelOpts(unittest.TestCase):
+  def test_symbolic_elementwise_optimizations(self):
+    n = UOp.variable("n", 1, 32, param=True)
+    # The maximum alone is not enough: only factors valid for every n can be split out.
+    for size, lanes, local in [(n*128, 4, 32), (n*128+4, 4, 1), (n*127, 1, 1), (n*128+1, 1, 1)]:
+      with self.subTest(size=size.render()):
+        src, dst = (UOp.param(i, dtypes.float, size.vmax) for i in range(2))
+        r = UOp.range(size, 0, AxisType.WEAK)
+        uops = get_uops(dst.index(r).store(src.index(r)+1).end(r).sink(), Renderer(Target()))
+        self.assertEqual([u.shape for u in uops if u.op is Ops.LOAD], [(lanes,)] if lanes > 1 else [()])
+        self.assertEqual([u.src[0].val for u in uops if u.op is Ops.SPECIAL and u.arg.startswith("lidx")], [local] if local > 1 else [])
+
   def test_opt_without_axis(self):
     ast = Tensor.empty(32, 32).sum(1).schedule_linear().src[-1].src[0]
     for opt in [Opt(OptOps.SPLIT, None, (2, AxisType.UPCAST)), Opt(OptOps.PADTO, None, 32), Opt(OptOps.SWAP, None, 1)]:

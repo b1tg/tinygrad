@@ -155,8 +155,9 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
 
   # if nothing at all is upcasted and it's easy to, do an upcast
   for splits in [4]:
-    if not k.upcasted and k.upcastable_dims and k.full_shape[k.upcastable_dims[-1]] % splits == 0:
-      k.apply_opt(Opt(OptOps.SPLIT, k.upcastable_dims[-1], (splits, AxisType.UPCAST)))
+    dims = k.axes_of(AxisType.GLOBAL, AxisType.LOCAL, AxisType.WEAK)
+    if not k.upcasted and dims and k.rngs[dims[-1]].src[0].divides(splits) is not None:
+      k.apply_opt(Opt(OptOps.SPLIT, dims[-1], (splits, AxisType.UPCAST)))
 
   # **** local groups ****
 
@@ -177,16 +178,17 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
     else:
       # prioritize making expand axes local
       local_axis_ranking = [(any(k.rngs[axis] not in b.src[1].get_idx().backward_slice for b in k.bufs), axis) \
-                              for axis in k.axes_of(AxisType.GLOBAL, AxisType.WEAK) if k.rngs[axis].src[0].op is Ops.CONST]
+                              for axis in k.axes_of(AxisType.GLOBAL, AxisType.WEAK)]
       to_local: list[tuple[int, int]] = []
       for _, axis in sorted(local_axis_ranking, key=lambda x: (-x[0], -x[1])):
         local_size = prod(sz for _, sz in to_local)
-        local_sz: int|None = next((x for x in ([32] * (axis == 0) + [16,8,4,3,2]) if k.full_shape[axis] % x == 0 and local_size * x <= 128), None)
+        local_sz: int|None = next((x for x in ([32] * (axis == 0) + [16,8,4,3,2])
+                                  if k.rngs[axis].src[0].divides(x) is not None and local_size * x <= 128), None)
         if local_sz is not None: to_local.append((axis, local_sz))
       deleted_shape = 0
       for axis, local_sz in sorted(to_local[:3]):
         axis = axis - deleted_shape
-        will_delete_shape = local_sz == k.full_shape[axis]
+        will_delete_shape = resolve(local_sz == k.full_shape[axis], False)
         k.apply_opt(Opt(OptOps.SPLIT, axis, (local_sz, AxisType.LOCAL)))
         if will_delete_shape: deleted_shape += 1
 
