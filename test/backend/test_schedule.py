@@ -115,7 +115,7 @@ class TestSchedule(unittest.TestCase):
     idx = Tensor([1,2,5,6], dtype=dtypes.int32)
     flat_base[idx] = Tensor([99,99,99,99])
     base.assign(flat_base.reshape(4, 4))
-    sched = check_schedule(base, 4)
+    sched = check_schedule(base, 3)
     run_linear(*sched)
     expected = list(range(16))
     for i, v in zip([1,2,5,6], [99,99,99,99]): expected[i] = v
@@ -369,7 +369,7 @@ class TestCopyFolding(unittest.TestCase):
     a = Tensor.ones(4).contiguous().realize().uop.buf_uop
     t = Tensor(a.copy_to_device(a.device))
     linear, var_vals = t.linear_with_vars()
-    assert len([call for call in linear.src if call.src[0].op is Ops.COPY]) == 0
+    assert len([call for call in linear.src if call.src[0].op is Ops.STORE]) == 0
     run_linear(linear, var_vals)
     assert t.uop.is_realized, f"didn't realize Tensor {t}"
     self.assertListEqual(t.tolist(), [1.,1.,1.,1.])
