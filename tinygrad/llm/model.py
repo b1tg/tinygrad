@@ -294,8 +294,9 @@ class GatedDeltaNetBlock(FFNBlock):
   def _prepare_history(self, x:Tensor, length:int) -> bool:
     self._init_state(x)
     if hasattr(self, "state_history") and self.state_history.shape[0] >= length: return False
-    self.state_history = Tensor.empty(length, *self.recurrent_state.shape, dtype=dtypes.half, device=self.recurrent_state.device).realize()
-    self.conv_history = Tensor.empty(length, *self.conv_state.shape, dtype=dtypes.half, device=self.conv_state.device).realize()
+    state_history = Tensor.empty(length, *self.recurrent_state.shape, dtype=dtypes.half, device=self.recurrent_state.device).realize()
+    conv_history = Tensor.empty(length, *self.conv_state.shape, dtype=dtypes.half, device=self.conv_state.device).realize()
+    self.state_history, self.conv_history = state_history, conv_history
     return True
 
   def _restore_state(self, index:Tensor) -> list[UOp]:
@@ -518,6 +519,8 @@ class Transformer:
       config = replace(config, mtp_layers=1)
       prefix = f"blk.{config.num_blocks}."
       state_dict = {("mtp.0."+k[len(prefix):] if k.startswith(prefix) else k):v for k,v in state_dict.items()}
+      for name in ("embed_tokens", "shared_head_head"):
+        assert f"mtp.0.nextn.{name}.weight" not in state_dict, f"separate MTP {name} weights are not supported"
       state_dict.setdefault("mtp.0.nextn.shared_head_norm.weight", state_dict["output_norm.weight"])
     model = Transformer(config)
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
@@ -602,8 +605,8 @@ class Transformer:
     out, prompt_len = None, len(tokens)
     hidden_history:Tensor
     while len(tokens) < self.max_context:
+      self._cached_tokens = []  # a failed forward may have updated only part of the cached state
       if mtp and out is not None and start_pos >= prompt_len and (count:=min(mtp, self.max_context-start_pos-1)) > 0:
-        self._cached_tokens = []  # state may advance past tokens yielded if the consumer stops mid-round
         if count not in self.mtp_round_jit:
           self.mtp_round_jit[count] = (TinyJit(functools.partial(self._mtp_round, count=count)),
                                      Tensor.empty(1, count+1, dtype=dtypes.int32, device=t.device).realize(),
