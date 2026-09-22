@@ -5,7 +5,7 @@ from unittest.mock import patch
 from tinygrad import Tensor, UOp
 from tinygrad.nn.state import get_state_dict
 from tinygrad.schedule import schedule_cache
-from tinygrad.llm.model import Transformer, TransformerConfig
+from tinygrad.llm.model import IndexerConfig, MLATransformerBlock, Transformer, TransformerConfig
 from tinygrad.llm.serve import StreamRouter, normalize_messages
 
 TEST_CONFIG = TransformerConfig(num_blocks=1, dim=64, hidden_dim=128, n_heads=2, n_kv_heads=2,
@@ -74,6 +74,13 @@ class TestTransformerGenerate(unittest.TestCase):
     model.has_recurrent_block = True
     with patch.object(Transformer, '__call__', return_value=Tensor([[42]])):
       self.assertEqual(next(model.generate([0])), 42)
+
+  def test_mla_block_initializes_indexer_state(self):
+    config = replace(TEST_CONFIG, q_lora_rank=32, kv_lora_rank=32, indexer=IndexerConfig(top_k=4, head_dim=32, n_heads=2, kpool=2))
+    block = MLATransformerBlock(config)
+    block._init_state(Tensor.empty(1, 1, config.dim))
+    self.assertTrue(hasattr(block.indexer, "cache"))
+    self.assertTrue(hasattr(block.indexer, "pool_cache"))
 
   def test_recurrent_live_state_reuse(self):
     model = Transformer(TEST_CONFIG)

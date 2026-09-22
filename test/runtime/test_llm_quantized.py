@@ -1,8 +1,8 @@
-import gc, unittest, weakref
+import unittest
 import numpy as np
 from tinygrad import Tensor, UOp, dtypes, function, Device
 from tinygrad.helpers import Context
-from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported, QUANT_SIZES, HALFWORD_QUANTS, iq4_half_lut, _iq_grid
+from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported, QUANT_FORMATS, iq4_half_lut, iq3_grid_lut
 from tinygrad.llm.gguf import ggml_data_to_tensor
 
 class QuantLinearMixin:
@@ -51,27 +51,23 @@ class QuantLinearMixin:
     self.assertEqual(linear.ggml_type, ggml_type if custom else None)
 
 class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
-  def test_quant_tables_not_retained(self):
-    # one _iq_grid table and the iq4 lut cover both table creation paths
-    for typ in (18, 23):
-      table = (iq4_half_lut(Device.DEFAULT) if typ == 23 else _iq_grid(Device.DEFAULT, typ)).realize()
-      ref = weakref.ref(table)
-      del table
-      gc.collect()
-      self.assertIsNone(ref())
+  def test_quant_tables_cached(self):
+    for make_table in (iq3_grid_lut, iq4_half_lut):
+      self.assertEqual(make_table(Device.DEFAULT).uop.key, make_table(Device.DEFAULT).uop.key)
 
   def test_quant_weights_share_storage(self):
-    for ggml_type, type_size in QUANT_SIZES.items():
+    for ggml_type, (block_size, type_size) in QUANT_FORMATS.items():
       with self.subTest(ggml_type=ggml_type):
         packed = np.arange(type_size + 4, dtype=np.uint8)
         raw = Tensor(packed).realize()[4:]
         if raw.uop.contiguous_view() is None: self.skipTest("requires buffer views")
-        decoded = ggml_data_to_tensor(raw, 256, ggml_type).reshape(1, 256)
-        linear = Linear(256, 1, bias=False)
+        decoded = ggml_data_to_tensor(raw, block_size, ggml_type).reshape(1, block_size)
+        linear = Linear(block_size, 1, bias=False)
         linear.set_quantized(decoded)
         linear.weight.realize()
         self.assertEqual(linear.ggml_type, ggml_type)
-        self.assertEqual(linear.weight.dtype, dtypes.uint16 if ggml_type in HALFWORD_QUANTS else dtypes.uint32)
+        expected_dtype = dtypes.uint16 if ggml_type == 14 else dtypes.uint8 if ggml_type in (2, 8, 17, 18) else dtypes.uint32
+        self.assertEqual(linear.weight.dtype, expected_dtype)
         self.assertEqual(linear.weight.nbytes(), type_size)
         np.testing.assert_array_equal(linear.weight.bitcast(dtypes.uint8).numpy(), packed[4:])
         raw.assign(raw.full_like(1)).realize()
@@ -82,6 +78,6 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
     # per-type dequant math on the generic path is covered by test_gguf, spot check a representative set here
     for typ in (12, 14, 17, 23):
       with self.subTest(ggml_type=typ):
-        self._test_quant_linear(typ, QUANT_SIZES[typ], in_features=256, out_features=16, token_counts=(1, 3), bias=True, custom=False)
+        self._test_quant_linear(typ, QUANT_FORMATS[typ][1], in_features=256, out_features=16, token_counts=(1, 3), bias=True, custom=False)
 
 if __name__ == "__main__": unittest.main()

@@ -142,8 +142,9 @@ class ExpertWeights:
       if self.use_custom_quant and self.weight.dtype == dtypes.half and x.dtype == dtypes.float32 \
         and self.in_features % 256 == 0 and self.out_features % 4 == 0 \
         and amd_custom_kernels_supported(self.weight.device):
-        return expert_q6_f16_linear(self._packed_q6, sel, x, self.out_features, self.in_features)
-      return (x.unsqueeze(-2) @ self.weight[sel].transpose(-1, -2)).contiguous().squeeze(-2)
+        ret = expert_q6_f16_linear(self._packed_q6, sel, x, self.out_features, self.in_features)
+      else: ret = (x.unsqueeze(-2) @ self.weight[sel].transpose(-1, -2)).contiguous().squeeze(-2)
+      return ret + self.bias[sel] if hasattr(self, 'bias') else ret
     if self.ggml_type is not None and self.use_custom_quant and amd_custom_kernels_supported(self.weight.device):
       ret = expert_quant_linear(self.weight, self.ggml_type, sel, x, self.out_features, self.in_features)
       return ret + self.bias[sel] if hasattr(self, 'bias') else ret
@@ -742,6 +743,7 @@ class MLATransformerBlock(FFNBlock):
       if self.config.rope_dim:
         self.freqs_cis = precompute_freqs_cis(self.config.rope_dim, self.config.max_context, self.config.rope_theta,
                                               device=x.device, yarn=self.config.yarn)
+    if hasattr(self, "indexer"): self.indexer._init_state(x)
 
 class GatedDeltaNetBlock(FFNBlock):
   def __init__(self, config:TransformerConfig, ssm:SSMConfig):
