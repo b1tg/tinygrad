@@ -706,6 +706,7 @@ class MLATransformerBlock(FFNBlock):
       self.cache_k = self.cache_k_flat[:n].reshape(x.shape[0], 1, self.config.max_context, self.config.kv_lora_rank + self.config.rope_dim)
       if self.config.rope_dim:
         self.freqs_cis = precompute_freqs_cis(self.config.rope_dim, self.config.max_context, self.config.rope_theta, device=x.device)
+    if hasattr(self, "indexer"): self.indexer._init_state(x)
 
 class GatedDeltaNetBlock(FFNBlock):
   def __init__(self, config:TransformerConfig, ssm:SSMConfig):
