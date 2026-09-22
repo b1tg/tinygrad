@@ -612,7 +612,8 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
     D >= 64 and 2*(2*BLOCK_M*(D+LDS_PAD) + D*(BLOCK_N+LDS_PAD)) <= 65536 and N % BLOCK_N == 0 and T_pad % BLOCK_M == 0)
   if not supported:
     k, v = (assigned_kv[i, :, :, :valid_end].float() for i in range(2))
-    mask = None if decode else Tensor.full((T_real, valid_end), -math.inf, dtype=dtypes.float32, device=q.device).triu(valid_end-T_real+1)
+    mask = None if resolve(T_real == 1) else \
+      Tensor.full((T_real, valid_end), -math.inf, dtype=dtypes.float32, device=q.device).triu(valid_end-T_real+1)
     return q.float().scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)
   if decode: return amd_flash_attention_decode(q.half(), assigned_kv, valid_end, cast(int, N))
   if isinstance(T_real, int) and T_real % BLOCK_M:
