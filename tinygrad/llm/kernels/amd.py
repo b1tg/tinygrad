@@ -336,9 +336,8 @@ def q8_linear(layer:Linear, x:Tensor) -> Tensor:
   in_features = layer.in_features//ranks if axis == 1 else layer.in_features
   def run(fxn:Callable[..., UOp], out:UOp, *srcs:UOp) -> Tensor:
     all_srcs = (out,)+srcs
-    params = tuple(UOp.placeholder_like(src, slot=i).flatten() if i == 1 else UOp.placeholder_like(src, slot=i)
-                   for i,src in enumerate(all_srcs))
-    kernel = fxn(*params, out_features=out_features, in_features=in_features).call(*all_srcs)
+    params = tuple(UOp.placeholder_like(src, slot=i) for i,src in enumerate(all_srcs))
+    kernel = fxn(params[0], params[1].flatten(), *params[2:], out_features=out_features, in_features=in_features).call(*all_srcs)
     result = Tensor(out.after(kernel))
     if len(result.shape) == 3: result = result.sum(-1)
     return _linear_output(layer, x, result, out_features)
@@ -355,8 +354,7 @@ def q8_linear(layer:Linear, x:Tensor) -> Tensor:
 # ******** tiny dense fp16 gemv ********
 
 @functools.cache
-def _amd_f16_gemv_kernel(out:UOp, w:UOp, x:UOp, *rest:UOp, in_features:int, out_features:int, tokens:int) -> UOp:
-  bias: UOp|None = rest[0] if rest else None
+def _amd_f16_gemv_kernel(out:UOp, w:UOp, x:UOp, *, in_features:int, out_features:int, tokens:int) -> UOp:
   # one block per (token, output row), 32 lanes accumulate 4-wide chunks of the row
   lanes, val_chunk = WARP_SIZE, 4
   token, out_row = UOp.range(tokens, 0, AxisType.GLOBAL), UOp.range(out_features, 1, AxisType.GLOBAL)
@@ -370,7 +368,6 @@ def _amd_f16_gemv_kernel(out:UOp, w:UOp, x:UOp, *rest:UOp, in_features:int, out_
     for j in range(val_chunk):
       acc = acc + w[out_row, i, lane*val_chunk + j].load().float() * x[token, i, lane*val_chunk + j].load().float()
   total = warp_reduce(acc, full_wave=True)
-  if bias is not None: total = total + bias[out_row].load().float()
   return out[token, out_row.valid(lane.eq(0))].store(total).end(token, out_row, lane).sink(arg=KernelInfo(name="linear_f16_gemv", opts_to_apply=()))
 
 def _view_back(t:Tensor) -> Tensor:

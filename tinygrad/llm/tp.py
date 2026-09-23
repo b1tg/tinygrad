@@ -32,10 +32,8 @@ def gguf_sharder(devices:tuple[str, ...]) -> GGUFLoader:
     shards = [p.contiguous().flatten().bitcast(word if packed else dtypes.uint8).to(d).clone().realize() for p,d in zip(pieces, devices)]
     local = tuple(s//len(devices) if i == axis else s for i,s in enumerate(shape))
     data = Tensor(UOp.mstack(*(p.uop for p in shards)))
-    if packed:
-      data = data.reshape(local[0], local[1]//block, -1)
-      if axis is not None: data = Tensor(data.uop.unshard(axis))
-      return GGUFQuantizedTensor(data, shape, typ)
-    decoded = ggml_data_to_tensor(data, prod(local), typ).reshape(local).clone().realize()
-    return (Tensor(decoded.uop.unshard(axis)) if axis is not None else decoded).contiguous().realize()
+    if packed: data = data.reshape(local[0], local[1]//block, -1)
+    else: data = ggml_data_to_tensor(data, prod(local), typ).reshape(local).clone().realize()
+    if axis is not None: data = Tensor(data.uop.unshard(axis))
+    return GGUFQuantizedTensor(data, shape, typ) if packed else data.contiguous().realize()
   return load

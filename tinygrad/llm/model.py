@@ -5,7 +5,7 @@ from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
 from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
 from tinygrad.llm.gguf import gguf_load, GGUFQuantizedTensor
 from tinygrad.uop.ops import resolve
-from tinygrad.llm.tp import gguf_sharder 
+from tinygrad.llm.tp import gguf_sharder
 from tinygrad.helpers import get_child
 
 class ExpertGating(enum.IntEnum):
@@ -284,7 +284,7 @@ class GatedDeltaNetBlock(FFNBlock):
     B, T, _ = x.shape
     # bind ints to a variable so the reset flag stays a runtime value (it toggles when generation restarts at position 0)
     start_pos = start_pos if isinstance(start_pos, UOp) else UOp.variable("start_pos", 0, self.config.max_context-1).bind(start_pos)
-    initial = Tensor(start_pos, device=x.device).eq(0)
+    initial = Tensor(start_pos).eq(0)
     is_kda = hasattr(self, "ssm_g_a")
     symbolic = isinstance(T, UOp)
     T_pad = x.max_shape[1]  # symbolic chunks are padded to their max size: one graph serves every size
