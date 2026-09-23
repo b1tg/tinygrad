@@ -1,5 +1,6 @@
 import functools, io, pathlib, re, struct
 from typing import Any, Callable
+from dataclasses import dataclass
 
 from tinygrad.tensor import Tensor
 from tinygrad.dtype import dtypes
@@ -194,9 +195,7 @@ readers: dict[int, Callable[[io.BufferedIOBase], Any]] = { 8: read_str, 9: read_
     [ (0,"c",1), (1,"b",1), (2,"H",2), (3,"h",2), (4,"I",4), (5,"i",4), (6,"f",4), (7,"?",1), (10,"Q",8), (11,"q",8), (12,"d",8) ] } }
 read_uint32, read_int32, read_uint64, read_int64 = readers[4], readers[5], readers[10], readers[11]
 
-def _gguf_parse(tensor: Tensor) -> tuple[dict, dict[str, Tensor]]:
-  # TODO: remove the need for copy to default device
-  tensor = tensor.to(None).realize()
+def _gguf_header(tensor:Tensor):
   r = io.BufferedReader(TensorIO(tensor), 1_000_000)
   magic, version, n_tensors, n_kv = r.read(4), read_int32(r), read_int64(r), read_int64(r)
   if magic != b"GGUF" or version not in [2, 3]: raise ValueError("Invalid GGUF format!")
@@ -210,8 +209,46 @@ def _gguf_parse(tensor: Tensor) -> tuple[dict, dict[str, Tensor]]:
   alignment, pos = kv_data.get("general.alignment", 32), r.tell()
   data_start = round_up(pos, alignment)
 
-  state_dict = {name: ggml_data_to_tensor(tensor[data_start + off:], prod(dims), typ).reshape(*reversed(dims)) for name, dims, typ, off in t_infos}
-  return kv_data, state_dict
+  return kv_data, t_infos, data_start
+
+def _gguf_parse(tensor:Tensor) -> tuple[dict, dict[str, Tensor]]:
+  tensor = tensor.to(None).realize()
+  kv, infos, start = _gguf_header(tensor)
+  return kv, {name:ggml_data_to_tensor(tensor[start+off:], prod(dims), typ).reshape(*reversed(dims)) for name,dims,typ,off in infos}
+
+@dataclass(frozen=True)
+class GGUFWeight:
+  data: Tensor
+  shape: tuple[int, ...]
+  ggml_type: int
+
+  @property
+  def dtype(self): return _GGML_NATIVE.get(self.ggml_type, dtypes.float32)
+
+  def decode(self, device:str) -> Tensor:
+    return ggml_data_to_tensor(self.data.to(device), prod(self.shape), self.ggml_type).reshape(self.shape)
+
+def gguf_load_index(fn:Tensor|str|pathlib.Path) -> tuple[dict, dict[str, GGUFWeight]]:
+  """Read headers and keep byte ranges on the source device, without realizing the model's payload."""
+  def read(source:Tensor):
+    kv, infos, start = _gguf_header(source)
+    weights = {}
+    for name,dims,typ,off in infos:
+      n = prod(dims)
+      if typ in _GGML_NATIVE: size = n * _GGML_NATIVE[typ].itemsize
+      elif typ in _GGML_QUANT:
+        block, size = _GGML_QUANT[typ]
+        if n % block: raise ValueError(f"{name}: incomplete GGML block")
+        size *= n//block
+      else: raise ValueError(f"unsupported GGML type {typ}")
+      if start+off+size > source.numel(): raise ValueError(f"{name}: tensor extends past end of GGUF")
+      weights[name] = GGUFWeight(source[start+off:start+off+size], tuple(reversed(dims)), typ)
+    return kv, weights
+  kv, weights = read(fn if isinstance(fn, Tensor) else Tensor(pathlib.Path(fn)))
+  if kv.get('split.count', 1) <= 1: return kv, weights
+  if isinstance(fn, Tensor): raise ValueError("multi-part GGUF requires a path argument (got Tensor)")
+  for path in _gguf_split_paths(pathlib.Path(fn), kv)[1:]: weights.update(read(Tensor(path))[1])
+  return kv, weights
 
 def _gguf_split_paths(path: pathlib.Path, kv: dict) -> list[pathlib.Path]:
   if (total := kv.get('split.count', 1)) <= 1: return [path]

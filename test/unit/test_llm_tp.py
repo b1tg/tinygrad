@@ -1,10 +1,12 @@
-import unittest
+import unittest, tempfile, pathlib
+from unittest.mock import patch
 import numpy as np
 from tinygrad import Tensor, UOp, nn
 from tinygrad.llm.model import Transformer, TransformerConfig, TransformerBlock, GatedDeltaNetBlock, SSMConfig
-from tinygrad.llm.tp import TensorParallelBlock, partition, split_linear, shard_model
+from tinygrad.llm.tp import TensorParallelBlock, partition, split_linear, shard_model, load_linear
 from tinygrad.llm.kernels.amd import Linear, QUANT_SIZES
-from tinygrad.llm.gguf import ggml_data_to_tensor
+from tinygrad.llm.gguf import ggml_data_to_tensor, gguf_load_index
+from test.unit import test_gguf
 
 class TestTensorParallel(unittest.TestCase):
   def test_group_partition(self):
@@ -28,6 +30,70 @@ class TestTensorParallel(unittest.TestCase):
             parts = [full] if groups is None else np.split(full, 2, axis=axis)
             expected = np.concatenate([np.array_split(p, 2, axis=axis)[rank] for p in parts], axis=axis)
             np.testing.assert_array_equal(actual, expected)
+
+  def test_file_backed_packed_weights(self):
+    device = str(Tensor.empty(1).device)
+    if device == "CPU": device = "CPU:1"
+    for typ, size in QUANT_SIZES.items():
+      packed = np.random.default_rng(0).integers(0, 255, (4, 4, size), dtype=np.uint8)
+      with tempfile.TemporaryDirectory() as folder:
+        path = pathlib.Path(folder)/'weights.gguf'
+        path.write_bytes(test_gguf.TestGGUF._build_gguf([('weight', (4, 1024), typ, packed.tobytes())], []))
+        _, index = gguf_load_index(path)
+        weight = index['weight']
+        self.assertTrue(weight.data.device.startswith('DISK:'))
+        with patch('tinygrad.llm.tp.amd_custom_kernels_supported', return_value=True):
+          for axis in (0, 1):
+            for groups in (None, (2, 2) if axis == 0 else (512, 512)):
+              for rank in (0, 1):
+                target = Linear(512 if axis == 1 else 1024, 2 if axis == 0 else 4, bias=False)
+                load_linear(weight, target, device, axis, rank, 2, groups)
+                self.assertEqual(target.weight.uop.buf_uop.dtype, target.weight.dtype)
+                parts = [packed] if groups is None else np.split(packed, 2, axis=axis)
+                expected = np.concatenate([np.split(p, 2, axis=axis)[rank] for p in parts], axis=axis)
+                np.testing.assert_array_equal(target.weight.bitcast('uint8').numpy(), expected.flatten())
+
+  def test_file_backed_model(self):
+    Tensor.manual_seed(42)
+    config = TransformerConfig(num_blocks=2, dim=32, hidden_dim=64, n_heads=4, n_kv_heads=2, norm_eps=1e-5,
+      vocab_size=64, head_dim=8, v_head_dim=8, rope_theta=10000, rope_dim=8, max_context=16)
+    model, tp = Transformer(config), Transformer(config)
+    with tempfile.TemporaryDirectory() as folder:
+      path = pathlib.Path(folder)/'model.gguf'
+      tensors = [(name, weight.shape, 0, weight.numpy().astype(np.float32).tobytes()) for name,weight in nn.state.get_state_dict(model).items()]
+      path.write_bytes(test_gguf.TestGGUF._build_gguf(tensors, []))
+      _, index = gguf_load_index(path)
+      shard_model(tp, 2, index)
+      for pos, token in enumerate((3, 7, 5, 11, 1)):
+        start = UOp.variable('start_pos', 0, 15).bind(pos)
+        x, temp = Tensor([[token]]), Tensor([0.0])
+        np.testing.assert_array_equal(tp(x, start, temp).numpy(), model(x, start, temp).numpy())
+
+  def test_gguf_streaming_model(self):
+    from gguf import GGUFWriter
+    Tensor.manual_seed(42)
+    config = TransformerConfig(num_blocks=1, dim=32, hidden_dim=64, n_heads=4, n_kv_heads=2, norm_eps=1e-5,
+      vocab_size=64, head_dim=8, v_head_dim=8, rope_theta=10000, rope_dim=8, max_context=16)
+    model = Transformer(config)
+    with tempfile.TemporaryDirectory() as folder:
+      path = pathlib.Path(folder)/'model.gguf'
+      writer = GGUFWriter(path, 'qwen3')
+      for key,value in {'context_length':16, 'embedding_length':32, 'feed_forward_length':64, 'block_count':1,
+                        'attention.head_count':4, 'attention.head_count_kv':2}.items(): writer.add_uint32('qwen3.'+key, value)
+      writer.add_float32('qwen3.rope.freq_base', 10000)
+      writer.add_float32('qwen3.attention.layer_norm_rms_epsilon', 1e-5)
+      writer.add_array('tokenizer.ggml.tokens', [str(i) for i in range(64)])
+      for name,weight in nn.state.get_state_dict(model).items(): writer.add_tensor(name, weight.numpy())
+      writer.write_header_to_file()
+      writer.write_kv_data_to_file()
+      writer.write_tensors_to_file()
+      writer.close()
+      single,_ = Transformer.from_gguf(path, 16)
+      parallel,_ = Transformer.from_gguf(path, 16, shard=2)
+      for pos,token in enumerate((3, 7, 5, 11, 1)):
+        start = UOp.variable('start_pos', 0, 15).bind(pos)
+        x, temp = Tensor([[token]]), Tensor([0.0])
+        np.testing.assert_array_equal(parallel(x, start, temp).numpy(), single(x, start, temp).numpy())
 
   def test_model_jit(self):
     Tensor.manual_seed(42)

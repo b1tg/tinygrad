@@ -218,6 +218,25 @@ class TestGGUF(unittest.TestCase):
     for _, _, _, data in tensors: buf += data
     return bytes(buf)
 
+  def test_file_backed_index(self):
+    from tinygrad.llm.gguf import gguf_load_index
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as folder:
+      path = pathlib.Path(folder)/'large.gguf'
+      # A sparse 64 MiB payload: indexing must only read headers, without copying the model into CPU storage.
+      header = self._build_gguf([('weight', (16*1024*1024,), 0, b'')], [])
+      with path.open('wb') as f:
+        f.write(header)
+        f.truncate(len(header)+64*1024*1024)
+      original, copied = Tensor.to, []
+      def track(t, device, *args, **kwargs):
+        if str(t.device).startswith('DISK:'): copied.append(t.nbytes())
+        return original(t, device, *args, **kwargs)
+      with patch.object(Tensor, 'to', track): _, index = gguf_load_index(path)
+      self.assertTrue(index['weight'].data.device.startswith('DISK:'))
+      self.assertEqual(index['weight'].shape, (16*1024*1024,))
+      self.assertLessEqual(max(copied, default=0), 1_000_000)
+
   def test_multi_part_load(self):
     with tempfile.TemporaryDirectory() as d:
       d = pathlib.Path(d)
@@ -225,6 +244,11 @@ class TestGGUF(unittest.TestCase):
       (d / "test-00001-of-00002.gguf").write_bytes(self._build_gguf([("a", (4,), 0, a.tobytes())], [("split.count", 2), ("split.no", 0)]))
       (d / "test-00002-of-00002.gguf").write_bytes(self._build_gguf([("b", (2,), 0, b.tobytes())], [("split.count", 2), ("split.no", 1)]))
       kv, ts = gguf_load(d / "test-00001-of-00002.gguf")
+      from tinygrad.llm.gguf import gguf_load_index
+      indexed_kv, index = gguf_load_index(d / "test-00001-of-00002.gguf")
+      self.assertEqual(indexed_kv['split.count'], 2)
+      np.testing.assert_equal(index['a'].decode('CPU').numpy(), a)
+      np.testing.assert_equal(index['b'].decode('CPU').numpy(), b)
       self.assertEqual(kv["split.count"], 2)
       np.testing.assert_equal(ts["a"].numpy(), a)
       np.testing.assert_equal(ts["b"].numpy(), b)

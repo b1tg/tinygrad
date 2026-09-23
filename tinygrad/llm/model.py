@@ -6,7 +6,7 @@ if TYPE_CHECKING:
 from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Context
 from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
-from tinygrad.llm.gguf import gguf_load
+from tinygrad.llm.gguf import gguf_load, gguf_load_index
 from tinygrad.uop.ops import resolve
 
 class ExpertGating(enum.IntEnum):
@@ -400,14 +400,18 @@ class Transformer:
                 realize=bool(getenv("REALIZE", 0)), shard:int=1) -> tuple[Transformer, dict]:
     if shard < 1: raise ValueError("shard must be positive")
     if shard > 1:
-      # Keep the source GGUF in host memory: GPU0 must not hold both the full file and its local shards.
-      with Context(DEV="CPU"): model, kv = Transformer.from_gguf(gguf, max_context, realize=False)
+      kv, weights = gguf_load_index(gguf)
+      # Only shapes are needed to construct the model. Weight payloads remain file-backed until partitioned.
+      with Context(DEV="CPU"):
+        model, kv = Transformer._from_gguf_state(kv, {k:Tensor.empty(*w.shape, dtype=w.dtype) for k,w in weights.items()}, max_context, False)
       from tinygrad.llm.tp import shard_model
-      shard_model(model, shard)
+      shard_model(model, shard, weights, kv['general.architecture'])
       return model, kv
-    # TODO: remove the need for copy to default device
     kv, state_dict = gguf_load(gguf.to(None).realize() if isinstance(gguf, Tensor) else gguf)
+    return Transformer._from_gguf_state(kv, state_dict, max_context, realize)
 
+  @staticmethod
+  def _from_gguf_state(kv:dict, state_dict:dict[str, Tensor], max_context:int|None, realize:bool) -> tuple[Transformer, dict]:
     # all state items should be float16, not float32
     state_dict = {k:v.cast('float16') if getenv("HALF", 1) else v for k,v in state_dict.items()}
 
