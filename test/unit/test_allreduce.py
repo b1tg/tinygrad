@@ -50,6 +50,15 @@ class TestRingAllReduce(unittest.TestCase):
     self.assertEqual(out.shape, (rows,))
     self.assertTrue((out == 4).all().item())
 
+  def test_symbolic_matmul(self):
+    devices = ("CPU:0", "CPU:1")
+    rows = UOp.variable("rows", 1, 2).bind(1)
+    x = Tensor.ones(2, 2).shard(devices, axis=1).realize()
+    weight = Tensor.ones(2, 2).shard(devices, axis=1).realize()
+    out = ((x[:rows] @ weight.T).contiguous() + 1).realize()
+    self.assertEqual(out.shape, (rows, 2))
+    self.assertEqual([out[0, i].item() for i in range(2)], [3, 3])
+
   def test_correct_ring(self):
     with Context(RING=2):
       N = 4

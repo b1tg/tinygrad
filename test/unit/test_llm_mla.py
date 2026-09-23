@@ -1,7 +1,7 @@
 import unittest
 import numpy as np
-from tinygrad import Tensor
-from tinygrad.llm.model import Transformer, TransformerConfig, apply_rope, MLATransformerBlock, precompute_freqs_cis
+from tinygrad import Tensor, nn
+from tinygrad.llm.model import Transformer, TransformerConfig, apply_attn_res, apply_rope, MLATransformerBlock, precompute_freqs_cis
 
 class TestMLA(unittest.TestCase):
   def _make_config(self, **kwargs):
@@ -63,8 +63,26 @@ class TestMLA(unittest.TestCase):
     np.testing.assert_allclose(naive_np, abs_np, atol=1e-4, rtol=1e-4,
       err_msg="Absorbed MLA should match naive MLA")
 
+  def test_mla_nope(self):
+    nope = MLATransformerBlock(self._make_config(max_context=16, mla_nope=True))
+    rope = MLATransformerBlock(self._make_config(max_context=16))
+    x = Tensor.randn(1, 1, nope.config.dim).half()
+    nope._init_state(x)
+    rope._init_state(x)
+    self.assertFalse(hasattr(nope, "freqs_cis"))
+    self.assertTrue(hasattr(rope, "freqs_cis"))
+    self.assertEqual(nope._attention(nope.attn_norm(x), 0).shape, x.shape)
+
+  def test_attn_res_score_norm(self):
+    prefix, residuals = Tensor([[[1., 2., 3.]]]), Tensor([[[[2., 1., 0.], [0., 1., 2.]]]])
+    score_norm = nn.RMSNorm(3, 1e-5)
+    score_norm.weight = Tensor([0.5, 1., 1.5])
+    values = residuals.cat(prefix.unsqueeze(2), dim=2)
+    scores = (values * (values.square().mean(-1, keepdim=True) + 1e-5).rsqrt() * score_norm.weight).sum(-1)
+    expected = (values * scores.softmax(-1).unsqueeze(-1)).sum(2)
+    np.testing.assert_allclose(apply_attn_res(prefix, residuals, score_norm, 2).numpy(), expected.numpy(), rtol=1e-6, atol=1e-6)
+
   def test_shared_expert_gate_optional(self):
-    from tinygrad import nn
     model = Transformer(self._make_config(num_experts=4, num_experts_per_tok=2, shared_expert_dim=32, shared_expert_gate=False))
     self.assertNotIn('blk.0.ffn_gate_inp_shexp.weight', nn.state.get_state_dict(model))
     out = model.blk[0]._feed_forward(Tensor.randn(1, 4, model.blk[0].config.dim))

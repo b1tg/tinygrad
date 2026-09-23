@@ -1,7 +1,7 @@
 from __future__ import annotations
 from typing import Any, Callable, cast, TYPE_CHECKING, Type, Sequence, Iterable, Final, Iterator
 import sys, time, functools, itertools, math, operator, hashlib, os, types, pickle, pathlib, inspect, weakref, collections, struct
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, replace, fields, is_dataclass
 from enum import Enum, auto
 from tinygrad.uop import Ops, GroupOp
 from tinygrad.dtype import ConstType, dtypes, DType, DTypeLike, truncate, least_upper_dtype, least_upper_float, Invalid, AddrSpace, strong_dtype
@@ -232,6 +232,24 @@ class recursive_property(property):
     for node in x.toposort(gate=lambda node: self.nm not in node.__dict__): node.__dict__[self.nm] = self.fxn(node)
     return x.__dict__[self.nm]
 
+def _key_arg_repr(x:Any) -> tuple[str, bool]:
+  if isinstance(x, UOp): return f"UOpKey({x.key.hex()!r})", True
+  if is_dataclass(x) and not isinstance(x, type):
+    vals = [(f.name, _key_arg_repr(getattr(x, f.name))) for f in fields(x)]
+    return (f"{type(x).__name__}({', '.join(f'{name}={value[0]}' for name,value in vals)})", True) if any(v[1] for _,v in vals) else (repr(x), False)
+  if isinstance(x, tuple):
+    vals = [_key_arg_repr(v) for v in x]
+    if not any(v[1] for v in vals): return repr(x), False
+    body = ", ".join(v[0] for v in vals) + ("," if len(vals) == 1 else "")
+    return f"({body})", True
+  if isinstance(x, list):
+    vals = [_key_arg_repr(v) for v in x]
+    return (f"[{', '.join(v[0] for v in vals)}]", True) if any(v[1] for v in vals) else (repr(x), False)
+  if isinstance(x, dict):
+    vals = [(_key_arg_repr(k), _key_arg_repr(v)) for k,v in x.items()]
+    return ("{" + ", ".join(f"{k[0]}: {v[0]}" for k,v in vals) + "}", True) if any(k[1] or v[1] for k,v in vals) else (repr(x), False)
+  return repr(x), False
+
 # we import this late so we can use resolve/smax in mixins
 from tinygrad.mixin.op import OpMixin
 from tinygrad.mixin.rand import RandMixin
@@ -267,7 +285,8 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
   def is_invalid(self) -> bool: return self.op is Ops.CONST and self.val is Invalid
   @recursive_property
   def key(self) -> bytes:
-    return hashlib.sha256(str((self.op, self.dtype, self.arg)).encode() + b"".join([s.key for s in self.src])).digest()
+    arg, _ = _key_arg_repr(self.arg)
+    return hashlib.sha256(f"({self.op!r}, {self.dtype!r}, {arg})".encode() + b"".join([s.key for s in self.src])).digest()
   def __repr__(self):
     from tinygrad.uop.render import pretty_print
     return pretty_print(self)

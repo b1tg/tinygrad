@@ -1,7 +1,10 @@
 import os, struct, unittest, tempfile, pathlib, sys
+from unittest import mock
 from tinygrad import dtypes, Tensor, fetch, Device
-from tinygrad.helpers import disable_gc
-from tinygrad.llm.gguf import _ggml_iq_grid, ggml_data_to_tensor, gguf_load
+from tinygrad.helpers import disable_gc, prod, getenv
+from tinygrad.llm.gguf import _ggml_iq_grid, ggml_data_to_tensor, gguf_load, _quantized_tensor, _shard_tensor, _shard_tensor_fused
+from tinygrad.llm.model import Transformer
+from test.helpers import not_support_multi_device
 from tinygrad.runtime.autogen import ggml_common as _ggml
 import numpy as np
 from gguf import GGUFReader, GGUFValueType, GGMLQuantizationType, GGML_QUANT_SIZES, dequantize, quantize
@@ -55,11 +58,126 @@ class TestGGUF(unittest.TestCase):
   def test_dequantization_q4_k(self): self._test_dequantization(GGMLQuantizationType.Q4_K)
   def test_dequantization_q5_k(self): self._test_dequantization(GGMLQuantizationType.Q5_K)
   def test_dequantization_q6_k(self): self._test_dequantization(GGMLQuantizationType.Q6_K)
+  def test_dequantization_iq2_xs(self): self._test_dequantization(GGMLQuantizationType.IQ2_XS)
   def test_dequantization_iq3_xxs(self): self._test_dequantization(GGMLQuantizationType.IQ3_XXS)
   def test_dequantization_iq3_s(self): self._test_dequantization(GGMLQuantizationType.IQ3_S)
   def test_dequantization_iq2_s(self): self._test_dequantization(GGMLQuantizationType.IQ2_S)
   def test_dequantization_iq4_xs(self): self._test_dequantization(GGMLQuantizationType.IQ4_XS)
   def test_dequantization_mxfp4(self): self._test_dequantization(GGMLQuantizationType.MXFP4)
+
+  @unittest.skipIf(not_support_multi_device(), "no multi device")
+  def test_shard_tensor(self):
+    devices = tuple(f"{Device.DEFAULT}:{i}" for i in range(2))
+    def q8_0_bytes(shape):
+      nblk = prod(shape)//32
+      scale = Tensor.ones(nblk, 1, dtype=dtypes.float16).bitcast(dtypes.uint8)
+      quants = (Tensor.arange(nblk*32) % 256).cast(dtypes.uint8).reshape(nblk, 32)
+      return scale.cat(quants, dim=1).flatten()
+    for shape,axis in (((64,128),0), ((4,32,64),1), ((4,32,64),2)):
+      data = q8_0_bytes(shape)
+      expected = ggml_data_to_tensor(data, prod(shape), GGMLQuantizationType.Q8_0.value).reshape(shape)
+      actual = _shard_tensor(data, 0, ("weight", tuple(reversed(shape)), GGMLQuantizationType.Q8_0.value, 0), devices, axis)
+      self.assertEqual(actual.uop.axis, axis)
+      self.assertEqual(actual.tolist(), expected.tolist())
+
+  @unittest.skipIf(not_support_multi_device(), "no multi device")
+  def test_shard_tensor_q4_k(self):
+    devices,shape,axis = tuple(f"{Device.DEFAULT}:{i}" for i in range(2)),(4, 8, 512),2
+    qtype = GGMLQuantizationType.Q4_K
+    nblocks = prod(shape)//GGML_QUANT_SIZES[qtype][0]
+    blocks = np.zeros((nblocks, GGML_QUANT_SIZES[qtype][1]), dtype=np.uint8)
+    blocks[:,:2] = np.linspace(0.5, 1.5, nblocks, dtype=np.float16).view(np.uint8).reshape(nblocks, 2)
+    blocks[:,4:16] = 1
+    blocks[:,16:] = np.arange(nblocks*128, dtype=np.uint8).reshape(nblocks, 128)
+    data = Tensor(blocks.flatten())
+    expected = ggml_data_to_tensor(data, prod(shape), qtype.value).reshape(shape)
+    actual = _shard_tensor(data, 0, ("weight", tuple(reversed(shape)), qtype.value, 0), devices, axis)
+    self.assertEqual(actual.uop.axis, axis)
+    self.assertEqual(actual.tolist(), expected.tolist())
+
+  @unittest.skipIf(not_support_multi_device(), "no multi device")
+  def test_shard_tensor_fused(self):
+    devices = tuple(f"{Device.DEFAULT}:{i}" for i in range(2))
+    shape, count = (4, 32, 64), 16
+    def q8_data(seed):
+      nblocks = prod(shape)//32
+      scales = Tensor.ones(nblocks, 1, dtype=dtypes.float16).bitcast(dtypes.uint8)
+      values = ((Tensor.arange(nblocks*32) + seed) % 256).cast(dtypes.uint8).reshape(nblocks, 32)
+      return scales.cat(values, dim=1).flatten()
+    gate, up = q8_data(0), q8_data(7)
+    gate_ref = ggml_data_to_tensor(gate, prod(shape), GGMLQuantizationType.Q8_0.value).reshape(shape)
+    up_ref = ggml_data_to_tensor(up, prod(shape), GGMLQuantizationType.Q8_0.value).reshape(shape)
+    expected = Tensor.cat(*[x[:, i*count:(i+1)*count] for i in range(2) for x in (gate_ref, up_ref)], dim=1)
+    data = gate.cat(up)
+    actual = _shard_tensor_fused(data, 0, ("gate", tuple(reversed(shape)), GGMLQuantizationType.Q8_0.value, 0),
+                                 ("up", tuple(reversed(shape)), GGMLQuantizationType.Q8_0.value, gate.shape[0]), devices)
+    self.assertEqual(actual.uop.axis, 1)
+    self.assertEqual(actual.shape, (shape[0], 2*shape[1], shape[2]))
+    self.assertEqual(actual.tolist(), expected.tolist())
+
+  @unittest.skipIf(not_support_multi_device(), "no multi device")
+  def test_load_fuse_policy(self):
+    devices,shape = tuple(f"{Device.DEFAULT}:{i}" for i in range(2)),(2, 4, 4)
+    up,gate = np.arange(prod(shape), dtype=np.float32).reshape(shape),np.arange(prod(shape), dtype=np.float32).reshape(shape)+100
+    payload = self._build_gguf([("up", shape, 0, up.tobytes()), ("gate", shape, 0, gate.tobytes())], [])
+    source = Tensor(np.frombuffer(payload, dtype=np.uint8).copy())
+    fuse_policy = lambda name: ("up", "gateup") if name == "gate" else None
+    _,state_dict = gguf_load(source, devices, lambda _: 1, fuse_policy)
+    self.assertEqual(set(state_dict), {"gateup"})
+    expected = np.concatenate([x[:, i*2:(i+1)*2] for i in range(2) for x in (gate, up)], axis=1)
+    np.testing.assert_equal(state_dict["gateup"].numpy(), expected)
+
+    _,filtered = gguf_load(source, devices, lambda _: 1, fuse_policy, tensor_filter=lambda name: name == "gate")
+    self.assertEqual(set(filtered), {"gate"})
+    np.testing.assert_equal(filtered["gate"].numpy(), gate)
+
+  @unittest.skipIf(not_support_multi_device(), "no multi device")
+  def test_shard_tensor_q4_k_unaligned_blocks(self):
+    devices,shape,axis = tuple(f"{Device.DEFAULT}:{i}" for i in range(4)),(2, 2, 1536),2
+    qtype = GGMLQuantizationType.Q4_K
+    nblocks = prod(shape)//GGML_QUANT_SIZES[qtype][0]
+    blocks = np.zeros((nblocks, GGML_QUANT_SIZES[qtype][1]), dtype=np.uint8)
+    blocks[:,:2] = np.linspace(0.5, 1.5, nblocks, dtype=np.float16).view(np.uint8).reshape(nblocks, 2)
+    blocks[:,4:16] = 1
+    blocks[:,16:] = np.arange(nblocks*128, dtype=np.uint8).reshape(nblocks, 128)
+    data = Tensor(blocks.flatten())
+    expected = ggml_data_to_tensor(data, prod(shape), qtype.value).reshape(shape)
+    actual = _shard_tensor(data, 0, ("weight", tuple(reversed(shape)), qtype.value, 0), devices, axis)
+    self.assertEqual(actual.uop.axis, axis)
+    self.assertEqual(actual.tolist(), expected.tolist())
+
+  @unittest.skipIf(not_support_multi_device(), "no multi device")
+  def test_load_shard_policy(self):
+    devices,shape = tuple(Device.canonicalize(f"{Device.DEFAULT}:{i}") for i in range(2)),(4, 32, 64)
+    nblk = prod(shape)//32
+    scale = Tensor.ones(nblk, 1, dtype=dtypes.float16).bitcast(dtypes.uint8)
+    quants = (Tensor.arange(nblk*32) % 256).cast(dtypes.uint8).reshape(nblk, 32)
+    data = scale.cat(quants, dim=1).flatten()
+    payload = self._build_gguf([("weight", shape, GGMLQuantizationType.Q8_0.value, bytes(data.numpy()))], [])
+    expected = ggml_data_to_tensor(data, prod(shape), GGMLQuantizationType.Q8_0.value).reshape(shape).tolist()
+
+    for spec,axis in ((1, 1), ("replicate", None)):
+      _,state_dict = gguf_load(Tensor(np.frombuffer(payload, dtype=np.uint8).copy()), devices, lambda _: spec)
+      weight = state_dict["weight"]
+      self.assertEqual(weight.device, devices)
+      self.assertEqual(weight.uop.axis, axis)
+      self.assertEqual(weight.tolist(), expected)
+
+  @unittest.skipIf(not_support_multi_device(), "no multi device")
+  def test_quantized_tensor_select(self):
+    devices = tuple(f"{Device.DEFAULT}:{i}" for i in range(2))
+    shape = (4, 4, 768)
+    rng = np.random.default_rng(42)
+    blocks = rng.integers(0, 256, size=(prod(shape)//256, 74), dtype=np.uint8)
+    blocks[:, :2] = np.full(prod(shape)//256, 0.5, dtype=np.float16).view(np.uint8).reshape(-1, 2)
+    data = Tensor(blocks.flatten())
+    full = ggml_data_to_tensor(data, prod(shape), 17).reshape(shape)
+    sel = Tensor([[[0, 3]]], dtype=dtypes.int32)
+    np.testing.assert_equal(_quantized_tensor(data, 0, ("w", tuple(reversed(shape)), 17, 0)).decode(sel).numpy(), full[sel].numpy())
+    for axis in (1, 2):
+      weight = _quantized_tensor(data, 0, ("w", tuple(reversed(shape)), 17, 0), devices, axis)
+      np.testing.assert_equal(weight.decode(sel).numpy(), full[sel].numpy())
+
   @unittest.skipUnless(dtypes.bfloat16 in supported_dtypes, "Backend must support bfloat16")
   def test_dequantization_bf16(self): self._test_dequantization(GGMLQuantizationType.BF16)
   def test_dequantization_mxfp4_old(self):
@@ -149,10 +267,34 @@ class TestGGUF(unittest.TestCase):
       np.testing.assert_equal(ts["a"].numpy(), a)
       np.testing.assert_equal(ts["b"].numpy(), b)
 
+      _, limited = gguf_load(d / "test-00001-of-00002.gguf", split_limit=1)
+      self.assertEqual(set(limited), {"a"})
+
+      _, filtered = gguf_load(d / "test-00001-of-00002.gguf", tensor_filter=lambda name: name == "b")
+      self.assertEqual(set(filtered), {"b"})
+
       # missing part 2
       (d / "test-00002-of-00002.gguf").unlink()
       with self.assertRaises(FileNotFoundError):
         gguf_load(d / "test-00001-of-00002.gguf")
+
+  def test_debug_layer_and_split_limits(self):
+    kv = {
+      "general.architecture":"llama", "llama.block_count":8, "llama.embedding_length":4, "llama.feed_forward_length":8,
+      "llama.attention.head_count":1, "llama.attention.head_count_kv":1, "llama.attention.layer_norm_rms_epsilon":1e-5,
+      "llama.context_length":16, "llama.rope.freq_base":10_000.0, "tokenizer.ggml.tokens":["a", "b"],
+    }
+    with mock.patch.dict(os.environ, {"L":"4", "S":"2"}), \
+         mock.patch("tinygrad.llm.model.gguf_load", return_value=(kv, {})) as load:
+      getenv.cache_clear()
+      try: model, _ = Transformer.from_gguf("unused.gguf")
+      finally: getenv.cache_clear()
+    self.assertEqual(len(model.blk), 4)
+    self.assertEqual(load.call_args.kwargs["split_limit"], 2)
+    tensor_filter = load.call_args.kwargs["tensor_filter"]
+    self.assertTrue(tensor_filter("blk.3.attn_q.weight"))
+    self.assertFalse(tensor_filter("blk.4.attn_q.weight"))
+    self.assertTrue(tensor_filter("token_embd.weight"))
 
   def _test_dequantization(self, qtype: GGMLQuantizationType):
     block_size, type_size = GGML_QUANT_SIZES[qtype]

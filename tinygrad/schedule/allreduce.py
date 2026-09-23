@@ -19,6 +19,13 @@ def handle_allreduce(buf:UOp, red:UOp) -> UOp|None:
   # contiguous before we copy it
   buf = buf.contiguous()
 
+  star_threshold = getenv("STAR_ALLREDUCE_THRESHOLD", 0)
+  if getenv("STAR_ALLREDUCE", 0) and isinstance(device, tuple) and device == buf.device and \
+     (not star_threshold or not concrete or numel <= star_threshold):
+    root = device[getenv("STAR_ROOT", 0) % ndev]
+    total = functools.reduce(lambda x,y: x.alu(op, y), [buf.mselect(i).copy_to_device(root) for i in range(ndev)])
+    return UOp.mstack(*(total.copy_to_device(d) for d in device)).shrink_to(shape)
+
   # naive: copy to all devices. if you shrink later, that'll be handled
   if not use_ring and not use_all2all:
     return functools.reduce(lambda x,y: x.alu(op, y), [buf.mselect(i).copy_to_device(device) for i in range(ndev)]).shrink_to(shape)
@@ -58,8 +65,8 @@ def handle_allreduce(buf:UOp, red:UOp) -> UOp|None:
   return UOp.usum(*[c.pad(((s,numel-e),)) for (s,e),c in zip(chunks, copied_chunks)]).reshape(shape)
 
 def create_allreduce_function(buf:UOp, red:UOp, output:UOp|None=None) -> UOp|None:
-  if output is None: output = UOp.invalids(red.shape, dtype=red.dtype, device=red.device)
+  if output is None: output = UOp.invalids(red.max_shape, dtype=red.dtype, device=red.device)
   to = red.param_like(0)
   src = buf.param_like(1)
   red = src.allreduce(*red.arg)
-  return output.after(to.after(to.store(handle_allreduce(src, red))).sink().call(output, buf.contiguous(), name="allreduce", precompile=True))
+  return output.after(to.after(to.store(handle_allreduce(src, red))).sink().call(output, buf.contiguous(), name="allreduce", precompile=True)).shrink_to(buf.shape)

@@ -448,18 +448,35 @@ class AMDComputeAQLQueue(AMDComputeQueue):
     self.binded_device = dev
     self.hw_page = dev.allocator.alloc(len(self._q) * 4, BufferSpec(cpu_access=True, nolru=True, uncached=True))
     self._cmds = self._prep_aql(self._q, self.hw_page)
+    packet_offsets, offset, parts = {}, 0, []
+    for cmd in self._cmds:
+      data = bytes(cmd) if isinstance(cmd, hsa.hsa_kernel_dispatch_packet_t) else cmd
+      if isinstance(cmd, hsa.hsa_kernel_dispatch_packet_t): packet_offsets[ctypes.addressof(cmd)] = offset
+      parts.append(data)
+      offset += len(data)
+    self._aql_data = bytearray(b''.join(parts))
+    self._aql_addr = ctypes.addressof(ctypes.c_char.from_buffer(self._aql_data))
+    packet_size = ctypes.sizeof(hsa.hsa_kernel_dispatch_packet_t)
+    self.mv_sints = [(MMIOInterface(self._aql_addr + packet_offsets[pkt_addr] + mv.addr - pkt_addr, mv.nbytes, mv.fmt), off, sym_idx, mask)
+      if (pkt_addr:=next((addr for addr in packet_offsets if addr <= mv.addr < addr + packet_size), None)) is not None else (mv, off, sym_idx, mask)
+      for mv, off, sym_idx, mask in self.mv_sints]
     self._q = self.hw_page.cpu_view().view(fmt='I')
     return self
 
   def _submit(self, dev:AMDDevice):
-    cmds = self._cmds if dev == self.binded_device else self._prep_aql(self._q, dev.pm4_ibs.offset(dev.pm4_ib_alloc.alloc(len(self._q) * 4, 16)))
-    aql_bytes = b''.join(bytes(c) if isinstance(c, hsa.hsa_kernel_dispatch_packet_t) else c for c in cmds)
+    if dev == self.binded_device: aql_addr, aql_size = self._aql_addr, len(self._aql_data)
+    else:
+      cmds = self._prep_aql(self._q, dev.pm4_ibs.offset(dev.pm4_ib_alloc.alloc(len(self._q) * 4, 16)))
+      aql_bytes = b''.join(bytes(c) if isinstance(c, hsa.hsa_kernel_dispatch_packet_t) else c for c in cmds)
+      aql_buf, aql_size = ctypes.create_string_buffer(aql_bytes), len(aql_bytes)
+      aql_addr = ctypes.addressof(aql_buf)
 
-    assert len(aql_bytes) < dev.compute_queue.ring.nbytes, "submit is too large for the queue"
-    cp_bytes = min(len(aql_bytes), (dev.compute_queue.ring.nbytes - (dev.compute_queue.put_value * 64) % dev.compute_queue.ring.nbytes))
-    dev.compute_queue.ring.view(offset=(dev.compute_queue.put_value * 64) % dev.compute_queue.ring.nbytes, fmt='B')[:cp_bytes] = aql_bytes[:cp_bytes]
-    if (tail_bytes:=(len(aql_bytes) - cp_bytes)) > 0: dev.compute_queue.ring.view(offset=0, fmt='B')[:tail_bytes] = aql_bytes[cp_bytes:]
-    dev.compute_queue.put_value += len(aql_bytes) // 64
+    assert aql_size < dev.compute_queue.ring.nbytes, "submit is too large for the queue"
+    ring_off = (dev.compute_queue.put_value * 64) % dev.compute_queue.ring.nbytes
+    cp_bytes = min(aql_size, dev.compute_queue.ring.nbytes - ring_off)
+    ctypes.memmove(dev.compute_queue.ring.addr + ring_off, aql_addr, cp_bytes)
+    if (tail_bytes:=(aql_size - cp_bytes)) > 0: ctypes.memmove(dev.compute_queue.ring.addr, aql_addr + cp_bytes, tail_bytes)
+    dev.compute_queue.put_value += aql_size // 64
     dev.compute_queue.signal_doorbell(dev, doorbell_value=dev.compute_queue.put_value-1)
 
 class AMDCopyQueue(HWQueue):
