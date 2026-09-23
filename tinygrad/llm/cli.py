@@ -106,6 +106,7 @@ class FallbackTemplate:
   # minimal jinja2.Template-compatible chat template without jinja2, no tool calling support
   def __init__(self, tok:SimpleTokenizer): self.tok = tok
   def role(self, role:str) -> str:
+    if self.tok.preset == 'gpt-4o': return "<|start|>" + role + ("<|channel|>final" if role == "assistant" else "") + "<|message|>"
     if self.tok.preset == 'olmo': return "<|" + role + "|>\n"  # OLMoE Instruct format
     if self.tok.preset == 'kimi-k2': return "<|im_" + role + "|>" + role + "<|im_middle|>"
     if self.tok.preset == 'qwen2': return "<|im_start|>" + role + "\n"
@@ -116,6 +117,7 @@ class FallbackTemplate:
       raise ValueError(f"Unsupported role '{role}' for tokenizer preset '{self.tok.preset}'")
     return "<|start_header_id|>" + role + "<|end_header_id|>\n\n"
   def end_turn(self) -> str:
+    if self.tok.preset == 'gpt-4o': return "<|end|>"
     if self.tok.preset == 'olmo': return "\n"
     if self.tok.preset == 'kimi-k2': return self.tok.decode([self.tok.eos_id])
     if self.tok.preset == 'qwen2': return self.tok.decode([self.tok.eos_id]) + "\n"
@@ -124,6 +126,7 @@ class FallbackTemplate:
     return self.tok.decode([self.tok.eos_id])
   def render(self, messages:list[dict], tools=None, add_generation_prompt:bool=True, preserve_thinking:bool=False) -> str:
     out = self.tok.decode([] if self.tok.bos_id is None else [self.tok.bos_id]) + ("<sop>" if self.tok.preset == 'glm4' else "")
+    if self.tok.preset == 'gpt-4o': out = ""
     for msg in messages:
       out += self.role(msg["role"])
       content = msg.get("content")
@@ -134,7 +137,7 @@ class FallbackTemplate:
           else: raise RuntimeError(f"unhandled type: {c['type']}")
       elif content is not None: raise RuntimeError(f"unknown content type: {type(content)}")
       out += self.end_turn()
-    return out + self.role("assistant") if add_generation_prompt else out
+    return out + ("<|start|>assistant" if self.tok.preset == 'gpt-4o' else self.role("assistant")) if add_generation_prompt else out
 
 from tinygrad.llm.serve import LLMServer
 
