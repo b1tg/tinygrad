@@ -5,7 +5,70 @@ from tinygrad import Tensor, UOp
 from tinygrad.nn.state import get_state_dict
 from tinygrad.schedule import schedule_cache
 from tinygrad.llm.model import Transformer, TransformerConfig
-from tinygrad.llm.serve import StreamRouter
+from tinygrad.llm.serve import StreamRouter, HarmonyRouter
+
+class TestHarmonyRouter(unittest.TestCase):
+  # <|return|> and <|call|> are stop tokens and are filtered before route; final=True flushes the remaining body.
+  @staticmethod
+  def route(pieces:list[str]):
+    router, events = HarmonyRouter(), []
+    for piece in pieces: events.extend(router.route(piece))
+    events.extend(router.route("", final=True))
+    return router, events
+
+  @staticmethod
+  def joined(events:list[tuple[str, str]], field:str) -> str:
+    return "".join(text for event_field, text in events if event_field == field)
+
+  def test_analysis_then_final(self):
+    router, events = self.route(["<|channel|>analysis<|message|>think<|end|>"
+                                 "<|start|>assistant<|channel|>final<|message|>answer"])
+    self.assertEqual(events, [("reasoning_content", "think"), ("content", "answer")])
+    self.assertEqual(router.mode, "content")
+
+  def test_commentary_is_visible_content(self):
+    _, events = self.route(["<|channel|>commentary<|message|>checking<|end|>"
+                            "<|start|>assistant<|channel|>final<|message|>done"])
+    self.assertEqual(self.joined(events, "content"), "checkingdone")
+    self.assertEqual(self.joined(events, "reasoning_content"), "")
+
+  def test_delimiters_may_cross_chunk_boundaries(self):
+    text = ("<|channel|>analysis<|message|>reason<|end|>"
+            "<|start|>assistant<|channel|>final<|message|>result")
+    _, events = self.route(list(text))
+    self.assertEqual(self.joined(events, "reasoning_content"), "reason")
+    self.assertEqual(self.joined(events, "content"), "result")
+
+  def test_final_flushes_message_without_end_token(self):
+    router = HarmonyRouter()
+    events = list(router.route("<|channel|>final<|message|>answer"))
+    events.extend(router.route("", final=True))
+    self.assertEqual(self.joined(events, "content"), "answer")
+
+  def test_json_tool_call(self):
+    router, events = self.route([" to=functions.get_weather<|channel|>commentary json<|message|>"
+                                 '{"city":"Paris"}'])
+    self.assertEqual(events, [])
+    self.assertEqual(list(router.tool_calls()), [("get_weather", {"city":"Paris"})])
+
+  def test_tool_header_and_arguments_may_cross_chunk_boundaries(self):
+    text = (" to=functions.search<|channel|>commentary json<|message|>"
+            '{"query":"tinygrad"}')
+    router, events = self.route(list(text))
+    self.assertEqual(events, [])
+    self.assertEqual(list(router.tool_calls()), [("search", {"query":"tinygrad"})])
+
+  def test_empty_tool_arguments_are_an_object(self):
+    router, _ = self.route([" to=functions.ping<|channel|>commentary json<|message|>"])
+    self.assertEqual(list(router.tool_calls()), [("ping", {})])
+
+  def test_constrained_json_tool_header(self):
+    router, _ = self.route([" to=functions.lookup<|channel|>commentary<|constrain|>json<|message|>{\"id\":1}"])
+    self.assertEqual(list(router.tool_calls()), [("lookup", {"id":1})])
+
+  def test_invalid_tool_arguments_are_preserved(self):
+    router, _ = self.route([" to=functions.search<|channel|>commentary json<|message|>{invalid"])
+    self.assertEqual(list(router.tool_calls()), ["{invalid"])
 
 TEST_CONFIG = TransformerConfig(num_blocks=1, dim=64, hidden_dim=128, n_heads=2, n_kv_heads=2,
                            norm_eps=1e-5, vocab_size=100, head_dim=32, rope_theta=10000.0, rope_dim=32, v_head_dim=32, max_context=32)
