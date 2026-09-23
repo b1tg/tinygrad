@@ -9,9 +9,6 @@ _TP_LAYOUT = {"attn_q.weight":0, "attn_k.weight":0, "attn_v.weight":0, "attn_q.b
               "attn_output.weight":1, "ffn_gate.weight":0, "ffn_up.weight":0, "ffn_down.weight":1, "output.weight":0,
               "attn_gate.weight":0, "ssm_alpha.weight":0, "ssm_beta.weight":0, "ssm_a":0, "ssm_dt.bias":0, "ssm_out.weight":1}
 
-def replicate(x:Tensor, devices:tuple[str, ...]) -> Tensor:
-  return x.pad_to(x.max_shape).to(devices).shrink(tuple((0, s) for s in x.shape))
-
 def gguf_sharder(devices:tuple[str, ...]) -> GGUFLoader:
   assert len(devices) > 1 and len(set(devices)) == len(devices), "TP requires distinct devices"
   packed_kernels = all(amd_custom_kernels_supported(d) for d in devices)

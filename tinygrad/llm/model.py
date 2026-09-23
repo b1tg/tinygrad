@@ -5,7 +5,7 @@ from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
 from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
 from tinygrad.llm.gguf import gguf_load, GGUFQuantizedTensor
 from tinygrad.uop.ops import resolve
-from tinygrad.llm.tp import gguf_sharder, replicate
+from tinygrad.llm.tp import gguf_sharder 
 from tinygrad.helpers import get_child
 
 class ExpertGating(enum.IntEnum):
@@ -377,7 +377,7 @@ class Transformer:
 
   def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
     x = self.token_embd(tokens).float()                   # (B, T, D)
-    if self.devices: x = replicate(x, self.devices)
+    if self.devices: x= x.to(self.devices)
     for block in self.blk: x = block(x, start_pos)
     # only run the output projection on the last token
     logits = self.output(self.output_norm(x[:, -1:]))[:, -1, :]

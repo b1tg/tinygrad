@@ -5,7 +5,7 @@ import numpy as np
 from tinygrad import Tensor, UOp, nn, Device, TinyJit
 from tinygrad.helpers import get_child
 from tinygrad.llm.model import Transformer, TransformerConfig, TransformerBlock, GatedDeltaNetBlock, SSMConfig
-from tinygrad.llm.tp import gguf_sharder, replicate
+from tinygrad.llm.tp import gguf_sharder
 from tinygrad.llm.gguf import gguf_load, ggml_data_to_tensor, GGUFQuantizedTensor
 from tinygrad.llm.kernels.amd import Linear, QUANT_SIZES, amd_custom_kernels_supported
 from test.unit import test_gguf
@@ -120,9 +120,13 @@ class TestTensorParallel(unittest.TestCase):
       width=32 if kernel else 8
       start=UOp.variable('start_pos',0,config.max_context-1).bind(pos)
       x=Tensor.randn(1,width if tokens>1 else 1,config.dim).realize()
-      if tokens>1:x=x[:,:UOp.variable('toks',1,width).bind(tokens)]
+      # Transfer the backing buffer before taking symbolic views on each device.
+      tx=x.to(devices)
+      if tokens>1:
+        nt=UOp.variable('toks',1,width).bind(tokens)
+        x,tx=x[:,:nt],tx[:,:nt]
       expected=(reference(x,start) if tokens>1 else ref_jit(x,start)).pad_to((1,width if tokens>1 else 1,config.dim)).numpy()[:,:tokens]
-      out=parallel(replicate(x,devices),start) if tokens>1 else tp_jit(replicate(x,devices),start)
+      out=parallel(tx,start) if tokens>1 else tp_jit(tx,start)
       out=out.pad_to((1,width if tokens>1 else 1,config.dim)).realize()
       self.assertIsNone(out.uop.axis)
       for rank in (0,1):
