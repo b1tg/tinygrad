@@ -3,39 +3,43 @@ from unittest.mock import patch
 import numpy as np
 from tinygrad import Tensor, UOp, nn, Device, TinyJit
 from tinygrad.llm.model import Transformer, TransformerConfig, TransformerBlock, GatedDeltaNetBlock, SSMConfig
-from tinygrad.llm.tp import partition, shard_config, load_sharded, load_linear, replicate
+from tinygrad.llm.tp import _local_shard, shard_config, load_sharded, replicate
 from tinygrad.llm.kernels.amd import Linear, QUANT_SIZES
-from tinygrad.llm.gguf import gguf_load_index, GGUFWeight
+from tinygrad.llm.gguf import gguf_load
 from test.unit import test_gguf
 
 class TestTensorParallel(unittest.TestCase):
   def test_group_partition(self):
-    x = Tensor.arange(24).reshape(12, 2)
-    shards = [partition(x, 0, i, 2, (4, 4, 4)).numpy() for i in range(2)]
+    x = Tensor(np.arange(24).reshape(12, 2), device="CPU").realize()
+    local = _local_shard(x, ("CPU", "CPU:1"), 0, (4, 4, 4)).realize()
+    shards = [Tensor(local.uop.mselect(i)).numpy() for i in range(2)]
     np.testing.assert_array_equal(shards[0], x.numpy()[[0, 1, 4, 5, 8, 9]])
     np.testing.assert_array_equal(shards[1], x.numpy()[[2, 3, 6, 7, 10, 11]])
 
   def test_file_backed_packed_weights(self):
-    device = str(Tensor.empty(1).device)
-    if device == "CPU": device = "CPU:1"
-    for typ, size in QUANT_SIZES.items():
-      packed = np.random.default_rng(0).integers(0, 255, (4, 4, size), dtype=np.uint8)
+    devices = ('CPU:1', 'CPU:2') if Device.DEFAULT == 'CPU' else (Device.DEFAULT, Device.DEFAULT+':1')
+    for typ,size in QUANT_SIZES.items():
+      packed = np.random.default_rng(0).integers(0, 255, (8, 4, size), dtype=np.uint8)
       with tempfile.TemporaryDirectory() as folder:
         path = pathlib.Path(folder)/'weights.gguf'
-        path.write_bytes(test_gguf.TestGGUF._build_gguf([('weight', (4, 1024), typ, packed.tobytes())], []))
-        _, index = gguf_load_index(path)
-        weight = index['weight']
-        self.assertTrue(weight.data.device.startswith('DISK:'))
-        with patch('tinygrad.llm.tp.amd_custom_kernels_supported', return_value=True):
-          for axis in (0, 1):
-            for groups in (None, (2, 2) if axis == 0 else (512, 512)):
-              for rank in (0, 1):
-                target = Linear(512 if axis == 1 else 1024, 2 if axis == 0 else 4, bias=False)
-                load_linear(weight, target, device, axis, rank, 2, groups)
-                self.assertEqual(target.weight.uop.buf_uop.dtype, target.weight.dtype)
-                parts = [packed] if groups is None else np.split(packed, 2, axis=axis)
-                expected = np.concatenate([np.split(p, 2, axis=axis)[rank] for p in parts], axis=axis)
-                np.testing.assert_array_equal(target.weight.bitcast('uint8').numpy(), expected.flatten())
+        path.write_bytes(test_gguf.TestGGUF._build_gguf([('weight', (8, 1024), typ, packed.tobytes())], []))
+        for axis in (0, 1):
+          for grouped in (False, True):
+            config = TransformerConfig(num_blocks=1, dim=1024, hidden_dim=8, n_heads=4, n_kv_heads=2, norm_eps=1e-5,
+              vocab_size=64, head_dim=8, v_head_dim=8, rope_theta=10000, rope_dim=8, ssm_layers=(grouped,),
+              ssm=SSMConfig(4, 1, 2, 4, 4 if axis == 0 else 1024) if grouped else None)
+            key = ('attn_qkv' if axis == 0 else 'ssm_out') if grouped else ('ffn_gate' if axis == 0 else 'ffn_down')
+            _, state = gguf_load(path, device=lambda _: 'CPU')
+            target = Linear(512 if axis == 1 else 1024, 4 if axis == 0 else 8, bias=False)
+            with patch('tinygrad.llm.tp.amd_custom_kernels_supported', return_value=True):
+              load_sharded({'blk':[{key:target}]}, {'blk.0.'+key+'.weight':state['weight'].half()}, config, devices)
+            self.assertEqual(target.ggml_type, typ)
+            pieces = np.split(packed, 4 if axis == 0 else 2, axis=axis) if grouped else (packed,)
+            for rank in (0, 1):
+              local = Tensor(target.weight.uop.mselect(rank))
+              self.assertEqual(local.uop.buf_uop.dtype, target.weight.dtype)
+              expected = np.concatenate([np.split(p, 2, axis=axis)[rank] for p in pieces], axis=axis)
+              np.testing.assert_array_equal(local.bitcast('uint8').numpy(), expected.flatten())
 
   def test_file_backed_model(self):
     Tensor.manual_seed(42)
@@ -48,8 +52,8 @@ class TestTensorParallel(unittest.TestCase):
       path = pathlib.Path(folder)/'model.gguf'
       tensors = [(name, weight.shape, 0, weight.numpy().astype(np.float32).tobytes()) for name,weight in nn.state.get_state_dict(model).items()]
       path.write_bytes(test_gguf.TestGGUF._build_gguf(tensors, []))
-      _, index = gguf_load_index(path)
-      load_sharded(tp, index, config, devices)
+      _, index = gguf_load(path, device=lambda _: "CPU")
+      load_sharded(tp, {k:v.half() for k,v in index.items()}, config, devices)
       for pos, token in enumerate((3, 7, 5, 11, 1)):
         start = UOp.variable('start_pos', 0, 15).bind(pos)
         x, temp = Tensor([[token]]), Tensor([0.0])
@@ -101,7 +105,7 @@ class TestTensorParallel(unittest.TestCase):
     weights = {}
     for name,weight in nn.state.get_state_dict(block).items():
       weight.replace(weight.half().realize())
-      weights['blk.0.'+name] = GGUFWeight(weight.bitcast('uint8').flatten(), weight.shape, 1)
+      weights['blk.0.'+name] = weight
     load_sharded({'blk':[tp]}, weights, config, devices)
     ref_decode, tp_decode = TinyJit(block), TinyJit(tp)
     for pos, tokens in ((0, 3), (3, 1), (4, 1), (5, 1), (6, 1), (0, 2)):

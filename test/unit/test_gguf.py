@@ -218,24 +218,25 @@ class TestGGUF(unittest.TestCase):
     for _, _, _, data in tensors: buf += data
     return bytes(buf)
 
-  def test_file_backed_index(self):
-    from tinygrad.llm.gguf import gguf_load_index
-    from unittest.mock import patch
+  def test_lazy_per_tensor_loading(self):
+    from tinygrad.uop.ops import Ops
     with tempfile.TemporaryDirectory() as folder:
       path = pathlib.Path(folder)/'large.gguf'
-      # A sparse 64 MiB payload: indexing must only read headers, without copying the model into CPU storage.
       header = self._build_gguf([('weight', (16*1024*1024,), 0, b'')], [])
       with path.open('wb') as f:
         f.write(header)
         f.truncate(len(header)+64*1024*1024)
-      original, copied = Tensor.to, []
-      def track(t, device, *args, **kwargs):
-        if str(t.device).startswith('DISK:'): copied.append(t.nbytes())
-        return original(t, device, *args, **kwargs)
-      with patch.object(Tensor, 'to', track): _, index = gguf_load_index(path)
-      self.assertTrue(index['weight'].data.device.startswith('DISK:'))
-      self.assertEqual(index['weight'].shape, (16*1024*1024,))
-      self.assertLessEqual(max(copied, default=0), 1_000_000)
+      # Reading metadata must not allocate the payload in CPU memory. Transfers stay lazy until weight loading.
+      _, state = gguf_load(path, device=lambda _: 'CPU')
+      self.assertEqual(state['weight'].shape, (16*1024*1024,))
+      self.assertFalse(any(u.op is Ops.BUFFER and u.device == 'CPU' and u.nbytes() >= 64*1024*1024
+                           for u in state['weight'].uop.toposort()))
+      small = pathlib.Path(folder)/'small.gguf'
+      values = np.arange(8, dtype=np.float32)
+      small.write_bytes(self._build_gguf([('a', (8,), 0, values.tobytes())], []))
+      _, loaded = gguf_load(small, device=lambda _: 'CPU:1')
+      self.assertEqual(loaded['a'].device, 'CPU:1')
+      np.testing.assert_array_equal(loaded['a'].numpy(), values)
 
   def test_multi_part_load(self):
     with tempfile.TemporaryDirectory() as d:
@@ -244,11 +245,10 @@ class TestGGUF(unittest.TestCase):
       (d / "test-00001-of-00002.gguf").write_bytes(self._build_gguf([("a", (4,), 0, a.tobytes())], [("split.count", 2), ("split.no", 0)]))
       (d / "test-00002-of-00002.gguf").write_bytes(self._build_gguf([("b", (2,), 0, b.tobytes())], [("split.count", 2), ("split.no", 1)]))
       kv, ts = gguf_load(d / "test-00001-of-00002.gguf")
-      from tinygrad.llm.gguf import gguf_load_index
-      indexed_kv, index = gguf_load_index(d / "test-00001-of-00002.gguf")
+      indexed_kv, index = gguf_load(d / "test-00001-of-00002.gguf", device=lambda _: "CPU")
       self.assertEqual(indexed_kv['split.count'], 2)
-      np.testing.assert_equal(index['a'].decode('CPU').numpy(), a)
-      np.testing.assert_equal(index['b'].decode('CPU').numpy(), b)
+      np.testing.assert_equal(index['a'].numpy(), a)
+      np.testing.assert_equal(index['b'].numpy(), b)
       self.assertEqual(kv["split.count"], 2)
       np.testing.assert_equal(ts["a"].numpy(), a)
       np.testing.assert_equal(ts["b"].numpy(), b)

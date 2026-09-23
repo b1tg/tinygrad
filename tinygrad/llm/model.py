@@ -1,9 +1,9 @@
 from __future__ import annotations
 import enum, functools, itertools, pathlib
 from dataclasses import dataclass, replace
-from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Context, Device
+from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
 from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
-from tinygrad.llm.gguf import gguf_load, gguf_load_index
+from tinygrad.llm.gguf import gguf_load
 from tinygrad.uop.ops import resolve
 from tinygrad.llm.tp import shard_config, load_sharded, sum_shards, replicate
 
@@ -389,19 +389,9 @@ class Transformer:
   def from_gguf(gguf:Tensor|str|pathlib.Path, max_context:int|None=None,
                 realize=bool(getenv("REALIZE", 0)), shard:int=1) -> tuple[Transformer, dict]:
     if shard < 1: raise ValueError("shard must be positive")
-    if shard > 1:
-      kv, weights = gguf_load_index(gguf)
-      # Only shapes are needed to construct the model. Weight payloads remain file-backed until partitioned.
-      devices = tuple(Device.canonicalize(f"{Device.DEFAULT.split(':')[0]}:{i}") for i in range(shard))
-      with Context(DEV="CPU"):
-        return Transformer._from_gguf_state(kv, {k:Tensor.empty(*w.shape, dtype=w.dtype) for k,w in weights.items()},
-                                            max_context, realize, devices, weights)
-    kv, state_dict = gguf_load(gguf.to(None).realize() if isinstance(gguf, Tensor) else gguf)
-    return Transformer._from_gguf_state(kv, state_dict, max_context, realize)
+    devices = tuple(Device.canonicalize(f"{Device.DEFAULT.split(':')[0]}:{i}") for i in range(shard)) if shard > 1 else None
+    kv, state_dict = gguf_load(gguf, device=(lambda name: devices[0] if name == 'token_embd.weight' else "CPU") if devices else None)
 
-  @staticmethod
-  def _from_gguf_state(kv:dict, state_dict:dict[str, Tensor], max_context:int|None, realize:bool,
-                       devices:tuple[str, ...]|None=None, weights=None) -> tuple[Transformer, dict]:
     # all state items should be float16, not float32
     state_dict = {k:v.cast('float16') if getenv("HALF", 1) else v for k,v in state_dict.items()}
 
@@ -473,7 +463,7 @@ class Transformer:
       qkv_bias='blk.0.attn_q.bias' in state_dict,
       expert_bias=f"blk.{kv.get(f'{arch}.leading_dense_block_count', 0)}.exp_probs_b.bias" in state_dict)
     model = Transformer(config, devices)
-    if devices is not None: load_sharded(model, weights, config, devices, arch)
+    if devices is not None: load_sharded(model, state_dict, config, devices)
     else: nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:
