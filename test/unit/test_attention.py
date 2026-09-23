@@ -2,7 +2,7 @@ import unittest
 import numpy as np
 from tinygrad import Tensor, dtypes, nn
 from tinygrad.llm.model import (
-  GatedDeltaNetBlock, SSMConfig, TransformerBlock, TransformerConfig,
+  GatedDeltaNetBlock, SSMConfig, TransformerBlock, TransformerConfig, YaRNConfig,
   apply_rope as apply_rope_new, precompute_freqs_cis, pairwise_topk,
 )
 from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, amd_custom_kernels_supported
@@ -36,6 +36,28 @@ class TestAttention(unittest.TestCase):
     self.assertEqual(result.dtype, x.dtype)
     self.assertGreater((result - apply_rope(x, 5)).abs().max().item(), 1e-6)
     with self.assertRaises(AssertionError): apply_rope(Tensor.randn(1, 1, 4, 7, dtype=dtypes.float32), 0)
+
+  def test_gptoss_yarn_long_context(self):
+    # NumPy reference for OpenAI's ModelConfig and RotaryEmbedding (fractional YaRN boundaries):
+    # https://github.com/openai/gpt-oss/blob/243a1b02767da73bd2e3975be250afa801635866/gpt_oss/torch/model.py
+    dim, theta = 64, 150000.0
+    yarn = YaRNConfig(factor=32, orig_ctx_len=4096, beta_fast=32, beta_slow=1)
+    indices = np.arange(dim // 2, dtype=np.float32)
+    freq = theta ** (2 * indices / dim)
+    low, high = [dim / 2 * np.log(yarn.orig_ctx_len / (beta * 2 * np.pi)) / np.log(theta)
+                 for beta in (yarn.beta_fast, yarn.beta_slow)]
+    mask = 1 - np.clip((indices - low) / (high - low), 0, 1)
+    inv_freq = (1 - mask) / (yarn.factor * freq) + mask / freq
+    concentration = 1 + 0.1 * np.log(yarn.factor)
+    end = int(yarn.orig_ctx_len * yarn.factor)
+    positions = [0, yarn.orig_ctx_len, end // 2, end - 1]
+    # Check every interpolated frequency, where rounding the correction boundaries changes RoPE.
+    transition = np.flatnonzero((indices > low) & (indices < high))
+    phases = np.array(positions, dtype=np.float32)[:, None] * inv_freq[transition]
+    expected = np.concatenate((np.cos(phases), np.sin(phases)), axis=-1) * concentration
+    freqs = precompute_freqs_cis(dim, end, theta, yarn=yarn)
+    actual = freqs[Tensor(positions)][:, Tensor(np.concatenate((transition, transition + dim // 2)))].numpy()
+    np.testing.assert_allclose(actual, expected, atol=1e-3, rtol=1e-3)
 
   def test_attention_sink(self):
     x = Tensor([[[2., 4.]]])

@@ -26,8 +26,8 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, device:str|
   if yarn is not None and yarn.factor > 1.0:
     concentration = 0.1 * math.log(yarn.factor) + 1.0
     d_half = dim // 2
-    low = max(0, math.floor(d_half * math.log(yarn.orig_ctx_len / (yarn.beta_fast * 2 * math.pi)) / math.log(theta)))
-    high = min(dim-1, math.ceil(d_half * math.log(yarn.orig_ctx_len / (yarn.beta_slow * 2 * math.pi)) / math.log(theta)))
+    low = max(0, d_half * math.log(yarn.orig_ctx_len / (yarn.beta_fast * 2 * math.pi)) / math.log(theta))
+    high = min(dim-1, d_half * math.log(yarn.orig_ctx_len / (yarn.beta_slow * 2 * math.pi)) / math.log(theta))
     interp = 1 - ((Tensor.arange(d_half).float() - low) / max(0.001, high-low)).clamp(0, 1)
     freqs = freqs * interp + (freqs / yarn.factor) * (1 - interp)
   freqs = Tensor.arange(end).unsqueeze(dim=1) * freqs.unsqueeze(dim=0)
@@ -462,10 +462,12 @@ class Transformer:
     kv_lora_rank = kv.get(f'{arch}.attention.kv_lora_rank', 0)
     head_dim = kv.get(f'{arch}.attention.key_length_mla', kv.get(f'{arch}.attention.key_length', kv[f'{arch}.embedding_length'] // n_heads))
     rope_dim = kv.get(f'{arch}.rope.dimension_count', head_dim)
-    yarn = YaRNConfig(factor=kv[f'{arch}.rope.scaling.factor'],
-                      orig_ctx_len=kv.get(f'{arch}.rope.scaling.original_context_length', kv[f'{arch}.context_length']),
-                      beta_fast=kv.get(f'{arch}.rope.scaling.yarn_beta_fast', 32.0),
-                      beta_slow=kv.get(f'{arch}.rope.scaling.yarn_beta_slow', 1.0)) if kv.get(f'{arch}.rope.scaling.type') == 'yarn' else None
+    yarn = None
+    if arch == 'gpt-oss' and kv.get(f'{arch}.rope.scaling.type') == 'yarn':
+      yarn = YaRNConfig(factor=kv[f'{arch}.rope.scaling.factor'],
+                        orig_ctx_len=kv.get(f'{arch}.rope.scaling.original_context_length', kv[f'{arch}.context_length']),
+                        beta_fast=kv.get(f'{arch}.rope.scaling.yarn_beta_fast', 32.0),
+                        beta_slow=kv.get(f'{arch}.rope.scaling.yarn_beta_slow', 1.0))
 
     # Permute RoPE weights from interleaved to half-split layout.
     for name in state_dict:
