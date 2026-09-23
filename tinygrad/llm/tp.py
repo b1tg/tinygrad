@@ -1,33 +1,62 @@
-"""Tensor parallel blocks with local packed weights and two reductions per transformer block."""
+"""Tensor-parallel configuration, weight placement, and collective operations."""
+from __future__ import annotations
 from dataclasses import replace
-from tinygrad import Tensor, Device, UOp, nn, function, dtypes
+from typing import TYPE_CHECKING
+from tinygrad import Tensor, UOp, nn, dtypes, getenv
+from tinygrad.helpers import get_child, tqdm, prod
 from tinygrad.llm.kernels.amd import Linear, QUANT_SIZES, amd_custom_kernels_supported
-from tinygrad.llm.model import TransformerBlock, GatedDeltaNetBlock
-from tinygrad.helpers import tqdm, prod
 from tinygrad.llm.gguf import GGUFWeight
+from tinygrad.uop.ops import Ops
+if TYPE_CHECKING:
+  from tinygrad.llm.model import TransformerConfig
+
+
+def replicate(x:Tensor, devices:tuple[str, ...]) -> Tensor:
+  # Device copies must have static sizes; restore the logical prefill length after broadcasting.
+  return x.pad_to(x.max_shape).to(devices).shrink(tuple((0, s) for s in x.shape))
+
+
+def sum_shards(x:Tensor) -> Tensor:
+  if not isinstance(x.device, tuple): return x
+  summed = Tensor(x.pad_to(x.max_shape).contiguous().uop.allreduce(Ops.ADD, x.device))
+  return summed.shrink(tuple((0, s) for s in x.shape))
+
+
+def shard_config(config:TransformerConfig, devices:tuple[str, ...]) -> TransformerConfig:
+  count = len(devices)
+  assert count > 1 and len(set(devices)) == count, "tensor parallelism requires distinct devices"
+  if config.num_experts or config.kv_lora_rank or (config.ssm is not None and config.ssm.kda):
+    raise ValueError("tensor parallelism supports dense attention and Qwen Gated DeltaNet blocks")
+  dims = (config.n_heads, config.n_kv_heads, config.hidden_dim, config.dense_hidden_dim, config.vocab_size)
+  assert all(v % count == 0 for v in dims), "uneven TP split"
+  ssm = config.ssm
+  if ssm is not None:
+    assert all(v % count == 0 for v in (ssm.group_count, ssm.time_step_rank, ssm.inner_size)), "uneven SSM split"
+    ssm = replace(ssm, group_count=ssm.group_count//count, time_step_rank=ssm.time_step_rank//count, inner_size=ssm.inner_size//count)
+  return replace(config, n_heads=config.n_heads//count, n_kv_heads=config.n_kv_heads//count,
+                 hidden_dim=config.hidden_dim//count, dense_hidden_dim=config.dense_hidden_dim//count, ssm=ssm)
+
+
+def shard_layout(name:str, module, shape:tuple[int, ...], config:TransformerConfig) -> tuple[int|None, tuple[int, ...]|None]:
+  key = name.split('.', 2)[-1] if name.startswith('blk.') else name
+  axis = (1 if key in ('attn_output.weight', 'ffn_down.weight', 'ssm_out.weight') else 0) if isinstance(module, Linear) else None
+  if key in ('ssm_conv1d.weight', 'ssm_dt.bias', 'ssm_a'): axis = 0
+  groups = None
+  if config.ssm is not None and name.startswith('blk.') and config.ssm_layers[int(name.split('.')[1])]:
+    ssm = config.ssm
+    repeats = ssm.time_step_rank//ssm.group_count
+    if key in ('attn_qkv.weight', 'ssm_conv1d.weight'):
+      groups = (ssm.group_count*ssm.state_size,)*2 + (ssm.inner_size//repeats,)*repeats
+    elif key in ('attn_gate.weight', 'ssm_out.weight', 'ssm_alpha.weight', 'ssm_beta.weight', 'ssm_dt.bias', 'ssm_a'):
+      assert axis is not None
+      groups = (shape[axis]//repeats,)*repeats
+  return axis, groups
 
 
 def partition(t:Tensor, axis:int, rank:int, count:int, groups:tuple[int, ...]|None=None) -> Tensor:
   parts = t.split(groups, dim=axis) if groups is not None else (t,)
   assert all(p.shape[axis] % count == 0 for p in parts), f"cannot split {t.shape} into {count} shards along {axis}"
   return Tensor.cat(*(p.chunk(count, dim=axis)[rank] for p in parts), dim=axis).contiguous()
-
-
-def split_linear(source:Linear, target:Linear, device:str, axis:int, rank:int, count:int, groups:tuple[int, ...]|None=None):
-  if amd_custom_kernels_supported(device) and source.ggml_type is None: source.set_quantized(source.weight)
-  if source.ggml_type is not None:
-    assert source.in_features % (256*count if axis == 1 else 256) == 0, "TP must preserve GGML blocks"
-    words = QUANT_SIZES[source.ggml_type] // source.weight.dtype.itemsize
-    raw = source.weight.realize().reshape(source.out_features, source.in_features//256, words)
-    if axis == 1 and groups is not None:
-      assert all(g % 256 == 0 for g in groups), "TP must preserve GGML blocks"
-      groups = tuple(g//256 for g in groups)
-    target.weight = partition(raw, axis, rank, count, groups).flatten().to(device).contiguous().realize()
-    target.ggml_type = source.ggml_type
-  else:
-    target.weight = partition(source.weight, axis, rank, count, groups).to(device).contiguous().realize()
-  if source.bias is not None:
-    target.bias = (partition(source.bias, 0, rank, count, groups) if axis == 0 else source.bias/count).to(device).contiguous().realize()
 
 
 def load_linear(weight:GGUFWeight, target:Linear, device:str, axis:int, rank:int, count:int,
@@ -67,92 +96,32 @@ def load_linear(weight:GGUFWeight, target:Linear, device:str, axis:int, rank:int
                                        target.in_features*target.out_features//256*QUANT_SIZES[target.ggml_type]//target.weight.dtype.itemsize)
 
 
-class TensorParallelBlock:
-  def __init__(self, source, devices:tuple[str, ...], weights:dict[str, GGUFWeight]|None=None, arch:str=""):
-    self.devices, self.parts = devices, []
-    config, count = source.config, len(devices)
-    if config.num_experts or config.kv_lora_rank or (config.ssm is not None and config.ssm.kda):
-      raise ValueError("tensor parallel currently supports dense attention and Qwen Gated DeltaNet blocks")
-    assert config.n_heads % count == config.n_kv_heads % count == config.hidden_dim % count == 0
-    local = replace(config, n_heads=config.n_heads//count, n_kv_heads=config.n_kv_heads//count, hidden_dim=config.hidden_dim//count)
-    ssm = config.ssm
-    recurrent = isinstance(source, GatedDeltaNetBlock)
-    if recurrent:
-      assert ssm is not None and ssm.group_count % count == 0
-      local = replace(local, ssm=replace(ssm, group_count=ssm.group_count//count, time_step_rank=ssm.time_step_rank//count,
-                                        inner_size=ssm.inner_size//count))
-      # q/k heads repeat across the value heads. Preserve that ordering within each shard.
-      repeats = ssm.time_step_rank//ssm.group_count
-      value_groups = (ssm.inner_size//repeats,)*repeats
-      head_groups = (ssm.group_count,)*repeats
-      qkv_groups = (ssm.group_count*ssm.state_size,)*2 + value_groups
-    for rank, device in enumerate(devices):
-      block = GatedDeltaNetBlock(local, local.ssm) if recurrent else TransformerBlock(local)
-      for name, module in vars(source).items():
-        target = getattr(block, name)
-        if isinstance(module, Linear):
-          axis = 1 if name in ('ffn_down', 'attn_output', 'ssm_out') else 0
-          groups = None
-          if recurrent:
-            if name == 'attn_qkv': groups = qkv_groups
-            elif name in ('attn_gate', 'ssm_out'): groups = value_groups
-            elif name in ('ssm_alpha', 'ssm_beta'): groups = head_groups
-          if weights is None: split_linear(module, target, device, axis, rank, count, groups)
-          else:
-            rope = (config.head_dim, config.head_dim-config.rope_dim if name == 'attn_q' else 0) \
-              if arch == 'llama' and name in ('attn_q', 'attn_k') else None
-            target.weight = target.weight.cast(module.weight.dtype)
-            load_linear(weights[name+'.weight'], target, device, axis, rank, count, groups, rope)
-            if module.bias is not None:
-              bias = weights[name+'.bias'].decode("CPU")
-              target.bias = (partition(bias, 0, rank, count, groups) if axis == 0 else bias/count).to(device).cast(module.bias.dtype).realize()
-        elif isinstance(module, nn.RMSNorm) and module.weight is not None:
-          target.weight = (module.weight.to(device) if weights is None else weights[name+'.weight'].decode(device).cast(module.weight.dtype)) \
-            .contiguous().realize()
-        elif recurrent and name in ('ssm_a', 'ssm_dt', 'ssm_conv1d'):
-          tensor = module if isinstance(module, Tensor) else module['bias' if name == 'ssm_dt' else 'weight']
-          if weights is not None:
-            key = name if isinstance(module, Tensor) else name + ('.bias' if name == 'ssm_dt' else '.weight')
-            tensor = weights[key].decode("CPU").cast(tensor.dtype)
-          value = partition(tensor, 0, rank, count, qkv_groups if name == 'ssm_conv1d' else head_groups).to(device).realize()
-          if isinstance(module, Tensor): setattr(block, name, value)
-          else: target['bias' if name == 'ssm_dt' else 'weight'] = value
-      self.parts.append(block)
-
-  def _reusable_prefix_len(self, prefix_len:int, cached_len:int) -> int: return prefix_len
-
-  def __call__(self, xs:tuple[Tensor, ...], start_pos):
-    for block, x in zip(self.parts, xs): block._init_state(x)
-    @function(precompile=True, allow_implicit=True)
-    def run(start_pos:int|UOp, *xs:Tensor):
-      attn = [b._attention(b.attn_norm(x), start_pos).contiguous() for b,x in zip(self.parts, xs)]
-      hs = [(x + sum(a.to(d) for a in attn)).contiguous() for x,d in zip(xs, self.devices)]
-      ffn = [b._feed_forward(b.ffn_norm(h)).contiguous() for b,h in zip(self.parts, hs)]
-      return tuple((h + sum(f.to(d) for f in ffn)).contiguous() for h,d in zip(hs, self.devices))
-    return run(start_pos, *xs)
-
-
-def shard_model(model, count:int, weights:dict[str, GGUFWeight]|None=None, arch:str=""):
-  devices = tuple(Device.canonicalize(f'{Device.DEFAULT}:{i}') for i in range(count))
-  if weights is not None:
-    if arch in ('qwen35', 'qwen35moe', 'glm4moe'): weights = {k.replace('post_attention_norm', 'ffn_norm'):v for k,v in weights.items()}
-    if 'output.weight' not in weights: weights['output.weight'] = weights['token_embd.weight']
-  model.tp_blocks = []
-  for i in tqdm(range(len(model.blk)), desc="sharding"):
-    prefix = f'blk.{i}.'
-    local_weights = {k[len(prefix):]:v for k,v in weights.items() if k.startswith(prefix)} if weights is not None else None
-    model.tp_blocks.append(TensorParallelBlock(model.blk.pop(0), devices, local_weights, arch))
-  outputs = []
-  for rank, device in enumerate(devices):
-    layer = Linear(model.output.in_features, model.output.out_features//count, bias=False)
-    if weights is None: split_linear(model.output, layer, device, 0, rank, count)
+def load_sharded(model, weights:dict[str, GGUFWeight], config:TransformerConfig, devices:tuple[str, ...], arch:str=""):
+  if arch in ('qwen35', 'qwen35moe', 'glm4moe'): weights = {k.replace('post_attention_norm', 'ffn_norm'):v for k,v in weights.items()}
+  if 'output.weight' not in weights and 'token_embd.weight' in weights: weights['output.weight'] = weights['token_embd.weight']
+  for name,target in tqdm(nn.state.get_state_dict(model).items(), desc="sharding"):
+    weight = weights[name]
+    module = get_child(model, name.rsplit('.', 1)[0])
+    dtype = dtypes.half if getenv("HALF", 1) else weight.dtype
+    if name == 'token_embd.weight':
+      target.replace(weight.decode(devices[0]).cast(dtype).contiguous().realize())
+      continue
+    axis, groups = shard_layout(name, module, weight.shape, config)
+    if isinstance(module, Linear) and name.endswith('.weight'):
+      key = name.rsplit('.', 2)[-2] if name.startswith('blk.') else name.rsplit('.', 1)[0]
+      rope = (config.head_dim, config.head_dim-config.rope_dim if key == 'attn_q' else 0) \
+        if arch == 'llama' and key in ('attn_q', 'attn_k') else None
+      assert axis is not None
+      shards = []
+      for rank,device in enumerate(devices):
+        local = Linear(module.in_features, module.out_features, bias=False)
+        local.weight = local.weight.cast(dtype)
+        load_linear(weight, local, device, axis, rank, len(devices), groups, rope)
+        shards.append(local.weight)
+      module.ggml_type = local.ggml_type
+      module.weight = Tensor(UOp.mstack(*(w.uop for w in shards))).contiguous().realize()
     else:
-      layer.weight = layer.weight.cast(model.output.weight.dtype)
-      load_linear(weights['output.weight'], layer, device, 0, rank, count)
-    outputs.append(layer)
-  model.output, model.tp_outputs = outputs[0], outputs[1:]
-  for name in ('token_embd', 'output_norm'):
-    module = getattr(model, name)
-    module.weight = (module.weight.to(devices[0]) if weights is None else weights[name+'.weight'].decode(devices[0]).cast(module.weight.dtype)) \
-      .contiguous().realize()
-  model.devices = devices
+      value = weight.decode("CPU").cast(dtype)
+      shards = [value.to(d) if axis is None else partition(value, axis, i, len(devices), groups).to(d) for i,d in enumerate(devices)]
+      placed = Tensor(UOp.mstack(*(w.contiguous().realize().uop for w in shards))).contiguous().realize()
+      target.replace(placed)

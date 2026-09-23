@@ -136,7 +136,7 @@ def _iq4_scales(raw:UOp, base:UOp, subgroup:UOp) -> tuple[UOp, UOp]:
   return _half(raw[base] & 0xffff), (scale.cast(dtypes.uint8).bitcast(dtypes.int8)-32).float()
 
 @functools.cache
-def iq4_half_lut(device:str) -> Tensor:
+def iq4_half_lut(device:str|tuple[str, ...]) -> Tensor:
   from tinygrad.runtime.autogen.ggml_common import kvalues_iq4nl
   return Tensor([x for j in range(16) for i in range(16) for x in (kvalues_iq4nl[i], kvalues_iq4nl[j])],
                 dtype=dtypes.float16, device=device).bitcast(dtypes.uint32).contiguous()
@@ -329,7 +329,7 @@ def q8_linear(layer:Linear, x:Tensor) -> Tensor:
   out = Tensor.empty(tokens, out_features, dtype=dtypes.float32, device=x.device).uop
   if tokens % 16 == 0 and out_features % 16 == 0 and layer.ggml_type in (Q4_K, Q5_K, IQ4_XS):
     fxn = _iq4_linear_f16_wmma_kernel if layer.ggml_type == IQ4_XS else functools.partial(_q5_linear_f16_wmma_kernel, ggml_type=layer.ggml_type)
-    extra = (iq4_half_lut(str(x.device)).uop,) if layer.ggml_type == IQ4_XS else ()
+    extra = (iq4_half_lut(x.device).uop,) if layer.ggml_type == IQ4_XS else ()
     return run(fxn, out, raw, x.cast(dtypes.float16).contiguous().uop, *extra)
   xq_, xd, xs = q8_quantize(x, tokens, in_features)
   decode = functools.partial(_quant_decode_kernel, ggml_type=layer.ggml_type)

@@ -1,13 +1,11 @@
 from __future__ import annotations
 import enum, functools, itertools, pathlib
-from typing import TYPE_CHECKING
-if TYPE_CHECKING:
-  from tinygrad.llm.tp import TensorParallelBlock
 from dataclasses import dataclass, replace
-from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Context
+from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Context, Device
 from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
 from tinygrad.llm.gguf import gguf_load, gguf_load_index
 from tinygrad.uop.ops import resolve
+from tinygrad.llm.tp import shard_config, load_sharded, sum_shards, replicate
 
 class ExpertGating(enum.IntEnum):
   SOFTMAX = 1
@@ -16,7 +14,7 @@ class ExpertGating(enum.IntEnum):
   SQRT_SOFTPLUS = 4
 
 @functools.cache
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, device:str|None=None) -> Tensor:
+def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, device:str|tuple[str, ...]|None=None) -> Tensor:
   freqs = 1.0 / (theta ** (Tensor.arange(0, dim, 2)[:(dim // 2)] / dim))
   freqs = Tensor.arange(end).unsqueeze(dim=1) * freqs.unsqueeze(dim=0)
   return freqs.cos().cat(freqs.sin(), dim=-1).clone(device)
@@ -149,8 +147,8 @@ class FFNBlock:
     # we pass in the weights implicitly so we unpack the GGUF on the fly
     @function(precompile=True, allow_implicit=True)
     def _run(x:Tensor, start_pos:int|UOp):
-      h =     x + self._attention(self.attn_norm(x), start_pos)
-      return (h + self._feed_forward(self.ffn_norm(h))).contiguous()
+      h =     x + sum_shards(self._attention(self.attn_norm(x), start_pos))
+      return (h + sum_shards(self._feed_forward(self.ffn_norm(h)))).contiguous()
     return _run(x, start_pos)
 
 class TransformerBlock(FFNBlock):
@@ -355,19 +353,18 @@ class GatedDeltaNetBlock(FFNBlock):
       self.recurrent_state = Tensor.zeros(x.shape[0], self.num_v_heads, self.head_v_dim, self.head_k_dim, device=x.device).clone()
 
 class Transformer:
-  def __init__(self, config:TransformerConfig):
+  def __init__(self, config:TransformerConfig, devices:tuple[str, ...]|None=None):
+    self.devices = tuple(Device.canonicalize(d) for d in devices) if devices is not None else None
+    if self.devices is not None: config = shard_config(config, self.devices)
     dense_config = replace(config, num_experts=0, num_experts_per_tok=0, shared_expert_dim=0, hidden_dim=config.dense_hidden_dim or config.hidden_dim)
     if config.ssm: config = replace(config, qk_norm=config.head_dim)
     block_cls = MLATransformerBlock if config.kv_lora_rank > 0 else TransformerBlock
     self.blk:list[FFNBlock] = [GatedDeltaNetBlock(dense_config if i < config.leading_dense_blocks else config, config.ssm)
                                if config.ssm and config.ssm_layers[i] else
                                block_cls(dense_config if i < config.leading_dense_blocks else config) for i in range(config.num_blocks)]
-    self.tp_blocks: list[TensorParallelBlock] = []
-    self.devices: tuple[str, ...] = ()
-    self.tp_outputs: list[Linear] = []
     self.token_embd  = nn.Embedding(config.vocab_size, config.dim)
     self.output_norm = nn.RMSNorm(config.dim, config.norm_eps)
-    self.output = Linear(config.dim, config.vocab_size, bias=False)
+    self.output = Linear(config.dim, config.vocab_size//len(self.devices) if self.devices else config.vocab_size, bias=False)
     self.max_context = config.max_context
     self.has_recurrent_block = any(isinstance(b, GatedDeltaNetBlock) for b in self.blk)
     self._cached_tokens: list[int] = []
@@ -377,18 +374,11 @@ class Transformer:
 
   def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
     x = self.token_embd(tokens).float()                   # (B, T, D)
-    if self.tp_blocks:
-      xs = tuple(x.to(d) for d in self.devices)
-      for tp_block in self.tp_blocks: xs = tp_block(xs, start_pos)
-      x = xs[0]
-    else:
-      for block in self.blk: x = block(x, start_pos)
+    if self.devices: x = replicate(x, self.devices)
+    for block in self.blk: x = block(x, start_pos)
     # only run the output projection on the last token
-    h = self.output_norm(x[:, -1:])
-    if self.tp_outputs:
-      logits = Tensor.cat(*(layer(h.to(d)).to(self.devices[0]) for layer,d in zip([self.output]+self.tp_outputs, self.devices)), dim=-1)
-    else: logits = self.output(h)
-    logits = logits[:, -1, :]
+    logits = self.output(self.output_norm(x[:, -1:]))[:, -1, :]
+    if self.devices: logits = Tensor(logits.uop.unshard(1)).to(self.devices[0])
     # Gumbel-max trick: argmax(logits/temp - log(-log(uniform))) is equivalent to sampling from softmax(logits/temp)
     return (logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1, keepdim=True)
 
@@ -402,16 +392,16 @@ class Transformer:
     if shard > 1:
       kv, weights = gguf_load_index(gguf)
       # Only shapes are needed to construct the model. Weight payloads remain file-backed until partitioned.
+      devices = tuple(Device.canonicalize(f"{Device.DEFAULT.split(':')[0]}:{i}") for i in range(shard))
       with Context(DEV="CPU"):
-        model, kv = Transformer._from_gguf_state(kv, {k:Tensor.empty(*w.shape, dtype=w.dtype) for k,w in weights.items()}, max_context, False)
-      from tinygrad.llm.tp import shard_model
-      shard_model(model, shard, weights, kv['general.architecture'])
-      return model, kv
+        return Transformer._from_gguf_state(kv, {k:Tensor.empty(*w.shape, dtype=w.dtype) for k,w in weights.items()},
+                                            max_context, realize, devices, weights)
     kv, state_dict = gguf_load(gguf.to(None).realize() if isinstance(gguf, Tensor) else gguf)
     return Transformer._from_gguf_state(kv, state_dict, max_context, realize)
 
   @staticmethod
-  def _from_gguf_state(kv:dict, state_dict:dict[str, Tensor], max_context:int|None, realize:bool) -> tuple[Transformer, dict]:
+  def _from_gguf_state(kv:dict, state_dict:dict[str, Tensor], max_context:int|None, realize:bool,
+                       devices:tuple[str, ...]|None=None, weights=None) -> tuple[Transformer, dict]:
     # all state items should be float16, not float32
     state_dict = {k:v.cast('float16') if getenv("HALF", 1) else v for k,v in state_dict.items()}
 
@@ -482,8 +472,9 @@ class Transformer:
       ssm_layers=ssm_layers,
       qkv_bias='blk.0.attn_q.bias' in state_dict,
       expert_bias=f"blk.{kv.get(f'{arch}.leading_dense_block_count', 0)}.exp_probs_b.bias" in state_dict)
-    model = Transformer(config)
-    nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
+    model = Transformer(config, devices)
+    if devices is not None: load_sharded(model, weights, config, devices, arch)
+    else: nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:
       for s in (params:=nn.state.get_parameters(model)): s.replace(s.contiguous())
@@ -499,16 +490,16 @@ class Transformer:
       return len(self._cached_tokens) if self._cached_tokens and len(self._cached_tokens) < len(tokens) \
         and tokens[:len(self._cached_tokens)] == self._cached_tokens else 0
     prefix_len = sum(1 for _ in itertools.takewhile(lambda ab: ab[0] == ab[1], zip(tokens[:-1], self._cached_tokens)))
-    return min(block._reusable_prefix_len(prefix_len, len(self._cached_tokens)) for block in (self.tp_blocks or self.blk))
+    return min(block._reusable_prefix_len(prefix_len, len(self._cached_tokens)) for block in self.blk)
 
   def generate(self, tokens:list[int], chunk_size:int=32, temperature:float=0.0):
     if self.has_recurrent_block and not amd_custom_kernels_supported(self.token_embd.weight.device): chunk_size = 1
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
     v_toks = UOp.variable("toks", 1, chunk_size)
     # TODO: use UOp.variable for temperature once float variables are supported
-    temp = Tensor([temperature])
+    temp = Tensor([temperature], device=self.token_embd.weight.device)
     # assign all input tokens once, then slice from start_pos for the model call
-    t = Tensor(tokens + [0] * (self.max_context - len(tokens)), dtype="int32").reshape(1, self.max_context)
+    t = Tensor(tokens + [0] * (self.max_context - len(tokens)), dtype="int32", device=self.token_embd.weight.device).reshape(1, self.max_context)
     # recompute start_pos from what's currently valid in the caches
     start_pos = self.get_start_pos(tokens)
     out, prompt_len = None, len(tokens)
