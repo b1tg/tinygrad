@@ -227,14 +227,14 @@ class TestGGUF(unittest.TestCase):
         f.write(header)
         f.truncate(len(header)+64*1024*1024)
       # Reading metadata must not allocate the payload in CPU memory. Transfers stay lazy until weight loading.
-      _, state = gguf_load(path, device=lambda _: 'CPU')
+      _, state = gguf_load(path, loader=lambda kv,n,r,s,t: ggml_data_to_tensor(r.to('CPU'), np.prod(s).item(), t).reshape(s))
       self.assertEqual(state['weight'].shape, (16*1024*1024,))
       self.assertFalse(any(u.op is Ops.BUFFER and u.device == 'CPU' and u.nbytes() >= 64*1024*1024
                            for u in state['weight'].uop.toposort()))
       small = pathlib.Path(folder)/'small.gguf'
       values = np.arange(8, dtype=np.float32)
       small.write_bytes(self._build_gguf([('a', (8,), 0, values.tobytes())], []))
-      _, loaded = gguf_load(small, device=lambda _: 'CPU:1')
+      _, loaded = gguf_load(small, loader=lambda kv,n,r,s,t: ggml_data_to_tensor(r.to('CPU:1'), np.prod(s).item(), t).reshape(s))
       self.assertEqual(loaded['a'].device, 'CPU:1')
       np.testing.assert_array_equal(loaded['a'].numpy(), values)
 
@@ -245,7 +245,8 @@ class TestGGUF(unittest.TestCase):
       (d / "test-00001-of-00002.gguf").write_bytes(self._build_gguf([("a", (4,), 0, a.tobytes())], [("split.count", 2), ("split.no", 0)]))
       (d / "test-00002-of-00002.gguf").write_bytes(self._build_gguf([("b", (2,), 0, b.tobytes())], [("split.count", 2), ("split.no", 1)]))
       kv, ts = gguf_load(d / "test-00001-of-00002.gguf")
-      indexed_kv, index = gguf_load(d / "test-00001-of-00002.gguf", device=lambda _: "CPU")
+      indexed_kv, index = gguf_load(d / "test-00001-of-00002.gguf",
+        loader=lambda kv,n,r,s,t: ggml_data_to_tensor(r.to("CPU"), np.prod(s).item(), t).reshape(s))
       self.assertEqual(indexed_kv['split.count'], 2)
       np.testing.assert_equal(index['a'].numpy(), a)
       np.testing.assert_equal(index['b'].numpy(), b)

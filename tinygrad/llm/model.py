@@ -3,9 +3,10 @@ import enum, functools, itertools, pathlib
 from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
 from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
-from tinygrad.llm.gguf import gguf_load
+from tinygrad.llm.gguf import gguf_load, GGUFQuantizedTensor
 from tinygrad.uop.ops import resolve
-from tinygrad.llm.tp import shard_config, load_sharded, sum_shards, replicate
+from tinygrad.llm.tp import gguf_sharder, replicate
+from tinygrad.helpers import get_child
 
 class ExpertGating(enum.IntEnum):
   SOFTMAX = 1
@@ -147,8 +148,8 @@ class FFNBlock:
     # we pass in the weights implicitly so we unpack the GGUF on the fly
     @function(precompile=True, allow_implicit=True)
     def _run(x:Tensor, start_pos:int|UOp):
-      h =     x + sum_shards(self._attention(self.attn_norm(x), start_pos))
-      return (h + sum_shards(self._feed_forward(self.ffn_norm(h)))).contiguous()
+      h =     x + self._attention(self.attn_norm(x), start_pos)
+      return (h + self._feed_forward(self.ffn_norm(h))).contiguous()
     return _run(x, start_pos)
 
 class TransformerBlock(FFNBlock):
@@ -208,7 +209,8 @@ class TransformerBlock(FFNBlock):
     if not hasattr(self, "cache_kv"):
       # zeroed so the flash kernels can safely read whole tiles past the valid region (masked lanes multiply by 0)
       self.cache_kv = Tensor.zeros(2, x.shape[0], self.config.n_kv_heads, self.config.max_context, self.config.head_dim,
-                                   dtype=dtypes.half, device=x.device)
+                                   dtype=dtypes.half, device=x.device[0] if isinstance(x.device, tuple) else x.device)
+      if isinstance(x.device, tuple): self.cache_kv = self.cache_kv.shard(x.device, axis=2).realize()
       self.freqs_cis = precompute_freqs_cis(self.config.rope_dim, self.config.max_context, self.config.rope_theta, device=x.device)
 
 class MLATransformerBlock(FFNBlock):
@@ -317,6 +319,7 @@ class GatedDeltaNetBlock(FFNBlock):
     q, k = (z.reshape(B, T_pad, self.num_k_heads, self.head_k_dim).normalize(dim=-1, eps=qk_eps)
             .repeat(1, 1, self.num_v_heads//self.num_k_heads, 1) for z in (q, k))
     v = v.reshape(B, T_pad, self.num_v_heads, self.head_v_dim)
+    if isinstance(x.device, tuple): q, k, v = (Tensor(t.uop.shard(x.device, axis=2)) for t in (q, k, v))
     # layout the per-step operands to broadcast against the (B, H, V, K) state
     q, k, v, beta = (z.transpose(1, 2).float() for z in (q, k, v, beta))
     q = q * self.head_k_dim**-0.5
@@ -351,11 +354,11 @@ class GatedDeltaNetBlock(FFNBlock):
     if not hasattr(self, "conv_state"):
       self.conv_state = Tensor.zeros(x.shape[0], self.ssm_conv_kernel-1, self.conv_channels, device=x.device).clone()
       self.recurrent_state = Tensor.zeros(x.shape[0], self.num_v_heads, self.head_v_dim, self.head_k_dim, device=x.device).clone()
+      if isinstance(x.device, tuple): self.recurrent_state = Tensor(self.recurrent_state.uop.shard(x.device, axis=1)).realize()
 
 class Transformer:
   def __init__(self, config:TransformerConfig, devices:tuple[str, ...]|None=None):
     self.devices = tuple(Device.canonicalize(d) for d in devices) if devices is not None else None
-    if self.devices is not None: config = shard_config(config, self.devices)
     dense_config = replace(config, num_experts=0, num_experts_per_tok=0, shared_expert_dim=0, hidden_dim=config.dense_hidden_dim or config.hidden_dim)
     if config.ssm: config = replace(config, qk_norm=config.head_dim)
     block_cls = MLATransformerBlock if config.kv_lora_rank > 0 else TransformerBlock
@@ -364,7 +367,7 @@ class Transformer:
                                block_cls(dense_config if i < config.leading_dense_blocks else config) for i in range(config.num_blocks)]
     self.token_embd  = nn.Embedding(config.vocab_size, config.dim)
     self.output_norm = nn.RMSNorm(config.dim, config.norm_eps)
-    self.output = Linear(config.dim, config.vocab_size//len(self.devices) if self.devices else config.vocab_size, bias=False)
+    self.output = Linear(config.dim, config.vocab_size, bias=False)
     self.max_context = config.max_context
     self.has_recurrent_block = any(isinstance(b, GatedDeltaNetBlock) for b in self.blk)
     self._cached_tokens: list[int] = []
@@ -378,7 +381,7 @@ class Transformer:
     for block in self.blk: x = block(x, start_pos)
     # only run the output projection on the last token
     logits = self.output(self.output_norm(x[:, -1:]))[:, -1, :]
-    if self.devices: logits = Tensor(logits.uop.unshard(1)).to(self.devices[0])
+    if self.devices: logits = logits.to(self.devices[0])
     # Gumbel-max trick: argmax(logits/temp - log(-log(uniform))) is equivalent to sampling from softmax(logits/temp)
     return (logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1, keepdim=True)
 
@@ -390,13 +393,15 @@ class Transformer:
                 realize=bool(getenv("REALIZE", 0)), shard:int=1) -> tuple[Transformer, dict]:
     if shard < 1: raise ValueError("shard must be positive")
     devices = tuple(Device.canonicalize(f"{Device.DEFAULT.split(':')[0]}:{i}") for i in range(shard)) if shard > 1 else None
-    kv, state_dict = gguf_load(gguf, device=(lambda name: devices[0] if name == 'token_embd.weight' else "CPU") if devices else None)
+    kv, loaded = gguf_load(gguf, loader=gguf_sharder(devices) if devices else None)
+    packed = {k:v for k,v in loaded.items() if isinstance(v, GGUFQuantizedTensor)}
+    state_dict = {k:v for k,v in loaded.items() if isinstance(v, Tensor)}
 
     # all state items should be float16, not float32
     state_dict = {k:v.cast('float16') if getenv("HALF", 1) else v for k,v in state_dict.items()}
 
     # some models like Llama 3.2 don't have an output.weight, they just tie to the token_embd.weight
-    if 'output.weight' not in state_dict: state_dict['output.weight'] = state_dict['token_embd.weight']
+    if 'output.weight' not in loaded: state_dict['output.weight'] = state_dict['token_embd.weight']
 
     arch = kv['general.architecture']
     max_context = min(max_context, kv[f'{arch}.context_length']) if max_context is not None else kv[f'{arch}.context_length']
@@ -463,7 +468,13 @@ class Transformer:
       qkv_bias='blk.0.attn_q.bias' in state_dict,
       expert_bias=f"blk.{kv.get(f'{arch}.leading_dense_block_count', 0)}.exp_probs_b.bias" in state_dict)
     model = Transformer(config, devices)
-    if devices is not None: load_sharded(model, state_dict, config, devices)
+    if devices is not None:
+      for name,target in nn.state.get_state_dict(model).items():
+        if name in packed:
+          assert packed[name].shape == target.shape, f"{name}: GGUF shape mismatch"
+          layer = get_child(model, name.rsplit('.', 1)[0])
+          layer.weight, layer.ggml_type = packed[name].data, packed[name].ggml_type
+        else: target.replace(state_dict[name])
     else: nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:

@@ -96,6 +96,10 @@ class Linear(nn.Linear):
       # symbolic token count: pad to the max chunk size so the kernels see static shapes, garbage rows are sliced off
       out = q8_linear(self, x.pad_to(x.max_shape))
       return out.shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
+    if self.ggml_type is None and self.weight.uop.axis is not None:
+      # Generic row-parallel matmul also needs a fixed-sized collective for symbolic prefill.
+      out = super().__call__(x.pad_to(x.max_shape))
+      return out.shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
     return super().__call__(x)
 
 def _amd_dp4a(a:UOp, b:UOp, c:UOp) -> UOp:
@@ -316,18 +320,28 @@ def _iq4_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, lut:UOp, out_features:i
     return tuple((_half((pair >> (half*16)) & 0xffff)*scale).cast(dtypes.float16) for pair in pairs)
   return _quant_linear_wmma(out, x, out_features, in_features, IQ4_WORDS, layout, dequant, "linear_iq4_xs_f16_wmma")
 
+def _linear_output(layer:Linear, x:Tensor, result:Tensor, features:int) -> Tensor:
+  result = result.reshape(*x.shape[:-1], features)
+  if layer.weight.uop.axis == 0: result = Tensor(result.uop.unshard(len(result.shape)-1))
+  if layer.weight.uop.axis == 1: result = Tensor(result.uop.allreduce(Ops.ADD, cast(tuple[str, ...], layer.weight.device)))
+  return result if layer.bias is None else result + layer.bias
+
 def q8_linear(layer:Linear, x:Tensor) -> Tensor:
   assert layer.ggml_type in (Q4_K, Q5_K, Q6_K, IQ4_XS)
   tokens = int(x.numel()) // layer.in_features
-  raw, out_features, in_features = layer.weight.uop, layer.out_features, layer.in_features
+  axis = layer.weight.uop.axis
+  ranks = len(layer.weight.device) if isinstance(layer.weight.device, tuple) else 1
+  raw = layer.weight.uop
+  out_features = layer.out_features//ranks if axis == 0 else layer.out_features
+  in_features = layer.in_features//ranks if axis == 1 else layer.in_features
   def run(fxn:Callable[..., UOp], out:UOp, *srcs:UOp) -> Tensor:
     all_srcs = (out,)+srcs
-    params = tuple(UOp.placeholder_like(src, slot=i) for i,src in enumerate(all_srcs))
+    params = tuple(UOp.placeholder_like(src, slot=i).flatten() if i == 1 else UOp.placeholder_like(src, slot=i)
+                   for i,src in enumerate(all_srcs))
     kernel = fxn(*params, out_features=out_features, in_features=in_features).call(*all_srcs)
     result = Tensor(out.after(kernel))
     if len(result.shape) == 3: result = result.sum(-1)
-    result = result.reshape(*x.shape[:-1], out_features)
-    return result if layer.bias is None else result + layer.bias
+    return _linear_output(layer, x, result, out_features)
   out = Tensor.empty(tokens, out_features, dtype=dtypes.float32, device=x.device).uop
   if tokens % 16 == 0 and out_features % 16 == 0 and layer.ggml_type in (Q4_K, Q5_K, IQ4_XS):
     fxn = _iq4_linear_f16_wmma_kernel if layer.ggml_type == IQ4_XS else functools.partial(_q5_linear_f16_wmma_kernel, ggml_type=layer.ggml_type)
@@ -369,11 +383,13 @@ def f16_gemv(layer:Linear, x:Tensor) -> Tensor:
   tokens = prod(x.shape[:-1])
   assert isinstance(tokens, int)
   weight = _view_back(layer.weight)
+  out_features, in_features = map(int, weight.uop.shard_shape)
   x = x.contiguous()
-  out = Tensor.empty(tokens, layer.out_features, dtype=dtypes.float32, device=x.device)
-  fxn = functools.partial(_amd_f16_gemv_kernel, in_features=layer.in_features, out_features=layer.out_features, tokens=tokens)
-  srcs = (out, weight.reshape(-1), x.reshape(tokens, layer.in_features)) + (() if layer.bias is None else (_view_back(layer.bias),))
-  return Tensor.custom_kernel(*srcs, fxn=fxn)[0].reshape(*x.shape[:-1], layer.out_features)
+  out = Tensor.empty(tokens, out_features, dtype=dtypes.float32, device=x.device)
+  def fxn(o, w, inp):
+    return _amd_f16_gemv_kernel(o, w.flatten(), inp, in_features=in_features, out_features=out_features, tokens=tokens)
+  srcs = (out, weight, x.reshape(tokens, layer.in_features))
+  return _linear_output(layer, x, Tensor.custom_kernel(*srcs, fxn=fxn)[0], out_features)
 
 # ******** flash attention on the KV cache ********
 
@@ -494,8 +510,8 @@ def _amd_flash_decode_combine(o:UOp, partial:UOp, stats:UOp, live:int|UOp) -> UO
 def amd_flash_attention_decode(q:Tensor, cache_kv:Tensor, valid_kv_len:int|UOp, max_kv_len:int) -> Tensor:
   B, H, D = cache_kv.shape[1], q.shape[1], cache_kv.shape[4]
   chunks = min(48, max_kv_len // 64)
-  partial = Tensor.empty(B, H, chunks, D, dtype="float32", device=q.device)
-  stats = Tensor.empty(B, H, chunks, 2, dtype="float32", device=q.device)
+  partial = Tensor.empty_like(q.expand(B, H, chunks, D), dtype=dtypes.float32)
+  stats = Tensor.empty_like(q[..., :2].expand(B, H, chunks, 2), dtype=dtypes.float32)
   waves, group = 16, H // cache_kv.shape[2]
   while waves * group * ((D+LDS_PAD)*2 + 8) > 65536: waves //= 2
   assert waves > 0, "attention head group exceeds shared memory capacity"
@@ -503,7 +519,7 @@ def amd_flash_attention_decode(q:Tensor, cache_kv:Tensor, valid_kv_len:int|UOp, 
   partial, stats = Tensor.custom_kernel(partial, stats, q, cache_kv, fxn=fxn)[:2]
   live = (valid_kv_len+63)//64
   live = min(live, chunks) if isinstance(live, int) else live.minimum(chunks)
-  out = Tensor.empty(B, H, 1, D, dtype="float32", device=q.device)
+  out = Tensor.empty_like(q, dtype=dtypes.float32)
   fxn = functools.partial(_amd_flash_decode_combine, live=live)
   return Tensor.custom_kernel(out, partial, stats, fxn=fxn)[0]
 
@@ -610,9 +626,10 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
     assert T_pad % BLOCK_M == 0, "chunk_size must be a multiple of 32"
     q, q_start = q.pad_to((*q.shape[:2], T_pad, q.shape[3])), valid_end - T_real
   B, H, T, D = q.shape
-  out = Tensor.empty(B*H, T, D, dtype="float32", device=q.device)
-  fxn = functools.partial(_amd_flash_attention, valid_kv_len=valid_end, q_start=q_start)
-  out = Tensor.custom_kernel(out, q.half().reshape(B*H, T, D), assigned_kv, fxn=fxn)[0].reshape(B, H, T, D)
+  out = Tensor.empty_like(q, dtype=dtypes.float32)
+  def fxn(o, query, cache):
+    return _amd_flash_attention(o.reshape(-1, T, D), query.reshape(-1, T, D), cache, valid_kv_len=valid_end, q_start=q_start)
+  out = Tensor.custom_kernel(out, q.half(), assigned_kv, fxn=fxn)[0]
   return out if q_start is None else out[:, :, :T_real]
 
 # ******** gated delta net: fused recurrent scan ********
@@ -658,7 +675,10 @@ def gated_delta_prefill(q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:Tensor,
   assert alpha.shape[:3] == (batch, heads, tokens) and (len(alpha.shape) == 3 or alpha.shape[-1] in (1, value_dim))
   assert key_dim % 32 == 0 and value_dim % 4 == 0
   assert q.dtype == k.dtype == dtypes.float32, "recurrent Q/K must be float32"
-  assert state.uop.contiguous_view_offset() is not None, "recurrent state must be contiguous"
+  storage = state.uop
+  while storage.op is Ops.AFTER: storage = storage.src[0]
+  if storage.op is Ops.UNSHARD: storage = storage.src[0]
+  assert storage.contiguous_view_offset() is not None, "recurrent state must be contiguous"
   if start_pos is not None:
     assert start_pos.uop.is_bound_var
     state = Tensor(state.uop.after(start_pos.uop))
