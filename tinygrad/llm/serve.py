@@ -27,6 +27,8 @@ def parse_tool_call(s:str) -> tuple[str, typing.Any]|None:
 def normalize_messages(messages:list[dict]) -> None:
   # chat templates expect tool_call arguments as dicts (OpenAI clients send JSON strings)
   for m in messages:
+    if isinstance(content := m.get("content"), list) and all(c.get("type") == "text" for c in content):
+      m["content"] = "".join(c["text"] for c in content)
     for tc in m.get("tool_calls") or []:
       if "function" in tc and isinstance(args := tc["function"].get("arguments"), str):
         try: tc["function"]["arguments"] = json.loads(args)
@@ -34,9 +36,12 @@ def normalize_messages(messages:list[dict]) -> None:
 
 class StreamRouter:
   # routes streamed output text to (field, text) deltas, keeping tool_call regions in .buf for the final parse
-  def __init__(self, reasoning:bool=False):
+  def __init__(self, reasoning:bool=False, harmony:bool=False):
     self.buf = ""
-    self.mode = "reasoning" if reasoning else "undecided"  # output inside a think block is sent as reasoning_content
+    self.harmony = harmony
+    self.calls: list[tuple[str, typing.Any]] = []
+    self.tool_args = ""
+    self.mode = "header" if harmony else "reasoning" if reasoning else "undecided"
   def split(self, tag:str, final:bool) -> tuple[str, bool]:
     # split buf on the first full tag, holding back a partial tag at the end unless final
     if tag in self.buf:
@@ -47,6 +52,24 @@ class StreamRouter:
     return emit, False
   def route(self, piece:str, final:bool=False) -> typing.Iterator[tuple[str, str]]:
     self.buf += piece
+    if self.harmony:
+      while True:
+        if self.mode == "header":
+          if "<|message|>" not in self.buf: return
+          header, self.buf = self.buf.split("<|message|>", 1)
+          self.mode = "reasoning_content" if re.search(r"<\|channel\|>analysis(?:\s|$)", header) else "content"
+          if (recipient := re.search(r"\bto=functions\.([^\s<]+)", header)):
+            self.mode, self.tool_name = "harmony_tool", recipient[1]
+        emit, done = self.split("<|end|>", final)
+        if self.mode == "harmony_tool":
+          self.tool_args += emit
+          if not (done or final): return
+          try: self.calls.append((self.tool_name, json.loads(self.tool_args)))
+          except json.JSONDecodeError: yield "content", self.tool_args
+          self.tool_args = ""
+        elif emit: yield self.mode, emit
+        if not done: return
+        self.mode = "header"
     if self.mode == "undecided":  # decide whether the output starts with a think block
       if not final and len(self.buf) < len("<think>") and "<think>".startswith(self.buf): return
       self.mode, self.buf = ("reasoning", self.buf[len("<think>"):]) if self.buf.startswith("<think>") else ("content", self.buf)
@@ -79,7 +102,7 @@ class Handler(VizHandler):
     finish_reason = "stop"
     st = pt = time.perf_counter()
     dec = tok.stream_decoder()
-    router = StreamRouter(reasoning)
+    router = StreamRouter(reasoning, harmony=tok.preset == "gpt-4o")
     def log_stats(interrupted:bool=False):
       et = time.perf_counter()
       total = f"total:{et-st:6.2f}s"
@@ -92,21 +115,23 @@ class Handler(VizHandler):
         if len(out) == 0:
           stderr_log(f"prefill:{(prompt_tokens-cache_start_pos)/((pt:=time.perf_counter())-st):4.0f} tok/s  {colored('--', 'BLACK')}  ")
         if tok.is_end(next_id): break
+        if router.harmony and tok.decode([next_id]) == "<|call|>": break
         out.append(next_id)
         for field, delta in router.route(dec(next_id)): yield chunk({field:delta})
         if max_tokens is not None and len(out) >= max_tokens:
           finish_reason = "length"
           break
       for field, delta in router.route(dec(), final=True): yield chunk({field:delta})
-      tool_calls: list[dict] = []
+      parsed_calls = router.calls
       for m in re.finditer(r"<tool_call>\s*(.*?)\s*(?:</tool_call>|$)", router.buf, re.DOTALL):
         if (parsed := parse_tool_call(m.group(1))) is None:
           stderr_log(f"failed to parse tool call: {m.group(1)[:200]}")
           yield chunk({"content":m.group(0)})  # don't silently drop output the client can't use
         else:
-          name, args = parsed
-          tool_calls.append({"index":len(tool_calls), "id":f"call_{uuid.uuid4().hex[:24]}", "type":"function",
-                             "function":{"name":name, "arguments":args if isinstance(args, str) else json.dumps(args)}})
+          parsed_calls.append(parsed)
+      tool_calls = [{"index":i, "id":f"call_{uuid.uuid4().hex[:24]}", "type":"function",
+                     "function":{"name":name, "arguments":args if isinstance(args, str) else json.dumps(args)}}
+                    for i, (name, args) in enumerate(parsed_calls)]
       if tool_calls:
         yield chunk({"tool_calls":tool_calls})
         if finish_reason == "stop": finish_reason = "tool_calls"
@@ -141,7 +166,7 @@ class Handler(VizHandler):
       # reply
       max_tokens = body.get("max_completion_tokens") or body.get("max_tokens")
       chunks = self.run_model(ids, body["model"], not body.get("stream") or body.get("stream_options",{}).get("include_usage", False),
-                              max_tokens=max_tokens, temperature=float(body.get("temperature", 0.0)),
+                              max_tokens=max_tokens, temperature=float(body.get("temperature", 1.0)),
                               reasoning=rendered.rstrip().endswith("<think>"))
       if body.get("stream"): self.stream_json(chunks)
       else:

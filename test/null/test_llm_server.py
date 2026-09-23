@@ -150,6 +150,30 @@ class TestLLMServer(unittest.TestCase):
     self.assertIsNotNone(resp.usage.prompt_tokens)
     self.assertIsNotNone(resp.usage.completion_tokens)
 
+  def test_harmony_response(self):
+    text = "<|channel|>analysis<|message|>reason<|end|><|start|>assistant<|channel|>final<|message|>answer"
+    for output, reasoning in ((text, "reason"), ("<|channel|>final<|message|>answer", "")):
+      for stream in (False, True):
+        pieces = dict(enumerate(output))
+        with patch.object(self.mock_tok, "preset", "gpt-4o"), \
+             patch.object(self.mock_tok, "stream_decoder", return_value=lambda tid=None: pieces[tid] if tid is not None else ""), \
+             patch.object(self.mock_model, "generate", side_effect=lambda ids, **kwargs: iter([*pieces, 999])):
+          response = self.client.chat.completions.create(model="test", messages=[{"role":"user", "content":"Hi"}], stream=stream)
+          deltas = [c.choices[0].delta for c in response] if stream else [response.choices[0].message]
+          self.assertEqual("".join(d.content or "" for d in deltas), "answer")
+          self.assertEqual("".join(getattr(d, "reasoning_content", "") or "" for d in deltas), reasoning)
+
+  def test_text_content_parts(self):
+    import jinja2
+    template = jinja2.Template("{% for m in messages %}{{ '<user>' + m.content + '</user>' }}{% endfor %}")
+    with patch.object(self.server, 'template', template), patch.object(self.mock_tok, 'encode', side_effect=lambda s: [200, 201, 202]):
+      for stream in (False, True):
+        response = self.client.chat.completions.create(model='test', stream=stream, messages=[{'role':'user', 'content':[
+          {'type':'text', 'text':'show me '}, {'type':'text', 'text':'the date'}]}])
+        if stream: list(response)
+        else: self.assertIsNotNone(response.choices[0].message.content)
+        self.assertEqual(self.mock_tok.encode.call_args.args[0], '<user>show me the date</user>')
+
   def test_context_length_error(self):
     from openai import BadRequestError
     self.mock_tok.encode.return_value = [200, 201, 202, 203]
@@ -188,6 +212,29 @@ class TestLLMServer(unittest.TestCase):
     self.assertEqual(data["data"][0]["id"], "test-model")
     self.assertEqual(data["data"][0]["object"], "model")
 
+class TestStreamRouter(unittest.TestCase):
+  def test_harmony_chunks(self):
+    from tinygrad.llm.serve import StreamRouter
+    text = ("<|channel|>analysis<|message|>first<|end|><|start|>assistant<|channel|>analysis<|message|>second"
+            "<|end|><|start|>assistant<|channel|>final<|message|>answer")
+    for size in (1, 7, len(text)):
+      router, out = StreamRouter(harmony=True), {"content":"", "reasoning_content":""}
+      for piece in [text[i:i+size] for i in range(0, len(text), size)] + [""]:
+        for field, value in router.route(piece, final=piece == ""): out[field] += value
+      self.assertEqual(out, {"content":"answer", "reasoning_content":"firstsecond"})
+
+  def test_harmony_truncated_header(self):
+    from tinygrad.llm.serve import StreamRouter
+    self.assertEqual(list(StreamRouter(harmony=True).route("<|channel|>anal", final=True)), [])
+
+  def test_harmony_invalid_tool_then_final(self):
+    from tinygrad.llm.serve import StreamRouter
+    router = StreamRouter(harmony=True)
+    text = (' to=functions.read<|channel|>commentary json<|message|>not JSON<|end|>'
+            '<|start|>assistant<|channel|>final<|message|>answer')
+    self.assertEqual(list(router.route(text, final=True)), [('content', 'not JSON'), ('content', 'answer')])
+    self.assertEqual(router.calls, [])
+
 class TestLLMToolCalls(unittest.TestCase):
   """Tool calling through the OpenAI-compatible HTTP API."""
 
@@ -223,8 +270,10 @@ class TestLLMToolCalls(unittest.TestCase):
     cls.server.shutdown()
     cls.server.server_close()
 
-  def set_output(self, text:str):
+  def set_output(self, text:str, stop:str|None=None):
     pieces = dict(enumerate(text, 1))
+    if stop: pieces.update({len(pieces)+1:stop, len(pieces)+2:"must not generate after handoff"})
+    self.mock_tok.decode = Mock(side_effect=lambda ids: pieces[ids[0]] if ids else "")
     self.mock_tok.stream_decoder = Mock(return_value=lambda tid=None: pieces[tid] if tid is not None else "")
     self.mock_model.generate = Mock(side_effect=lambda ids, **kwargs: iter(pieces))
 
@@ -232,6 +281,24 @@ class TestLLMToolCalls(unittest.TestCase):
   def tools():
     return [{"type":"function", "function":{"name":"read", "description":"Read a file",
       "parameters":{"type":"object", "properties":{"path":{"type":"string"}}, "required":["path"]}}}]
+
+  def test_harmony_tool_call(self):
+    for header in (' to=functions.read<|channel|>commentary json', '<|channel|>commentary to=functions.read'):
+      for stream in (False, True):
+        self.set_output('<|channel|>analysis<|message|>check file<|end|><|start|>assistant' + header +
+                        '<|message|>{"path":"README.md"}', stop='<|call|>')
+        with patch.object(self.mock_tok, 'preset', 'gpt-4o'):
+          response = self.client.chat.completions.create(model='test', messages=[{'role':'user', 'content':'Read README.md'}],
+                                                         tools=self.tools(), stream=stream)
+          chunks = list(response) if stream else []
+          deltas = [c.choices[0].delta for c in chunks] if stream else [response.choices[0].message]
+          calls = [tc for d in deltas for tc in d.tool_calls or []]
+          self.assertEqual(len(calls), 1)
+          self.assertEqual(calls[0].function.name, 'read')
+          self.assertEqual(json.loads(calls[0].function.arguments), {'path':'README.md'})
+          self.assertEqual(''.join(d.content or '' for d in deltas), '')
+          self.assertEqual(''.join(getattr(d, 'reasoning_content', '') or '' for d in deltas), 'check file')
+          self.assertEqual((chunks[-1] if stream else response).choices[0].finish_reason, 'tool_calls')
 
   def test_streaming_tool_call(self):
     self.set_output('before<tool_call>{"name":"read","arguments":{"path":"README.md"}}</tool_call>')

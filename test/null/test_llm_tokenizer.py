@@ -95,6 +95,16 @@ class TestLLMTokenizer(unittest.TestCase):
     self.assertEqual(template.end_turn(), "[/INST]")
     self.assertEqual(template.role("assistant"), "")
 
+  def test_gptoss_fallback_template(self):
+    tok = SimpleTokenizer({}, {"<|startoftext|>":0, "<|return|>":1}, "gpt-4o", bos_id=0, eos_id=1)
+    template = FallbackTemplate(tok)
+    messages = [{"role":"system", "content":"Be concise."}, {"role":"user", "content":"Hi"},
+                {"role":"assistant", "content":"Hello"}, {"role":"user", "content":[{"type":"text", "text":"Again"}]}]
+    expected = ("<|start|>system<|message|>Be concise.<|end|><|start|>user<|message|>Hi<|end|>"
+                "<|start|>assistant<|channel|>final<|message|>Hello<|end|><|start|>user<|message|>Again<|end|>")
+    self.assertEqual(template.render(messages, add_generation_prompt=False), expected)
+    self.assertEqual(template.render(messages), expected + "<|start|>assistant")
+
   def test_tekken_gpt4o_split(self):
     split = {p: SimpleTokenizer({}, {}, p)._split_to_word.findall for p in ("tekken", "gpt-4o")}
     shared = {
