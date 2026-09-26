@@ -4,7 +4,7 @@ from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
 from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
 from tinygrad.llm.gguf import gguf_load
-from tinygrad.uop.ops import Ops, resolve
+from tinygrad.uop.ops import resolve
 
 class ExpertGating(enum.IntEnum):
   SOFTMAX = 1
@@ -118,10 +118,6 @@ def shard_config(config:TransformerConfig, count:int) -> TransformerConfig:
     hidden_dim=config.hidden_dim//count, ssm=replace(config.ssm, group_count=config.ssm.group_count//count,
       time_step_rank=config.ssm.time_step_rank//count, inner_size=config.ssm.inner_size//count))
 
-def tp_sum(x:Tensor) -> Tensor:
-  if not isinstance(x.device, tuple): return x
-  return Tensor(x.pad_to(x.max_shape).uop.allreduce(Ops.ADD, x.device)).shrink(tuple((0, s) for s in x.shape))
-
 class FFNBlock:
   def __init__(self, config:TransformerConfig):
     self.config = config
@@ -189,8 +185,8 @@ class FFNBlock:
     # we pass in the weights implicitly so we unpack the GGUF on the fly
     @function(precompile=True, allow_implicit=True)
     def _run(x:Tensor, start_pos:int|UOp):
-      h =     x + tp_sum(self._attention(self.attn_norm(x), start_pos))
-      return (h + tp_sum(self._feed_forward(self.ffn_norm(h)))).contiguous()
+      h =     x + self._attention(self.attn_norm(x), start_pos)
+      return (h + self._feed_forward(self.ffn_norm(h))).contiguous()
     return _run(x, start_pos)
 
 class TransformerBlock(FFNBlock):
@@ -406,18 +402,18 @@ class GatedDeltaNetBlock(FFNBlock):
 
 class Transformer:
   def __init__(self, config:TransformerConfig, shard:int=1):
-    local = shard_config(config, shard) if shard > 1 else config
-    dense_config = replace(local, num_experts=0, num_experts_per_tok=0, shared_expert_dim=0, hidden_dim=local.dense_hidden_dim or local.hidden_dim)
-    if local.ssm: local = replace(local, qk_norm=local.head_dim)
-    block_cls = MLATransformerBlock if local.kv_lora_rank > 0 else TransformerBlock
+    full_config, config = config, shard_config(config, shard) if shard > 1 else config
+    dense_config = replace(config, num_experts=0, num_experts_per_tok=0, shared_expert_dim=0, hidden_dim=config.dense_hidden_dim or config.hidden_dim)
+    if config.ssm: config = replace(config, qk_norm=config.head_dim)
+    block_cls = MLATransformerBlock if config.kv_lora_rank > 0 else TransformerBlock
     self.blk:list[FFNBlock] = []
-    for i in range(local.num_blocks):
-      c = dense_config if i < local.leading_dense_blocks else local
-      if local.sliding_window_pattern != 0 and (i+1) % local.sliding_window_pattern == 0: c = replace(c, sliding_window=0)
-      self.blk.append(GatedDeltaNetBlock(c, local.ssm) if local.ssm and local.ssm_layers[i] else block_cls(c))
-    self.token_embd  = nn.Embedding(config.vocab_size, config.dim)
-    self.output_norm = nn.RMSNorm(local.dim, local.norm_eps)
-    self.output = Linear(local.dim, local.vocab_size, bias=False)
+    for i in range(config.num_blocks):
+      c = dense_config if i < config.leading_dense_blocks else config
+      if config.sliding_window_pattern != 0 and (i+1) % config.sliding_window_pattern == 0: c = replace(c, sliding_window=0)
+      self.blk.append(GatedDeltaNetBlock(c, config.ssm) if config.ssm and config.ssm_layers[i] else block_cls(c))
+    self.token_embd  = nn.Embedding(full_config.vocab_size, full_config.dim)
+    self.output_norm = nn.RMSNorm(config.dim, config.norm_eps)
+    self.output = Linear(config.dim, config.vocab_size, bias=False)
     self.max_context = config.max_context
     self.has_recurrent_block = any(isinstance(b, GatedDeltaNetBlock) for b in self.blk)
     self._cached_tokens: list[int] = []
@@ -523,10 +519,9 @@ class Transformer:
       sliding_window=kv.get(f'{arch}.attention.sliding_window', 0),
       sliding_window_pattern=kv.get(f'{arch}.attention.sliding_window_pattern', 2 if arch == 'gpt-oss' else 0))
     model = Transformer(config, shard=shard)
-    if devices:
-      for name,target in nn.state.get_state_dict(model).items(): target.replace(state_dict.pop(name))
-    else:  # NOTE: rope_freqs.weight (32,) is unused
-      nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)
+    for name,target in nn.state.get_state_dict(model).items():
+      if target.shape != (weight:=state_dict.pop(name)).uop.shard_shape: raise ValueError(f'{name}: shape mismatch')
+      target.uop = weight.uop
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:
       for s in (params:=nn.state.get_parameters(model)): s.replace(s.contiguous())

@@ -66,7 +66,7 @@ class Linear(nn.Linear):
     self.in_features, self.out_features = in_features, out_features
   def set_quantized(self, decoded:Tensor):
     if self.in_features % GGML_BLOCK_SIZE: return
-    packed_sizes = {typ: decoded.numel() // 256 * type_size for typ,type_size in QUANT_SIZES.items()}
+    packed_sizes = {typ: prod(decoded.uop.shard_shape) // 256 * type_size for typ,type_size in QUANT_SIZES.items()}
     graph = decoded.uop.toposort()
     raw = next((u for u in graph if u.op in (Ops.SHRINK, Ops.MSTACK, Ops.BITCAST) and u.dtype == dtypes.uint8
                 and prod(u.shape) in packed_sizes.values()), None)
@@ -74,7 +74,7 @@ class Linear(nn.Linear):
     # Only unwrap storage/order-preserving views, then require the exact dequantization expression.
     # This rejects subsequent arithmetic and permutations, including RoPE's concatenated query weights.
     def unwrapped(u:UOp) -> UOp:
-      while u.op in (Ops.RESHAPE, Ops.STAGE) or (u.op is Ops.CAST and dtypes.is_float(u.dtype) and dtypes.is_float(u.src[0].dtype)):
+      while u.op in (Ops.RESHAPE, Ops.STAGE, Ops.UNSHARD) or (u.op is Ops.CAST and dtypes.is_float(u.dtype) and dtypes.is_float(u.src[0].dtype)):
         u = u.src[0]
       return u
     # Several formats have the same byte count (Q3_K/IQ3_S and Q4_K/IQ4_NL). Match the expression, not just the size.
@@ -90,6 +90,8 @@ class Linear(nn.Linear):
            u.buf_uop.dtype not in (dtypes.uint8, word_dtype) for u in (storage.src if storage.op is Ops.MSTACK else (storage,))): return
     self.ggml_type = ggml_type
     self.weight = Tensor(storage) if storage.dtype == word_dtype else Tensor(raw).bitcast(word_dtype).contiguous()
+    # Packed storage is flat: its device shards use axis 0 instead of the matrix input axis.
+    if decoded.uop.axis == 1: self.weight = Tensor(self.weight.uop.unshard(0))
   def __call__(self, x:Tensor) -> Tensor:
     supported = self.use_custom_quant and amd_custom_kernels_supported(self.weight.device)
     if self.ggml_type is None and supported:
@@ -98,18 +100,15 @@ class Linear(nn.Linear):
         # tiny dense fp16 matmul (e.g. the ssm beta/alpha head rows): single fp16 gemv kernel instead of a
         # generic matmul schedule, and realize the densely packed weight once if it is still a lazy ggml view
         if self.weight.dtype in (dtypes.half, dtypes.float, dtypes.bfloat16) and self.out_features <= 2048 \
-          and self.in_features % (WARP_SIZE*4) == 0:
-          numel, max_shape = x.numel(), x.max_shape
-          if isinstance(numel, int) or prod(max_shape) // self.in_features <= 32:
-            out = f16_gemv(self, x if isinstance(numel, int) else x.pad_to(max_shape))
-            return out if isinstance(numel, int) else out.shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
+          and self.in_features % (WARP_SIZE*4) == 0 and (self.bias is None or self.weight.uop.axis is None):
+          if isinstance(x.numel(), int) or prod(x.max_shape) // self.in_features <= 32:
+            return f16_gemv(self, x.pad_to(x.max_shape)).shrink_to((*x.shape[:-1], self.out_features))
         self.use_custom_quant = supported = False  # not a supported quant format
     if self.ggml_type in QUANT_SIZES and supported:
-      if isinstance(x.numel(), int): return q8_linear(self, x)
       # symbolic token count: pad to the max chunk size so the kernels see static shapes, garbage rows are sliced off
       out = q8_linear(self, x.pad_to(x.max_shape))
-      return out.shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
-    return super().__call__(x)
+      return out.shrink_to((*x.shape[:-1], self.out_features))
+    return super().__call__(Tensor(x.uop.unshard(x.ndim-1)) if self.weight.uop.axis == 1 else x)
 
 def _amd_dp4a(a:UOp, b:UOp, c:UOp) -> UOp:
   return UOp(Ops.CUSTOMI, src=(a, b, c), arg=("__builtin_amdgcn_sudot4(true, {}, true, {}, {}, false)", dtypes.int32))
@@ -463,6 +462,7 @@ def q8_linear(layer:Linear, x:Tensor) -> Tensor:
   result = Tensor.custom_kernel(out, layer.weight, *srcs, fxn=functools.partial(fxn, out_features=out_features, in_features=in_features))[0]
   if len(result.shape) == 3: result = result.sum(-1)
   result = result.reshape(*x.shape[:-1], out_features)
+  if layer.weight.uop.axis is not None: result = Tensor(result.uop.allreduce(Ops.ADD, cast(tuple, result.device)))
   return result if layer.bias is None else result + layer.bias
 
 # ******** tiny dense fp16 gemv ********
@@ -499,8 +499,9 @@ def f16_gemv(layer:Linear, x:Tensor) -> Tensor:
   x = x.contiguous()
   out = Tensor.empty(tokens, layer.out_features, dtype=dtypes.float32, device=x.device)
   fxn = functools.partial(_amd_f16_gemv_kernel, in_features=layer.in_features, out_features=layer.out_features, tokens=tokens)
-  srcs = (out, weight.reshape(-1), x.reshape(tokens, layer.in_features)) + (() if layer.bias is None else (_view_back(layer.bias),))
-  return Tensor.custom_kernel(*srcs, fxn=fxn)[0].reshape(*x.shape[:-1], layer.out_features)
+  srcs = (out, weight, x.reshape(tokens, layer.in_features)) + (() if layer.bias is None else (_view_back(layer.bias),))
+  out = Tensor.custom_kernel(*srcs, fxn=fxn)[0].reshape(*x.shape[:-1], layer.out_features)
+  return Tensor(out.uop.allreduce(Ops.ADD, cast(tuple, out.device))) if layer.weight.uop.axis == 1 else out
 
 # ******** flash attention on the KV cache ********
 

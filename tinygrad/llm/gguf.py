@@ -216,8 +216,7 @@ def _gguf_parse(tensor: Tensor, lazy:bool=False) -> tuple[dict, dict[str, GGUFTe
   alignment, pos = kv_data.get("general.alignment", 32), r.tell()
   data_start = round_up(pos, alignment)
 
-  state_dict = {name: GGUFTensor(tensor[data_start + off:], tuple(reversed(dims)), typ) for name, dims, typ, off in t_infos}
-  return kv_data, state_dict
+  return kv_data, {name: GGUFTensor(tensor[data_start + off:], tuple(reversed(dims)), typ) for name, dims, typ, off in t_infos}
 
 def _gguf_split_paths(path: pathlib.Path, kv: dict) -> list[pathlib.Path]:
   if (total := kv.get('split.count', 1)) <= 1: return [path]
@@ -283,5 +282,6 @@ def apply_shards(state:dict[str, GGUFTensor], kv:dict, devices:tuple[str, ...]) 
     word = (dtypes.uint16 if typ in HALFWORD_QUANTS else dtypes.uint32) if packed_kernels and typ in (Q4_K, Q5_K, Q6_K, IQ4_XS) else dtypes.uint8
     data = Tensor(UOp.mstack(*(p.contiguous().flatten().bitcast(word).to(d).clone().realize().uop for p,d in zip(pieces, devices))))
     data = ggml_data_to_tensor(data.bitcast(dtypes.uint8), prod(local), typ).reshape(local)
-    weights[name] = data if word != dtypes.uint8 else data.realize()
+    weights[name] = Tensor(data.uop.unshard(1)) if axis == 1 else data
+    if word == dtypes.uint8: weights[name].realize()
   return weights
