@@ -586,10 +586,12 @@ class HIPRenderer(CStyleLanguage):
     true, __builtin_bit_cast(wmma_int4, b), c, false);\n}""")
       elif dtype_out == dtypes.float:
         prefix.append(f"#define __{name} __builtin_amdgcn_wmma_f32_16x16x16_{'f16' if dtype_in == dtypes.half else 'bf16'}_w32")
-      else: prefix.append(f"static inline __attribute__((device)) half8 __{name}"+"""(half16 a, half16 b, half8 c) {
-  half16 c_frag = {}; half8 d; for (int n = 0; n < 8; n++) { c_frag[n*2] = c[n]; }
-  c_frag = __builtin_amdgcn_wmma_f16_16x16x16_f16_w32(a, b, c_frag, false);
-  for (int n = 0; n < 8; n++) { d[n] = c_frag[n*2]; } return d;\n}""")
+      else:
+        vec8, vec16 = (self._render_dtype(dtype_out, count, AddrSpace.REG) for count in (8, 16))
+        prefix.append(f"""static inline __attribute__((device)) {vec8} __{name}({vec16} a, {vec16} b, {vec8} c) {{
+  {vec16} c_frag = {{}}; {vec8} d; for (int n = 0; n < 8; n++) {{ c_frag[n*2] = c[n]; }}
+  c_frag = __builtin_amdgcn_wmma_{type_map[dtype_out]}_16x16x16_{type_map[dtype_in]}_w32(a, b, c_frag, false);
+  for (int n = 0; n < 8; n++) {{ d[n] = c_frag[n*2]; }} return d;\n}}""")
     return super().render_kernel(function_name, kernel, bufs, uops, prefix)
 
   def supported_dtypes(self): return {d for d in super().supported_dtypes() if d not in dtypes.fp8s or d in amd_fp8s(self.target.arch)}

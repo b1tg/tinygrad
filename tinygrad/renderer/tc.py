@@ -73,7 +73,8 @@ def get_cuda(arch): return cuda_sm89 if (ver:=int(arch[3:])) >= 89 else cuda_sm8
 # (16,16,16)
 amd_rdna3 = [TensorCore(dtype_in=di, dtype_out=do, frag_a=(("m0", "m1", "m2", "m3", "n0"), ("k0", "k1", "k2", "k3")),
   frag_b=(("n0", "n1", "n2", "n3", "m0"), ("k0", "k1", "k2", "k3")), frag_c=(("n0", "n1", "n2", "n3", "m0"), ("m1", "m2", "m3")))
-  for di,do in [(dtypes.half,dtypes.float),(dtypes.half,dtypes.half),(dtypes.bfloat16,dtypes.float),(dtypes.int8,dtypes.int32)]]
+  for di,do in [(dtypes.half,dtypes.float),(dtypes.half,dtypes.half),(dtypes.bfloat16,dtypes.float),(dtypes.bfloat16,dtypes.bfloat16),
+                (dtypes.int8,dtypes.int32)]]
 # (16,16,16)
 amd_rdna4 = [TensorCore(dtype_in=di, dtype_out=do, frag_a=(("m0", "m1", "m2", "m3", "k2"), ("k0", "k1", "k3")),
   frag_b=(("n0", "n1", "n2", "n3", "k2"), ("k0", "k1", "k3")), frag_c=(("n0", "n1", "n2", "n3", "m3"), ("m0", "m1", "m2")))
@@ -101,12 +102,14 @@ pm_validate_wmma_rdna3 = PatternMatcher([
   (UPat(Ops.WMMA, name="x", dtype=dtypes.int32), lambda x: x.replace(
     src=(x.src[0].bitcast(dtypes.uint32), x.src[1].bitcast(dtypes.uint32), x.src[2]))
     if x.src[0].dtype == dtypes.int8 and x.src[0].max_numel() == 16 else None),
-  (UPat(Ops.WMMA, name="x", dtype=dtypes.half), lambda x: UOp(Ops.STACK, src=tuple(x.replace(
+  (UPat(Ops.WMMA, name="x", dtype=(dtypes.half, dtypes.bfloat16)), lambda x: UOp(Ops.STACK, src=tuple(x.replace(
       src=(x.src[0], x.src[1], UOp(Ops.STACK, src=tuple(x.src[2].index(UOp.const(j//2, dtypes.int16))
       if j%2 == 0 else UOp.const(0.0, x.src[2].dtype)
       for j in range(x.max_numel()*2)))),
       arg=(*x.arg[:3], None)).index(UOp.const(i*2, dtypes.int16))
       for i in range(x.max_numel()))) if x.max_numel() == 8 else None),
+  (UPat(Ops.WMMA, name="x", dtype=dtypes.bfloat16), lambda x:
+    x.replace(src=tuple(s.bitcast(dtypes.uint16) for s in x.src)).bitcast(dtypes.bfloat16) if x.max_numel() == 16 else None),
   (UPat(Ops.WMMA, name="x"), lambda x: x.replace(
     src=(x.src[0].bitcast(dtypes.uint16), x.src[1].bitcast(dtypes.uint16), x.src[2]))
     if x.src[0].dtype == dtypes.bfloat16 and x.src[0].max_numel() == 16 else None),
