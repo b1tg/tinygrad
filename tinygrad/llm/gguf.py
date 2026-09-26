@@ -1,7 +1,9 @@
 import functools, io, pathlib, re, struct
 from typing import Any, Callable, NamedTuple
 
-from tinygrad import Tensor, Device, UOp, dtypes
+from tinygrad.tensor import Tensor
+from tinygrad.dtype import dtypes
+from tinygrad import Device, UOp
 from tinygrad.helpers import prod, round_up
 from tinygrad.nn.state import TensorIO
 
@@ -199,6 +201,7 @@ class GGUFTensor(NamedTuple):
   ggml_type: int
 
 def _gguf_parse(tensor: Tensor, device:str|None=None) -> tuple[dict, dict[str, GGUFTensor]]:
+  # TODO: remove the need for copy to default device
   if device is not None: tensor = tensor.to(device).realize()
   r = io.BufferedReader(TensorIO(tensor), 1_000_000)
   magic, version, n_tensors, n_kv = r.read(4), read_int32(r), read_int64(r), read_int64(r)
@@ -226,13 +229,28 @@ def _gguf_split_paths(path: pathlib.Path, kv: dict) -> list[pathlib.Path]:
   if not (m := re.match(r"^(.*)-00001-of-\d{5}\.gguf$", str(path))): raise ValueError(f"first split path must end with -00001-of-NNNNN.gguf: {path}")
   return [pathlib.Path(f"{m.group(1)}-{i:05d}-of-{total:05d}.gguf") for i in range(1, total+1)]
 
-def gguf_read(fn: Tensor|str|pathlib.Path, device:str|None=None) -> tuple[dict, dict[str, GGUFTensor]]:
-  """Read metadata and raw weight views, moving payloads only when a device is specified."""
+def gguf_load(fn: Tensor|str|pathlib.Path, devices:tuple[str, ...]|None=None) -> tuple[dict, dict[str, Tensor]]:
+  """
+  Loads a .gguf file, returning the `kv_data` and `state_dict`. Multi-part splits are auto-merged when loaded by path.
+
+  ```python
+  import pathlib
+  from tinygrad import Device, Tensor
+  from tinygrad.llm.gguf import gguf_load
+
+  gguf_tensor = Tensor(pathlib.Path("Meta-Llama-3-8B-Instruct.Q4_0.gguf")).to(Device.DEFAULT)
+  kv_data, state_dict = gguf_load(gguf_tensor)
+  ```
+
+  NOTE: The provided tensor must be on a device that supports execution.
+  """
+  device = Device.DEFAULT if devices is None else None
   kv, sd = _gguf_parse(fn if isinstance(fn, Tensor) else Tensor(pathlib.Path(fn)), device)
-  if kv.get('split.count', 1) <= 1: return kv, sd
-  if isinstance(fn, Tensor): raise ValueError("multi-part GGUF requires a path argument (got Tensor)")
-  for pp in _gguf_split_paths(pathlib.Path(fn), kv)[1:]: sd.update(_gguf_parse(Tensor(pp), device)[1])
-  return kv, sd
+  if kv.get('split.count', 1) > 1:
+    if isinstance(fn, Tensor): raise ValueError("multi-part GGUF requires a path argument (got Tensor)")
+    for pp in _gguf_split_paths(pathlib.Path(fn), kv)[1:]: sd.update(_gguf_parse(Tensor(pp), device)[1])
+  if devices is not None: return kv, apply_shards(sd, kv, devices)
+  return kv, {name: ggml_data_to_tensor(value.data, prod(value.shape), value.ggml_type).reshape(value.shape) for name,value in sd.items()}
 
 def apply_shards(state:dict[str, GGUFTensor], kv:dict, devices:tuple[str, ...]) -> dict[str, Tensor]:
   from tinygrad.llm.kernels.amd import HALFWORD_QUANTS, Q4_K, Q5_K, Q6_K, IQ4_XS, amd_custom_kernels_supported
@@ -271,23 +289,3 @@ def apply_shards(state:dict[str, GGUFTensor], kv:dict, devices:tuple[str, ...]) 
     data = ggml_data_to_tensor(data.bitcast(dtypes.uint8), prod(local), typ).reshape(local)
     weights[name] = data if word != dtypes.uint8 else data.realize()
   return weights
-
-def gguf_load(fn: Tensor|str|pathlib.Path, devices:tuple[str, ...]|None=None) -> tuple[dict, dict[str, Tensor]]:
-  """
-  Loads a .gguf file, returning the `kv_data` and `state_dict`. Multi-part splits are auto-merged when loaded by path.
-
-  ```python
-  import pathlib
-  from tinygrad import Device, Tensor
-  from tinygrad.llm.gguf import gguf_load
-
-  gguf_tensor = Tensor(pathlib.Path("Meta-Llama-3-8B-Instruct.Q4_0.gguf")).to(Device.DEFAULT)
-  kv_data, state_dict = gguf_load(gguf_tensor)
-  ```
-
-  With devices, raw weights are sharded before decoding; otherwise weights load on Device.DEFAULT.
-  """
-  # TODO: remove the need for copy to default device
-  kv, sd = gguf_read(fn, Device.DEFAULT if devices is None else None)
-  if devices is not None: return kv, apply_shards(sd, kv, devices)
-  return kv, {name: ggml_data_to_tensor(value.data, prod(value.shape), value.ggml_type).reshape(value.shape) for name,value in sd.items()}
