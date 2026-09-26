@@ -216,7 +216,8 @@ def _gguf_parse(tensor: Tensor, lazy:bool=False) -> tuple[dict, dict[str, GGUFTe
   alignment, pos = kv_data.get("general.alignment", 32), r.tell()
   data_start = round_up(pos, alignment)
 
-  return kv_data, {name: GGUFTensor(tensor[data_start + off:], tuple(reversed(dims)), typ) for name, dims, typ, off in t_infos}
+  state_dict = {name: GGUFTensor(tensor[data_start + off:], tuple(reversed(dims)), typ) for name, dims, typ, off in t_infos}
+  return kv_data, state_dict
 
 def _gguf_split_paths(path: pathlib.Path, kv: dict) -> list[pathlib.Path]:
   if (total := kv.get('split.count', 1)) <= 1: return [path]
