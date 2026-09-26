@@ -3,7 +3,7 @@ from typing import Any, Callable, NamedTuple
 
 from tinygrad.tensor import Tensor
 from tinygrad.dtype import dtypes
-from tinygrad import Device, UOp
+from tinygrad.uop.ops import UOp
 from tinygrad.helpers import prod, round_up
 from tinygrad.nn.state import TensorIO
 
@@ -200,9 +200,9 @@ class GGUFTensor(NamedTuple):
   shape: tuple[int, ...]
   ggml_type: int
 
-def _gguf_parse(tensor: Tensor, device:str|None=None) -> tuple[dict, dict[str, GGUFTensor]]:
+def _gguf_parse(tensor: Tensor, lazy:bool=False) -> tuple[dict, dict[str, GGUFTensor]]:
   # TODO: remove the need for copy to default device
-  if device is not None: tensor = tensor.to(device).realize()
+  if not lazy: tensor = tensor.to(None).realize()
   r = io.BufferedReader(TensorIO(tensor), 1_000_000)
   magic, version, n_tensors, n_kv = r.read(4), read_int32(r), read_int64(r), read_int64(r)
   if magic != b"GGUF" or version not in [2, 3]: raise ValueError("Invalid GGUF format!")
@@ -216,11 +216,7 @@ def _gguf_parse(tensor: Tensor, device:str|None=None) -> tuple[dict, dict[str, G
   alignment, pos = kv_data.get("general.alignment", 32), r.tell()
   data_start = round_up(pos, alignment)
 
-  state_dict = {}
-  for name, dims, typ, off in t_infos:
-    n = prod(dims)
-    size = n*_GGML_NATIVE[typ].itemsize if typ in _GGML_NATIVE else n//_GGML_QUANT[typ][0]*_GGML_QUANT[typ][1]
-    state_dict[name] = GGUFTensor(tensor[data_start+off:data_start+off+size], tuple(reversed(dims)), typ)
+  state_dict = {name: GGUFTensor(tensor[data_start + off:], tuple(reversed(dims)), typ) for name, dims, typ, off in t_infos}
   return kv_data, state_dict
 
 def _gguf_split_paths(path: pathlib.Path, kv: dict) -> list[pathlib.Path]:
@@ -244,11 +240,10 @@ def gguf_load(fn: Tensor|str|pathlib.Path, devices:tuple[str, ...]|None=None) ->
 
   NOTE: The provided tensor must be on a device that supports execution.
   """
-  device = Device.DEFAULT if devices is None else None
-  kv, sd = _gguf_parse(fn if isinstance(fn, Tensor) else Tensor(pathlib.Path(fn)), device)
+  kv, sd = _gguf_parse(fn if isinstance(fn, Tensor) else Tensor(pathlib.Path(fn)), lazy=devices is not None)
   if kv.get('split.count', 1) > 1:
     if isinstance(fn, Tensor): raise ValueError("multi-part GGUF requires a path argument (got Tensor)")
-    for pp in _gguf_split_paths(pathlib.Path(fn), kv)[1:]: sd.update(_gguf_parse(Tensor(pp), device)[1])
+    for pp in _gguf_split_paths(pathlib.Path(fn), kv)[1:]: sd.update(_gguf_parse(Tensor(pp), lazy=devices is not None)[1])
   if devices is not None: return kv, apply_shards(sd, kv, devices)
   return kv, {name: ggml_data_to_tensor(value.data, prod(value.shape), value.ggml_type).reshape(value.shape) for name,value in sd.items()}
 
@@ -261,6 +256,8 @@ def apply_shards(state:dict[str, GGUFTensor], kv:dict, devices:tuple[str, ...]) 
   packed_kernels = all(amd_custom_kernels_supported(d) for d in devices)
   assert all(kv.get(f'{arch}.attention.{k}', len(devices)) % len(devices) == 0 for k in ('head_count', 'head_count_kv')), 'uneven heads'
   for name,(raw,shape,typ) in state.items():
+    block, size = _GGML_QUANT[typ] if typ in _GGML_QUANT else (1, _GGML_NATIVE[typ].itemsize)
+    raw = raw[:prod(shape)//block*size]
     if name == 'token_embd.weight':
       weights[name] = ggml_data_to_tensor(raw.to(devices[0]), prod(shape), typ).reshape(shape)
       continue
@@ -270,7 +267,6 @@ def apply_shards(state:dict[str, GGUFTensor], kv:dict, devices:tuple[str, ...]) 
     elif key in ('attn_q.weight', 'attn_k.weight', 'attn_v.weight', 'attn_qkv.weight', 'attn_gate.weight', 'ssm_alpha.weight',
                  'ssm_beta.weight', 'ffn_gate.weight', 'ffn_up.weight', 'output.weight', 'ssm_conv1d.weight', 'ssm_a', 'ssm_dt.bias'): axis = 0
     local = tuple(s//len(devices) if i == axis else s for i,s in enumerate(shape))
-    block, size = _GGML_QUANT[typ] if typ in _GGML_QUANT else (1, _GGML_NATIVE[typ].itemsize)
     storage = raw.reshape(*shape[:-1], shape[-1]//block, size)
     if axis is None: pieces = [storage]*len(devices)
     else:
