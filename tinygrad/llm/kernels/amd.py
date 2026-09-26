@@ -111,7 +111,8 @@ class Linear(nn.Linear):
       out = q8_linear(self, x.pad_to(x.max_shape))
     if out is None: return super().__call__(Tensor(x.uop.unshard(x.ndim-1)) if self.weight.uop.axis == 1 else x)
     if self.weight.uop.axis is not None: out = Tensor(out.uop.allreduce(Ops.ADD, cast(tuple, out.device)))
-    return (out if self.bias is None else out + self.bias).shrink_to((*x.shape[:-1], self.out_features))
+    if self.bias is not None and (self.ggml_type is not None or self.weight.uop.axis is not None): out = out + self.bias
+    return out.shrink_to((*x.shape[:-1], self.out_features))
 
 def _amd_dp4a(a:UOp, b:UOp, c:UOp) -> UOp:
   return UOp(Ops.CUSTOMI, src=(a, b, c), arg=("__builtin_amdgcn_sudot4(true, {}, true, {}, {}, false)", dtypes.int32))
@@ -470,7 +471,8 @@ def q8_linear(layer:Linear, x:Tensor) -> Tensor:
 # ******** tiny dense fp16 gemv ********
 
 @functools.cache
-def _amd_f16_gemv_kernel(out:UOp, w:UOp, x:UOp, *, in_features:int, out_features:int, tokens:int) -> UOp:
+def _amd_f16_gemv_kernel(out:UOp, w:UOp, x:UOp, *rest:UOp, in_features:int, out_features:int, tokens:int) -> UOp:
+  bias: UOp|None = rest[0] if rest else None
   # one block per (token, output row), 32 lanes accumulate 4-wide chunks of the row
   lanes, val_chunk = WARP_SIZE, 4
   token, out_row = UOp.range(tokens, 0, AxisType.GLOBAL), UOp.range(out_features, 1, AxisType.GLOBAL)
@@ -484,6 +486,7 @@ def _amd_f16_gemv_kernel(out:UOp, w:UOp, x:UOp, *, in_features:int, out_features
     for j in range(val_chunk):
       acc = acc + w[out_row, i, lane*val_chunk + j].load().float() * x[token, i, lane*val_chunk + j].load().float()
   total = warp_reduce(acc, full_wave=True)
+  if bias is not None: total = total + bias[out_row].load().float()
   return out[token, out_row.valid(lane.eq(0))].store(total).end(token, out_row, lane).sink(arg=KernelInfo(name="linear_f16_gemv", opts_to_apply=()))
 
 def _view_back(t:Tensor) -> Tensor:
@@ -499,7 +502,7 @@ def f16_gemv(layer:Linear, x:Tensor) -> Tensor:
   x = x.contiguous()
   out = Tensor.empty(tokens, layer.out_features, dtype=dtypes.float32, device=x.device)
   fxn = functools.partial(_amd_f16_gemv_kernel, in_features=layer.in_features, out_features=layer.out_features, tokens=tokens)
-  srcs = (out, weight, x.reshape(tokens, layer.in_features))
+  srcs = (out, weight, x.reshape(tokens, layer.in_features)) + (() if layer.bias is None or weight.uop.axis == 1 else (_view_back(layer.bias),))
   return Tensor.custom_kernel(*srcs, fxn=fxn)[0].reshape(*x.shape[:-1], layer.out_features)
 
 # ******** flash attention on the KV cache ********
