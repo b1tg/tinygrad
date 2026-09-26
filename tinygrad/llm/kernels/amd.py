@@ -68,8 +68,7 @@ class Linear(nn.Linear):
     if self.in_features % GGML_BLOCK_SIZE: return
     packed_sizes = {typ: prod(decoded.uop.shard_shape) // 256 * type_size for typ,type_size in QUANT_SIZES.items()}
     graph = decoded.uop.toposort()
-    raw = next((u for u in graph if u.op in (Ops.SHRINK, Ops.MSTACK, Ops.BITCAST) and u.dtype == dtypes.uint8
-                and prod(u.shape) in packed_sizes.values()), None)
+    raw = next((u for u in graph if u.op in (Ops.SHRINK, Ops.BITCAST) and u.dtype == dtypes.uint8 and prod(u.shape) in packed_sizes.values()), None)
     if raw is None: return
     # Only unwrap storage/order-preserving views, then require the exact dequantization expression.
     # This rejects subsequent arithmetic and permutations, including RoPE's concatenated query weights.

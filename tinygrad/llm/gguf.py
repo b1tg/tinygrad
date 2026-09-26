@@ -277,11 +277,11 @@ def apply_shards(state:dict[str, GGUFTensor], kv:dict, devices:tuple[str, ...]) 
         groups = ((kv[f'{arch}.ssm.group_count']*kv[f'{arch}.ssm.state_size'],)*2 + (kv[f'{arch}.ssm.inner_size']//repeats,)*repeats
                   if key in ('attn_qkv.weight', 'ssm_conv1d.weight') else (shape[axis]//repeats,)*repeats)
       assert all(g % (len(devices)*(block if axis == len(shape)-1 else 1)) == 0 for g in groups), f'{name}: uneven TP group'
-      if axis == len(shape)-1 or len(groups) > 1: storage = storage.to('CPU').realize()
+      if axis == len(shape)-1 or len(groups) > 1: storage = storage.to('CPU')
       parts = storage.split(tuple(g//block if axis == len(shape)-1 else g for g in groups), dim=axis)
       pieces = [p[0] if len(p) == 1 else Tensor.cat(*p, dim=axis) for p in zip(*(p.chunk(len(devices), dim=axis) for p in parts))]
     word = (dtypes.uint16 if typ in HALFWORD_QUANTS else dtypes.uint32) if packed_kernels and typ in (Q4_K, Q5_K, Q6_K, IQ4_XS) else dtypes.uint8
-    data = Tensor(UOp.mstack(*(p.contiguous().flatten().bitcast(word).to(d).clone().realize().uop for p,d in zip(pieces, devices))))
+    data = Tensor(UOp.mstack(*(p.contiguous().flatten().bitcast(word).to(d).realize().uop for p,d in zip(pieces, devices))))
     data = ggml_data_to_tensor(data.bitcast(dtypes.uint8), prod(local), typ).reshape(local)
     weights[name] = Tensor(data.uop.unshard(1)) if axis == 1 else data
     if word == dtypes.uint8: weights[name].realize()
