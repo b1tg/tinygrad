@@ -48,21 +48,22 @@ def render_wmma_amd(ctx, wmma: UOp, cdna=False, rdna4=False) -> str:
     if scaled:
       _fmt = { dtypes.fp8e5m2:1, dtypes.fp8e4m3:0 }
       # (a_fp8_fmt, b_fp8_fmt, opsel, scale_a, opsel, scale_b)
-      args.extend([f"i32 {_fmt[wmma.arg[1]]}", f"i32 {_fmt[wmma.arg[1]]}", "i32 0", "i32 127", "i32 0", "i32 127"])
+      args.extend([f"i32 {_fmt[wmma.arg[1][0]]}", f"i32 {_fmt[wmma.arg[1][1]]}", "i32 0", "i32 127", "i32 0", "i32 127"])
     else: args.extend(["i32 0", "i32 0", "i32 0"]) # (cbsz, blgp, ?)
 
     scale = "scale." if scaled else ""
-    dt_in = dt_map[wmma.arg[1]] if not scaled else ".f8f6f4"
+    dt_in = ".f8f6f4" if scaled else f".{('fp8', 'bf8')[fp8_index(wmma.arg[1][0])]}.{('fp8', 'bf8')[fp8_index(wmma.arg[1][1])]}" \
+      if wmma.arg[1][0] in dtypes.fp8s else dt_map[wmma.arg[1][0]]
     return f"  {ctx[wmma]} = call {ldt(wmma.dtype, wmma.max_numel())} @llvm.amdgcn.mfma.{scale}{dt_map[wmma.src[-1].dtype]}" + \
            f".{N}x{M}x{K}{dt_in}(" + ", ".join(args) + ")"
   # https://github.com/llvm/llvm-project/blob/main/llvm/test/CodeGen/AMDGPU/GlobalISel/llvm.amdgcn.wmma_32.ll
   # example: %wmma0 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x16.f16(<16 x half> %v99,<16 x half> %v100,<8 x float> %v101)
   args = [f"{ldt(w.dtype, w.max_numel())} {ctx[w]}" for w in wmma.src]
-  if wmma.arg[1] == dtypes.int8: args = ["i1 true", args[0], "i1 true", args[1], args[2]]  # iu8 flags A/B signed
+  if wmma.arg[1][0] == dtypes.int8: args = ["i1 true", args[0], "i1 true", args[1], args[2]]  # iu8 flags A/B signed
   if wmma.dtype != dtypes.float: args.append("i1 false") # opsel
-  suffix = f".v{wmma.max_numel()}{dt_map[wmma.dtype]}.v{wmma.src[0].max_numel()}{dt_map[wmma.arg[1]]}" if rdna4 else ""
+  suffix = f".v{wmma.max_numel()}{dt_map[wmma.dtype]}.v{wmma.src[0].max_numel()}{dt_map[wmma.arg[1][0]]}" if rdna4 else ""
   return f"  {ctx[wmma]} = call {ldt(wmma.dtype, wmma.max_numel())} @llvm.amdgcn.wmma.{dt_map[wmma.src[-1].dtype]}.16x16x16." + \
-    f"{dt_map[wmma.arg[1]]}{suffix}(" + ", ".join(args) + ")"
+    f"{dt_map[wmma.arg[1][0]]}{suffix}(" + ", ".join(args) + ")"
 
 # llvm ops, lop[<dtype>][<op>]
 unsigned_lop = { Ops.ADD: "add", Ops.MUL: "mul", Ops.CDIV: "udiv", Ops.CMOD: "urem",

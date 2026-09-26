@@ -56,7 +56,7 @@ class TestCustomKernel(unittest.TestCase):
   def test_loop_acc_gemm_tc_refused(self):
     # ACC[j] += A[t,:] @ B[:,j] over t: the recurrence on ACC makes t a serial LOOP, so no tensor core may split it
     ren = AMDLLVMRenderer(Target("AMD", arch="gfx1100"))
-    i, tc = next((i, tc) for i, tc in enumerate(ren.tensor_cores) if tc.dtype_in is dtypes.half and tc.dtype_out is dtypes.float)
+    i, tc = next((i, tc) for i, tc in enumerate(ren.tensor_cores) if tc.dtype_in == (dtypes.half, dtypes.half) and tc.dtype_out is dtypes.float)
     def kernel(ACC:UOp, A:UOp, B:UOp) -> UOp:
       t, j, k = UOp.range(A.shape[0], 0, AxisType.LOOP), UOp.range(B.shape[1], 1), UOp.range(A.shape[1], 2, AxisType.REDUCE)
       mm = (A[t, k] * B[k, j]).cast(dtypes.float).reduce(k, arg=Ops.ADD)

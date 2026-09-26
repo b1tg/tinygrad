@@ -66,6 +66,8 @@ spec_shared = PatternMatcher([
    matches_dtype(c, a.dtype) or c.dtype in (dtypes.uint, dtypes.weakint) or x.base.is_invalid),
   (UPat((Ops.CDIV, Ops.CMOD, Ops.FLOORDIV, Ops.FLOORMOD), name="x"),
    lambda x: None if dtypes.is_int(x.dtype) or any(s.base.is_invalid for s in x.src) else False),
+  (UPat(Ops.MUL, name="x"), lambda x: True if {y.dtype for y in x.src} in ({dtypes.fp8e4m3, dtypes.fp8e5m2},
+                                                                           {dtypes.fp8e4m3fnuz, dtypes.fp8e5m2fnuz}) else None),
   (UPat(GroupOp.ALU, name="x"), lambda x: all(matches_dtype(y, x.dtype) or y.dtype in dtypes.weaks for y in x.src)),
 
   # CAST

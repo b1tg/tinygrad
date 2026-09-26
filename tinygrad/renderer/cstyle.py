@@ -110,7 +110,8 @@ def uops_to_dtypes(uops:list[UOp]) -> list[tuple[DType, int]]:
 
 def _wmma_name(u:UOp) -> str:
   # sanitize spaces in DType.name (int8 = "signed char")
-  return f"WMMA_{'_'.join(map(str, u.arg[0]))}_{u.arg[1].name}_{u.dtype.name}".replace(" ", "_")
+  dtype_in = u.arg[1][0].name if u.arg[1][0] == u.arg[1][1] else "_".join(x.name for x in u.arg[1])
+  return f"WMMA_{'_'.join(map(str, u.arg[0]))}_{dtype_in}_{u.dtype.name}".replace(" ", "_")
 
 # (name, dims, dtype_in, dtype_out, upcast_sizes)
 def wmma_args(uops:list[UOp]):
@@ -381,7 +382,7 @@ class MetalRenderer(CStyleLanguage):
 
   def render_kernel(self, function_name, kernel, bufs, uops, prefix=None):
     prefix = ["#include <metal_stdlib>","using namespace metal;"]
-    for name, _, dtype_in, dtype_out, _ in wmma_args(uops):
+    for name, _, (dtype_in, _), dtype_out, _ in wmma_args(uops):
       dstr_out, dstr_in = self._render_dtype(dtype_out, 2, AddrSpace.REG), self._render_dtype(dtype_in, 2, AddrSpace.REG)
       prefix.append(
 f"""{dstr_out} __{name}({dstr_in} a, {dstr_in} b, {dstr_out} c){{
@@ -456,14 +457,14 @@ class CUDARenderer(CStyleLanguage):
     dt_map_in = { dtypes.float: "tf32", dtypes.half: "f16", dtypes.bfloat16: "bf16", dtypes.fp8e4m3: "e4m3", dtypes.fp8e5m2: "e5m2" }
     dt_map_out = { dtypes.float: "f32", dtypes.half: "f16" }
     for name, (N, M, K), dtype_in, dtype_out, upcast_sizes in wmma_args(uops):
-      wmma_dtypes = [self._render_dtype(dtype, size, AddrSpace.REG) for dtype, size in zip([dtype_in, dtype_in, dtype_out], upcast_sizes)]
-      n_operands = [size*dtype.itemsize//4 for dtype, size in zip([dtype_in, dtype_in, dtype_out], upcast_sizes)] # 4 => CUDA reg size in bytes
+      wmma_dtypes = [self._render_dtype(dtype, size, AddrSpace.REG) for dtype, size in zip([*dtype_in, dtype_out], upcast_sizes)]
+      n_operands = [size*dtype.itemsize//4 for dtype, size in zip([*dtype_in, dtype_out], upcast_sizes)] # 4 => CUDA reg size in bytes
       operands = [f"%{i}" for i in range(sum(n_operands))]
 
       # mma operands => {c}, {a}, {b}, {c}
       prefix.append(f"""__device__ {wmma_dtypes[2]} __{name}({wmma_dtypes[0]} a, {wmma_dtypes[1]} b, {wmma_dtypes[2]} c){{
   int *a_pk = (int *)(&a), *b_pk = (int *)(&b), *c_pk = (int *)(&c);
-  asm("mma.sync.aligned.m{M}n{N}k{K}.row.col.{dt_map_out[dtype_out]}.{dt_map_in[dtype_in]}.{dt_map_in[dtype_in]}.{dt_map_out[dtype_out]}"
+  asm("mma.sync.aligned.m{M}n{N}k{K}.row.col.{dt_map_out[dtype_out]}.{dt_map_in[dtype_in[0]]}.{dt_map_in[dtype_in[1]]}.{dt_map_out[dtype_out]}"
       "{{{", ".join(operands[:n_operands[2]])}}}, {{{", ".join(operands[n_operands[2]:n_operands[2]+n_operands[0]])}}},"
       "{{{", ".join(operands[-n_operands[1]:])}}}, {{{", ".join(operands[:n_operands[2]])}}};"
     : {", ".join([f'"+r"(c_pk[{i}])' for i in range(n_operands[2])])}
@@ -502,7 +503,7 @@ class HIPRenderer(CStyleLanguage):
     if self.is_cdna(target.arch):
       self.string_rewrite = PatternMatcher([
         (UPat(Ops.WMMA, name="x"), lambda ctx,x: f"__{_wmma_name(x)}({ctx[x.src[0]]}, {ctx[x.src[1]]}, {ctx[x.src[2]]},"
-          f" {fp8_index(x.src[0].dtype)}, {fp8_index(x.src[0].dtype)}, 0, 0, 0, 0)" if x.arg[0][2] == 128 else None),
+          f" {fp8_index(x.src[0].dtype)}, {fp8_index(x.src[1].dtype)}, 0, 0, 0, 0)" if x.arg[0][2] == 128 else None),
         (UPat(Ops.WMMA, name="x"), lambda ctx,x: f"__{_wmma_name(x)}({ctx[x.src[0]]}, {ctx[x.src[1]]}, {ctx[x.src[2]]}, 0, 0, 0)"),
         (UPat.cvar("c").cast(dtypes.fp8s, name="x"), lambda ctx,x,c:
           f"f32_to_fp8({ctx.nan if math.isnan(v:=c.val) else ctx.infinity if v == math.inf else f'-{ctx.infinity}' if v == -math.inf else f'{v}f'},"
@@ -574,18 +575,19 @@ class HIPRenderer(CStyleLanguage):
       if self.is_cdna(self.target.arch):
         if (N, M, K) == (16, 16, 16): type_map[dtypes.bfloat16] = 'bf16_1k'
         elif (N, M, K) == (16, 16, 32): type_map = {**type_map, dtypes.bfloat16: "_bf16", dtypes.half: "_f16"}
-        elif (N, M, K) == (16, 16, 128): type_map = {**type_map, dtypes.fp8e4m3: "_f8f6f4", dtypes.fp8e5m2: "_f8f6f4"}
-        prefix.append(f"#define __{name} __builtin_amdgcn_mfma_{'scale_' if K == 128 else ''}f32_{N}x{M}x{K}{type_map[dtype_in]}")
+        dtype_suffix = "_f8f6f4" if K == 128 else f"_{('fp8', 'bf8')[fp8_index(dtype_in[0])]}_{('fp8', 'bf8')[fp8_index(dtype_in[1])]}" \
+          if dtype_in[0] in dtypes.fp8s else type_map[dtype_in[0]]
+        prefix.append(f"#define __{name} __builtin_amdgcn_mfma_{'scale_' if K == 128 else ''}f32_{N}x{M}x{K}{dtype_suffix}")
       # #define __WMMA_16_16_16_half_half __builtin_amdgcn_wmma_f16_16x16x16_f16_w32_gfx12
       elif self.tensor_cores == tc.amd_rdna4:
-        prefix.append(f"#define __{name} __builtin_amdgcn_wmma_{type_map[dtype_out]}_16x16x16_{type_map[dtype_in]}_w32_gfx12")
+        prefix.append(f"#define __{name} __builtin_amdgcn_wmma_{type_map[dtype_out]}_16x16x16_{type_map[dtype_in[0]]}_w32_gfx12")
       elif dtype_out == dtypes.int32:
         prefix.append("typedef int wmma_int4 __attribute__((ext_vector_type(4)));\n"+
           f"static inline __attribute__((device)) int8 __{name}"+"""(signed_char16 a, signed_char16 b, int8 c) {
   return __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, __builtin_bit_cast(wmma_int4, a),
     true, __builtin_bit_cast(wmma_int4, b), c, false);\n}""")
       elif dtype_out == dtypes.float:
-        prefix.append(f"#define __{name} __builtin_amdgcn_wmma_f32_16x16x16_{'f16' if dtype_in == dtypes.half else 'bf16'}_w32")
+        prefix.append(f"#define __{name} __builtin_amdgcn_wmma_f32_16x16x16_{'f16' if dtype_in[0] == dtypes.half else 'bf16'}_w32")
       else: prefix.append(f"static inline __attribute__((device)) half8 __{name}"+"""(half16 a, half16 b, half8 c) {
   half16 c_frag = {}; half8 d; for (int n = 0; n < 8; n++) { c_frag[n*2] = c[n]; }
   c_frag = __builtin_amdgcn_wmma_f16_16x16x16_f16_w32(a, b, c_frag, false);
