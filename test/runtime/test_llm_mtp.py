@@ -1,4 +1,5 @@
 import unittest
+from itertools import islice
 from unittest.mock import patch
 import numpy as np
 from tinygrad import Tensor, UOp, nn, dtypes, TinyJit
@@ -59,7 +60,6 @@ class TestMTP(unittest.TestCase):
   def test_greedy_generation(self):
     Tensor.manual_seed(21)
     m = model()
-    from itertools import islice
     expected = list(islice(m.generate([3, 5, 7], mtp=0), 10))
     for count in (1, 2, 7, 1):
       with patch.object(m, '_mtp_round', wraps=m._mtp_round) as run:
@@ -70,7 +70,6 @@ class TestMTP(unittest.TestCase):
     for count in (0, 2): self.assertEqual(list(islice(m.generate([3, 5, 7], mtp=count), 10)), expected)
 
   def test_attention_only_target(self):
-    from itertools import islice
     Tensor.manual_seed(23)
     m = model(recurrent=False)
     self.assertFalse(m.has_recurrent_block)
@@ -89,7 +88,6 @@ class TestMTP(unittest.TestCase):
     self.assertEqual(list(islice(m.generate(extended.copy(), mtp=2), 8)), resumed)
 
   def test_prefix_reuse(self):
-    from itertools import islice
     Tensor.manual_seed(23)
     m = model()
     t = [3, 5, 7, 11, 13]
@@ -125,7 +123,6 @@ class TestMTP(unittest.TestCase):
       np.testing.assert_allclose(m.mtp[0].cache_kv.numpy()[:, :, :, :6], expected_cache, atol=2e-3, rtol=2e-3)
 
   def test_stop_mid_round(self):
-    from itertools import islice
     Tensor.manual_seed(23)
     m = model()
     # Make every draft accepted while retaining nontrivial recurrent and convolution states.

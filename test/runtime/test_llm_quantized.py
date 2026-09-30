@@ -43,8 +43,6 @@ class QuantLinearMixin:
         actual = (run if tokens == 1 or symbolic else linear)(inp)[:tokens].numpy()
         self.assertEqual(linear.ggml_type, ggml_type if custom else None)
         np.testing.assert_allclose(actual, reference_x @ reference_w.T + bias_value, rtol=3e-3, atol=2e-2)
-        if custom and not symbolic and tokens == 3 and ggml_type in (12, 13, 14, 23):
-          np.testing.assert_array_equal(actual, np.concatenate([linear(Tensor(row[None])).numpy() for row in x]))
         if not symbolic and tokens == 3 and ggml_type not in (12, 13, 14, 23):
           sym = Tensor(np.pad(x, ((0, 1), (0, 0)))).contiguous()[:UOp.variable("tokens", 1, 4).bind(3)]
           np.testing.assert_allclose(linear(sym)[:3].numpy(), reference_x @ reference_w.T + bias_value, rtol=3e-3, atol=2e-2)

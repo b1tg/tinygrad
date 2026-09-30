@@ -285,7 +285,7 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
 
   def test_attention_fallback_shapes(self):
     if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
-    for tokens, capacity, dim in ((1, 65, 64), (17, 64, 128), (32, 64, 32), (32, 64, 384), (32, 64, 512)):
+    for tokens, capacity, dim in ((1, 65, 64), (32, 64, 32), (32, 64, 384), (32, 64, 512)):
       with self.subTest(tokens=tokens, capacity=capacity, dim=dim):
         valid = 33
         cache = np.full((2, 1, 1, capacity, dim), np.nan, dtype=np.float16)

@@ -205,29 +205,26 @@ class TransformerBlock(FFNBlock):
     if config.qk_norm: self.attn_q_norm, self.attn_k_norm = nn.RMSNorm(config.qk_norm, config.norm_eps), nn.RMSNorm(config.qk_norm, config.norm_eps)
     if config.attn_sinks: self.attn_sinks = {"weight": Tensor.zeros(config.n_heads)}
 
-  def _cache_kv(self, x:Tensor, start_pos:int|UOp) -> Tensor:
-    B, T, _ = x.shape
-    k, v = self.attn_k(x), self.attn_v(x)
-    if self.config.qk_norm and self.config.qk_norm != self.config.head_dim: k = self.attn_k_norm(k)
-    k = k.reshape(B, T, self.config.n_kv_heads, self.config.head_dim).transpose(1, 2)  # (B,KvH,T,Hd)
-    v = v.reshape(B, T, self.config.n_kv_heads, self.config.head_dim).transpose(1, 2)  # (B,KvH,T,Hd)
-    if self.config.qk_norm == self.config.head_dim: k = self.attn_k_norm(k)
-    k = apply_rope(k[..., :self.config.rope_dim], self.freqs_cis[start_pos:start_pos+T]).cat(k[..., self.config.rope_dim:], dim=-1)
-    # NOTE: we don't want to change self.cache_kv, the function API doesn't support this well
-    store = self.cache_kv[:, :, :, start_pos:start_pos+T, :].uop.store(Tensor.stack(k, v).cast(self.cache_kv.dtype).uop)
-    return Tensor(self.cache_kv.uop.after(store))
+  def _attention(self, x:Tensor, start_pos:int|UOp, cache_only:bool=False) -> Tensor:
+    q, k, v = self.attn_q(x), self.attn_k(x), self.attn_v(x)
+    if self.config.qk_norm and self.config.qk_norm != self.config.head_dim: q, k = self.attn_q_norm(q), self.attn_k_norm(k)
 
-  def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
-    q = self.attn_q(x)
-    if self.config.qk_norm and self.config.qk_norm != self.config.head_dim: q = self.attn_q_norm(q)
     B, T, _ = x.shape
     if self.config.attn_output_gate:
       qg = q.reshape(B, T, self.config.n_heads, 2, self.config.head_dim)
       q, gate = qg[:, :, :, 0, :], qg[:, :, :, 1, :].reshape(B, T, self.config.n_heads * self.config.head_dim)
-    q = q.reshape(B, T, self.config.n_heads, self.config.head_dim).transpose(1, 2)  # (B,H,T,Hd)
-    if self.config.qk_norm == self.config.head_dim: q = self.attn_q_norm(q)
+    q = q.reshape(B, T, self.config.n_heads,    self.config.head_dim).transpose(1, 2)  # (B,H,T,Hd)
+    k = k.reshape(B, T, self.config.n_kv_heads, self.config.head_dim).transpose(1, 2)  # (B,KvH,T,Hd)
+    v = v.reshape(B, T, self.config.n_kv_heads, self.config.head_dim).transpose(1, 2)  # (B,KvH,T,Hd)
+    if self.config.qk_norm == self.config.head_dim: q, k = self.attn_q_norm(q), self.attn_k_norm(k)
+
     q = apply_rope(q[..., :self.config.rope_dim], self.freqs_cis[start_pos:start_pos+T]).cat(q[..., self.config.rope_dim:], dim=-1)
-    assigned_kv = self._cache_kv(x, start_pos)
+    k = apply_rope(k[..., :self.config.rope_dim], self.freqs_cis[start_pos:start_pos+T]).cat(k[..., self.config.rope_dim:], dim=-1)
+
+    # NOTE: we don't want to change self.cache_kv, the function API doesn't support this well
+    store = self.cache_kv[:, :, :, start_pos:start_pos+T, :].uop.store(Tensor.stack(k, v).cast(self.cache_kv.dtype).uop)
+    assigned_kv = Tensor(self.cache_kv.uop.after(store))
+    if cache_only: return assigned_kv
     # on RDNA3/4, hybrid models use custom flash attention kernels on the KV cache
     if amd_custom_kernels_supported(x.device) and self.config.ssm is not None:
       attn = flash_attention(q, assigned_kv, start_pos+T)
@@ -437,7 +434,7 @@ class MTPBlock(TransformerBlock):
   def forward(self, embedding:Tensor, hidden:Tensor, start_pos:int|UOp, cache_only:bool=False) -> Tensor:
     x = self.nextn["eh_proj"](self.nextn["enorm"](embedding).cat(self.nextn["hnorm"](hidden), dim=-1))
     self._init_state(x)
-    if cache_only: return self._cache_kv(self.attn_norm(x), start_pos)
+    if cache_only: return self._attention(self.attn_norm(x), start_pos, cache_only=True)
     return self.nextn["shared_head_norm"](self(x, start_pos))
 
 class Transformer:
@@ -565,9 +562,9 @@ class Transformer:
       swiglu_up_bias=1.0 if arch == 'gpt-oss' else 0.0, attn_sinks='blk.0.attn_sinks.weight' in state_dict,
       sliding_window=kv.get(f'{arch}.attention.sliding_window', 0),
       sliding_window_pattern=kv.get(f'{arch}.attention.sliding_window_pattern', 2 if arch == 'gpt-oss' else 0))
-    if kv.get(f'{arch}.nextn_predict_layers', 0) and arch == 'qwen35':
-      assert kv[f'{arch}.nextn_predict_layers'] == 1, "only one Qwen3.5 MTP block is supported"
-      config = replace(config, mtp_layers=1)
+    if (mtp_layers := kv.get(f'{arch}.nextn_predict_layers', 0)) and arch == 'qwen35':
+      assert mtp_layers == 1, "only one Qwen3.5 MTP block is supported"
+      config = replace(config, mtp_layers=mtp_layers)
       prefix = f"blk.{config.num_blocks}."
       state_dict = {("mtp.0."+k[len(prefix):] if k.startswith(prefix) else k):v for k,v in state_dict.items()}
       for name in ("embed_tokens", "shared_head_head"):

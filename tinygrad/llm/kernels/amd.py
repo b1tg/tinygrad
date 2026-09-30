@@ -184,21 +184,19 @@ def q8_quantize(x:Tensor, tokens:int, in_features:int) -> tuple[Tensor, Tensor, 
   return q, scale, xsum
 
 def _decode_linear(out:UOp, out_features:int, group_count:int, group_dot, name:str) -> UOp:
-  chunks, tokens = out.shape[2], out.shape[0]
-  # one block per (output, chunk) with a runtime token loop: the packed weight block is loaded once and reused for
-  # every token instead of being streamed again per token (the previous token-major grid did that). A real range loop
-  # (not a Python unroll) keeps the kernel size independent of the token count, so prefill (large T) is not slowed.
-  output_chunk = UOp.range(out_features*chunks, 0, axis_type=AxisType.GLOBAL)
-  output, chunk = output_chunk // chunks, output_chunk % chunks
-  lane = UOp.range(32, 1, axis_type=AxisType.LOCAL)
-  group = (lane+chunk*32).minimum(group_count-1)
-  active = lane+chunk*32 < group_count
-  token = UOp.range(tokens, 2, AxisType.REDUCE)
-  value = group_dot(token, output, group)
-  if chunks*32 != group_count: value = active.where(value, UOp.const(0, dtypes.float32))
+  chunks = out.shape[2]
+  # One wave per output/chunk; group neighboring rows to amortize workgroup scheduling.
+  rows = math.gcd(out_features, 4)
+  row = UOp.range(out.shape[0]*out_features//rows, 0, AxisType.GLOBAL)
+  wave = UOp.range(rows, 3, AxisType.LOCAL)
+  token_output = row*rows+wave
+  chunk, lane = UOp.range(chunks, 1, AxisType.GLOBAL), UOp.range(32, 2, AxisType.LOCAL)
+  token, output = token_output // out_features, token_output % out_features
+  group = lane+chunk*32
+  value = (group < group_count).where(group_dot(token, output, group.minimum(group_count-1)), UOp.const(0, dtypes.float32))
   total = warp_reduce(value, full_wave=True)
-  store = out[token, output, chunk.valid(lane.eq(0))].store(total.cast(out.dtype))
-  return UOp.group(store).end(token).end(output_chunk, lane).sink(arg=KernelInfo(name=name, opts_to_apply=()))
+  return out[token, output, chunk.valid(lane.eq(0))].store(total.cast(out.dtype)).end(row, wave, chunk, lane).sink(
+    arg=KernelInfo(name=name, opts_to_apply=()))
 
 def _iq_grid(device:str|tuple[str, ...]|None, ggml_type:int) -> Tensor:
   from tinygrad.runtime.autogen import ggml_common as ggml
