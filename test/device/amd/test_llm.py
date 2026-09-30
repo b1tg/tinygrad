@@ -258,33 +258,6 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
         x = rng.normal(size=(tokens, 128)).astype(np.float16)
         np.testing.assert_allclose(linear(Tensor(x)).numpy(), x.astype(np.float32) @ w.astype(np.float32).T + bias, rtol=2e-3, atol=2e-3)
 
-  def _test_quant_linear(self, ggml_type, block_bytes, in_features=2048, out_features=64, token_counts=(1, 3, 32, 64, 128)):
-    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
-    rng = np.random.default_rng(42)
-    packed = rng.integers(0, 256, (out_features*in_features//256, block_bytes), dtype=np.uint8)
-    if ggml_type == 14: packed[:, -2:] = np.array([0.001], dtype=np.float16).view(np.uint8)
-    else: packed[:, :2] = np.array([0.001], dtype=np.float16).view(np.uint8)
-    if ggml_type in (12, 13): packed[:, 2:4] = np.array([0.0002], dtype=np.float16).view(np.uint8)
-    raw = Tensor(np.pad(packed.flatten(), (4, 0))).contiguous().realize()[4:]
-    decoded = ggml_data_to_tensor(raw, out_features*in_features, ggml_type).reshape(out_features, in_features)
-    weight = decoded.numpy()
-    linear = Linear(in_features, out_features, bias=False)
-    linear.weight = decoded
-    for tokens in token_counts:
-      with self.subTest(tokens=tokens):
-        x = rng.normal(size=(tokens, in_features)).astype(np.float32 if tokens == 3 else np.float16)
-        reference_x = x.astype(np.float32)
-        if tokens < 16 or ggml_type == 14:
-          grouped = reference_x.reshape(tokens, -1, 32)
-          scale = np.maximum(np.abs(grouped).max(-1, keepdims=True) / 127, 1e-8)
-          reference_x = (np.clip(np.rint(grouped/scale), -127, 127)*scale).reshape(tokens, in_features)
-        reference_w = weight if tokens < 16 or ggml_type == 14 else weight.astype(np.float16).astype(np.float32)
-        batch = linear(Tensor(x)).numpy()
-        np.testing.assert_allclose(batch, reference_x @ reference_w.T, rtol=3e-3, atol=2e-2)
-        if tokens == 3:
-          np.testing.assert_array_equal(batch, np.concatenate([linear(Tensor(row[None])).numpy() for row in x]))
-    self.assertEqual(linear.ggml_type, ggml_type)
-
   def test_q6_linear_multiple_tokens(self):
     if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
     rng = np.random.default_rng(42)
