@@ -29,7 +29,10 @@ def realize(ctx:IndexingContext, tr:UOp) -> None: ctx.realize_map[tr] = None
 
 def realize_srcs(ctx:IndexingContext, rb:UOp) -> None:
   for s in rb.src:
-    if s.base.op not in ALWAYS_CONTIGUOUS: ctx.realize_map[s] = None
+    # a src is the storage of its device: a view of a buffer isn't, it's realized
+    b = s
+    while b.op is Ops.RESHAPE: b = b.src[0]
+    if b.op not in ALWAYS_CONTIGUOUS: ctx.realize_map[s] = None
 
 def realize_store_after_src(ctx:IndexingContext, dest:UOp, src:UOp):
   # you don't usually have to do this for assign unless there's a WAR hazard like TestAssign.test_assign_double_diamond_reduce

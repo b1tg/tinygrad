@@ -179,6 +179,8 @@ def stage_to_anon_store(x:UOp, stg:UOp):
 def materialize_cross_device_src(dest:UOp, src:UOp):
   # cross-device copies must read a whole buffer (SDMA can't do offset copies)
   if src.device is None or dest.device == src.device or src.has_buffer_identity(after_ok=True): return None
+  # a disk read can start anywhere: a range of a disk buffer is read in place
+  if src.on_disk() and src.op is Ops.SHRINK and src.src[0].has_buffer_identity(): return None
   return dest.store(src.contiguous())
 
 pm_inline_calls = PatternMatcher([
@@ -186,14 +188,21 @@ pm_inline_calls = PatternMatcher([
   (UPat(Ops.AFTER, src=(UPat(name="r"), UPat(Ops.SINK, name="t")), allow_any_len=True), resolve_returned_after),
 ])
 
+def disk_copy_view(x:UOp, copy:UOp):
+  if not x.on_disk(): return None
+  # a contiguous range is read in place, as a view of the flat buffer (e.g. the shard of one device)
+  if (cv:=x.contiguous_view()) is not None and cv[0].op is Ops.PARAM and cv[0].ndim == 1 and cv[0].dtype == x.dtype:
+    if x.op is Ops.SHRINK and x.src[0] is cv[0]: return None
+    return copy.replace(src=(cv[0][cv[1]:cv[1]+x.numel()],)).reshape(x.shape)
+  # push the other movement ops to the destination: views exposed here are no longer normalized into input PARAMs,
+  # so leaving SHRINK/RESHAPE behind can cause materialize_cross_device_src to allocate a temporary on disk
+  return x.replace(src=(copy.replace(src=(x.src[0],)),)+x.src[1:])
+
 pm_disk_copy = PatternMatcher([
   # remove contiguous on movement ops before a copy on disk
   (UPat(GroupOp.Movement, name="x").f(Ops.STAGE).f(Ops.COPY, name="copy"), lambda x,copy:
    copy.replace(src=(x,)) if x.on_disk() else None),
-  # push all movement ops to the destination: views exposed here are no longer normalized into input PARAMs,
-  # so leaving SHRINK/RESHAPE behind can cause materialize_cross_device_src to allocate a temporary on disk
-  (UPat(GroupOp.Movement, name="x").f(Ops.COPY, name="copy"), lambda x,copy:
-   x.replace(src=(copy.replace(src=(x.src[0],)),)+x.src[1:]) if x.on_disk() else None),
+  (UPat(GroupOp.Movement, name="x").f(Ops.COPY, name="copy"), disk_copy_view),
 ])
 
 earliest_rewrites = mop_cleanup+PatternMatcher([

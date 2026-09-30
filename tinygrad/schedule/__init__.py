@@ -157,9 +157,14 @@ def assert_all_same_devices(ast:UOp):
   devices = dedup([x.device for x in ast.toposort() if x.op is Ops.PARAM and x.device is not None])
   if len(devices) >= 2: raise RuntimeError(f"all buffers must be on the same device: {devices}")
 
-def copy_kernel_to_store(call:UOp, dst:UOp, src:UOp, r:UOp|None=None):
+def copy_kernel_to_store(call:UOp, dst:UOp, src:UOp, r:UOp|None=None, off:UOp|None=None):
   if dst.device == src.device and not (isinstance(dst.device, str) and dst.device.startswith("DISK")): return None
-  return call.replace(src=(dst.store(src),) + call.src[1:])
+  if off is None and src.arg.size == dst.arg.size: return call.replace(src=(dst.store(src),) + call.src[1:])
+  # a copy of a range of a disk buffer: the argument is a view of the range
+  if not src.device.startswith("DISK"): return None
+  args, start = list(call.src[1:]), 0 if off is None else off.arg
+  args[src.arg.slot] = args[src.arg.slot][start:start+dst.arg.size]
+  return call.replace(src=(dst.store(src.replace(arg=replace(src.arg, size=dst.arg.size))),)+tuple(args))
 
 def simplify_copy_kernel(call:UOp, ast:UOp, dst:UOp, src:UOp):
   # NOTE: this is a codegen for SDMA devices
@@ -180,6 +185,9 @@ pm_copy_from_store = PatternMatcher([
                 name="call", allow_any_len=True), copy_kernel_to_store),
   (UPat(Ops.CALL, src=(UPat(Ops.PARAM, name="dst").index(UPat(Ops.RANGE, name="r"))
                 .store(UPat(Ops.PARAM, name="src").index(UPat(Ops.RANGE, name="r"))).end(UPat(Ops.RANGE, name="r")).sink(),),
+                name="call", allow_any_len=True), copy_kernel_to_store),
+  (UPat(Ops.CALL, src=(UPat(Ops.PARAM, name="dst").index(UPat(Ops.RANGE, name="r"))
+                .store(UPat(Ops.PARAM, name="src").index(UPat(Ops.RANGE, name="r")+UPat.cvar("off"))).end(UPat(Ops.RANGE, name="r")).sink(),),
                 name="call", allow_any_len=True), copy_kernel_to_store),
 
   # if it wasn't copy, it currently can't be cross device
