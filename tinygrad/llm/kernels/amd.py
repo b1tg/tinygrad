@@ -185,6 +185,18 @@ def q8_quantize(x:Tensor, tokens:int, in_features:int) -> tuple[Tensor, Tensor, 
 
 def _decode_linear(out:UOp, out_features:int, group_count:int, group_dot, name:str) -> UOp:
   chunks = out.shape[2]
+  if out.shape[0] > 1:
+    # Reuse each packed weight block across tokens during batched MTP verification.
+    output_chunk = UOp.range(out_features*chunks, 0, AxisType.GLOBAL)
+    output, chunk = output_chunk // chunks, output_chunk % chunks
+    lane = UOp.range(32, 1, AxisType.LOCAL)
+    group = (lane+chunk*32).minimum(group_count-1)
+    token = UOp.range(out.shape[0], 2, AxisType.REDUCE)
+    value = group_dot(token, output, group)
+    if chunks*32 != group_count: value = (lane+chunk*32 < group_count).where(value, UOp.const(0, dtypes.float32))
+    total = warp_reduce(value, full_wave=True)
+    store = out[token, output, chunk.valid(lane.eq(0))].store(total.cast(out.dtype))
+    return UOp.group(store).end(token).end(output_chunk, lane).sink(arg=KernelInfo(name=name, opts_to_apply=()))
   # One wave per output/chunk; group neighboring rows to amortize workgroup scheduling.
   rows = math.gcd(out_features, 4)
   row = UOp.range(out.shape[0]*out_features//rows, 0, AxisType.GLOBAL)
