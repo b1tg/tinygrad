@@ -387,9 +387,10 @@ class Tensor(RandMixin):
     if not isinstance(self.device, str): raise RuntimeError("can't shard a multi-device tensor")
     if len(devices) == 1: return self.to(devices[0])
     devices = cast(tuple[str, ...], canonicalize_device(devices))
-    # a shard of a load from a creation device (disk/npy/python) wants the copy to persist, so it inserts a clone
-    src = self.uop.clone(devices) if self.uop.on_creation_device() else self.uop
+    src = self.uop.clone(devices) if self.uop.on_creation_device() and not self.uop.on_disk() else self.uop
     uop = src.shard(devices, None if axis is None else self._resolve_dim(axis))
+    # Persist disk loads after sharding, so each device only stores its own part.
+    if self.uop.on_disk(): uop = uop.clone()
     return Tensor(uop).is_param_(self.is_param)
 
   def shard_(self, devices:tuple[str, ...], axis:int|None=None) -> Tensor:

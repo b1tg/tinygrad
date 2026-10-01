@@ -754,6 +754,12 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
     sz = self.shape[axis] // dcount
     return self.shrink(tuple((0,s) if i != axis else (rng*sz,rng*sz+sz) for i,s in enumerate(self.shape)))
   def shard(self, devices:tuple[str, ...], axis:int|None=None) -> UOp:
+    if self.on_disk() and axis is not None:
+      rng = UOp.range(len(devices), -1, AxisType.DEVICE)
+      shard = self._shard(axis, rng)
+      # Expose each disk view before callify so contiguous shards become offset input buffers.
+      copied = UOp(Ops.MSTACK, src=tuple(shard.substitute({rng: rng.const_like(i)}).copy_to_device(d).contiguous() for i,d in enumerate(devices)))
+      return copied.unshard(axis)
     copied = self.copy_to_device(devices)
     return copied if axis is None else copied._shard(axis, UOp.range(len(devices), -1, AxisType.DEVICE)).unshard(axis)
 

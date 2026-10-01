@@ -5,6 +5,7 @@ from tinygrad.dtype import DType, DTYPES_DICT
 from tinygrad.nn.state import safe_load, safe_save, get_state_dict, torch_load
 from tinygrad.helpers import Timing, fetch, OSX, dedup, Context
 from test.helpers import slow
+from tinygrad.uop.ops import Ops
 
 class TempDirTestCase(unittest.TestCase):
   def setUp(self):
@@ -420,6 +421,44 @@ class TestDiskTensor(TempDirTestCase):
     with Context(CACHELEVEL=0):
       t = Tensor.empty(8, 4, device=f"disk:{fn}", dtype=dtypes.uint8)[0:4].shard(("CPU:0", "CPU:1"), axis=0).realize()
       np.testing.assert_equal(t.to("CPU").numpy(), np.arange(16, dtype=np.uint8).reshape(4, 4))
+  def test_shard_from_disk(self):
+    fn = pathlib.Path(self.tmp("dt_shard_from_disk"))
+    fn.write_bytes(bytes(range(64)))
+    # every device holds its own part: a contiguous range (axis 0) and a strided one (axis 1)
+    for axis in (0, 1):
+      t = Tensor.empty(8, 8, device=f"disk:{fn}", dtype=dtypes.uint8).shard(("CPU:0", "CPU:1"), axis=axis).realize()
+      for buf, part in zip(t.uop.buffer.bufs, np.split(np.arange(64, dtype=np.uint8).reshape(8, 8), 2, axis)):
+        np.testing.assert_equal(buf.numpy().reshape(part.shape), part)
+
+  def test_shard_from_disk_copies_its_part(self):
+    fn = pathlib.Path(self.tmp("dt_shard_from_disk_copies_its_part"))
+    fn.write_bytes(bytes(range(64)))
+    t = Tensor.empty(8, 8, device=f"disk:{fn}", dtype=dtypes.uint8).shard(("CPU:0", "CPU:1"), axis=0)
+    # a contiguous shard: every device copies only its half of the file
+    copies = [c.src[1] for c in t.schedule_linear().src if c.src[0].op is Ops.STORE and c.src[2].device.startswith("DISK")]
+    self.assertEqual({d.device: d.numel() for d in copies}, {d: 32 for d in t.device})
+
+  def test_shard_from_disk_bitcast_slice(self):
+    fn = pathlib.Path(self.tmp("dt_shard_from_disk_bitcast_slice"))
+    fn.write_bytes(bytes(range(128)))
+    t = Tensor(fn)[8:72].bitcast(dtypes.uint16).reshape(8, 4).shard(("CPU:0", "CPU:1"), axis=0)
+    linear = t.schedule_linear()
+    copies = [c for c in linear.src if c.src[0].op is Ops.STORE and c.src[2].device.startswith("DISK")]
+    self.assertEqual([(c.src[1].buffer.nbytes, c.src[2].buffer.offset) for c in copies], [(32, 8), (32, 40)])
+    from tinygrad.engine.realize import run_linear
+    run_linear(linear)
+    expected = np.frombuffer(fn.read_bytes()[8:72], dtype=np.uint16).reshape(8, 4)
+    np.testing.assert_equal(t.numpy(), expected)
+
+  def test_shard_from_disk_persists(self):
+    fn = pathlib.Path(self.tmp("dt_shard_from_disk_persists"))
+    fn.write_bytes(bytes(range(64)))
+    for axis in (None, 0, 1):
+      t = Tensor(fn).reshape(8, 8).shard(("CPU:0", "CPU:1"), axis=axis)
+      (t + 1).realize()
+      linear = (t + 2).schedule_linear()
+      self.assertFalse(any(isinstance(s.device, str) and s.device.startswith("DISK") for c in linear.src for s in c.src[1:]))
+      np.testing.assert_equal(t.numpy(), np.arange(64, dtype=np.uint8).reshape(8, 8))
 
   @slow
   def test_copy_from_disk_huge(self):
