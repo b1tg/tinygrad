@@ -4,7 +4,7 @@ from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
 from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
 from tinygrad.llm.gguf import gguf_parse, gguf_shard
-from tinygrad.uop.ops import resolve, Ops
+from tinygrad.uop.ops import resolve
 
 class ExpertGating(enum.IntEnum):
   SOFTMAX = 1
@@ -111,8 +111,6 @@ class TransformerConfig:
   sliding_window: int = 0
   sliding_window_pattern: int = 0
 
-def allreduce(x:Tensor) -> Tensor: return Tensor(x.uop.allreduce(Ops.ADD, x.device)) if isinstance(x.device, tuple) else x
-
 class FFNBlock:
   def __init__(self, config:TransformerConfig):
     self.config = config
@@ -180,8 +178,8 @@ class FFNBlock:
     # we pass in the weights implicitly so we unpack the GGUF on the fly
     @function(precompile=True, allow_implicit=True)
     def _run(x:Tensor, start_pos:int|UOp):
-      h =     x + allreduce(self._attention(self.attn_norm(x), start_pos))
-      return (h + allreduce(self._feed_forward(self.ffn_norm(h)))).contiguous()
+      h =     x + self._attention(self.attn_norm(x), start_pos)
+      return (h + self._feed_forward(self.ffn_norm(h))).contiguous()
     return _run(x, start_pos)
 
 class TransformerBlock(FFNBlock):
@@ -249,7 +247,8 @@ class TransformerBlock(FFNBlock):
     if not hasattr(self, "cache_kv"):
       # zeroed so the flash kernels can safely read whole tiles past the valid region (masked lanes multiply by 0)
       self.cache_kv = Tensor.zeros(2, x.shape[0], self.config.n_kv_heads, self.config.max_context, self.config.head_dim,
-                                   dtype=dtypes.half, device=x.device)
+                                   dtype=dtypes.half, device=x.device if isinstance(x.device, str) else None)
+      if isinstance(x.device, tuple): self.cache_kv = self.cache_kv.shard(x.device, 2).realize()
       self.freqs_cis = precompute_freqs_cis(self.config.rope_dim, self.config.max_context, self.config.rope_theta,
                                             device=x.device, yarn=self.config.yarn)
 
@@ -414,11 +413,10 @@ class Transformer:
     self.rollout_jit = TinyJit(self.forward)
 
   def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
-    x = self.token_embd(tokens.to(self.token_embd.weight.device)).float() # (B, T, D)
+    x = self.token_embd(tokens.to(self.token_embd.weight.device)).float()  # (B, T, D)
     for block in self.blk: x = block(x, start_pos)
     # only run the output projection on the last token
-    logits = self.output(self.output_norm(x[:, -1:]))[:, -1, :]
-    if isinstance(logits.device, tuple): logits = Tensor(logits.uop.unshard(logits.ndim-1)).to(logits.device[0])
+    logits = self.output(self.output_norm(x[:, -1:]))[:, -1, :].to(tokens.device)
     # Gumbel-max trick: argmax(logits/temp - log(-log(uniform))) is equivalent to sampling from softmax(logits/temp)
     return (logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1, keepdim=True)
 
@@ -430,14 +428,10 @@ class Transformer:
                 realize=bool(getenv("REALIZE", 0)), shard:int=1) -> tuple[Transformer, dict]:
     # TODO: remove the need for copy to default device
     kv, entries = gguf_parse(gguf.to(None).realize() if isinstance(gguf, Tensor) else gguf)
-    rules:dict[str, tuple[int, tuple[int, ...]]] = {**{w: (0, (1,)) for w in ('token_embd.weight', 'output.weight', 'attn_q.weight', 'attn_k.weight',
-      'attn_v.weight', 'ffn_gate.weight', 'ffn_up.weight')}, **{w: (1, (1,)) for w in ('attn_output.weight', 'ffn_down.weight')}}
-    if f"{(arch:=kv['general.architecture'])}.ssm.group_count" in kv:
-      q, v_groups = kv[f'{arch}.ssm.group_count']*kv[f'{arch}.ssm.state_size'], kv[f'{arch}.ssm.time_step_rank']//kv[f'{arch}.ssm.group_count']
-      # fused q|k|v, v is v_groups groups of heads repeating over the k heads: every device gets its share of every part
-      rules |= {w: (0, (q, q) + (kv[f'{arch}.ssm.inner_size']//v_groups,)*v_groups) for w in ('attn_qkv.weight', 'ssm_conv1d.weight')}
-      rules |= {w: (0, (1,)*v_groups) for w in ('attn_gate.weight', 'ssm_alpha.weight', 'ssm_beta.weight', 'ssm_a', 'ssm_dt.bias')}
-      rules['ssm_out.weight'] = (1, (1,)*v_groups)
+    assert shard == 1 or not kv.get(f"{kv['general.architecture']}.attention.kv_lora_rank"), "tensor parallel of MLA attention"
+    # tensor parallel: column-parallel weights are split on axis 0, row-parallel on axis 1
+    rules = {**{w: 0 for w in ('token_embd.weight', 'output.weight', 'attn_q.weight', 'attn_k.weight', 'attn_v.weight', 'ffn_gate.weight',
+      'ffn_up.weight')}, **{w: 1 for w in ('attn_output.weight', 'ffn_down.weight')}}
     devices = tuple(Device.canonicalize(f'{Device.DEFAULT}:{i}') for i in range(shard))
     state_dict = gguf_shard(entries, devices, {name: rules[k] for name in entries if shard > 1 and (k:=re.sub(r"^blk\.\d+\.", "", name)) in rules})
 
@@ -520,12 +514,9 @@ class Transformer:
       swiglu_up_bias=1.0 if arch == 'gpt-oss' else 0.0, attn_sinks='blk.0.attn_sinks.weight' in state_dict,
       sliding_window=kv.get(f'{arch}.attention.sliding_window', 0),
       sliding_window_pattern=kv.get(f'{arch}.attention.sliding_window_pattern', 2 if arch == 'gpt-oss' else 0))
-    if shard > 1: config = replace(config, **{k: getattr(config, k)//shard for k in ('n_heads', 'n_kv_heads', 'hidden_dim', 'vocab_size')},
-      ssm=config.ssm and replace(config.ssm, **{k: getattr(config.ssm, k)//shard for k in ('group_count', 'time_step_rank', 'inner_size')}))
     model = Transformer(config)
     for p in (nn.state.get_parameters(model) if shard > 1 else []): p.to_(devices)
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
-    if shard > 1: model.token_embd.weight = Tensor(model.token_embd.weight.uop.unshard(0))
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:
       for s in (params:=nn.state.get_parameters(model)): s.replace(s.contiguous())
