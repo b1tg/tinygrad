@@ -62,6 +62,8 @@ class CPUProgram(Program['CPUDevice']):
       data = struct.pack(f'<{len(args)}Q', *(a & 0xffffffffffffffff for a in args))
       ret = (remote._rpc if wait else remote._post)(remote.sock, RemoteCmd.EXEC_PROG, self.fxn, len(args), int(wait), payload=data)
       return ret[0] / 1e9 if ret is not None else None
+    # other devices may still be writing our memory through their own queues (copies of shards to CPU): wait for them
+    for dev, value in self.dev.pending.items(): dev._wait_signal(dev.timeline.host.view(fmt='Q'), value, timeout)
     with cpu_profile(self.name, self.dev.device, profile_key=self.profile_key) as prof:
       if self.lvp:
         lvp_args = bytearray(12 + (len(bufs) + len(vals)) * 8)

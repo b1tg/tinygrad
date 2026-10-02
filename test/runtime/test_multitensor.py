@@ -108,6 +108,13 @@ class TestMultiTensor(unittest.TestCase):
     X.shard_((d1, d2), 0)
     np.testing.assert_allclose(X.numpy(), 1)
 
+  def test_numpy_sharded(self):
+    # the devices copy their shards to CPU on their own queues, the CPU kernel joining them must wait for the copies
+    data = np.arange(256*64, dtype=np.float32).reshape(256, 64)
+    for axis in (0, 1):
+      X = (Tensor(data).shard((d0, d1), axis) + 1).realize()
+      np.testing.assert_equal(X.numpy(), data + 1)
+
   def test_four_add(self):
     X = Tensor.ones(256, 256).contiguous().realize()
     W = Tensor.ones(256, 256).contiguous().realize()
