@@ -428,8 +428,12 @@ class Transformer:
                 realize=bool(getenv("REALIZE", 0)), shard:int=1) -> tuple[Transformer, dict]:
     # TODO: remove the need for copy to default device
     kv, entries = gguf_parse(gguf.to(None).realize() if isinstance(gguf, Tensor) else gguf)
-    assert shard == 1 or not kv.get(f"{kv['general.architecture']}.attention.kv_lora_rank"), "tensor parallel of MLA attention"
-    # tensor parallel: column-parallel weights are split on axis 0, row-parallel on axis 1
+    arch = kv['general.architecture']
+    n_heads, n_kv_heads = kv[f'{arch}.attention.head_count'], kv[f'{arch}.attention.head_count_kv']
+    assert shard >= 1, f"shard must be at least 1, got {shard}"
+    if shard > 1:
+      assert not kv.get(f"{arch}.attention.kv_lora_rank"), "tensor parallel doesn't support MLA attention"
+      assert n_kv_heads % shard == 0, f"tensor parallel needs the kv heads to split over {shard} devices"
     rules = {**{w: 0 for w in ('token_embd.weight', 'output.weight', 'attn_q.weight', 'attn_k.weight', 'attn_v.weight', 'ffn_gate.weight',
       'ffn_up.weight')}, **{w: 1 for w in ('attn_output.weight', 'ffn_down.weight')}}
     devices = tuple(Device.canonicalize(f'{Device.DEFAULT}:{i}') for i in range(shard))
@@ -441,9 +445,7 @@ class Transformer:
     # some models like Llama 3.2 don't have an output.weight, they just tie to the token_embd.weight
     if 'output.weight' not in state_dict: state_dict['output.weight'] = state_dict['token_embd.weight']
 
-    arch = kv['general.architecture']
     max_context = min(max_context, kv[f'{arch}.context_length']) if max_context is not None else kv[f'{arch}.context_length']
-    n_heads, n_kv_heads = kv[f'{arch}.attention.head_count'], kv[f'{arch}.attention.head_count_kv']
 
     ssm = None
     ssm_layers: tuple[bool, ...] = ()

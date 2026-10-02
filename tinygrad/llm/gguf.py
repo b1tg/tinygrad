@@ -262,10 +262,9 @@ def gguf_shard(entries:dict[str, tuple[Tensor, tuple[int, ...], int]], devices:t
       # move the devices in front so every shard is contiguous: DISK reads the shards that already are, the others are cut on the host
       split = (data.to("CPU") if prod(shape[:axis]) > 1 else data).reshape(*shape[:axis], n, -1)
       packed[name] = split.permute(axis, *range(axis), axis+1).shard(devices, 0)
-  # TODO: shard copies the whole tensor to every device before shrinking it, so this realizes in batches and frees the copies
-  for i in range(0, len(names:=list(packed)), 64):
-    Tensor.realize(*(packed[k] for k in names[i:i+64]))
-    for d in ("CPU", *devices): Device[d].allocator.free_cache()
+  # TODO: shard copies the whole tensor to every device before shrinking it, so this realizes one tensor at a time
+  for t in packed.values(): t.realize()
+  for d in ("CPU", *devices): Device[d].allocator.free_cache()
   def decode(name:str, shape:tuple[int, ...], typ:int) -> Tensor:
     decoded = ggml_data_to_tensor(packed[name].flatten(), prod(shape), typ)
     if (axis:=shard_map.get(name)) is None: return decoded.reshape(shape)

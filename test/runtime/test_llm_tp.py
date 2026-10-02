@@ -4,8 +4,8 @@ from gguf import GGUFWriter, GGMLQuantizationType as Q, GGML_QUANT_SIZES
 from tinygrad import Device, Tensor, nn
 from tinygrad.helpers import DEV
 from tinygrad.llm.model import Transformer, TransformerConfig, SSMConfig
-from tinygrad.llm.gguf import gguf_load, gguf_parse, gguf_shard
-from tinygrad.llm.kernels.amd import Linear
+from tinygrad.llm.gguf import gguf_load, gguf_parse, gguf_shard, ggml_data_to_tensor
+from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported
 from test.helpers import not_support_multi_device
 
 DEVICES = (Device.DEFAULT, f"{Device.DEFAULT}:1")
@@ -46,7 +46,8 @@ class TestGGUFShard(unittest.TestCase):
     with self.assertRaises(ValueError): gguf_shard({'w': (data, (8, 768), Q.Q4_K)}, DEVICES, {'w': 1})
 
   def test_quantized_shards(self):
-    # the kernels run on the packed shards: split output features, split input features, or copied
+    # the shards are still recognized as packed quantized weights, and keep the direction of their split
+    if Tensor.empty(1, device=DEVICES[0]).uop.contiguous_view() is None: self.skipTest("requires buffer views")
     for typ, axis in itertools.product((Q.Q4_K, Q.Q6_K, Q.IQ4_XS), (0, 1, None)):
       with self.subTest(typ=typ.name, axis=axis):
         data = Tensor(random_data((8, 1024), typ).reshape(-1), device='CPU')
@@ -56,6 +57,21 @@ class TestGGUFShard(unittest.TestCase):
 
 @unittest.skipIf(not_support_multi_device(), "no multi")
 class TestTensorParallel(unittest.TestCase):
+  def test_quantized_linear(self):
+    # the AMD kernels on the packed shards: decode (1 token) and WMMA (16 tokens), output and input features split
+    if not amd_custom_kernels_supported(DEVICES[0]): self.skipTest("needs the AMD custom kernels")
+    for typ, axis, tokens in itertools.product((Q.Q4_K, Q.Q6_K), (0, 1), (1, 16)):
+      with self.subTest(typ=typ.name, axis=axis, tokens=tokens):
+        data = random_data((64, 1024), typ).reshape(-1)
+        layer = Linear(1024, 64, bias=False)
+        layer.set_quantized(gguf_shard({'w': (Tensor(data, device='CPU'), (64, 1024), typ)}, DEVICES, {'w': axis})['w'].half())
+        self.assertEqual(layer.ggml_type, typ)
+        x = np.random.default_rng(1).normal(size=(1, tokens, 1024)).astype(np.float16)
+        w = ggml_data_to_tensor(Tensor(data, device='CPU'), 64*1024, typ).reshape(64, 1024).float().numpy()
+        ref = x.astype(np.float32) @ w.T
+        got = layer(Tensor(x).shard(DEVICES, 2 if axis == 1 else None)).float().to(Device.DEFAULT).numpy()
+        np.testing.assert_allclose(got, ref, rtol=2e-2, atol=2e-2*np.abs(ref).max())
+
   @unittest.skipIf(DEV.interface.startswith("MOCK"), "too heavy for mock GPUs")
   def test_model(self):
     rng = np.random.default_rng(42)
