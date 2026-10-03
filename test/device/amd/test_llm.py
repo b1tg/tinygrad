@@ -242,10 +242,13 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
             delta = (v[:, :, t] - (expected_state*k[:, :, t, None]).sum(-1)) * beta[:, :, t, None]
             expected_state += delta[..., None]*k[:, :, t, None]
             outputs.append((expected_state*q[:, :, t, None]).sum(-1))
-          state = Tensor(initial).contiguous().realize()
-          out = gated_delta_prefill(*map(Tensor, (q, k, v, beta, alpha)), state, Tensor(UOp.variable("start", 0, 3).bind(start)))
-          np.testing.assert_allclose(out.numpy(), np.stack(outputs, axis=2), rtol=2e-4, atol=2e-6)
-          np.testing.assert_allclose(state.numpy(), expected_state, rtol=2e-4, atol=2e-6)
+          # the heads as one axis, and as (repeats, k heads)
+          for heads in ((2,), (2, 1)):
+            state = Tensor(initial.reshape(1, *heads, 8, 32)).contiguous().realize()
+            srcs = (Tensor(z.reshape(1, *heads, *z.shape[2:])) for z in (q, k, v, beta, alpha))
+            out = gated_delta_prefill(*srcs, state, Tensor(UOp.variable("start", 0, 3).bind(start)))
+            np.testing.assert_allclose(out.numpy().reshape(1, 2, 4, 8), np.stack(outputs, axis=2), rtol=2e-4, atol=2e-6)
+            np.testing.assert_allclose(state.numpy().reshape(initial.shape), expected_state, rtol=2e-4, atol=2e-6)
 
   def test_dense_gemv_bias(self):
     if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")

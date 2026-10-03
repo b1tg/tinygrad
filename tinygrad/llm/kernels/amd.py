@@ -778,10 +778,10 @@ def _gated_delta_prefill_kernel(core:UOp, q:UOp, k:UOp, v:UOp, beta:UOp, alpha:U
   return UOp.group(*state_stores).end(lane, bh_row).sink(arg=KernelInfo(name="gated_delta_prefill", opts_to_apply=()))
 
 def gated_delta_prefill(q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:Tensor, state:Tensor, start_pos:Tensor|None=None) -> Tensor:
-  batch, heads, tokens, key_dim = q.shape
-  value_dim = v.shape[-1]
-  assert q.shape == k.shape and v.shape[:3] == beta.shape == (batch, heads, tokens) and state.shape == (batch, heads, value_dim, key_dim)
-  assert alpha.shape[:3] == (batch, heads, tokens) and (len(alpha.shape) == 3 or alpha.shape[-1] in (1, key_dim))
+  batch, *heads, value_dim, key_dim = state.shape  # the heads can be several axes, e.g. (repeats, k heads)
+  tokens, n = q.shape[-2], len(heads)
+  assert q.shape == k.shape == (batch, *heads, tokens, key_dim) and v.shape == (*beta.shape, value_dim) and beta.shape == (batch, *heads, tokens)
+  assert alpha.shape[:n+2] == beta.shape and (alpha.ndim == n+2 or alpha.shape[-1] in (1, key_dim))
   assert key_dim % 32 == 0 and value_dim % 4 == 0
   assert q.dtype == k.dtype == dtypes.float32, "recurrent Q/K must be float32"
   assert state.uop.contiguous_view_offset() is not None, "recurrent state must be contiguous"
@@ -791,6 +791,6 @@ def gated_delta_prefill(q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:Tensor,
   core, kq = Tensor.empty_like(v), (q*k).sum(-1).contiguous()
   srcs = (core, q.contiguous(), k.contiguous(), v.contiguous(), beta.contiguous(), alpha.contiguous(), state, kq)
   contig = tuple(x.uop if x.uop.op is Ops.AFTER else x.uop.contiguous() for x in srcs)
-  params = tuple(UOp.placeholder_like(x, slot=i) for i,x in enumerate(contig))
+  params = tuple(UOp.placeholder_like(x, slot=i).reshape(batch, -1, *x.shape[n+1:]) for i,x in enumerate(contig))
   call = _gated_delta_prefill_kernel(*params, None if start_pos is None else start_pos.uop.unbound()).call(*contig)
   return Tensor(contig[0].after(call))
