@@ -8,6 +8,7 @@ from tinygrad.helpers import prod, getenv
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops, resolve
 from tinygrad.renderer.cstyle import HIPRenderer
 
+MAX_DECODE_TOKENS = 8  # small-query decode kernels, including MTP verification
 BLOCK_M, BLOCK_N, WARP_SIZE = 32, 32, 32
 WMMA_M, WMMA_N, WMMA_K = 16, 16, 16
 WAVES_M, WAVES_N, LANES_PER_WAVE_M, LANES_PER_WAVE_N = 2, 2, 2, 16
@@ -185,7 +186,7 @@ def q8_quantize(x:Tensor, tokens:int, in_features:int) -> tuple[Tensor, Tensor, 
 
 def _decode_linear(out:UOp, out_features:int, group_count:int, group_dot, name:str) -> UOp:
   chunks = out.shape[2]
-  if out.shape[0] > 1:
+  if 1 < out.shape[0] <= MAX_DECODE_TOKENS:
     # Reuse each packed weight block across tokens during batched MTP verification.
     output_chunk = UOp.range(out_features*chunks, 0, AxisType.GLOBAL)
     output, chunk = output_chunk // chunks, output_chunk % chunks
@@ -734,7 +735,7 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
   T_real, q_start = q.shape[2], None
   D, N, group = q.shape[3], assigned_kv.shape[3], q.shape[1] // assigned_kv.shape[2]
   # small token counts (MTP verify / short chunks) use the split-K decode kernel; larger ones the WMMA prefill
-  decode = resolve(T_real <= 8, False)
+  decode = resolve(T_real <= MAX_DECODE_TOKENS, False)
   # Non-power-of-two decode dimensions can lose tail-store masks. Q/P, K, and V use separate LDS allocations.
   supported = D % 32 == 0 and (D & (D-1) == 0 and N % 64 == 0 and group*((D+LDS_PAD)*2+8) <= 65536 if decode else
     D >= 64 and 2*(2*BLOCK_M*(D+LDS_PAD) + D*(BLOCK_N+LDS_PAD)) <= 65536 and N % BLOCK_N == 0 and q.max_shape[2] % BLOCK_M == 0)
