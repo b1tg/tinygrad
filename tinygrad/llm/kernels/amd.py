@@ -191,7 +191,7 @@ def _decode_linear(out:UOp, out_features:int, group_count:int, group_dot, name:s
     output, chunk = output_chunk // chunks, output_chunk % chunks
     lane = UOp.range(32, 1, AxisType.LOCAL)
     group = (lane+chunk*32).minimum(group_count-1)
-    token = UOp.range(out.shape[0], 2, AxisType.REDUCE)
+    token = UOp.range(out.shape[0], 2, AxisType.LOOP)
     value = group_dot(token, output, group)
     if chunks*32 != group_count: value = (lane+chunk*32 < group_count).where(value, UOp.const(0, dtypes.float32))
     total = warp_reduce(value, full_wave=True)
