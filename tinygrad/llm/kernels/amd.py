@@ -4,7 +4,7 @@ from typing import Callable, cast
 from tinygrad import Tensor, UOp, nn, Device, Context
 from tinygrad.llm.gguf import ggml_data_to_tensor
 from tinygrad.dtype import AddrSpace, dtypes
-from tinygrad.helpers import prod, getenv
+from tinygrad.helpers import prod, getenv, argfix
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops, resolve
 from tinygrad.renderer.cstyle import HIPRenderer
 
@@ -56,9 +56,13 @@ def _reg(shape:tuple[int, ...], value:float, dep:UOp|None=None) -> UOp:
 class Linear(nn.Linear):
   ggml_type:int|None = None
   use_custom_quant = True
-  def __init__(self, in_features:int, out_features:int, bias=True):
-    super().__init__(in_features, out_features, bias)
-    self.in_features, self.out_features = in_features, out_features
+  def __init__(self, in_features:int|tuple[int, ...], out_features:int|tuple[int, ...], bias=True):
+    # the weight is (*out_shape, *in_shape): the call reduces the last axes of x like in_shape
+    self.in_shape, self.out_shape = argfix(in_features), argfix(out_features)
+    super().__init__(prod(self.in_shape), prod(self.out_shape), bias)
+    self.in_features, self.out_features = prod(self.in_shape), prod(self.out_shape)
+    self.weight = self.weight.reshape(*self.out_shape, *self.in_shape)
+    if self.bias is not None: self.bias = self.bias.reshape(self.out_shape)
   def set_quantized(self, decoded:Tensor):
     if self.in_features % GGML_BLOCK_SIZE: return
     packed_sizes = {typ: decoded.numel() // 256 * type_size for typ,type_size in QUANT_SIZES.items()}
@@ -95,14 +99,17 @@ class Linear(nn.Linear):
           numel, max_shape = x.numel(), x.max_shape
           if isinstance(numel, int) or prod(max_shape) // self.in_features <= 32:
             out = f16_gemv(self, x if isinstance(numel, int) else x.pad_to(max_shape))
-            return out if isinstance(numel, int) else out.shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
+            return out if isinstance(numel, int) else out.shrink(tuple((0, s) for s in (*x.shape[:x.ndim-len(self.in_shape)], *self.out_shape)))
         self.use_custom_quant = supported = False  # not a supported quant format
     if self.ggml_type in QUANT_SIZES and supported:
       if isinstance(x.numel(), int): return q8_linear(self, x)
       # symbolic token count: pad to the max chunk size so the kernels see static shapes, garbage rows are sliced off
       out = q8_linear(self, x.pad_to(x.max_shape))
-      return out.shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
-    return super().__call__(x)
+      return out.shrink(tuple((0, s) for s in (*x.shape[:x.ndim-len(self.in_shape)], *self.out_shape)))
+    if len(self.in_shape) + len(self.out_shape) == 2: return super().__call__(x)
+    out = (x.reshape(*x.shape[:x.ndim-len(self.in_shape)], *(1,)*len(self.out_shape), *self.in_shape) * self.weight) \
+      .sum(tuple(range(-len(self.in_shape), 0)))
+    return out if self.bias is None else out + self.bias
 
 def _amd_dp4a(a:UOp, b:UOp, c:UOp) -> UOp:
   return UOp(Ops.CUSTOMI, src=(a, b, c), arg=("__builtin_amdgcn_sudot4(true, {}, true, {}, {}, false)", dtypes.int32))
@@ -433,6 +440,7 @@ def _quant_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, *grids:UOp,
 def q8_linear(layer:Linear, x:Tensor) -> Tensor:
   assert layer.ggml_type in QUANT_SIZES
   tokens = int(x.numel()) // layer.in_features
+  batch, x = x.shape[:x.ndim-len(layer.in_shape)], x.reshape(tokens, layer.in_features)
   out_features, in_features = layer.out_features, layer.in_features
   out_shape:tuple[int, ...] = (tokens, out_features)
   fxn:Callable[..., UOp]
@@ -452,7 +460,7 @@ def q8_linear(layer:Linear, x:Tensor) -> Tensor:
   out = Tensor.empty(out_shape, dtype=dtypes.float32, device=x.device)
   result = Tensor.custom_kernel(out, layer.weight, *srcs, fxn=functools.partial(fxn, out_features=out_features, in_features=in_features))[0]
   if len(result.shape) == 3: result = result.sum(-1)
-  result = result.reshape(*x.shape[:-1], out_features)
+  result = result.reshape(*batch, *layer.out_shape)
   return result if layer.bias is None else result + layer.bias
 
 # ******** tiny dense fp16 gemv ********
@@ -483,14 +491,14 @@ def _view_back(t:Tensor) -> Tensor:
   return Tensor(uop).reshape(t.shape)
 
 def f16_gemv(layer:Linear, x:Tensor) -> Tensor:
-  tokens = prod(x.shape[:-1])
+  tokens = prod(batch:=x.shape[:x.ndim-len(layer.in_shape)])
   assert isinstance(tokens, int)
   weight = _view_back(layer.weight)
   x = x.contiguous()
   out = Tensor.empty(tokens, layer.out_features, dtype=dtypes.float32, device=x.device)
   fxn = functools.partial(_amd_f16_gemv_kernel, in_features=layer.in_features, out_features=layer.out_features, tokens=tokens)
-  srcs = (out, weight.reshape(-1), x.reshape(tokens, layer.in_features)) + (() if layer.bias is None else (_view_back(layer.bias),))
-  return Tensor.custom_kernel(*srcs, fxn=fxn)[0].reshape(*x.shape[:-1], layer.out_features)
+  srcs = (out, weight.reshape(-1), x.reshape(tokens, layer.in_features)) + (() if layer.bias is None else (_view_back(layer.bias).reshape(-1),))
+  return Tensor.custom_kernel(*srcs, fxn=fxn)[0].reshape(*batch, *layer.out_shape)
 
 # ******** flash attention on the KV cache ********
 

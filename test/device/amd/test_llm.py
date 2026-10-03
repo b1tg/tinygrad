@@ -242,10 +242,13 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
             delta = (v[:, :, t] - (expected_state*k[:, :, t, None]).sum(-1)) * beta[:, :, t, None]
             expected_state += delta[..., None]*k[:, :, t, None]
             outputs.append((expected_state*q[:, :, t, None]).sum(-1))
-          state = Tensor(initial).contiguous().realize()
-          out = gated_delta_prefill(*map(Tensor, (q, k, v, beta, alpha)), state, Tensor(UOp.variable("start", 0, 3).bind(start)))
-          np.testing.assert_allclose(out.numpy(), np.stack(outputs, axis=2), rtol=2e-4, atol=2e-6)
-          np.testing.assert_allclose(state.numpy(), expected_state, rtol=2e-4, atol=2e-6)
+          # the heads as one axis, and as (repeats, k heads)
+          for heads in ((2,), (2, 1)):
+            state = Tensor(initial.reshape(1, *heads, 8, 32)).contiguous().realize()
+            srcs = (Tensor(z.reshape(1, *heads, *z.shape[2:])) for z in (q, k, v, beta, alpha))
+            out = gated_delta_prefill(*srcs, state, Tensor(UOp.variable("start", 0, 3).bind(start)))
+            np.testing.assert_allclose(out.numpy().reshape(1, 2, 4, 8), np.stack(outputs, axis=2), rtol=2e-4, atol=2e-6)
+            np.testing.assert_allclose(state.numpy().reshape(initial.shape), expected_state, rtol=2e-4, atol=2e-6)
 
   def test_dense_gemv_bias(self):
     if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
@@ -257,6 +260,31 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
       with self.subTest(tokens=tokens):
         x = rng.normal(size=(tokens, 128)).astype(np.float16)
         np.testing.assert_allclose(linear(Tensor(x)).numpy(), x.astype(np.float32) @ w.astype(np.float32).T + bias, rtol=2e-3, atol=2e-3)
+
+  def test_linear_nd_shapes(self):
+    # the weight is (*out_shape, *in_shape): the same flat weight, viewed with several output and input axes
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
+    from gguf import dequantize, GGMLQuantizationType
+    rng = np.random.default_rng(42)
+    w, bias = rng.normal(size=(32, 128)).astype(np.float16), rng.normal(size=32).astype(np.float16)
+    linear = Linear(128, (4, 8))
+    linear.weight, linear.bias = Tensor(w).reshape(4, 8, 128), Tensor(bias).reshape(4, 8)
+    x = rng.normal(size=(3, 128)).astype(np.float16)
+    np.testing.assert_allclose(linear(Tensor(x)).numpy(), (x.astype(np.float32) @ w.astype(np.float32).T + bias).reshape(3, 4, 8),
+                               rtol=2e-3, atol=2e-3)
+    packed = rng.integers(0, 256, (32, 2, QUANT_SIZES[12]), dtype=np.uint8)
+    packed[:, :, :4] = 0x10  # small fp16 d and dmin of every block
+    weight = dequantize(packed.flatten(), GGMLQuantizationType(12)).reshape(32, 512).astype(np.float16).astype(np.float32)
+    for in_shape, out_shape in (((512,), (2, 16)), ((2, 256), (32,))):
+      for tokens in (1, 16):
+        with self.subTest(in_shape=in_shape, out_shape=out_shape, tokens=tokens):
+          linear = Linear(in_shape, out_shape, bias=False)
+          linear.weight = ggml_data_to_tensor(Tensor(packed.flatten()).realize(), 32*512, 12).reshape(*out_shape, *in_shape)
+          x = rng.normal(size=(tokens, 512)).astype(np.float16)
+          out = linear(Tensor(x).reshape(tokens, *in_shape))
+          self.assertEqual((linear.ggml_type, out.shape), (12, (tokens, *out_shape)))
+          ref = x.astype(np.float32) @ weight.T
+          np.testing.assert_allclose(out.numpy().reshape(tokens, 32), ref, rtol=2e-2, atol=2e-2*np.abs(ref).max())
 
   def test_q6_linear_multiple_tokens(self):
     if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")

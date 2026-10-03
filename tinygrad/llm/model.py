@@ -306,18 +306,22 @@ class GatedDeltaNetBlock(FFNBlock):
     assert self.num_v_heads % self.num_k_heads == 0
     self.head_v_dim, self.ssm_conv_kernel = ssm.inner_size // ssm.time_step_rank, ssm.conv_kernel
     self.conv_channels, self.q_dim = ssm.inner_size + 2*ssm.group_count*ssm.state_size, ssm.state_size*ssm.group_count
-    self.attn_qkv = Linear(config.dim, self.conv_channels, bias=False)
+    # the v heads are in tiled order, v head j*K+g uses k head g: the weights keep (repeats, k heads) as separate axes, and the
+    # fused q|k|v is (2 + repeats) parts of the k heads
+    assert self.head_k_dim == self.head_v_dim, "the fused q|k|v is equal parts of the k heads"
+    r, k_v_dim = self.num_v_heads // self.num_k_heads, self.num_k_heads*self.head_v_dim
+    self.attn_qkv = Linear(config.dim, (2+r, self.q_dim), bias=False)
     if ssm.kda:
       self.ssm_g_a, self.ssm_g_b = Linear(config.dim, self.head_v_dim, bias=False), Linear(self.head_v_dim, ssm.inner_size, bias=False)
       self.ssm_f_a, self.ssm_f_b = Linear(config.dim, self.head_k_dim, bias=False), Linear(self.head_k_dim, ssm.inner_size, bias=False)
     else:
-      self.attn_gate = Linear(config.dim, ssm.inner_size, bias=False)
-      self.ssm_alpha = Linear(config.dim, self.num_v_heads, bias=False)
-    self.ssm_beta = Linear(config.dim, self.num_v_heads, bias=False)
-    self.ssm_conv1d = {"weight": Tensor.zeros(self.conv_channels, self.ssm_conv_kernel)}
-    self.ssm_dt = {"bias": Tensor.zeros(ssm.inner_size if ssm.kda else self.num_v_heads)}
-    self.ssm_a = Tensor.zeros(self.num_v_heads, 1) if ssm.kda else Tensor.zeros(self.num_v_heads)
-    self.ssm_norm, self.ssm_out = nn.RMSNorm(self.head_v_dim, config.norm_eps), Linear(ssm.inner_size, config.dim, bias=False)
+      self.attn_gate = Linear(config.dim, (r, k_v_dim), bias=False)
+      self.ssm_alpha = Linear(config.dim, (r, self.num_k_heads), bias=False)
+    self.ssm_beta = Linear(config.dim, (r, self.num_k_heads), bias=False)
+    self.ssm_conv1d = {"weight": Tensor.zeros(2+r, self.q_dim, self.ssm_conv_kernel)}
+    self.ssm_dt = {"bias": Tensor.zeros(r, k_v_dim if ssm.kda else self.num_k_heads)}
+    self.ssm_a = Tensor.zeros(r, self.num_k_heads, 1) if ssm.kda else Tensor.zeros(r, self.num_k_heads)
+    self.ssm_norm, self.ssm_out = nn.RMSNorm(self.head_v_dim, config.norm_eps), Linear((r, k_v_dim), config.dim, bias=False)
 
   def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
     B, T, _ = x.shape
@@ -336,7 +340,7 @@ class GatedDeltaNetBlock(FFNBlock):
     out_gate = out_gate.reshape(B, T, r, K, self.head_v_dim)
     beta = self.ssm_beta(x).sigmoid().reshape(B, T, r, K)
     alpha = self.ssm_f_b(self.ssm_f_a(x)) if is_kda else self.ssm_alpha(x)
-    log_alpha = ((alpha.float() + self.ssm_dt["bias"]).softplus().reshape(B, T, r, K, -1) *
+    log_alpha = ((alpha.float().reshape(B, T, r, -1) + self.ssm_dt["bias"]).softplus().reshape(B, T, r, K, -1) *
                  self.ssm_a.reshape(r, K, -1))
 
     # qkv conv, conv_state is reset when starting from position 0
@@ -344,16 +348,16 @@ class GatedDeltaNetBlock(FFNBlock):
     # assemble the conv window in a static-size buffer: [conv_state | qkv rows | zero-pad].
     # padded steps are exact no-ops: beta=0 (delta rule off), log_alpha=0 (decay 1 after exp)
     conv_window = conv_state.cat(self.attn_qkv(x).cast(conv_state.dtype), dim=1)
-    conv_window = conv_window.pad_to((B, self.ssm_conv_kernel-1 + T_pad, self.conv_channels)).contiguous()
+    conv_window = conv_window.pad_to((B, self.ssm_conv_kernel-1 + T_pad, *conv_window.shape[2:])).contiguous()
     # the last conv_kernel-1 columns of the window become the next conv state
     conv_state_store = self.conv_state.uop.store(conv_window[:, T:T+self.ssm_conv_kernel-1].cast(self.conv_state.dtype).uop)
 
     conv_out = functools.reduce(lambda a,b: a+b,
-      (conv_window[:, i:i+T_pad] * self.ssm_conv1d["weight"][:, i] for i in range(self.ssm_conv_kernel))).silu()
+      (conv_window[:, i:i+T_pad] * self.ssm_conv1d["weight"][..., i] for i in range(self.ssm_conv_kernel))).silu()
     if symbolic:
       out_gate = out_gate.pad_to((B, T_pad, r, K, self.head_v_dim))
       beta, log_alpha = beta.pad_to((B, T_pad, r, K)), log_alpha.pad_to((B, T_pad, *log_alpha.shape[2:]))
-    q, k, v = conv_out.split([self.q_dim, self.q_dim, self.conv_channels - 2*self.q_dim], dim=-1)
+    q, k, v = conv_out.split([1, 1, r], dim=2)
     qk_eps = 1e-12 if is_kda else 1e-6
     q, k = (z.reshape(B, T_pad, 1, K, self.head_k_dim).normalize(dim=-1, eps=qk_eps)
             .expand(B, T_pad, r, K, self.head_k_dim) for z in (q, k))
@@ -387,11 +391,11 @@ class GatedDeltaNetBlock(FFNBlock):
     # output; undo the padding before the output projection
     z = (self.ssm_norm(core) * (out_gate.sigmoid() if is_kda else out_gate.silu())).cast(x.dtype).contiguous()
     if symbolic: z = z[:, :T]
-    return self.ssm_out(z.reshape(B, T, -1))
+    return self.ssm_out(z.reshape(B, T, r, K*self.head_v_dim))
 
   def _init_state(self, x):
     if not hasattr(self, "conv_state"):
-      self.conv_state = Tensor.zeros(x.shape[0], self.ssm_conv_kernel-1, self.conv_channels, device=x.device).clone()
+      self.conv_state = Tensor.zeros(x.shape[0], self.ssm_conv_kernel-1, 2+self.num_v_heads//self.num_k_heads, self.q_dim, device=x.device).clone()
       self.recurrent_state = Tensor.zeros(x.shape[0], self.num_v_heads//self.num_k_heads, self.num_k_heads, self.head_v_dim, self.head_k_dim,
                                           device=x.device).clone()
 
@@ -512,6 +516,9 @@ class Transformer:
       sliding_window=kv.get(f'{arch}.attention.sliding_window', 0),
       sliding_window_pattern=kv.get(f'{arch}.attention.sliding_window_pattern', 2 if arch == 'gpt-oss' else 0))
     model = Transformer(config)
+    # the gated deltanet weights are views of the flat gguf ones, with the v heads as (repeats, k heads)
+    params = nn.state.get_state_dict(model)
+    state_dict = {k:v.reshape(params[k].shape) if k in params else v for k,v in state_dict.items()}
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:
