@@ -80,17 +80,19 @@ class TestGatedDeltaNetBlock(unittest.TestCase):
                                  "ssm":SSMConfig(conv_kernel=2, state_size=4, group_count=1, time_step_rank=1, inner_size=4)} | kwargs))
 
   def _make_block(self, config:TransformerConfig) -> GatedDeltaNetBlock:
+    # the weights in the flat gguf layout, the block holds the v heads as (repeats, k heads), q|k|v as (2 + repeats) parts
     block = GatedDeltaNetBlock(config, config.ssm)
+    r, q_dim = block.num_v_heads // block.num_k_heads, block.q_dim
     block.attn_norm.weight = self._tensor_linspace(0.8, 1.2, (config.dim,))
-    block.attn_qkv.weight = self._tensor_linspace(-0.15, 0.2, (block.conv_channels, config.dim))
-    block.attn_gate.weight = self._tensor_linspace(-0.1, 0.15, (config.ssm.inner_size, config.dim))
-    block.ssm_alpha.weight = self._tensor_linspace(-0.08, 0.12, (block.num_v_heads, config.dim))
-    block.ssm_beta.weight = self._tensor_linspace(-0.12, 0.07, (block.num_v_heads, config.dim))
-    block.ssm_conv1d["weight"] = self._tensor_linspace(-0.05, 0.05, (block.conv_channels, block.ssm_conv_kernel))
-    block.ssm_dt["bias"] = self._tensor_linspace(-0.1, 0.1, (block.num_v_heads,))
-    block.ssm_a = self._tensor_linspace(-0.1, -0.05, (block.num_v_heads,))
+    block.attn_qkv.weight = self._tensor_linspace(-0.15, 0.2, (block.conv_channels, config.dim)).reshape(2+r, q_dim, config.dim)
+    block.attn_gate.weight = self._tensor_linspace(-0.1, 0.15, (config.ssm.inner_size, config.dim)).reshape(r, -1, config.dim)
+    block.ssm_alpha.weight = self._tensor_linspace(-0.08, 0.12, (block.num_v_heads, config.dim)).reshape(r, -1, config.dim)
+    block.ssm_beta.weight = self._tensor_linspace(-0.12, 0.07, (block.num_v_heads, config.dim)).reshape(r, -1, config.dim)
+    block.ssm_conv1d["weight"] = self._tensor_linspace(-0.05, 0.05, (block.conv_channels, block.ssm_conv_kernel)).reshape(2+r, q_dim, -1)
+    block.ssm_dt["bias"] = self._tensor_linspace(-0.1, 0.1, (block.num_v_heads,)).reshape(r, -1)
+    block.ssm_a = self._tensor_linspace(-0.1, -0.05, (block.num_v_heads,)).reshape(r, -1)
     block.ssm_norm.weight = self._tensor_linspace(0.9, 1.1, (block.head_v_dim,))
-    block.ssm_out.weight = self._tensor_linspace(-0.2, 0.18, (config.dim, config.ssm.inner_size))
+    block.ssm_out.weight = self._tensor_linspace(-0.2, 0.18, (config.dim, config.ssm.inner_size)).reshape(config.dim, r, -1)
     return block
 
   def _run_attention(self, block:GatedDeltaNetBlock, x:Tensor, start_pos:int):
@@ -134,14 +136,14 @@ class TestGatedDeltaNetBlock(unittest.TestCase):
     B, T, _ = x_np.shape
     conv_state = np.zeros((B, block.ssm_conv_kernel - 1, block.conv_channels), dtype=np.float32)
     recurrent_state = np.zeros((B, block.num_v_heads, block.head_v_dim, block.head_v_dim), dtype=np.float32)
-    conv_weight = block.ssm_conv1d["weight"].numpy().astype(np.float32).T[None, :, :]
-    qkv_weight = block.attn_qkv.weight.numpy().astype(np.float32)
-    gate_weight = block.attn_gate.weight.numpy().astype(np.float32)
-    alpha_weight = block.ssm_alpha.weight.numpy().astype(np.float32)
-    beta_weight = block.ssm_beta.weight.numpy().astype(np.float32)
-    out_weight = block.ssm_out.weight.numpy().astype(np.float32)
-    dt_bias = block.ssm_dt["bias"].numpy().astype(np.float32)
-    ssm_a = block.ssm_a.numpy().astype(np.float32)
+    conv_weight = block.ssm_conv1d["weight"].numpy().astype(np.float32).reshape(block.conv_channels, -1).T[None, :, :]
+    qkv_weight = block.attn_qkv.weight.numpy().astype(np.float32).reshape(block.conv_channels, -1)
+    gate_weight = block.attn_gate.weight.numpy().astype(np.float32).reshape(block.config.ssm.inner_size, -1)
+    alpha_weight = block.ssm_alpha.weight.numpy().astype(np.float32).reshape(block.num_v_heads, -1)
+    beta_weight = block.ssm_beta.weight.numpy().astype(np.float32).reshape(block.num_v_heads, -1)
+    out_weight = block.ssm_out.weight.numpy().astype(np.float32).reshape(block.config.dim, -1)
+    dt_bias = block.ssm_dt["bias"].numpy().astype(np.float32).reshape(-1)
+    ssm_a = block.ssm_a.numpy().astype(np.float32).reshape(-1)
     attn_norm_weight = block.attn_norm.weight.numpy().astype(np.float32)
     ssm_norm_weight = block.ssm_norm.weight.numpy().astype(np.float32)
     outputs, conv_states, recurrent_states = [], [], []
@@ -229,7 +231,7 @@ class TestGatedDeltaNetBlock(unittest.TestCase):
     block._init_state(x)
     initial_state = Tensor.arange(8, dtype=dtypes.float32).reshape(1, 2, 2, 2)
     block.recurrent_state.assign(initial_state.reshape(block.recurrent_state.shape)).realize()
-    block.ssm_a = Tensor([[-1.], [-1.]])
+    block.ssm_a = Tensor([[[-1.], [-1.]]])
     block._attention(x, x.shape[1]).realize()
     alpha = np.exp(-self._softplus_np(np.array([[1, 2, 3, 4], [2, 1, 3, 5]])).reshape(2, 2, 2)).prod(0)
     np.testing.assert_allclose(block.recurrent_state.numpy().reshape(1, 2, 2, 2), initial_state.numpy() * alpha[:, None, :], rtol=1e-5, atol=1e-5)

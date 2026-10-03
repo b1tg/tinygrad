@@ -306,19 +306,22 @@ class GatedDeltaNetBlock(FFNBlock):
     assert self.num_v_heads % self.num_k_heads == 0
     self.head_v_dim, self.ssm_conv_kernel = ssm.inner_size // ssm.time_step_rank, ssm.conv_kernel
     self.conv_channels, self.q_dim = ssm.inner_size + 2*ssm.group_count*ssm.state_size, ssm.state_size*ssm.group_count
+    # the v heads are in tiled order, v head j*K+g uses k head g: the weights keep (repeats, k heads) as separate axes, and the
+    # fused q|k|v is (2 + repeats) parts of the k heads
     assert self.head_k_dim == self.head_v_dim, "the fused q|k|v is equal parts of the k heads"
-    self.attn_qkv = Linear(config.dim, self.conv_channels, bias=False)
+    r, k_v_dim = self.num_v_heads // self.num_k_heads, self.num_k_heads*self.head_v_dim
+    self.attn_qkv = Linear(config.dim, (2+r, self.q_dim), bias=False)
     if ssm.kda:
       self.ssm_g_a, self.ssm_g_b = Linear(config.dim, self.head_v_dim, bias=False), Linear(self.head_v_dim, ssm.inner_size, bias=False)
       self.ssm_f_a, self.ssm_f_b = Linear(config.dim, self.head_k_dim, bias=False), Linear(self.head_k_dim, ssm.inner_size, bias=False)
     else:
-      self.attn_gate = Linear(config.dim, ssm.inner_size, bias=False)
-      self.ssm_alpha = Linear(config.dim, self.num_v_heads, bias=False)
-    self.ssm_beta = Linear(config.dim, self.num_v_heads, bias=False)
-    self.ssm_conv1d = {"weight": Tensor.zeros(self.conv_channels, self.ssm_conv_kernel)}
-    self.ssm_dt = {"bias": Tensor.zeros(ssm.inner_size if ssm.kda else self.num_v_heads)}
-    self.ssm_a = Tensor.zeros(self.num_v_heads, 1) if ssm.kda else Tensor.zeros(self.num_v_heads)
-    self.ssm_norm, self.ssm_out = nn.RMSNorm(self.head_v_dim, config.norm_eps), Linear(ssm.inner_size, config.dim, bias=False)
+      self.attn_gate = Linear(config.dim, (r, k_v_dim), bias=False)
+      self.ssm_alpha = Linear(config.dim, (r, self.num_k_heads), bias=False)
+    self.ssm_beta = Linear(config.dim, (r, self.num_k_heads), bias=False)
+    self.ssm_conv1d = {"weight": Tensor.zeros(2+r, self.q_dim, self.ssm_conv_kernel)}
+    self.ssm_dt = {"bias": Tensor.zeros(r, k_v_dim if ssm.kda else self.num_k_heads)}
+    self.ssm_a = Tensor.zeros(r, self.num_k_heads, 1) if ssm.kda else Tensor.zeros(r, self.num_k_heads)
+    self.ssm_norm, self.ssm_out = nn.RMSNorm(self.head_v_dim, config.norm_eps), Linear((r, k_v_dim), config.dim, bias=False)
 
   def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
     B, T, _ = x.shape
@@ -337,20 +340,20 @@ class GatedDeltaNetBlock(FFNBlock):
     out_gate = out_gate.reshape(B, T, r, K, self.head_v_dim)
     beta = self.ssm_beta(x).sigmoid().reshape(B, T, r, K)
     alpha = self.ssm_f_b(self.ssm_f_a(x)) if is_kda else self.ssm_alpha(x)
-    log_alpha = ((alpha.float() + self.ssm_dt["bias"]).softplus().reshape(B, T, r, K, -1) *
+    log_alpha = ((alpha.float().reshape(B, T, r, -1) + self.ssm_dt["bias"]).softplus().reshape(B, T, r, K, -1) *
                  self.ssm_a.reshape(r, K, -1))
 
     # qkv conv, conv_state is reset when starting from position 0
     conv_state = initial.where(0, self.conv_state)
     # assemble the conv window in a static-size buffer: [conv_state | qkv rows | zero-pad].
     # padded steps are exact no-ops: beta=0 (delta rule off), log_alpha=0 (decay 1 after exp)
-    conv_window = conv_state.cat(self.attn_qkv(x).reshape(B, T, 2+r, self.q_dim).cast(conv_state.dtype), dim=1)
+    conv_window = conv_state.cat(self.attn_qkv(x).cast(conv_state.dtype), dim=1)
     conv_window = conv_window.pad_to((B, self.ssm_conv_kernel-1 + T_pad, *conv_window.shape[2:])).contiguous()
     # the last conv_kernel-1 columns of the window become the next conv state
     conv_state_store = self.conv_state.uop.store(conv_window[:, T:T+self.ssm_conv_kernel-1].cast(self.conv_state.dtype).uop)
 
     conv_out = functools.reduce(lambda a,b: a+b,
-      (conv_window[:, i:i+T_pad] * self.ssm_conv1d["weight"][:, i].reshape(2+r, self.q_dim) for i in range(self.ssm_conv_kernel))).silu()
+      (conv_window[:, i:i+T_pad] * self.ssm_conv1d["weight"][..., i] for i in range(self.ssm_conv_kernel))).silu()
     if symbolic:
       out_gate = out_gate.pad_to((B, T_pad, r, K, self.head_v_dim))
       beta, log_alpha = beta.pad_to((B, T_pad, r, K)), log_alpha.pad_to((B, T_pad, *log_alpha.shape[2:]))
@@ -388,7 +391,7 @@ class GatedDeltaNetBlock(FFNBlock):
     # output; undo the padding before the output projection
     z = (self.ssm_norm(core) * (out_gate.sigmoid() if is_kda else out_gate.silu())).cast(x.dtype).contiguous()
     if symbolic: z = z[:, :T]
-    return self.ssm_out(z.reshape(B, T, -1))
+    return self.ssm_out(z.reshape(B, T, r, K*self.head_v_dim))
 
   def _init_state(self, x):
     if not hasattr(self, "conv_state"):
@@ -459,6 +462,15 @@ class Transformer:
         state_dict[f"blk.{i}.ssm_conv1d.weight"] = state_dict.pop(f"blk.{i}.ssm_conv1d_q.weight").cat(
           state_dict.pop(f"blk.{i}.ssm_conv1d_k.weight"), state_dict.pop(f"blk.{i}.ssm_conv1d_v.weight"), dim=0).squeeze(1).contiguous()
         state_dict[f"blk.{i}.ssm_out.weight"] = state_dict.pop(f"blk.{i}.attn_output.weight")
+    if ssm is not None:
+      # gated deltanet weights as views: the v heads (tiled in the gguf, v head j*K+g uses k head g) are (repeats, k heads), the fused
+      # q|k|v is (2 + repeats) parts of the k heads
+      r, q_dim = ssm.time_step_rank//ssm.group_count, ssm.group_count*ssm.state_size
+      for i in (i for i, is_ssm in enumerate(ssm_layers) if is_ssm and f"blk.{i}.ssm_out.weight" in state_dict):
+        for name in ('attn_qkv.weight', 'ssm_conv1d.weight'): state_dict[f"blk.{i}.{name}"] = state_dict[f"blk.{i}.{name}"].reshape(2+r, q_dim, -1)
+        for name in ('attn_gate.weight', 'ssm_alpha.weight', 'ssm_beta.weight', 'ssm_a', 'ssm_dt.bias'):
+          if (w:=state_dict.get(f"blk.{i}.{name}")) is not None: state_dict[f"blk.{i}.{name}"] = w.reshape(r, -1, *w.shape[1:])
+        state_dict[f"blk.{i}.ssm_out.weight"] = (w:=state_dict[f"blk.{i}.ssm_out.weight"]).reshape(w.shape[0], r, -1)
     if arch in ('qwen35', 'qwen35moe', 'glm4moe', 'gpt-oss'):
       state_dict = {k.replace('post_attention_norm', 'ffn_norm'):v for k,v in state_dict.items()}
 
