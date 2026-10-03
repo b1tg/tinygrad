@@ -100,7 +100,7 @@ class TestGatedDeltaNetBlock(unittest.TestCase):
 
   def _cache_views(self, block:GatedDeltaNetBlock) -> tuple[np.ndarray, np.ndarray]:
     if hasattr(block, 'conv_state'):
-      return block.conv_state.numpy(), block.recurrent_state.numpy()
+      return block.conv_state.numpy(), block.recurrent_state.numpy().reshape(-1, block.num_v_heads, block.head_v_dim, block.head_k_dim)
     else:
       conv_flat = (block.ssm_conv_kernel - 1) * block.conv_channels
       cache = block.delta_cache.numpy()
@@ -175,8 +175,12 @@ class TestGatedDeltaNetBlock(unittest.TestCase):
 
     return outputs, conv_states, recurrent_states
 
-  def test_gatedeltanet_reference_and_reset(self):
-    config = self._make_config(max_context=3)
+  def test_gatedeltanet_repeated_k_heads(self):
+    # two v heads use every k head: the tiled order of the gguf
+    self.test_gatedeltanet_reference_and_reset(SSMConfig(conv_kernel=2, state_size=4, group_count=2, time_step_rank=4, inner_size=16))
+
+  def test_gatedeltanet_reference_and_reset(self, ssm:SSMConfig|None=None):
+    config = self._make_config(max_context=3, **({"ssm": ssm} if ssm else {}))
     block = self._make_block(config)
     x = Tensor.linspace(-1.0, 1.0, 3 * config.dim, dtype=dtypes.float32).reshape(1, 3, config.dim)
 
@@ -223,11 +227,11 @@ class TestGatedDeltaNetBlock(unittest.TestCase):
     block.ssm_f_b.weight = Tensor([[1., 0.], [0., 1.], [1., 1.], [2., 1.]])
     block._init_state(x)
     initial_state = Tensor.arange(8, dtype=dtypes.float32).reshape(1, 2, 2, 2)
-    block.recurrent_state.assign(initial_state).realize()
+    block.recurrent_state.assign(initial_state.reshape(block.recurrent_state.shape)).realize()
     block.ssm_a = Tensor([[-1.], [-1.]])
     block._attention(x, x.shape[1]).realize()
     alpha = np.exp(-self._softplus_np(np.array([[1, 2, 3, 4], [2, 1, 3, 5]])).reshape(2, 2, 2)).prod(0)
-    np.testing.assert_allclose(block.recurrent_state.numpy(), initial_state.numpy() * alpha[:, None, :], rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(block.recurrent_state.numpy().reshape(1, 2, 2, 2), initial_state.numpy() * alpha[:, None, :], rtol=1e-5, atol=1e-5)
 
   def test_kda_prefill_matches_decode(self):
     config = self._make_config(ssm=SSMConfig(conv_kernel=2, state_size=4, group_count=1, time_step_rank=1, inner_size=4, kda=True))
