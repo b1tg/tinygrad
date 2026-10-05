@@ -419,8 +419,8 @@ class GatedDeltaNetBlock(FFNBlock):
 
 class MTPBlock(TransformerBlock):
   def __init__(self, config:TransformerConfig):
+    assert 1 <= config.mtp_tokens < MAX_DECODE_TOKENS, f"MTP needs 1..{MAX_DECODE_TOKENS-1} draft tokens (0 disables MTP)"
     super().__init__(config)
-    assert config.mtp_tokens < MAX_DECODE_TOKENS, "verification runs mtp_tokens+1 queries through the decode kernels"
     self.nextn:dict[str, nn.RMSNorm|Linear] = {
       "eh_proj": Linear(2*config.dim, config.dim, bias=False), "shared_head_norm": nn.RMSNorm(config.dim, config.norm_eps),
       "enorm": nn.RMSNorm(config.dim, config.norm_eps), "hnorm": nn.RMSNorm(config.dim, config.norm_eps)
@@ -473,9 +473,9 @@ class Transformer:
     self.max_context = config.max_context
     self.has_recurrent_block = any(isinstance(b, GatedDeltaNetBlock) for b in self.blk)
     self._cached_tokens: list[int] = []
-    # last delivered index of a round closed mid-delivery. until generate() applies it, the recurrent states and the
-    # draft hidden still describe the whole round, so nothing but generate() may read them
-    self._mtp_rewind:int|None = None
+    # Caches consume all but the last delivered token. A stopped MTP round may still need to restore that prefix.
+    self._pending_restore_index:int|None = None
+    self._generation_active = False
     # we specialize the JIT for prefill and rollout
     self.prefill_jit = TinyJit(self.forward)
     self.rollout_jit = TinyJit(self.forward)
@@ -493,7 +493,8 @@ class Transformer:
     h = self.output_norm(x if self.mtp is not None else x[:, -1:])
     logits = self.output(h[:, -1:])[:, -1, :]
     # Gumbel-max trick: argmax(logits/temp - log(-log(uniform))) is equivalent to sampling from softmax(logits/temp)
-    tok = (logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1, keepdim=True)
+    sampled = logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()
+    tok = temperature.eq(0).where(logits, sampled).argmax(-1, keepdim=True)
     return tok if self.mtp is None else self.mtp.track(self.token_embd(tokens).float(), h, tok, start_pos)
 
   def __call__(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
@@ -602,11 +603,9 @@ class Transformer:
     for _ in range(2): list(zip(range(2), self.generate([0])))
 
   def get_start_pos(self, tokens:list[int]) -> int:
-    # recurrent state and the MTP draft hidden can't be partially reused: reuse them only when tokens extend the cached prefix
-    if self.has_recurrent_block or self.mtp is not None:
-      return len(self._cached_tokens) if self._cached_tokens and len(self._cached_tokens) < len(tokens) \
-        and tokens[:len(self._cached_tokens)] == self._cached_tokens else 0
     prefix_len = sum(1 for _ in itertools.takewhile(lambda ab: ab[0] == ab[1], zip(tokens[:-1], self._cached_tokens)))
+    # Recurrent state and the draft hidden can only reuse the complete cached prefix.
+    if self.has_recurrent_block or self.mtp is not None: return prefix_len if prefix_len == len(self._cached_tokens) else 0
     return min(block._reusable_prefix_len(prefix_len, len(self._cached_tokens)) for block in self.blk)
 
   def _mtp_restore(self, index:Tensor) -> list[Tensor]:
@@ -632,44 +631,39 @@ class Transformer:
     stores = (kv.uop, m.pending.uop.store(predicted.gather(1, accepted).uop), m.previous.uop.store(chosen.uop))
     return Tensor(accepted.cat(predicted, dim=1).contiguous().uop.after(*stores))
 
-  def _mtp_decode(self, tokens:list[int], v_start_pos:UOp):
-    assert self.mtp is not None
-    # near the context end a full verification round no longer fits, the caller decodes the rest without drafts
-    while len(tokens) + self.mtp.config.mtp_tokens <= self.max_context:
-      target = self.mtp_jit(v_start_pos.bind(len(tokens)-1))
-      accepted, *values = target.numpy()[0].tolist()
-      if accepted < self.mtp.config.mtp_tokens: self.mtp_commit_jit(target)
-      for i, tok in enumerate(values[:accepted+1][:self.max_context-len(tokens)]):
-        tokens.append(tok)
-        self._cached_tokens, self._mtp_rewind = tokens[:-1], i if i < accepted else None
-        yield tok
-
   def generate(self, tokens:list[int], chunk_size:int=32, temperature:float=0.0):
-    if self._mtp_rewind is not None:
-      # a round closed mid-delivery: roll back to the last delivered token here, never in generator finalization
-      Tensor.realize(*self._mtp_restore(Tensor([self._mtp_rewind], dtype=dtypes.int32)))
-      self._mtp_rewind = None
-    if self.has_recurrent_block and not amd_custom_kernels_supported(self.token_embd.weight.device): chunk_size = 1
-    v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
-    v_toks = UOp.variable("toks", 1, chunk_size)
-    # TODO: use UOp.variable for temperature once float variables are supported
-    temp = Tensor([temperature])
-    # assign all input tokens once, then slice from start_pos for the model call
-    t = Tensor(tokens + [0] * (self.max_context - len(tokens)), dtype="int32").reshape(1, self.max_context)
-    # recompute start_pos from what's currently valid in the caches
-    start_pos = self.get_start_pos(tokens)
-    out, prompt_len = None, len(tokens)
-    while len(tokens) < self.max_context:
-      n_toks = min(chunk_size, len(tokens) - start_pos)
-      sp, nt = v_start_pos.bind(start_pos), v_toks.bind(n_toks)
-      out = self(t[:, sp:sp+nt] if start_pos < prompt_len or out is None else out, sp, temp).realize()
-      start_pos += n_toks
-      # chunked prefill: keep processing until all prompt tokens are consumed
-      if start_pos < len(tokens): continue
-      tokens.append(int(out.item()))
-      self._cached_tokens = tokens[:-1]
-      yield tokens[-1]
-      # MTP speculative decoding is greedy only
-      if self.mtp is not None and temperature == 0:
-        yield from self._mtp_decode(tokens, v_start_pos)
-        start_pos, out = len(tokens)-1, Tensor([[tokens[-1]]], dtype=dtypes.int32)
+    if self._generation_active: raise RuntimeError("only one active generator is allowed per model")
+    self._generation_active = True
+    try:
+      if len(tokens) >= self.max_context: return
+      start_pos, prompt_len = self.get_start_pos(tokens), len(tokens)
+      if start_pos and self._pending_restore_index is not None:
+        Tensor.realize(*self._mtp_restore(Tensor([self._pending_restore_index], dtype=dtypes.int32)))
+      if self.has_recurrent_block and not amd_custom_kernels_supported(self.token_embd.weight.device): chunk_size = 1
+      v_start_pos, v_toks = UOp.variable("start_pos", 0, self.max_context-1), UOp.variable("toks", 1, chunk_size)
+      # Assign the prompt once; subsequent decode steps consume the previous output directly.
+      t = Tensor(tokens + [0] * (self.max_context - prompt_len), dtype="int32").reshape(1, self.max_context)
+      temp, out = Tensor([temperature]), None
+      while len(tokens) < self.max_context:
+        # Publish a reusable prefix only after a successful forward, so failures leave no stale cache.
+        self._cached_tokens = []
+        if self.mtp is not None and temperature == 0 and start_pos >= prompt_len and len(tokens)+self.mtp.config.mtp_tokens <= self.max_context:
+          target = self.mtp_jit(v_start_pos.bind(start_pos))
+          accepted, *values = target.numpy()[0].tolist()
+          if accepted < self.mtp.config.mtp_tokens: self.mtp_commit_jit(target)
+          out = Tensor([[values[accepted]]], dtype=dtypes.int32)
+        else:
+          n_toks = min(chunk_size, len(tokens) - start_pos)
+          sp, nt = v_start_pos.bind(start_pos), v_toks.bind(n_toks)
+          out = self(t[:, sp:sp+nt] if start_pos < prompt_len or out is None else out, sp, temp).realize()
+          start_pos += n_toks
+          if start_pos < len(tokens): continue
+          accepted, values = 0, [int(out.item())]
+        for i, tok in enumerate(values[:min(accepted+1, self.max_context-len(tokens))]):
+          tokens.append(tok)
+          self._cached_tokens, self._pending_restore_index = tokens[:-1], i if i < accepted else None
+          yield tok
+        start_pos = len(tokens)-1
+    finally:
+      # Closing or collecting a generator must not submit GPU work.
+      self._generation_active = False

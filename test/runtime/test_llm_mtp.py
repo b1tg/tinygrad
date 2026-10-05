@@ -74,6 +74,16 @@ class TestMTP(unittest.TestCase):
       self.assertGreater(m.mtp_jit.cnt, 0)
       self.assertEqual(list(islice(m.generate([3, 5, 7]), 10)), expected)
 
+  def test_greedy_ties(self):
+    Tensor.manual_seed(123)
+    for m in pair():
+      m.output.weight.replace(Tensor.zeros_like(m.output.weight).contiguous().realize())
+      # Exercise JIT replay and switching between greedy decoding and sampling with tied logits.
+      for temperature in (0.0, 0.0, 0.5, 0.0):
+        tokens = list(islice(m.generate([3, 5, 7], temperature=temperature), 10))
+        if temperature == 0: self.assertEqual(tokens, [0]*10)
+        else: self.assertNotEqual(tokens, [0]*10)
+
   def test_attention_only_target(self):
     Tensor.manual_seed(23)
     m, ref = pair(recurrent=False)
@@ -113,11 +123,99 @@ class TestMTP(unittest.TestCase):
           del gen
           gc.collect()
         else: gen.close()
+      self.assertFalse(m._generation_active)
       extended = tokens+[17, 19]
       resumed = prefill(extended)
       m._cached_tokens = []
       for actual, expected in zip(prefill(extended), resumed):
         np.testing.assert_allclose(actual, expected, atol=2e-3, rtol=2e-3)
+
+  def test_acceptance_boundaries(self):
+    Tensor.manual_seed(23)
+    m, ref = pair()
+    for net in (m, ref): net.output.weight.replace(Tensor.zeros_like(net.output.weight).contiguous().realize())
+    verify = m.mtp_jit
+    # Reject otherwise correct zero-token drafts to exercise each commit length with real state histories.
+    for accepted, delivered in ((0, 1), (1, 1), (1, 2), (2, 1), (2, 2), (2, 3)):
+      with self.subTest(accepted=accepted, delivered=delivered):
+        def limited_verify(sp):
+          result = verify(sp)
+          return Tensor([[accepted]], dtype=dtypes.int32).cat(result[:, 1:], dim=1).realize()
+        with patch.object(m, 'mtp_jit', side_effect=limited_verify):
+          tokens = [3, 5, 7]
+          gen = m.generate(tokens)
+          list(islice(gen, 1 + delivered))
+          gen.close()
+          self.assertEqual(m._pending_restore_index, delivered-1 if delivered <= accepted else None)
+          # Resume ordinary sampling after a stopped round; it must not invoke the draft path.
+          with patch.object(m, 'mtp_jit', side_effect=AssertionError('drafts during sampling')):
+            gen = m.generate(tokens, temperature=0.5)
+            list(islice(gen, 2))
+            gen.close()
+          expected = ref.generate(tokens[:-1].copy())
+          next(expected)
+          expected.close()
+          for actual, state in zip(states(m), states(ref)):
+            np.testing.assert_allclose(actual.numpy(), state.numpy(), atol=2e-3, rtol=2e-3)
+          self.assertIsNone(m._pending_restore_index)
+          # Continue another verification round from the accepted prefix.
+          gen = m.generate(tokens)
+          list(islice(gen, accepted+2))
+          gen.close()
+          expected = ref.generate(tokens[:-1].copy())
+          next(expected)
+          expected.close()
+          for actual, state in zip(states(m), states(ref)):
+            np.testing.assert_allclose(actual.numpy(), state.numpy(), atol=2e-3, rtol=2e-3)
+
+  def test_new_prompt_and_context_end(self):
+    Tensor.manual_seed(23)
+    m = model()
+    m.output.weight.replace(Tensor.zeros_like(m.output.weight).contiguous().realize())
+    tokens = [3, 5, 7]*19+[3, 5]
+    gen = m.generate(tokens)
+    list(islice(gen, 2))
+    gen.close()
+    self.assertEqual(m._pending_restore_index, 0)
+    # An empty generation must not discard the restore needed by a later continuation.
+    self.assertEqual(list(m.generate([3]*64)), [])
+    self.assertEqual(m._pending_restore_index, 0)
+    with patch.object(m, 'mtp_jit', side_effect=AssertionError('round does not fit')):
+      self.assertEqual(len(list(m.generate(tokens+[17, 19]))), 1)
+    resumed = [s.numpy().copy() for s in [*states(m), m.mtp.previous]]
+    m._cached_tokens = []
+    gen = m.generate(tokens+[17, 19])
+    next(gen)
+    gen.close()
+    for actual, expected in zip([*states(m), m.mtp.previous], resumed):
+      np.testing.assert_allclose(actual.numpy(), expected, atol=2e-3, rtol=2e-3)
+    gen = m.generate([3, 5, 7])
+    list(islice(gen, 2))
+    gen.close()
+    self.assertEqual(m._pending_restore_index, 0)
+    with patch.object(m, '_mtp_restore', side_effect=AssertionError('restore for unrelated prompt')):
+      gen = m.generate([11, 13, 17])
+      next(gen)
+      gen.close()
+    self.assertIsNone(m._pending_restore_index)
+
+  def test_generator_ownership(self):
+    m = model()
+    first, second = m.generate([3, 5, 7]), m.generate([11, 13, 17])
+    second.close()  # An unstarted generator never owns the model.
+    next(first)
+    for _ in range(2):
+      with self.assertRaisesRegex(RuntimeError, 'one active generator'): next(m.generate([11, 13, 17]))
+    next(first)  # A rejected generator must not release the first generator's ownership.
+    first.close()
+    self.assertFalse(m._generation_active)
+    with patch.object(Transformer, '__call__', side_effect=ValueError('test failure')):
+      with self.assertRaisesRegex(ValueError, 'test failure'): next(m.generate([11, 13, 17]))
+    self.assertFalse(m._generation_active)
+    self.assertEqual(m._cached_tokens, [])
+    gen = m.generate([11, 13, 17])
+    next(gen)
+    gen.close()
 
   def test_from_gguf(self):
     kv = {'general.architecture':'qwen35', 'tokenizer.ggml.tokens':['']*64}
@@ -151,7 +249,11 @@ class TestMTP(unittest.TestCase):
     m = model()
     self.assertEqual(len(list(islice(m.generate([1], temperature=0.5), 4))), 4)
     self.assertEqual(m.mtp_jit.cnt, 0)
-    with self.assertRaises(AssertionError): model(mtp_tokens=8)
+
+  def test_invalid_mtp_tokens(self):
+    for count in (-2, -1, 8):
+      with self.subTest(mtp_tokens=count), self.assertRaisesRegex(AssertionError, "MTP needs 1..7 draft tokens"):
+        model(mtp_tokens=count)
 
 
 if __name__ == '__main__': unittest.main()
