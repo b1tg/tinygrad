@@ -51,10 +51,6 @@ def _reg(shape:tuple[int, ...], value:float, dep:UOp|None=None) -> UOp:
   ret = UOp.alloc(shape, dtypes.float, addrspace=AddrSpace.REG)
   return ret.after((ret if dep is None else ret.after(dep)).store(ret.const_like(value)))
 
-def _empty(*shape, dtype, device:str|tuple[str, ...]|None, axis:int|None) -> Tensor:
-  if isinstance(device, tuple) and axis is not None: return Tensor.empty(*shape, dtype=dtype).shard(device, axis).empty_like()
-  return Tensor.empty(*shape, dtype=dtype, device=device)
-
 # ******** quant linear: q8-activation kernels over packed ggml weights ********
 
 class Linear(nn.Linear):
@@ -446,11 +442,11 @@ def q8_linear(layer:Linear, x:Tensor) -> Tensor:
   out_features, in_features = layer.out_features, int(x.uop.shard_shape[-1])
   splits = layer.in_features // in_features
   assert (layer.shard_axis == 1) == (splits > 1), f"input features split over {splits} devices, weight split on axis {layer.shard_axis}"
-  out_shape:tuple[int, ...] = (splits*tokens, out_features)
   fxn:Callable[..., UOp]
   extra = (_iq_grid(x.device, layer.ggml_type),) if layer.ggml_type in (IQ2_XS, IQ3_XXS, IQ3_S, IQ2_S) else ()
   # the kernels write the output features of their own device
   local_out = out_features // len(dev) if isinstance(dev:=layer.weight.device, tuple) and layer.shard_axis == 0 else out_features
+  out_shape:tuple[int, ...] = (splits*tokens, out_features)
   if tokens % 16 == 0 and local_out % 16 == 0:
     if layer.ggml_type == IQ4_XS:
       fxn, extra = _iq4_linear_f16_wmma_kernel, (iq4_half_lut(x.device),)
@@ -463,8 +459,10 @@ def q8_linear(layer:Linear, x:Tensor) -> Tensor:
     fxn = functools.partial(_quant_decode_kernel, ggml_type=layer.ggml_type)
     srcs = (*q8_quantize(x, tokens, in_features), *extra)
     out_shape += ((in_features+1023)//1024,)
-  out = _empty(out_shape, dtype=dtypes.float32, device=x.device, axis=None if layer.shard_axis is None else 1-layer.shard_axis)
-  result = Tensor.custom_kernel(out, layer.weight, *srcs, fxn=functools.partial(fxn, out_features=out.uop.shard_shape[1], in_features=in_features))[0]
+  out = Tensor.empty(*out_shape, dtype=dtypes.float32, device=x.device if layer.shard_axis is None else None)
+  # the devices stack their partial sums on axis 0 (row parallel) or their output features on axis 1 (column parallel)
+  if layer.shard_axis is not None: out = out.shard(cast(tuple[str, ...], x.device), 1-layer.shard_axis).realize()
+  result = Tensor.custom_kernel(out, layer.weight, *srcs, fxn=functools.partial(fxn, out_features=local_out, in_features=in_features))[0]
   if len(result.shape) == 3: result = result.sum(-1)
   # row parallel: every device wrote the partial sum of its input features, the sum over the devices is the allreduce
   if splits > 1: result = result.reshape(splits, tokens, out_features).sum(0)
@@ -628,8 +626,10 @@ def amd_flash_attention_decode(q:Tensor, cache_kv:Tensor, valid_kv_len:int|UOp, 
   if isinstance(valid_kv_len, UOp): cache_kv = Tensor(cache_kv.uop.after(valid_kv_len))
   B, H, D = cache_kv.shape[1], q.shape[1], cache_kv.shape[4]
   chunks, axis = min(48, max_kv_len // 64), q.uop.axis
-  partial = _empty(B, H, chunks, D, dtype="float32", device=q.device, axis=axis)
-  stats = _empty(B, H, chunks, 2, dtype="float32", device=q.device, axis=axis)
+  # the buffers of one device hold its own heads
+  dev = q.device if axis is None else None
+  partial, stats, out = (Tensor.empty(B, H, *s, dtype="float32", device=dev) for s in ((chunks, D), (chunks, 2), (1, D)))
+  if axis is not None: partial, stats, out = (t.shard(cast(tuple[str, ...], q.device), axis).realize() for t in (partial, stats, out))
   waves, group = 16, H // cache_kv.shape[2]
   while waves * group * ((D+LDS_PAD)*2 + 8) > 65536: waves //= 2
   assert waves > 0, "attention head group exceeds shared memory capacity"
@@ -637,7 +637,6 @@ def amd_flash_attention_decode(q:Tensor, cache_kv:Tensor, valid_kv_len:int|UOp, 
   partial, stats = Tensor.custom_kernel(partial, stats, q, cache_kv, fxn=fxn)[:2]
   live = (valid_kv_len+63)//64
   live = min(live, chunks) if isinstance(live, int) else live.minimum(chunks)
-  out = _empty(B, H, 1, D, dtype="float32", device=q.device, axis=axis)
   fxn = functools.partial(_amd_flash_decode_combine, live=live)
   return Tensor.custom_kernel(out, partial, stats, fxn=fxn)[0]
 
