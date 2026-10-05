@@ -475,7 +475,6 @@ class Transformer:
     self._cached_tokens: list[int] = []
     # Caches consume all but the last delivered token. A stopped MTP round may still need to restore that prefix.
     self._pending_restore_index:int|None = None
-    self._generation_active = False
     # we specialize the JIT for prefill and rollout
     self.prefill_jit = TinyJit(self.forward)
     self.rollout_jit = TinyJit(self.forward)
@@ -633,7 +632,6 @@ class Transformer:
     return target
 
   def generate(self, tokens:list[int], chunk_size:int=32, temperature:float=0.0):
-    if self._generation_active: raise RuntimeError("only one active generator is allowed per model")
     if len(tokens) >= self.max_context: return
     if self.has_recurrent_block and not amd_custom_kernels_supported(self.token_embd.weight.device): chunk_size = 1
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
@@ -647,28 +645,23 @@ class Transformer:
     out, prompt_len = None, len(tokens)
     if start_pos and self._pending_restore_index is not None:
       Tensor.realize(*self._mtp_restore(Tensor([self._pending_restore_index], dtype=dtypes.int32)))
-    self._generation_active = True
-    try:
-      while len(tokens) < self.max_context:
-        # Publish a reusable prefix only after a successful forward, so failures leave no stale cache.
-        self._cached_tokens = []
-        if self.mtp is not None and temperature == 0 and start_pos >= prompt_len and len(tokens)+self.mtp.config.mtp_tokens <= self.max_context:
-          target = self.mtp_jit(v_start_pos.bind(start_pos))
-          accepted, *values = target.numpy()[0].tolist()
-          values, out = values[:accepted+1], self.mtp.pending
-        else:
-          n_toks = min(chunk_size, len(tokens) - start_pos)
-          sp, nt = v_start_pos.bind(start_pos), v_toks.bind(n_toks)
-          out = self(t[:, sp:sp+nt] if start_pos < prompt_len or out is None else out, sp, temp).realize()
-          start_pos += n_toks
-          if start_pos < len(tokens): continue
-          values = [int(out.item())]
-        for i, tok in enumerate(values[:self.max_context-len(tokens)]):
-          tokens.append(tok)
-          self._cached_tokens = tokens[:-1]
-          self._pending_restore_index = i if i+1 < len(values) else None
-          yield tok
-        start_pos = len(tokens)-1
-    finally:
-      # Closing or collecting a generator must not submit GPU work.
-      self._generation_active = False
+    while len(tokens) < self.max_context:
+      # Publish a reusable prefix only after a successful forward, so failures leave no stale cache.
+      self._cached_tokens = []
+      if self.mtp is not None and temperature == 0 and start_pos >= prompt_len and len(tokens)+self.mtp.config.mtp_tokens <= self.max_context:
+        target = self.mtp_jit(v_start_pos.bind(start_pos))
+        accepted, *values = target.numpy()[0].tolist()
+        values, out = values[:accepted+1], self.mtp.pending
+      else:
+        n_toks = min(chunk_size, len(tokens) - start_pos)
+        sp, nt = v_start_pos.bind(start_pos), v_toks.bind(n_toks)
+        out = self(t[:, sp:sp+nt] if start_pos < prompt_len or out is None else out, sp, temp).realize()
+        start_pos += n_toks
+        if start_pos < len(tokens): continue
+        values = [int(out.item())]
+      for i, tok in enumerate(values[:self.max_context-len(tokens)]):
+        tokens.append(tok)
+        self._cached_tokens = tokens[:-1]
+        self._pending_restore_index = i if i+1 < len(values) else None
+        yield tok
+      start_pos = len(tokens)-1

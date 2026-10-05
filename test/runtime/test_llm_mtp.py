@@ -123,7 +123,6 @@ class TestMTP(unittest.TestCase):
           del gen
           gc.collect()
         else: gen.close()
-      self.assertFalse(m._generation_active)
       extended = tokens+[17, 19]
       resumed = prefill(extended)
       m._cached_tokens = []
@@ -202,19 +201,13 @@ class TestMTP(unittest.TestCase):
       gen.close()
     self.assertIsNone(m._pending_restore_index)
 
-  def test_generator_ownership(self):
+  def test_failed_forward_invalidates_cache(self):
     m = model()
-    first, second = m.generate([3, 5, 7]), m.generate([11, 13, 17])
-    second.close()  # An unstarted generator never owns the model.
-    next(first)
-    for _ in range(2):
-      with self.assertRaisesRegex(RuntimeError, 'one active generator'): next(m.generate([11, 13, 17]))
-    next(first)  # A rejected generator must not release the first generator's ownership.
-    first.close()
-    self.assertFalse(m._generation_active)
+    gen = m.generate([3, 5, 7])
+    next(gen)
+    gen.close()
     with patch.object(Transformer, '__call__', side_effect=ValueError('test failure')):
       with self.assertRaisesRegex(ValueError, 'test failure'): next(m.generate([11, 13, 17]))
-    self.assertFalse(m._generation_active)
     self.assertEqual(m._cached_tokens, [])
     gen = m.generate([11, 13, 17])
     next(gen)
