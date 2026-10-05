@@ -2,7 +2,7 @@ import gc, unittest
 from itertools import islice
 from unittest.mock import patch
 import numpy as np
-from tinygrad import Tensor, UOp, nn, dtypes
+from tinygrad import Tensor, UOp, nn, dtypes, TinyJit
 from tinygrad.llm.model import Transformer, TransformerConfig, SSMConfig, GatedDeltaNetBlock
 
 
@@ -134,13 +134,16 @@ class TestMTP(unittest.TestCase):
     Tensor.manual_seed(23)
     m, ref = pair()
     for net in (m, ref): net.output.weight.replace(Tensor.zeros_like(net.output.weight).contiguous().realize())
-    verify = m.mtp_jit
-    # Reject otherwise correct zero-token drafts to exercise each commit length with real state histories.
+    # Force draft mismatches before verification so both acceptance and state restoration run inside the real round.
     for accepted, delivered in ((0, 1), (1, 1), (1, 2), (2, 1), (2, 2), (2, 3)):
       with self.subTest(accepted=accepted, delivered=delivered):
+        verify, output = TinyJit(m._mtp_round), m.output
         def limited_verify(sp):
-          result = verify(sp)
-          return Tensor([[accepted]], dtype=dtypes.int32).cat(result[:, 1:], dim=1).realize()
+          drafts = iter([0]*accepted + [1]*(2-accepted))
+          def logits(h):
+            if h.shape[1] != 1: return output(h)
+            return (Tensor.arange(output.out_features).to(h.device) == next(drafts)).float().reshape(1, 1, -1)
+          with patch.object(m, 'output', side_effect=logits): return verify(sp)
         with patch.object(m, 'mtp_jit', side_effect=limited_verify):
           tokens = [3, 5, 7]
           gen = m.generate(tokens)

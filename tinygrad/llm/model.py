@@ -480,7 +480,6 @@ class Transformer:
     self.prefill_jit = TinyJit(self.forward)
     self.rollout_jit = TinyJit(self.forward)
     self.mtp_jit = TinyJit(self._mtp_round)
-    self.mtp_commit_jit = TinyJit(lambda target: self._mtp_restore(target[0, :1]))
 
   def _hidden(self, tokens:Tensor, start_pos:int|UOp, save_state:bool=False) -> Tensor:
     x = self.token_embd(tokens).float()                   # (B, T, D)
@@ -629,7 +628,9 @@ class Transformer:
     kv = m.write_kv(self.token_embd(predicted[:, :-1]).float(), hidden[:, :-1], start_pos+1)
     chosen = hidden.gather(1, accepted.unsqueeze(-1).expand(*accepted.shape, hidden.shape[-1]))
     stores = (kv.uop, m.pending.uop.store(predicted.gather(1, accepted).uop), m.previous.uop.store(chosen.uop))
-    return Tensor(accepted.cat(predicted, dim=1).contiguous().uop.after(*stores))
+    target = Tensor(accepted.cat(predicted, dim=1).contiguous().uop.after(*stores)).realize()
+    Tensor.realize(*self._mtp_restore(target[0, :1]))
+    return target
 
   def generate(self, tokens:list[int], chunk_size:int=32, temperature:float=0.0):
     if self._generation_active: raise RuntimeError("only one active generator is allowed per model")
@@ -650,7 +651,6 @@ class Transformer:
         if self.mtp is not None and temperature == 0 and start_pos >= prompt_len and len(tokens)+self.mtp.config.mtp_tokens <= self.max_context:
           target = self.mtp_jit(v_start_pos.bind(start_pos))
           accepted, *values = target.numpy()[0].tolist()
-          if accepted < self.mtp.config.mtp_tokens: self.mtp_commit_jit(target)
           out = Tensor([[values[accepted]]], dtype=dtypes.int32)
         else:
           n_toks = min(chunk_size, len(tokens) - start_pos)
