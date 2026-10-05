@@ -55,15 +55,16 @@ class TestMTP(unittest.TestCase):
       h = m.output_norm(m._hidden(Tensor([[tok]], dtype=dtypes.int32), sp.bind(i)))
       ref.append(h.numpy())
       snapshots.append([state.numpy().copy() for state in states(m)])
-    h = m.output_norm(m._hidden(Tensor([tokens[:4]], dtype=dtypes.int32), sp.bind(0), save_state=True))
-    np.testing.assert_allclose(h.numpy(), np.concatenate(ref[:4], axis=1), atol=2e-3, rtol=2e-3)
     def restore(i): return [t.numpy().copy() for b in m.blk for t in b._restore_state(Tensor([i], dtype=dtypes.int32))]
-    # The last snapshot must preserve every bit of the live FP32 state, including low mantissa bits.
-    last = [state.numpy().copy() for state in states(m)]
-    for actual, expected in zip(restore(3), last): np.testing.assert_array_equal(actual, expected)
-    for accepted in range(4):
-      for actual, expected in zip(restore(accepted), snapshots[accepted]):
-        np.testing.assert_allclose(actual, expected, atol=2e-3, rtol=2e-3)
+    for length in (4, 2):  # a shorter capture must overwrite the valid prefix without reading stale history
+      h = m.output_norm(m._hidden(Tensor([tokens[:length]], dtype=dtypes.int32), sp.bind(0), save_state=True))
+      np.testing.assert_allclose(h.numpy(), np.concatenate(ref[:length], axis=1), atol=2e-3, rtol=2e-3)
+      # The last snapshot must preserve every bit of the live FP32 state, including low mantissa bits.
+      last = [state.numpy().copy() for state in states(m)]
+      for actual, expected in zip(restore(length-1), last): np.testing.assert_array_equal(actual, expected)
+      for accepted in range(length):
+        for actual, expected in zip(restore(accepted), snapshots[accepted]):
+          np.testing.assert_allclose(actual, expected, atol=2e-3, rtol=2e-3)
 
   def test_greedy_generation(self):
     Tensor.manual_seed(21)

@@ -310,8 +310,6 @@ class MLATransformerBlock(FFNBlock):
                                             device=x.device, yarn=self.config.yarn)
 
 class GatedDeltaNetBlock(FFNBlock):
-  state_history:Tensor
-  conv_history:Tensor
   def __init__(self, config:TransformerConfig, ssm:SSMConfig):
     super().__init__(config)
     self.head_k_dim, self.num_k_heads, self.num_v_heads = ssm.state_size, ssm.group_count, ssm.time_step_rank
@@ -332,8 +330,9 @@ class GatedDeltaNetBlock(FFNBlock):
     self.ssm_norm, self.ssm_out = nn.RMSNorm(self.head_v_dim, config.norm_eps), Linear(ssm.inner_size, config.dim, bias=False)
 
   def _restore_state(self, index:Tensor) -> list[Tensor]:
+    conv_history = self.conv_history.unfold(1, self.ssm_conv_kernel-1, 1).permute(1, 0, 3, 2)
     return [Tensor(state.uop.after(state.uop.store(history[index].reshape(state.shape).uop)))
-            for state, history in ((self.recurrent_state, self.state_history), (self.conv_state, self.conv_history))]
+            for state, history in ((self.recurrent_state, self.state_history), (self.conv_state, conv_history))]
 
   def _attention(self, x:Tensor, start_pos:int|UOp, capture:bool=False) -> Tensor:
     B, T, _ = x.shape
@@ -362,9 +361,8 @@ class GatedDeltaNetBlock(FFNBlock):
     # the last conv_kernel-1 columns of the window become the next conv state
     conv_state_store = self.conv_state.uop.store(conv_window[:, T:T+self.ssm_conv_kernel-1].cast(self.conv_state.dtype).uop)
 
-    if capture:
-      conv_state_store = UOp.group(conv_state_store, self.conv_history[:T].uop.store(
-        Tensor.stack(*(conv_window[:, i+1:i+self.ssm_conv_kernel] for i in range(T))).cast(self.conv_history.dtype).uop))
+    if capture: conv_state_store = UOp.group(conv_state_store,
+      self.conv_history[:, :T+self.ssm_conv_kernel-2].uop.store(conv_window[:, 1:T+self.ssm_conv_kernel-1].uop))
 
     conv_out = functools.reduce(lambda a,b: a+b,
       (conv_window[:, i:i+T_pad] * self.ssm_conv1d["weight"][:, i] for i in range(self.ssm_conv_kernel))).silu()
@@ -414,8 +412,8 @@ class GatedDeltaNetBlock(FFNBlock):
       self.conv_state = Tensor.zeros(x.shape[0], self.ssm_conv_kernel-1, self.conv_channels, device=x.device).clone()
       self.recurrent_state = Tensor.zeros(x.shape[0], self.num_v_heads, self.head_v_dim, self.head_k_dim, device=x.device).clone()
       if self.config.mtp_tokens:  # the state after each token of an MTP verification round
-        self.state_history, self.conv_history = (Tensor.empty(self.config.mtp_tokens+1, *s.shape, dtype=s.dtype, device=s.device).realize()
-                                                 for s in (self.recurrent_state, self.conv_state))
+        self.state_history = Tensor.empty(self.config.mtp_tokens+1, *self.recurrent_state.shape, device=x.device).realize()
+        self.conv_history = Tensor.empty_like(self.conv_state.pad((None, (0, self.config.mtp_tokens), None))).realize()
 
 class MTPBlock(TransformerBlock):
   def __init__(self, config:TransformerConfig):
@@ -625,8 +623,7 @@ class Transformer:
     accepted = (inputs[:, 1:] == predicted[:, :-1]).cast(dtypes.int32).cumprod(1).sum(1, keepdim=True)
     # rewrite the draft KV conditioned on the target hiddens. rows past the accepted ones are overwritten next round
     kv = m.write_kv(self.token_embd(predicted[:, :-1]).float(), hidden[:, :-1], start_pos+1)
-    chosen = hidden.gather(1, accepted.unsqueeze(-1).expand(*accepted.shape, hidden.shape[-1]))
-    stores = (kv.uop, m.pending.uop.store(predicted.gather(1, accepted).uop), m.previous.uop.store(chosen.uop))
+    stores = (kv.uop, m.pending.uop.store(predicted.gather(1, accepted).uop))
     target = Tensor(accepted.cat(predicted, dim=1).contiguous().uop.after(*stores)).realize()
     Tensor.realize(*self._mtp_restore(target[0, :1]))
     return target
@@ -657,11 +654,12 @@ class Transformer:
         sp, nt = v_start_pos.bind(start_pos), v_toks.bind(n_toks)
         out = self(t[:, sp:sp+nt] if start_pos < prompt_len or out is None else out, sp, temp).realize()
         start_pos += n_toks
+        # chunked prefill: keep processing until all prompt tokens are consumed
         if start_pos < len(tokens): continue
         values = [int(out.item())]
       for i, tok in enumerate(values[:self.max_context-len(tokens)]):
         tokens.append(tok)
         self._cached_tokens = tokens[:-1]
         self._pending_restore_index = i if i+1 < len(values) else None
-        yield tok
+        yield tokens[-1]
       start_pos = len(tokens)-1
