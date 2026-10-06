@@ -436,10 +436,14 @@ class Transformer:
       rules = {**{w: 0 for w in ('token_embd.weight', 'output.weight', 'attn_q.weight', 'attn_k.weight', 'attn_v.weight', 'ffn_gate.weight',
         'ffn_up.weight')}, **{w: 1 for w in ('attn_output.weight', 'ffn_down.weight')}}
       if kv.get(f'{arch}.attention.kv_lora_rank'):
-        # Replicate the compressed KV cache and low-rank projections; split expanded attention heads.
+        # replicate the compressed KV cache and low-rank projections, split expanded attention heads.
         rules.update({'attn_q_b.weight':0, 'attn_k_b.weight':0, 'attn_v_b.weight':0})
         assert n_heads % shard == 0, f"tensor parallel needs the MLA heads to split over {shard} devices"
       else: assert n_kv_heads % shard == 0, f"tensor parallel needs the kv heads to split over {shard} devices"
+      # split routed experts on hidden width, shared experts on model width to preserve quantization blocks in Moonlight.
+      if kv.get(f'{arch}.expert_count', 0):
+        rules.update({'ffn_gate_exps.weight':1, 'ffn_up_exps.weight':1, 'ffn_down_exps.weight':2,
+                      'ffn_gate_shexp.weight':1, 'ffn_up_shexp.weight':1, 'ffn_down_shexp.weight':0})
       shard_map = {name: rules[k] for name in entries if (k:=re.sub(r"^blk\.\d+\.", "", name)) in rules}
     devices = tuple(Device.canonicalize(f'{Device.DEFAULT}:{i}') for i in range(shard))
     state_dict = gguf_shard(entries, devices, shard_map)

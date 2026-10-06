@@ -80,6 +80,10 @@ class TestTensorParallel(unittest.TestCase):
       with self.assertRaisesRegex(AssertionError, 'MLA heads'): Transformer.from_gguf(path, 16, shard=3)
       for weight in (parallel.token_embd.weight, parallel.output.weight): self.assertEqual(weight.uop.axis, 0)
       block = parallel.blk[0]
+      for weight in (block.ffn_gate_exps.weight, block.ffn_up_exps.weight): self.assertEqual(weight.uop.axis, 1)
+      self.assertEqual(block.ffn_down_exps.weight.uop.axis, 2)
+      for weight in (block.ffn_gate_shexp.weight, block.ffn_up_shexp.weight): self.assertEqual(weight.uop.axis, 1)
+      self.assertEqual(block.ffn_down_shexp.weight.uop.axis, 0)
       for weight in (block.attn_k_b['weight'], block.attn_v_b['weight'], block.attn_q.weight): self.assertEqual(weight.uop.axis, 0)
       self.assertEqual(block.attn_output.weight.uop.axis, 1)
       for start, ids in ((0, [1, 4, 2, 7]), (4, [3]), (5, [8])):
