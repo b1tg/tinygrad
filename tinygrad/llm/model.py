@@ -43,6 +43,11 @@ class ExpertWeights:
     ret = (x.unsqueeze(-2) @ self.weight[sel].transpose(-1, -2)).contiguous().squeeze(-2)
     return ret + self.bias[sel] if hasattr(self, 'bias') else ret
 
+def sample_logits(logits:Tensor, temperature:Tensor) -> Tensor:
+  # Gumbel-max trick: argmax(logits/temp - log(-log(uniform))) is equivalent to sampling from softmax(logits/temp)
+  sampled = logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()
+  return temperature.eq(0).where(logits, sampled).argmax(-1)
+
 def gated_activation(gate:Tensor, up:Tensor, *, alpha:float=1.0, limit:float|None=None, up_bias:float=0.0) -> Tensor:
   if limit is not None and limit > 0: gate, up = gate.clamp(max_=limit), up.clamp(-limit, limit)
   return gate * (gate * alpha).sigmoid() * (up + up_bias)
@@ -487,10 +492,7 @@ class Transformer:
     x = self._hidden(tokens, start_pos)
     # only run the output projection on the last token. MTP drafts from the target hidden of every token
     h = self.output_norm(x if self.mtp is not None else x[:, -1:])
-    logits = self.output(h[:, -1:])[:, -1, :]
-    # Gumbel-max trick: argmax(logits/temp - log(-log(uniform))) is equivalent to sampling from softmax(logits/temp)
-    sampled = logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()
-    tok = temperature.eq(0).where(logits, sampled).argmax(-1, keepdim=True)
+    tok = sample_logits(self.output(h[:, -1:]), temperature)
     return tok if self.mtp is None else self.mtp.track(self.token_embd(tokens).float(), h, tok, start_pos)
 
   def __call__(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
@@ -609,7 +611,7 @@ class Transformer:
     return [t for block in [*self.blk, self.mtp] for t in block._restore_state(index)]
 
   # draft mtp_tokens tokens, verify them in one target pass, returns [accepted, target tokens...]
-  def _mtp_round(self, start_pos:UOp) -> Tensor:
+  def _mtp_round(self, start_pos:UOp, temperature:Tensor) -> Tensor:
     m = self.mtp
     assert m is not None
     draft, hidden = [m.pending], m.previous
@@ -619,7 +621,7 @@ class Transformer:
     inputs = Tensor.cat(*draft, dim=1).contiguous()
     hidden = self.output_norm(self._hidden(inputs, start_pos, save_state=True))
     hidden = Tensor(m.hidden_history.uop.after(m.hidden_history.uop.store(hidden.uop)))
-    predicted = self.output(hidden).argmax(-1).contiguous()
+    predicted = sample_logits(self.output(hidden), temperature).contiguous()
     accepted = (inputs[:, 1:] == predicted[:, :-1]).cast(dtypes.int32).cumprod(1).sum(1, keepdim=True)
     # rewrite the draft KV conditioned on the target hiddens. rows past the accepted ones are overwritten next round
     kv = m.write_kv(self.token_embd(predicted[:, :-1]).float(), hidden[:, :-1], start_pos+1)
@@ -645,8 +647,8 @@ class Transformer:
     while len(tokens) < self.max_context:
       # Publish a reusable prefix only after a successful forward, so failures leave no stale cache.
       self._cached_tokens = []
-      if self.mtp is not None and temperature == 0 and start_pos >= prompt_len and len(tokens)+self.mtp.config.mtp_tokens <= self.max_context:
-        target = self.mtp_jit(v_start_pos.bind(start_pos))
+      if self.mtp is not None and start_pos >= prompt_len and len(tokens)+self.mtp.config.mtp_tokens <= self.max_context:
+        target = self.mtp_jit(v_start_pos.bind(start_pos), temp)
         accepted, *values = target.numpy()[0].tolist()
         values, out = values[:accepted+1], self.mtp.pending
       else:

@@ -3,7 +3,7 @@ from itertools import islice
 from unittest.mock import patch
 import numpy as np
 from tinygrad import Tensor, UOp, nn, dtypes, TinyJit
-from tinygrad.llm.model import Transformer, TransformerConfig, SSMConfig, GatedDeltaNetBlock
+from tinygrad.llm.model import Transformer, TransformerConfig, SSMConfig, GatedDeltaNetBlock, sample_logits
 
 
 def model(recurrent=True, mtp_tokens=2):
@@ -25,6 +25,11 @@ def pair(recurrent=True, mtp_tokens=2):
   m, ref = model(recurrent, mtp_tokens), model(recurrent, 0)
   nn.state.load_state_dict(ref, nn.state.get_state_dict(m), verbose=False)
   return m, ref
+
+def prefill(m, tokens, temperature=0.0):
+  gen = m.generate(tokens, temperature=temperature)
+  next(gen)
+  gen.close()
 
 def states(m): return [s for b in m.blk if isinstance(b, GatedDeltaNetBlock) for s in (b.recurrent_state, b.conv_state)]
 
@@ -108,10 +113,8 @@ class TestMTP(unittest.TestCase):
     m = model()
     # Make every draft accepted while retaining nontrivial recurrent and convolution states.
     m.output.weight.replace(Tensor.zeros_like(m.output.weight).contiguous().realize())
-    def prefill(prompt):
-      gen = m.generate(prompt.copy())
-      next(gen)
-      gen.close()
+    def snapshot(prompt):
+      prefill(m, prompt.copy())
       return [s.numpy().copy() for s in [*states(m), m.mtp.previous]]
     for offset, length in enumerate((2, 3, 4, 2)):
       tokens = [3, 5, 7+offset]
@@ -125,9 +128,9 @@ class TestMTP(unittest.TestCase):
           gc.collect()
         else: gen.close()
       extended = tokens+[17, 19]
-      resumed = prefill(extended)
+      resumed = snapshot(extended)
       m._cached_tokens = []
-      for actual, expected in zip(prefill(extended), resumed):
+      for actual, expected in zip(snapshot(extended), resumed):
         np.testing.assert_allclose(actual, expected, atol=2e-3, rtol=2e-3)
 
   def test_acceptance_boundaries(self):
@@ -138,26 +141,22 @@ class TestMTP(unittest.TestCase):
     for accepted, delivered in ((0, 1), (1, 1), (1, 2), (2, 1), (2, 2), (2, 3)):
       with self.subTest(accepted=accepted, delivered=delivered):
         verify, output = TinyJit(m._mtp_round), m.output
-        def limited_verify(sp):
+        def limited_verify(sp, temperature):
           drafts = iter([0]*accepted + [1]*(2-accepted))
           def logits(h):
             if h.shape[1] != 1: return output(h)
             return (Tensor.arange(output.out_features).to(h.device) == next(drafts)).float().reshape(1, 1, -1)
-          with patch.object(m, 'output', side_effect=logits): return verify(sp)
+          with patch.object(m, 'output', side_effect=logits): return verify(sp, temperature)
         with patch.object(m, 'mtp_jit', side_effect=limited_verify):
           tokens = [3, 5, 7]
           gen = m.generate(tokens)
           list(islice(gen, 1 + delivered))
           gen.close()
           self.assertEqual(m._pending_restore_index, delivered-1 if delivered <= accepted else None)
-          # Resume ordinary sampling after a stopped round; it must not invoke the draft path.
-          with patch.object(m, 'mtp_jit', side_effect=AssertionError('drafts during sampling')):
-            gen = m.generate(tokens, temperature=0.5)
-            list(islice(gen, 2))
-            gen.close()
-          expected = ref.generate(tokens[:-1].copy())
-          next(expected)
-          expected.close()
+          # Resume with one sampled token, restoring the stopped round before another draft round.
+          with patch.object(m, 'mtp_jit', side_effect=AssertionError('drafts before consuming the prompt')):
+            prefill(m, tokens, temperature=0.5)
+          prefill(ref, tokens[:-1])
           for actual, state in zip(states(m), states(ref)):
             np.testing.assert_allclose(actual.numpy(), state.numpy(), atol=2e-3, rtol=2e-3)
           self.assertIsNone(m._pending_restore_index)
@@ -165,9 +164,7 @@ class TestMTP(unittest.TestCase):
           gen = m.generate(tokens)
           list(islice(gen, accepted+2))
           gen.close()
-          expected = ref.generate(tokens[:-1].copy())
-          next(expected)
-          expected.close()
+          prefill(ref, tokens[:-1])
           for actual, state in zip(states(m), states(ref)):
             np.testing.assert_allclose(actual.numpy(), state.numpy(), atol=2e-3, rtol=2e-3)
 
@@ -187,9 +184,7 @@ class TestMTP(unittest.TestCase):
       self.assertEqual(len(list(m.generate(tokens+[17, 19]))), 1)
     resumed = [s.numpy().copy() for s in [*states(m), m.mtp.previous]]
     m._cached_tokens = []
-    gen = m.generate(tokens+[17, 19])
-    next(gen)
-    gen.close()
+    prefill(m, tokens+[17, 19])
     for actual, expected in zip([*states(m), m.mtp.previous], resumed):
       np.testing.assert_allclose(actual.numpy(), expected, atol=2e-3, rtol=2e-3)
     gen = m.generate([3, 5, 7])
@@ -197,22 +192,16 @@ class TestMTP(unittest.TestCase):
     gen.close()
     self.assertEqual(m._pending_restore_index, 0)
     with patch.object(m, '_mtp_restore', side_effect=AssertionError('restore for unrelated prompt')):
-      gen = m.generate([11, 13, 17])
-      next(gen)
-      gen.close()
+      prefill(m, [11, 13, 17])
     self.assertIsNone(m._pending_restore_index)
 
   def test_failed_forward_invalidates_cache(self):
     m = model()
-    gen = m.generate([3, 5, 7])
-    next(gen)
-    gen.close()
+    prefill(m, [3, 5, 7])
     with patch.object(Transformer, '__call__', side_effect=ValueError('test failure')):
       with self.assertRaisesRegex(ValueError, 'test failure'): next(m.generate([11, 13, 17]))
     self.assertEqual(m._cached_tokens, [])
-    gen = m.generate([11, 13, 17])
-    next(gen)
-    gen.close()
+    prefill(m, [11, 13, 17])
 
   def test_from_gguf(self):
     kv = {'general.architecture':'qwen35', 'tokenizer.ggml.tokens':['']*64}
@@ -242,10 +231,65 @@ class TestMTP(unittest.TestCase):
     m.output.weight.replace(Tensor.zeros_like(m.output.weight).contiguous().realize())
     self.assertEqual(len(list(m.generate(prompt.copy()))), 6)
 
-  def test_sampling_skips_drafts(self):
+  def test_sampling(self):
+    Tensor.manual_seed(42)
+    m, ref = pair()
+    tokens = [3, 5, 7]
+    for temperature in (0.7, 1.2, 0.0):
+      gen = m.generate(tokens, temperature=temperature)
+      self.assertEqual(len(list(islice(gen, 10))), 10)
+      gen.close()
+      # Consume the last delivered token and restore any stopped round before comparing recurrent state.
+      prefill(m, tokens, temperature)
+      prefill(ref, tokens[:-1])
+      for actual, state in zip(states(m), states(ref)):
+        np.testing.assert_allclose(actual.numpy(), state.numpy(), atol=2e-3, rtol=2e-3)
+    self.assertGreater(m.mtp_jit.cnt, 2)
+
+  def test_sampling_distribution(self):
+    Tensor.manual_seed(42)
+    logits = Tensor([0.0, 1.0, 2.0]).reshape(1, 1, 3).expand(1, 16384, 3).contiguous().realize()
+    sample = TinyJit(lambda t: sample_logits(logits, t).realize())
+    previous = None
+    for temperature in (1.0, 1.0, 0.5, 2.0, 0.0):
+      actual = sample(Tensor([temperature])).numpy().flatten()
+      if temperature == 0: np.testing.assert_array_equal(actual, 2)
+      else:
+        p = np.exp(np.array([0.0, 1.0, 2.0])/temperature)
+        np.testing.assert_allclose(np.bincount(actual, minlength=3)/len(actual), p/p.sum(), atol=0.015)
+        if previous is not None: self.assertFalse(np.array_equal(actual, previous))
+      previous = actual
+
+  def test_sample_and_match_distribution(self):
+    Tensor.manual_seed(42)
+    m = model(recurrent=False)
+    p = np.array([0.6, 0.3, 0.1])
+    logits = Tensor(np.concatenate((np.log(p), np.full(61, -np.inf))).astype(np.float32)).realize()
+    accepted, tokens, verify = [], [], m.mtp_jit
+    def record(sp, temperature):
+      out = verify(sp, temperature)
+      accepted.append(int(out.numpy()[0, 0]))
+      return out
+    # Greedy drafts always propose token 0; emitted tokens must still follow the target distribution.
+    with patch.object(m, 'output', side_effect=lambda h: logits.reshape(1, 1, 64).expand(h.shape[0], h.shape[1], 64)), \
+         patch.object(m, 'mtp_jit', side_effect=record):
+      for _ in range(8): tokens.extend(islice(m.generate([3, 5, 7], temperature=1.0), 32))
+    np.testing.assert_allclose(np.bincount(tokens, minlength=3)/len(tokens), p, atol=0.1)
+    self.assertEqual(set(accepted), {0, 1, 2})
+
+  def test_mtp_temperature_replay(self):
     m = model()
-    self.assertEqual(len(list(islice(m.generate([1], temperature=0.5), 4))), 4)
-    self.assertEqual(m.mtp_jit.cnt, 0)
+    logits = Tensor([0., 1., 2.] + [-float('inf')]*61).realize()
+    # Fix the Gumbel noise to [2, 0, 0, ...], so only temperature can change the target's choice.
+    uniform = Tensor(np.exp(-np.exp(-np.array([2.] + [0.]*63))).astype(np.float32)).realize()
+    with patch.object(m, 'output', side_effect=lambda h: logits.reshape(1, 1, 64).expand(h.shape[0], h.shape[1], 64)), \
+         patch.object(Tensor, 'rand_like', side_effect=lambda x: uniform.reshape(1, 1, 64).expand(x.shape)):
+      prefill(m, [3, 5, 7])
+      # The first two calls warm up/capture; the remaining calls change temperature on the same JIT replay.
+      for temperature, token in ((0.25, 2), (4.0, 0), (0.0, 2), (4.0, 0), (0.25, 2)):
+        result = m.mtp_jit(UOp.variable('start_pos', 0, 63).bind(3), Tensor([temperature])).numpy()[0]
+        np.testing.assert_array_equal(result, [2 if token == 2 else 0, token, token, token])
+    self.assertEqual(m.mtp_jit.cnt, 5)
 
   def test_invalid_mtp_tokens(self):
     for count in (-2, -1, 8):
