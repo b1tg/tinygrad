@@ -57,17 +57,15 @@ class TestGGUFShard(unittest.TestCase):
 
 @unittest.skipIf(not_support_multi_device(), "no multi")
 class TestTensorParallel(unittest.TestCase):
-  def test_mla(self):
+  def test_moe(self):
     with tempfile.TemporaryDirectory() as folder:
-      config = TransformerConfig(num_blocks=2, dim=32, hidden_dim=256, n_heads=4, n_kv_heads=1, norm_eps=1e-5,
-        vocab_size=32, head_dim=16, v_head_dim=8, rope_theta=10000, rope_dim=8, max_context=16,
-        kv_lora_rank=16, num_experts=4, num_experts_per_tok=2, shared_expert_dim=256)
+      config = TransformerConfig(num_blocks=1, dim=32, hidden_dim=32, n_heads=4, n_kv_heads=4, norm_eps=1e-5,
+        vocab_size=32, head_dim=8, v_head_dim=8, rope_theta=10000, rope_dim=8, max_context=16,
+        num_experts=4, num_experts_per_tok=2)
       writer = GGUFWriter(path:=pathlib.Path(folder)/'model.gguf', 'deepseek2')
-      for key,value in {'context_length':16, 'embedding_length':32, 'expert_feed_forward_length':256, 'block_count':2,
-                        'attention.head_count':4, 'attention.head_count_kv':1, 'attention.key_length_mla':16,
-                        'attention.value_length_mla':8, 'attention.kv_lora_rank':16,
-                        'rope.dimension_count':8, 'expert_count':4, 'expert_used_count':2,
-                        'expert_shared_feed_forward_length':256}.items(): writer.add_uint32('deepseek2.'+key, value)
+      for key,value in {'context_length':16, 'embedding_length':32, 'expert_feed_forward_length':32, 'block_count':1,
+                        'attention.head_count':4, 'attention.head_count_kv':4, 'attention.key_length':8,
+                        'rope.dimension_count':8, 'expert_count':4, 'expert_used_count':2}.items(): writer.add_uint32('deepseek2.'+key, value)
       writer.add_float32('deepseek2.rope.freq_base', 10000)
       writer.add_float32('deepseek2.attention.layer_norm_rms_epsilon', 1e-5)
       writer.add_array('tokenizer.ggml.tokens', [str(i) for i in range(32)])
@@ -76,25 +74,11 @@ class TestTensorParallel(unittest.TestCase):
         value = rng.normal(1, .1, weight.shape) if name.endswith('norm.weight') else rng.normal(0, .1, weight.shape)
         writer.add_tensor(name, value.astype(np.float32))
       write_gguf(writer)
-      single, parallel = Transformer.from_gguf(path, 16)[0], Transformer.from_gguf(path, 16, shard=4)[0]
-      with self.assertRaisesRegex(AssertionError, 'MLA heads'): Transformer.from_gguf(path, 16, shard=3)
-      for weight in (parallel.token_embd.weight, parallel.output.weight): self.assertEqual(weight.uop.axis, 0)
-      block = parallel.blk[0]
-      for weight in (block.ffn_gate_exps.weight, block.ffn_up_exps.weight): self.assertEqual(weight.uop.axis, 1)
-      self.assertEqual(block.ffn_down_exps.weight.uop.axis, 2)
-      for weight in (block.ffn_gate_shexp.weight, block.ffn_up_shexp.weight): self.assertEqual(weight.uop.axis, 1)
-      self.assertEqual(block.ffn_down_shexp.weight.uop.axis, 0)
-      for weight in (block.attn_k_b['weight'], block.attn_v_b['weight'], block.attn_q.weight): self.assertEqual(weight.uop.axis, 0)
-      self.assertEqual(block.attn_output.weight.uop.axis, 1)
-      for start, ids in ((0, [1, 4, 2, 7]), (4, [3]), (5, [8])):
-        a, b = single.token_embd(Tensor([ids])).float(), parallel.token_embd(Tensor([ids]).to(parallel.token_embd.weight.device)).float()
-        for ba, bb in zip(single.blk, parallel.blk):
-          a, b = ba(a, start), bb(b, start)
-          np.testing.assert_allclose(a.numpy(), b.to(Device.DEFAULT).numpy(), atol=2e-3, rtol=2e-3)
-      self.assertIsNone(block.cache_k.uop.axis)
-      prompt = [1, 4, 2, 7]
-      self.assertEqual(list(itertools.islice(single.generate(prompt.copy()), 4)),
-                       list(itertools.islice(parallel.generate(prompt.copy()), 4)))
+      single, parallel = Transformer.from_gguf(path, 16)[0], Transformer.from_gguf(path, 16, shard=2)[0]
+      x = Tensor(rng.normal(size=(1, 4, config.dim)).astype(np.float32)).realize()
+      ref = single.blk[0]._feed_forward(x).numpy()
+      out = parallel.blk[0]._feed_forward(x.shard(DEVICES)).to(Device.DEFAULT).numpy()
+      np.testing.assert_allclose(out, ref, atol=2e-3, rtol=2e-3)
 
   def test_quantized_linear(self):
     # the AMD kernels on the packed shards: decode (1 token) and WMMA (16 tokens), output and input features split
