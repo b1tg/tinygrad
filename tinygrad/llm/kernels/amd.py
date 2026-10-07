@@ -660,7 +660,8 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   TM, TN, TD, SCALE = BLOCK_M//(WAVES_M*LANES_PER_WAVE_M), BLOCK_N//LANES_PER_WAVE_N, D//(WAVES_N*LANES_PER_WAVE_N), 1/math.sqrt(D)
   # query row 0 sits at sequence position q_base (the queries may be padded beyond valid_kv_len - q_base rows)
   q_base = valid_kv_len - M if q_start is None else q_start
-  block_bh, block_m = UOp.range(BH, 0, AxisType.GLOBAL), UOp.range(M // BLOCK_M, 1, AxisType.GLOBAL)
+  # only the query blocks that hold real queries are launched: valid_kv_len - q_base is the (symbolic) query count, M its padded size
+  block_bh, block_m = UOp.range(BH, 0, AxisType.GLOBAL), UOp.range((valid_kv_len - q_base + BLOCK_M - 1) // BLOCK_M, 1, AxisType.GLOBAL)
   kv_head = block_bh // gqa_group
   q, o = (x.reshape(BH, M//BLOCK_M, BLOCK_M, D)[block_bh, block_m] for x in (q, o))
   k, v = k[kv_head], v[kv_head]
