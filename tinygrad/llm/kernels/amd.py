@@ -97,16 +97,9 @@ class Linear(nn.Linear):
         # generic matmul schedule, and realize the densely packed weight once if it is still a lazy ggml view
         if self.weight.dtype in (dtypes.half, dtypes.float, dtypes.bfloat16) and self.out_features <= 2048 \
           and self.in_features % (WARP_SIZE*4) == 0 and self.weight.uop.axis is None:
-          numel, max_shape = x.numel(), x.max_shape
-          if isinstance(numel, int): return f16_gemv(self, x)
-          out = f16_gemv(self, x.pad_to(max_shape), Tensor(prod(x.shape[:-1])))
-          return out.shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
+          return f16_gemv(self, x)
         self.use_custom_quant = supported = False  # not a supported quant format
-    if self.ggml_type in QUANT_SIZES and supported:
-      if isinstance(x.numel(), int): return q8_linear(self, x)
-      # symbolic token count: pad to the max chunk size so the buffers have static shapes, the kernels only run the real tokens
-      out = q8_linear(self, x.pad_to(x.max_shape), Tensor(prod(x.shape[:-1])))
-      return out.shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
+    if self.ggml_type in QUANT_SIZES and supported: return q8_linear(self, x)
     return super().__call__(x)
 
 def _amd_dp4a(a:UOp, b:UOp, c:UOp) -> UOp:
@@ -440,8 +433,13 @@ def _quant_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, *grids:UOp,
   return _quant_linear_wmma(out, x, out_features, in_features, QUANT_SIZES[ggml_type]//raw.dtype.itemsize,
                             layout, dequant, f"linear_{QUANT_NAMES[ggml_type]}_f16_wmma", rdna4)
 
-def q8_linear(layer:Linear, x:Tensor, n_tokens:Tensor|None=None) -> Tensor:
+def _pad_tokens(x:Tensor, n_tokens:int|UOp) -> tuple[Tensor, Tensor|None]:
+  # symbolic token count: the buffer is padded to its max size so the kernels see static shapes, they only run the real tokens
+  return (x.pad_to(x.max_shape), Tensor(n_tokens)) if isinstance(n_tokens, UOp) else (x, None)
+
+def q8_linear(layer:Linear, x:Tensor) -> Tensor:
   assert layer.ggml_type in QUANT_SIZES
+  shape, (x, n_tokens) = x.shape, _pad_tokens(x, prod(x.shape[:-1]))
   tokens = int(x.numel()) // layer.in_features
   out_features, in_features = layer.out_features, int(x.uop.shard_shape[-1])
   splits = layer.in_features // in_features
@@ -471,6 +469,7 @@ def q8_linear(layer:Linear, x:Tensor, n_tokens:Tensor|None=None) -> Tensor:
   # row parallel: every device wrote the partial sum of its input features, the sum over the devices is the allreduce
   if splits > 1: result = result.reshape(splits, tokens, out_features).sum(0)
   result = result.reshape(*x.shape[:-1], out_features)
+  if n_tokens is not None: result = result.shrink(tuple((0, s) for s in (*shape[:-1], out_features)))
   return result if layer.bias is None else result + layer.bias
 
 # ******** tiny dense fp16 gemv ********
@@ -500,7 +499,8 @@ def _view_back(t:Tensor) -> Tensor:
   while uop.op is Ops.CAST and uop.dtype == dtypes.float32 and uop.src[0].dtype in (dtypes.half, dtypes.bfloat16): uop = uop.src[0]
   return Tensor(uop).reshape(t.shape)
 
-def f16_gemv(layer:Linear, x:Tensor, n_tokens:Tensor|None=None) -> Tensor:
+def f16_gemv(layer:Linear, x:Tensor) -> Tensor:
+  shape, (x, n_tokens) = x.shape, _pad_tokens(x, prod(x.shape[:-1]))
   tokens = prod(x.shape[:-1])
   assert isinstance(tokens, int)
   weight = _view_back(layer.weight)
@@ -509,7 +509,8 @@ def f16_gemv(layer:Linear, x:Tensor, n_tokens:Tensor|None=None) -> Tensor:
   fxn = functools.partial(_amd_f16_gemv_kernel, in_features=layer.in_features, out_features=layer.out_features, tokens=tokens,
                           n_tokens=None if n_tokens is None else _unbind(n_tokens.uop))
   srcs = (out, weight.reshape(-1), x.reshape(tokens, layer.in_features)) + (() if layer.bias is None else (_view_back(layer.bias),))
-  return Tensor.custom_kernel(*srcs, fxn=fxn)[0].reshape(*x.shape[:-1], layer.out_features)
+  out = Tensor.custom_kernel(*srcs, fxn=fxn)[0].reshape(*x.shape[:-1], layer.out_features)
+  return out if n_tokens is None else out.shrink(tuple((0, s) for s in (*shape[:-1], layer.out_features)))
 
 # ******** flash attention on the KV cache ********
 
@@ -799,9 +800,8 @@ def _gated_delta_prefill_kernel(core:UOp, q:UOp, k:UOp, v:UOp, beta:UOp, alpha:U
   return UOp.group(*state_stores).end(lane, bh_row).sink(arg=KernelInfo(name="gated_delta_prefill", opts_to_apply=()))
 
 def gated_delta_prefill(q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:Tensor, state:Tensor, start_pos:Tensor|None=None) -> Tensor:
-  # symbolic token count: the buffers are padded to the max chunk, the scan only runs the real tokens
-  n_tokens = Tensor(q.shape[2]) if isinstance(q.shape[2], UOp) else None
-  if n_tokens is not None: q, k, v, beta, alpha = (z.pad_to((*z.shape[:2], z.max_shape[2], *z.shape[3:])) for z in (q, k, v, beta, alpha))
+  n_tokens = _pad_tokens(q, q.shape[2])[1]
+  q, k, v, beta, alpha = (_pad_tokens(z, q.shape[2])[0] for z in (q, k, v, beta, alpha))
   batch, heads, tokens, key_dim = q.shape
   value_dim = v.shape[-1]
   assert q.shape == k.shape and v.shape[:3] == beta.shape == (batch, heads, tokens) and state.shape == (batch, heads, value_dim, key_dim)
