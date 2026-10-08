@@ -89,6 +89,7 @@ class Linear(nn.Linear):
     self.shard_axis = decoded.uop.axis
     self.weight = Tensor(raw).flatten().bitcast(word_dtype).contiguous()
   def __call__(self, x:Tensor) -> Tensor:
+    assert isinstance(prod(x.shape[:-1]), int) or len(x.shape) == 2 or x.shape[0] == 1, "no batch yet"
     supported = self.use_custom_quant and amd_custom_kernels_supported(self.weight.device)
     if self.ggml_type is None and supported:
       self.set_quantized(self.weight)
