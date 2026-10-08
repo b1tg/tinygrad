@@ -453,10 +453,11 @@ def q8_linear(layer:Linear, x:Tensor) -> Tensor:
     else:
       fxn = functools.partial(_q5_linear_f16_wmma_kernel if layer.ggml_type in (Q4_K, Q5_K) else _quant_linear_f16_wmma_kernel,
                               ggml_type=layer.ggml_type)
-    # a symbolic token count only reaches the kernel for a single-device input: the row-split layout interleaves the devices' tokens
-    fxn = functools.partial(fxn, rdna4=_wmma_rdna4(x.device), tokens=tokens if n_tokens is None or splits > 1 else _unbind(n_tokens.uop))
+    # the symbolic token count only reaches the kernel for a single-device input: the row-split layout interleaves the devices' tokens
+    sym = n_tokens if splits == 1 else None
+    fxn = functools.partial(fxn, rdna4=_wmma_rdna4(x.device), tokens=tokens if sym is None else _unbind(sym.uop))
     srcs = (x.cast(dtypes.float16).contiguous(), *extra)
-    if n_tokens is not None and splits == 1: srcs = (Tensor(srcs[0].uop.after(n_tokens.uop)), *srcs[1:])
+    if sym is not None: srcs = (Tensor(srcs[0].uop.after(sym.uop)), *srcs[1:])
   else:
     fxn = functools.partial(_quant_decode_kernel, ggml_type=layer.ggml_type)
     srcs = (*q8_quantize(x, tokens, in_features), *extra)
@@ -798,8 +799,9 @@ def _gated_delta_prefill_kernel(core:UOp, q:UOp, k:UOp, v:UOp, beta:UOp, alpha:U
   return UOp.group(*state_stores).end(lane, bh_row).sink(arg=KernelInfo(name="gated_delta_prefill", opts_to_apply=()))
 
 def gated_delta_prefill(q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:Tensor, state:Tensor, start_pos:Tensor|None=None) -> Tensor:
-  n_tokens = _pad_tokens(q, q.shape[2])[1]
-  q, k, v, beta, alpha = (_pad_tokens(z, q.shape[2])[0] for z in (q, k, v, beta, alpha))
+  # symbolic token count: the buffers are padded to the max chunk, the scan only runs the real tokens
+  n_tokens = Tensor(q.shape[2]) if isinstance(q.shape[2], UOp) else None
+  if n_tokens is not None: q, k, v, beta, alpha = (z.pad_to(z.max_shape) for z in (q, k, v, beta, alpha))
   batch, heads, tokens, key_dim = q.shape
   value_dim = v.shape[-1]
   assert q.shape == k.shape and v.shape[:3] == beta.shape == (batch, heads, tokens) and state.shape == (batch, heads, value_dim, key_dim)

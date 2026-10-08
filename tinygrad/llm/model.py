@@ -363,13 +363,11 @@ class GatedDeltaNetBlock(FFNBlock):
       # one fused kernel for the whole scan; it resets and updates the recurrent state in place (RDNA3/4)
       core = gated_delta_prefill(q, k, v, beta, alpha, state, Tensor(start_pos)).transpose(1, 2)
     else:
-      # symbolic chunks are padded to their max size so the unrolled scan has a static length, the extra rows are sliced off below
-      if isinstance(T, UOp): q, k, v, beta, alpha = (z.pad_to((*z.shape[:2], z.max_shape[2], *z.shape[3:])) for z in (q, k, v, beta, alpha))
       q, k, v, beta = q.unsqueeze(-2), k.unsqueeze(-2), v.unsqueeze(-1), beta.unsqueeze(-1).unsqueeze(-1)
       alpha = alpha.unsqueeze(-2)
       state = initial.where(0, state.float())
       outs = []
-      for t in range(q.shape[2]):
+      for t in range(T):  # generate() runs this path one token at a time, so T is an int
         s1 = state * alpha[:, :, t]  # decay the state
         delta = (v[:, :, t] - (s1*k[:, :, t]).sum(-1, keepdim=True)) * beta[:, :, t]  # the delta rule update
         state = s1 + delta * k[:, :, t]
@@ -377,7 +375,7 @@ class GatedDeltaNetBlock(FFNBlock):
 
       # store the updated recurrent state in place, then read the stacked outputs after the write
       state_store = self.recurrent_state.uop.store(state.cast(self.recurrent_state.dtype).uop)
-      core = Tensor(outs[0].stack(*outs[1:], dim=1).contiguous().uop.after(state_store))[:, :T]
+      core = Tensor(outs[0].stack(*outs[1:], dim=1).contiguous().uop.after(state_store))
 
     z = (self.ssm_norm(core) * (out_gate.sigmoid() if is_kda else out_gate.silu())).cast(x.dtype).contiguous()
     return self.ssm_out(z.reshape(B, T, -1))
