@@ -307,7 +307,8 @@ class GatedDeltaNetBlock(FFNBlock):
     assert self.num_v_heads % self.num_k_heads == 0
     self.head_v_dim, self.ssm_conv_kernel = ssm.inner_size // ssm.time_step_rank, ssm.conv_kernel
     self.conv_channels, self.q_dim = ssm.inner_size + 2*ssm.group_count*ssm.state_size, ssm.state_size*ssm.group_count
-    self.attn_qkv = Linear(config.dim, self.conv_channels, bias=False)
+    self.attn_q, self.attn_k = Linear(config.dim, self.q_dim, bias=False), Linear(config.dim, self.q_dim, bias=False)
+    self.attn_v = Linear(config.dim, ssm.inner_size, bias=False)
     if ssm.kda:
       self.ssm_g_a, self.ssm_g_b = Linear(config.dim, self.head_v_dim, bias=False), Linear(self.head_v_dim, ssm.inner_size, bias=False)
       self.ssm_f_a, self.ssm_f_b = Linear(config.dim, self.head_k_dim, bias=False), Linear(self.head_k_dim, ssm.inner_size, bias=False)
@@ -315,7 +316,8 @@ class GatedDeltaNetBlock(FFNBlock):
       self.attn_gate = Linear(config.dim, ssm.inner_size, bias=False)
       self.ssm_alpha = Linear(config.dim, self.num_v_heads, bias=False)
     self.ssm_beta = Linear(config.dim, self.num_v_heads, bias=False)
-    self.ssm_conv1d = {"weight": Tensor.zeros(self.conv_channels, self.ssm_conv_kernel)}
+    self.ssm_conv1d_q, self.ssm_conv1d_k = [{"weight": Tensor.zeros(self.q_dim, self.ssm_conv_kernel)} for _ in range(2)]
+    self.ssm_conv1d_v = {"weight": Tensor.zeros(ssm.inner_size, self.ssm_conv_kernel)}
     self.ssm_dt = {"bias": Tensor.zeros(ssm.inner_size if ssm.kda else self.num_v_heads)}
     self.ssm_a = Tensor.zeros(self.num_v_heads, 1) if ssm.kda else Tensor.zeros(self.num_v_heads)
     self.ssm_norm, self.ssm_out = nn.RMSNorm(self.head_v_dim, config.norm_eps), Linear(ssm.inner_size, config.dim, bias=False)
@@ -339,23 +341,23 @@ class GatedDeltaNetBlock(FFNBlock):
                  self.ssm_a.reshape(self.num_v_heads, -1))
 
     # qkv conv, conv_state is reset when starting from position 0
-    conv_state = initial.where(0, self.conv_state)
     # assemble the conv window in a static-size buffer: [conv_state | qkv rows | zero-pad].
     # padded steps are exact no-ops: beta=0 (delta rule off), log_alpha=0 (decay 1 after exp)
-    conv_window = conv_state.cat(self.attn_qkv(x).cast(conv_state.dtype), dim=1)
-    conv_window = conv_window.pad_to((B, self.ssm_conv_kernel-1 + T_pad, self.conv_channels)).contiguous()
-    # the last conv_kernel-1 columns of the window become the next conv state
-    conv_state_store = self.conv_state.uop.store(conv_window[:, T:T+self.ssm_conv_kernel-1].cast(self.conv_state.dtype).uop)
-
-    conv_out = functools.reduce(lambda a,b: a+b,
-      (conv_window[:, i:i+T_pad] * self.ssm_conv1d["weight"][:, i] for i in range(self.ssm_conv_kernel))).silu()
+    convs = []
+    for st, proj, w in zip(self.conv_state, (self.attn_q(x), self.attn_k(x), self.attn_v(x)),
+                           (self.ssm_conv1d_q["weight"], self.ssm_conv1d_k["weight"], self.ssm_conv1d_v["weight"])):
+      win = initial.where(0, st).cat(proj.cast(st.dtype), dim=1).pad_to((B, self.ssm_conv_kernel-1 + T_pad, proj.shape[-1])).contiguous()
+      convs.append((functools.reduce(lambda a,b: a+b, (win[:, i:i+T_pad]*w[:, i] for i in range(self.ssm_conv_kernel))).silu(),
+                    st.uop.store(win[:, T:T+self.ssm_conv_kernel-1].cast(st.dtype).uop)))
+    (q, k, v), conv_state_store = zip(*convs)
     if symbolic:
       out_gate = out_gate.pad_to((B, T_pad, self.num_v_heads, self.head_v_dim))
       beta, log_alpha = beta.pad_to((B, T_pad, self.num_v_heads)), log_alpha.pad_to((B, T_pad, *log_alpha.shape[2:]))
-    q, k, v = conv_out.split([self.q_dim, self.q_dim, self.conv_channels - 2*self.q_dim], dim=-1)
     qk_eps = 1e-12 if is_kda else 1e-6
-    q, k = (z.reshape(B, T_pad, self.num_k_heads, self.head_k_dim).normalize(dim=-1, eps=qk_eps)
-            .repeat(1, 1, self.num_v_heads//self.num_k_heads, 1) for z in (q, k))
+    # expand instead of repeat, which scrambles the shard axis
+    q, k = (z.reshape(B, T_pad, self.num_k_heads, 1, self.head_k_dim).normalize(dim=-1, eps=qk_eps)
+            .expand(B, T_pad, self.num_k_heads, self.num_v_heads//self.num_k_heads, self.head_k_dim)
+            .reshape(B, T_pad, self.num_v_heads, self.head_k_dim) for z in (q, k))
     v = v.reshape(B, T_pad, self.num_v_heads, self.head_v_dim)
     # layout the per-step operands to broadcast against the (B, H, V, K) state
     q, k, v, beta = (z.transpose(1, 2).float() for z in (q, k, v, beta))
@@ -363,7 +365,7 @@ class GatedDeltaNetBlock(FFNBlock):
     alpha = log_alpha.transpose(1, 2).exp()  # per-channel decay for kda, per-head otherwise (B, H, T, K|1)
 
     # recurrent: scan over the (padded) tokens, updating the recurrent state. collect the per-step outputs
-    state = Tensor(self.recurrent_state.uop.after(conv_state_store))  # carry the conv write into this graph
+    state = Tensor(self.recurrent_state.uop.after(*conv_state_store))  # carry the conv writes into this graph
     if self.head_k_dim % 32 == 0 and self.head_v_dim % 4 == 0 and amd_custom_kernels_supported(x.device):
       # one fused kernel for the whole scan; it resets and updates the recurrent state in place (RDNA3/4)
       core = gated_delta_prefill(q, k, v, beta, alpha, state, Tensor(start_pos)).transpose(1, 2)
@@ -389,8 +391,13 @@ class GatedDeltaNetBlock(FFNBlock):
 
   def _init_state(self, x):
     if not hasattr(self, "conv_state"):
-      self.conv_state = Tensor.zeros(x.shape[0], self.ssm_conv_kernel-1, self.conv_channels, device=x.device).clone()
-      self.recurrent_state = Tensor.zeros(x.shape[0], self.num_v_heads, self.head_v_dim, self.head_k_dim, device=x.device).clone()
+      dev = x.device if isinstance(x.device, str) else None
+      dims = (self.q_dim, self.q_dim, self.conv_channels - 2*self.q_dim)
+      self.conv_state = tuple(Tensor.zeros(x.shape[0], self.ssm_conv_kernel-1, d, device=dev) for d in dims)
+      self.recurrent_state = Tensor.zeros(x.shape[0], self.num_v_heads, self.head_v_dim, self.head_k_dim, device=dev)
+      if isinstance(x.device, tuple):
+        self.conv_state = tuple(t.shard(x.device, 2).realize() for t in self.conv_state)
+        self.recurrent_state = self.recurrent_state.shard(x.device, 1).realize()
 
 class Transformer:
   def __init__(self, config:TransformerConfig):
@@ -431,6 +438,13 @@ class Transformer:
     arch = kv['general.architecture']
     n_heads, n_kv_heads = kv[f'{arch}.attention.head_count'], kv[f'{arch}.attention.head_count_kv']
     assert shard >= 1, f"shard must be at least 1, got {shard}"
+    # split the fused gated deltanet q/k/v so each device owns whole heads
+    if arch in ('qwen35', 'qwen35moe') and 'blk.0.attn_qkv.weight' in entries:
+      q_dim = kv[f'{arch}.ssm.state_size'] * kv[f'{arch}.ssm.group_count']
+      for fused, stem in (('attn_qkv', 'attn_'), ('ssm_conv1d', 'ssm_conv1d_')):
+        for name in [n for n in entries if n.startswith('blk.') and n.endswith(f'.{fused}.weight')]:
+          data, shape, typ = entries.pop(name); parts = data.reshape(shape[0], -1).split([q_dim, q_dim, shape[0]-2*q_dim])
+          for p, t in zip('qkv', parts): entries[name.replace(fused, stem+p)] = (t.reshape(-1), (t.shape[0], shape[1]), typ)
     shard_map:dict[str, int] = {}
     if shard > 1:
       heads = n_heads if kv.get(f'{arch}.attention.kv_lora_rank') else n_kv_heads
@@ -439,6 +453,9 @@ class Transformer:
       rules = {**{w: 0 for w in ('token_embd.weight', 'output.weight', 'attn_q.weight', 'attn_k.weight', 'attn_v.weight', 'ffn_gate.weight',
         'ffn_up.weight', 'attn_q_b.weight', 'attn_k_b.weight', 'attn_v_b.weight')},
         **{w: 1 for w in ('attn_output.weight', 'ffn_down.weight', 'ffn_gate_exps.weight', 'ffn_up_exps.weight')}, 'ffn_down_exps.weight':2}
+      if arch in ('qwen35', 'qwen35moe', 'kimi-linear'):
+        rules.update({'ssm_out.weight': 1, 'attn_gate.weight': 0, 'ssm_alpha.weight': 0, 'ssm_beta.weight': 0,
+                      'ssm_g_b.weight': 0, 'ssm_f_b.weight': 0, 'ssm_conv1d_q.weight': 0, 'ssm_conv1d_k.weight': 0, 'ssm_conv1d_v.weight': 0})
       shard_map = {name: rules[k] for name in entries if (k:=re.sub(r"^blk\.\d+\.", "", name)) in rules}
     devices = tuple(Device.canonicalize(f'{Device.DEFAULT}:{i}') for i in range(shard))
     state_dict = gguf_shard(entries, devices, shard_map)
@@ -462,10 +479,8 @@ class Transformer:
       ssm = SSMConfig(kv[f'{arch}.ssm.conv_kernel'], kv[f'{arch}.kda.head_dim'], n_heads, n_heads, n_heads*kv[f'{arch}.kda.head_dim'], kda=True)
       for i, is_ssm in enumerate(ssm_layers):
         if not is_ssm: continue
-        state_dict[f"blk.{i}.attn_qkv.weight"] = state_dict.pop(f"blk.{i}.attn_q.weight").cat(
-          state_dict.pop(f"blk.{i}.attn_k.weight"), state_dict.pop(f"blk.{i}.attn_v.weight"), dim=0).contiguous()
-        state_dict[f"blk.{i}.ssm_conv1d.weight"] = state_dict.pop(f"blk.{i}.ssm_conv1d_q.weight").cat(
-          state_dict.pop(f"blk.{i}.ssm_conv1d_k.weight"), state_dict.pop(f"blk.{i}.ssm_conv1d_v.weight"), dim=0).squeeze(1).contiguous()
+        # conv is stored with a size-1 middle dim, ssm_out is the output projection
+        for p in ('q', 'k', 'v'): state_dict[f"blk.{i}.ssm_conv1d_{p}.weight"] = state_dict[f"blk.{i}.ssm_conv1d_{p}.weight"].squeeze(1)
         state_dict[f"blk.{i}.ssm_out.weight"] = state_dict.pop(f"blk.{i}.attn_output.weight")
     if arch in ('qwen35', 'qwen35moe', 'glm4moe', 'gpt-oss'):
       state_dict = {k.replace('post_attention_norm', 'ffn_norm'):v for k,v in state_dict.items()}
