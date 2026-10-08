@@ -7,7 +7,7 @@ if __name__ == "__main__":
   parser.add_argument("--max-context", type=int, default=8192, help="max context length (default: %(default)s)")
   parser.add_argument("--prompt-tokens", type=int, default=1024, help="number of prompt tokens (default: %(default)s)")
   parser.add_argument("--decode-tokens", type=int, default=16, help="number of tokens to decode (default: %(default)s)")
-  parser.add_argument("--chunk-size", type=int, default=32, help="chunk size for prefill (default: %(default)s)")
+  parser.add_argument("--chunk-size", type=int, default=256, help="chunk size for prefill (default: %(default)s)")
   parser.add_argument("--shard", type=int, default=1, help="tensor parallel device count (default: %(default)s)")
   args = parser.parse_args()
 
