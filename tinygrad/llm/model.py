@@ -326,8 +326,6 @@ class GatedDeltaNetBlock(FFNBlock):
     start_pos = start_pos if isinstance(start_pos, UOp) else UOp.variable("start_pos", 0, self.config.max_context-1).bind(start_pos)
     initial = Tensor(start_pos).eq(0)
     is_kda = hasattr(self, "ssm_g_a")
-    symbolic = isinstance(T, UOp)
-    T_pad = x.max_shape[1]  # symbolic chunks are padded to their max size: one graph serves every size
 
     # input processing
     x = x.half()
@@ -340,39 +338,35 @@ class GatedDeltaNetBlock(FFNBlock):
 
     # qkv conv, conv_state is reset when starting from position 0
     conv_state = initial.where(0, self.conv_state)
-    # assemble the conv window in a static-size buffer: [conv_state | qkv rows | zero-pad].
-    # padded steps are exact no-ops: beta=0 (delta rule off), log_alpha=0 (decay 1 after exp)
-    conv_window = conv_state.cat(self.attn_qkv(x).cast(conv_state.dtype), dim=1)
-    conv_window = conv_window.pad_to((B, self.ssm_conv_kernel-1 + T_pad, self.conv_channels)).contiguous()
+    conv_window = conv_state.cat(self.attn_qkv(x).cast(conv_state.dtype), dim=1).contiguous()  # [conv_state | qkv rows]
     # the last conv_kernel-1 columns of the window become the next conv state
     conv_state_store = self.conv_state.uop.store(conv_window[:, T:T+self.ssm_conv_kernel-1].cast(self.conv_state.dtype).uop)
 
     conv_out = functools.reduce(lambda a,b: a+b,
-      (conv_window[:, i:i+T_pad] * self.ssm_conv1d["weight"][:, i] for i in range(self.ssm_conv_kernel))).silu()
-    if symbolic:
-      out_gate = out_gate.pad_to((B, T_pad, self.num_v_heads, self.head_v_dim))
-      beta, log_alpha = beta.pad_to((B, T_pad, self.num_v_heads)), log_alpha.pad_to((B, T_pad, *log_alpha.shape[2:]))
+      (conv_window[:, i:i+T] * self.ssm_conv1d["weight"][:, i] for i in range(self.ssm_conv_kernel))).silu()
     q, k, v = conv_out.split([self.q_dim, self.q_dim, self.conv_channels - 2*self.q_dim], dim=-1)
     qk_eps = 1e-12 if is_kda else 1e-6
-    q, k = (z.reshape(B, T_pad, self.num_k_heads, self.head_k_dim).normalize(dim=-1, eps=qk_eps)
+    q, k = (z.reshape(B, T, self.num_k_heads, self.head_k_dim).normalize(dim=-1, eps=qk_eps)
             .repeat(1, 1, self.num_v_heads//self.num_k_heads, 1) for z in (q, k))
-    v = v.reshape(B, T_pad, self.num_v_heads, self.head_v_dim)
+    v = v.reshape(B, T, self.num_v_heads, self.head_v_dim)
     # layout the per-step operands to broadcast against the (B, H, V, K) state
     q, k, v, beta = (z.transpose(1, 2).float() for z in (q, k, v, beta))
     q = q * self.head_k_dim**-0.5
     alpha = log_alpha.transpose(1, 2).exp()  # per-channel decay for kda, per-head otherwise (B, H, T, K|1)
 
-    # recurrent: scan over the (padded) tokens, updating the recurrent state. collect the per-step outputs
+    # recurrent: scan over the tokens, updating the recurrent state. collect the per-step outputs
     state = Tensor(self.recurrent_state.uop.after(conv_state_store))  # carry the conv write into this graph
     if self.head_k_dim % 32 == 0 and self.head_v_dim % 4 == 0 and amd_custom_kernels_supported(x.device):
       # one fused kernel for the whole scan; it resets and updates the recurrent state in place (RDNA3/4)
       core = gated_delta_prefill(q, k, v, beta, alpha, state, Tensor(start_pos)).transpose(1, 2)
     else:
+      if isinstance(T, UOp):  # pad the chunk to its max size, the extra steps are no-ops (beta 0, alpha 1)
+        q, k, v, beta, alpha = [z.pad_to(z.max_shape, value=1 if z is alpha else 0) for z in (q, k, v, beta, alpha)]
       q, k, v, beta = q.unsqueeze(-2), k.unsqueeze(-2), v.unsqueeze(-1), beta.unsqueeze(-1).unsqueeze(-1)
       alpha = alpha.unsqueeze(-2)
       state = initial.where(0, state.float())
       outs = []
-      for t in range(T_pad):
+      for t in range(q.shape[2]):
         s1 = state * alpha[:, :, t]  # decay the state
         delta = (v[:, :, t] - (s1*k[:, :, t]).sum(-1, keepdim=True)) * beta[:, :, t]  # the delta rule update
         state = s1 + delta * k[:, :, t]
@@ -380,11 +374,9 @@ class GatedDeltaNetBlock(FFNBlock):
 
       # store the updated recurrent state in place, then read the stacked outputs after the write
       state_store = self.recurrent_state.uop.store(state.cast(self.recurrent_state.dtype).uop)
-      core = Tensor(outs[0].stack(*outs[1:], dim=1).contiguous().uop.after(state_store))
+      core = Tensor(outs[0].stack(*outs[1:], dim=1).contiguous().uop.after(state_store))[:, :T]
 
-    # output; undo the padding before the output projection
     z = (self.ssm_norm(core) * (out_gate.sigmoid() if is_kda else out_gate.silu())).cast(x.dtype).contiguous()
-    if symbolic: z = z[:, :T]
     return self.ssm_out(z.reshape(B, T, -1))
 
   def _init_state(self, x):

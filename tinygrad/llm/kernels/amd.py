@@ -97,16 +97,9 @@ class Linear(nn.Linear):
         # generic matmul schedule, and realize the densely packed weight once if it is still a lazy ggml view
         if self.weight.dtype in (dtypes.half, dtypes.float, dtypes.bfloat16) and self.out_features <= 2048 \
           and self.in_features % (WARP_SIZE*4) == 0 and self.weight.uop.axis is None:
-          numel, max_shape = x.numel(), x.max_shape
-          if isinstance(numel, int) or prod(max_shape) // self.in_features <= 32:
-            out = f16_gemv(self, x if isinstance(numel, int) else x.pad_to(max_shape))
-            return out if isinstance(numel, int) else out.shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
+          return f16_gemv(self, x)
         self.use_custom_quant = supported = False  # not a supported quant format
-    if self.ggml_type in QUANT_SIZES and supported:
-      if isinstance(x.numel(), int): return q8_linear(self, x)
-      # symbolic token count: pad to the max chunk size so the kernels see static shapes, garbage rows are sliced off
-      out = q8_linear(self, x.pad_to(x.max_shape))
-      return out.shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
+    if self.ggml_type in QUANT_SIZES and supported: return q8_linear(self, x)
     return super().__call__(x)
 
 def _amd_dp4a(a:UOp, b:UOp, c:UOp) -> UOp:
@@ -305,10 +298,11 @@ def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, *grids:UOp,
     return total * xd[token, group]
   return _decode_linear(out, out_features, in_features//32, group_dot, "linear_"+QUANT_NAMES[ggml_type])
 
-def _wmma_layout(out:UOp, out_features:int, token_tile:int, output_tiles:int):
+def _wmma_layout(out:UOp, out_features:int, token_tile:int, output_tiles:int, n_tokens:int|UOp):
   if out_features % (16*output_tiles): output_tiles = 1
   output_waves = 2 if out_features % (32*output_tiles) == 0 else 1
-  token_block, output_block = UOp.range(out.shape[0]//token_tile, 0), UOp.range(out_features//(16*output_tiles*output_waves), 1)
+  # n_tokens is symbolic for a padded chunk, only the blocks with real tokens launch
+  token_block, output_block = UOp.range((n_tokens + token_tile - 1)//token_tile, 0), UOp.range(out_features//(16*output_tiles*output_waves), 1)
   # lane is a hardware WARP range (like the flash kernel): the fragment math stays visible without being
   # range-split into nested loops, which would scramble the WMMA fragment layout
   lane, wave = UOp.range(WARP_SIZE, -1, axis_type=AxisType.WARP), UOp.range(output_waves, 3, axis_type=AxisType.LOCAL)
@@ -365,10 +359,10 @@ def _quant_linear_wmma(out, x, out_features, in_features, type_words, layout, de
   return UOp.group(*stores).end(token_block, output_block, lane, wave).sink(arg=KernelInfo(name=name, opts_to_apply=()))
 
 @functools.cache
-def _q5_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, out_features:int, in_features:int, ggml_type:int, rdna4:bool=False) -> UOp:
+def _q5_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, out_features:int, in_features:int, ggml_type:int, tokens:int|UOp, rdna4:bool=False) -> UOp:
   token_tile, output_tiles = (64, 1 if out_features <= 1024 else 2) if out.shape[0] % 64 == 0 else \
     (32 if out.shape[0] % 32 == 0 else 16, 2)
-  layout = _wmma_layout(out, out_features, token_tile, output_tiles)
+  layout = _wmma_layout(out, out_features, token_tile, output_tiles, tokens)
   word_indices = (layout[5], layout[5]+2) if rdna4 else tuple(range(4))
   def dequant(base:UOp, subgroup:UOp, half:int) -> tuple[UOp, ...]:
     d, dmin, scale, minimum = _q5_scales(raw, base, subgroup)
@@ -380,12 +374,12 @@ def _q5_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, out_features:int, in_fea
                             layout, dequant, f"linear_q{4 if ggml_type == Q4_K else 5}_k_f16_wmma", rdna4)
 
 @functools.cache
-def _iq4_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, lut:UOp, out_features:int, in_features:int, rdna4:bool=False) -> UOp:
+def _iq4_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, lut:UOp, out_features:int, in_features:int, tokens:int|UOp, rdna4:bool=False) -> UOp:
   token_tile = 32 if out_features <= 1024 and out.shape[0] % 32 == 0 else 64 if out.shape[0] % 64 == 0 and \
     out_features <= 6144 else 128 if out.shape[0] % 128 == 0 else \
     32 if out.shape[0] % 32 == 0 else 16
   output_tiles = 1 if out_features <= 1024 else 2 if out_features <= 6144 else 1 if out_features < 8192 else 2
-  layout = _wmma_layout(out, out_features, token_tile, output_tiles)
+  layout = _wmma_layout(out, out_features, token_tile, output_tiles, tokens)
   output_waves, _, _, lane, wave, half, _, _, _ = layout
   word_indices = (half, half+2) if rdna4 else tuple(range(4))
   local_lut = UOp.alloc((256,), dtypes.uint32, addrspace=AddrSpace.LOCAL)
@@ -400,9 +394,9 @@ def _iq4_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, lut:UOp, out_features:i
 
 @functools.cache
 def _quant_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, *grids:UOp,
-                                  out_features:int, in_features:int, ggml_type:int, rdna4:bool=False) -> UOp:
+                                  out_features:int, in_features:int, ggml_type:int, tokens:int|UOp, rdna4:bool=False) -> UOp:
   token_tile = 64 if out.shape[0] % 64 == 0 else 32 if out.shape[0] % 32 == 0 else 16
-  layout = _wmma_layout(out, out_features, token_tile, 2)
+  layout = _wmma_layout(out, out_features, token_tile, 2, tokens)
   output_waves, _, _, lane, wave, physical_half, _, _, _ = layout
   word_indices = (physical_half, physical_half+2) if rdna4 else tuple(range(4))
   grid = None
@@ -438,6 +432,9 @@ def _quant_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, *grids:UOp,
 
 def q8_linear(layer:Linear, x:Tensor) -> Tensor:
   assert layer.ggml_type in QUANT_SIZES
+  # a symbolic token count pads the buffer to its max size, the kernel only runs the real tokens
+  shape, n_tokens = x.shape, prod(x.shape[:-1])
+  x = x.pad_to(x.max_shape)
   tokens = int(x.numel()) // layer.in_features
   out_features, in_features = layer.out_features, int(x.uop.shard_shape[-1])
   splits = layer.in_features // in_features
@@ -453,8 +450,10 @@ def q8_linear(layer:Linear, x:Tensor) -> Tensor:
     else:
       fxn = functools.partial(_q5_linear_f16_wmma_kernel if layer.ggml_type in (Q4_K, Q5_K) else _quant_linear_f16_wmma_kernel,
                               ggml_type=layer.ggml_type)
-    fxn = functools.partial(fxn, rdna4=_wmma_rdna4(x.device))
+    # row-split inputs interleave the devices' tokens, keep the static grid there
+    fxn = functools.partial(fxn, rdna4=_wmma_rdna4(x.device), tokens=tokens if splits > 1 else _unbind(n_tokens))
     srcs = (x.cast(dtypes.float16).contiguous(), *extra)
+    if splits == 1 and isinstance(n_tokens, UOp): srcs = (Tensor(srcs[0].uop.after(n_tokens)), *srcs[1:])
   else:
     fxn = functools.partial(_quant_decode_kernel, ggml_type=layer.ggml_type)
     srcs = (*q8_quantize(x, tokens, in_features), *extra)
@@ -464,13 +463,13 @@ def q8_linear(layer:Linear, x:Tensor) -> Tensor:
   if len(result.shape) == 3: result = result.sum(-1)
   # row parallel: every device wrote the partial sum of its input features, the sum over the devices is the allreduce
   if splits > 1: result = result.reshape(splits, tokens, out_features).sum(0)
-  result = result.reshape(*x.shape[:-1], out_features)
+  result = result.reshape(*x.shape[:-1], out_features).shrink(tuple((0, s) for s in (*shape[:-1], out_features)))
   return result if layer.bias is None else result + layer.bias
 
 # ******** tiny dense fp16 gemv ********
 
 @functools.cache
-def _amd_f16_gemv_kernel(out:UOp, w:UOp, x:UOp, *rest:UOp, in_features:int, out_features:int, tokens:int) -> UOp:
+def _amd_f16_gemv_kernel(out:UOp, w:UOp, x:UOp, *rest:UOp, in_features:int, out_features:int, tokens:int|UOp) -> UOp:
   bias: UOp|None = rest[0] if rest else None
   # one block per (token, output row), 32 lanes accumulate 4-wide chunks of the row
   lanes, val_chunk = WARP_SIZE, 4
@@ -479,7 +478,7 @@ def _amd_f16_gemv_kernel(out:UOp, w:UOp, x:UOp, *rest:UOp, in_features:int, out_
   per = in_features // (lanes * val_chunk)
   assert per * lanes * val_chunk == in_features
   w = w.reshape((out_features, per, lanes*val_chunk))
-  x = x.reshape((tokens, per, lanes*val_chunk))
+  x = x.reshape((out.shape[0], per, lanes*val_chunk))
   acc = UOp.const(0, dtypes.float32)
   for i in range(per):
     for j in range(val_chunk):
@@ -495,14 +494,17 @@ def _view_back(t:Tensor) -> Tensor:
   return Tensor(uop).reshape(t.shape)
 
 def f16_gemv(layer:Linear, x:Tensor) -> Tensor:
+  shape, n_tokens = x.shape, prod(x.shape[:-1])
+  x = x.pad_to(x.max_shape)
   tokens = prod(x.shape[:-1])
   assert isinstance(tokens, int)
   weight = _view_back(layer.weight)
-  x = x.contiguous()
+  x = x.contiguous() if isinstance(n_tokens, int) else Tensor(x.contiguous().uop.after(n_tokens))
   out = Tensor.empty(tokens, layer.out_features, dtype=dtypes.float32, device=x.device)
-  fxn = functools.partial(_amd_f16_gemv_kernel, in_features=layer.in_features, out_features=layer.out_features, tokens=tokens)
+  fxn = functools.partial(_amd_f16_gemv_kernel, in_features=layer.in_features, out_features=layer.out_features, tokens=_unbind(n_tokens))
   srcs = (out, weight.reshape(-1), x.reshape(tokens, layer.in_features)) + (() if layer.bias is None else (_view_back(layer.bias),))
-  return Tensor.custom_kernel(*srcs, fxn=fxn)[0].reshape(*x.shape[:-1], layer.out_features)
+  out = Tensor.custom_kernel(*srcs, fxn=fxn)[0].reshape(*x.shape[:-1], layer.out_features)
+  return out.shrink(tuple((0, s) for s in (*shape[:-1], layer.out_features)))
 
 # ******** flash attention on the KV cache ********
 
@@ -756,7 +758,7 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
 # ******** gated delta net: fused recurrent scan ********
 
 @functools.cache
-def _gated_delta_prefill_kernel(core:UOp, q:UOp, k:UOp, v:UOp, beta:UOp, alpha:UOp, state:UOp, kq:UOp, start_pos:UOp|None=None) -> UOp:
+def _gated_delta_prefill_kernel(core:UOp, q:UOp, k:UOp, v:UOp, beta:UOp, alpha:UOp, state:UOp, kq:UOp, n_tokens:int|UOp, start_pos:UOp|None) -> UOp:
   batch, heads, tokens, value_dim, row_tile = *core.shape, 4
   key_dim, alpha_dim = q.shape[-1], alpha.shape[-1] if len(alpha.shape) == 4 else 1
   assert all(isinstance(x, int) for x in (batch, heads, tokens, value_dim, key_dim)) and key_dim % 32 == 0 and value_dim % row_tile == 0
@@ -772,7 +774,7 @@ def _gated_delta_prefill_kernel(core:UOp, q:UOp, k:UOp, v:UOp, beta:UOp, alpha:U
   initial = None if start_pos is None else start_pos.eq(0)
   current = current.after(current.store(UOp.stack(*(state[bh, row, col].float() if initial is None else
     initial.where(0, state[bh, row, col].float()) for row in rows for col in cols))))
-  token = UOp.range(tokens, 2, AxisType.LOOP)
+  token = UOp.range(n_tokens, 2, AxisType.LOOP)
   keys = tuple(k[bh, token, col].load() for col in cols)
   queries = tuple(q[bh, token, col].load() for col in cols)
   updates, stores = [], []
@@ -790,6 +792,9 @@ def _gated_delta_prefill_kernel(core:UOp, q:UOp, k:UOp, v:UOp, beta:UOp, alpha:U
   return UOp.group(*state_stores).end(lane, bh_row).sink(arg=KernelInfo(name="gated_delta_prefill", opts_to_apply=()))
 
 def gated_delta_prefill(q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:Tensor, state:Tensor, start_pos:Tensor|None=None) -> Tensor:
+  # a symbolic token count pads the buffers to the max chunk, the scan only runs the real tokens
+  n_tokens = q.shape[2]
+  q, k, v, beta, alpha = (z.pad_to(z.max_shape) for z in (q, k, v, beta, alpha))
   batch, heads, tokens, key_dim = q.shape
   value_dim = v.shape[-1]
   assert q.shape == k.shape and v.shape[:3] == beta.shape == (batch, heads, tokens) and state.shape == (batch, heads, value_dim, key_dim)
@@ -801,8 +806,9 @@ def gated_delta_prefill(q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:Tensor,
     assert start_pos.uop.is_bound_var
     state = Tensor(state.uop.after(start_pos.uop))
   core, kq = Tensor.empty_like(v), (q*k).sum(-1).contiguous()
+  if isinstance(n_tokens, UOp): core = Tensor(core.uop.after(n_tokens))  # the bound token count reaches the kernel through the graph
   srcs = (core, q.contiguous(), k.contiguous(), v.contiguous(), beta.contiguous(), alpha.contiguous(), state, kq)
   contig = tuple(x.uop if x.uop.op is Ops.AFTER else x.uop.contiguous() for x in srcs)
   params = tuple(UOp.placeholder_like(x, slot=i) for i,x in enumerate(contig))
-  call = _gated_delta_prefill_kernel(*params, None if start_pos is None else start_pos.uop.unbound()).call(*contig)
-  return Tensor(contig[0].after(call))
+  call = _gated_delta_prefill_kernel(*params, _unbind(n_tokens), None if start_pos is None else start_pos.uop.unbound()).call(*contig)
+  return Tensor(contig[0].after(call))[:, :, :n_tokens]
