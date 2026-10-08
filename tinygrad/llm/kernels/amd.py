@@ -431,13 +431,11 @@ def _quant_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, *grids:UOp,
   return _quant_linear_wmma(out, x, out_features, in_features, QUANT_SIZES[ggml_type]//raw.dtype.itemsize,
                             layout, dequant, f"linear_{QUANT_NAMES[ggml_type]}_f16_wmma", rdna4)
 
-def _pad_tokens(x:Tensor, n_tokens:int|UOp) -> tuple[Tensor, Tensor|None]:
-  # symbolic token count: the buffer is padded to its max size so the kernels see static shapes, they only run the real tokens
-  return (x.pad_to(x.max_shape), Tensor(n_tokens)) if isinstance(n_tokens, UOp) else (x, None)
-
 def q8_linear(layer:Linear, x:Tensor) -> Tensor:
   assert layer.ggml_type in QUANT_SIZES
-  shape, (x, n_tokens) = x.shape, _pad_tokens(x, prod(x.shape[:-1]))
+  # symbolic token count: the buffer is padded to its max size so the kernels see static shapes, they only run the real tokens
+  shape, n_tokens = x.shape, Tensor(n) if isinstance(n:=prod(x.shape[:-1]), UOp) else None
+  if n_tokens is not None: x = x.pad_to(x.max_shape)
   tokens = int(x.numel()) // layer.in_features
   out_features, in_features = layer.out_features, int(x.uop.shard_shape[-1])
   splits = layer.in_features // in_features
@@ -499,7 +497,8 @@ def _view_back(t:Tensor) -> Tensor:
   return Tensor(uop).reshape(t.shape)
 
 def f16_gemv(layer:Linear, x:Tensor) -> Tensor:
-  shape, (x, n_tokens) = x.shape, _pad_tokens(x, prod(x.shape[:-1]))
+  shape, n_tokens = x.shape, Tensor(n) if isinstance(n:=prod(x.shape[:-1]), UOp) else None
+  if n_tokens is not None: x = x.pad_to(x.max_shape)
   tokens = prod(x.shape[:-1])
   assert isinstance(tokens, int)
   weight = _view_back(layer.weight)
