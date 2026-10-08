@@ -129,7 +129,7 @@ def unwrap_multi(call:UOp, resolved:list[UOp]) -> Iterator[tuple[list[Buffer], d
   bufs = [b.buffer for b in resolved]
   if not any(isinstance(b, MultiBuffer) for b in bufs): yield cast(list[Buffer], bufs), {}
   else:
-    # the DEVICE axis is bound per device at launch: it's a RANGE in the AST and the _device_num variable after codegen, set on every lane
+    # the DEVICE axis is bound per device at launch: it's a RANGE in the AST and the _device_num variable after codegen
     lanes = max(len(b.bufs) for b in bufs if isinstance(b, MultiBuffer)) # a single buffer is shared by every lane
     per_lane = [b.bufs if isinstance(b, MultiBuffer) else (b,)*lanes for b in bufs]
     for j, per_dev in enumerate(zip(*per_lane)): yield list(per_dev), {"_device_num": j}

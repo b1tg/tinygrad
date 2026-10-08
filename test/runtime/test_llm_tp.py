@@ -120,7 +120,7 @@ class TestTensorParallel(unittest.TestCase):
       single, parallel = Transformer.from_gguf(path, 64)[0], Transformer.from_gguf(path, 64, shard=2)[0]
       prompt = [int(x) for x in rng.integers(0, 64, 40)]
       self.assertEqual(list(itertools.islice(parallel.generate(list(prompt)), 6)), list(itertools.islice(single.generate(list(prompt)), 6)))
-      # kv cache is sharded on its heads, gated deltanet q/k/v/gate are column parallel, ssm_out is row parallel
+      # the kv cache is sharded on its heads, the gated deltanet q/k/v/gate are column parallel, ssm_out is row parallel
       self.assertEqual(parallel.blk[1].cache_kv.uop.axis, 2)
       self.assertEqual((parallel.blk[0].attn_q.weight.uop.axis, parallel.blk[0].attn_v.weight.uop.axis,
                         parallel.blk[0].attn_gate.weight.uop.axis, parallel.blk[0].ssm_out.weight.uop.axis), (0, 0, 0, 1))

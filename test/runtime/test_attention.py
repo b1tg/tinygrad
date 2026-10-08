@@ -88,8 +88,8 @@ class TestGatedDeltaNetBlock(unittest.TestCase):
     block.ssm_alpha.weight = self._tensor_linspace(-0.08, 0.12, (block.num_v_heads, config.dim))
     block.ssm_beta.weight = self._tensor_linspace(-0.12, 0.07, (block.num_v_heads, config.dim))
     cw = self._tensor_linspace(-0.05, 0.05, (block.conv_channels, block.ssm_conv_kernel))
-    block.ssm_conv1d_q["weight"], block.ssm_conv1d_k["weight"], block.ssm_conv1d_v["weight"] = \
-      cw[:block.q_dim], cw[block.q_dim:2*block.q_dim], cw[2*block.q_dim:]
+    block.ssm_conv1d_q["weight"], block.ssm_conv1d_k["weight"], block.ssm_conv1d_v["weight"] = (
+      cw[:block.q_dim], cw[block.q_dim:2*block.q_dim], cw[2*block.q_dim:])
     block.ssm_dt["bias"] = self._tensor_linspace(-0.1, 0.1, (block.num_v_heads,))
     block.ssm_a = self._tensor_linspace(-0.1, -0.05, (block.num_v_heads,))
     block.ssm_norm.weight = self._tensor_linspace(0.9, 1.1, (block.head_v_dim,))
@@ -112,7 +112,8 @@ class TestGatedDeltaNetBlock(unittest.TestCase):
       return conv_state, recurrent_state
 
   def _reset_state(self, block:GatedDeltaNetBlock):
-    Tensor.realize(*[s.assign(s.const_like(0)) for s in block.conv_state], block.recurrent_state.assign(block.recurrent_state.const_like(0)))
+    Tensor.realize(*[s.assign(s.const_like(0)) for s in block.conv_state],
+                   block.recurrent_state.assign(block.recurrent_state.const_like(0)))
 
   def _linear_np(self, x:np.ndarray, weight:np.ndarray) -> np.ndarray:
     return x.astype(np.float32) @ weight.T.astype(np.float32)
