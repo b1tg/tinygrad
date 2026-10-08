@@ -361,8 +361,8 @@ def _quant_linear_wmma(out, x, out_features, in_features, type_words, layout, de
 
 @functools.cache
 def _q5_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, out_features:int, in_features:int, ggml_type:int, tokens:int|UOp, rdna4:bool=False) -> UOp:
-  token_tile, output_tiles = (64, 1 if out_features <= 1024 else 2) if out.shape[0] % 64 == 0 else \
-    (32 if out.shape[0] % 32 == 0 else 16, 2)
+  rows = out.shape[0] if isinstance(tokens, int) else 32  # the real token count is unknown, use the small tiles
+  token_tile, output_tiles = (64, 1 if out_features <= 1024 else 2) if rows % 64 == 0 else (32 if rows % 32 == 0 else 16, 2)
   layout = _wmma_layout(out, out_features, token_tile, output_tiles, tokens)
   word_indices = (layout[5], layout[5]+2) if rdna4 else tuple(range(4))
   def dequant(base:UOp, subgroup:UOp, half:int) -> tuple[UOp, ...]:
@@ -376,9 +376,9 @@ def _q5_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, out_features:int, in_fea
 
 @functools.cache
 def _iq4_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, lut:UOp, out_features:int, in_features:int, tokens:int|UOp, rdna4:bool=False) -> UOp:
-  token_tile = 32 if out_features <= 1024 and out.shape[0] % 32 == 0 else 64 if out.shape[0] % 64 == 0 and \
-    out_features <= 6144 else 128 if out.shape[0] % 128 == 0 else \
-    32 if out.shape[0] % 32 == 0 else 16
+  rows = out.shape[0] if isinstance(tokens, int) else 32
+  token_tile = 32 if out_features <= 1024 and rows % 32 == 0 else 64 if rows % 64 == 0 and out_features <= 6144 else 128 if rows % 128 == 0 else \
+    32 if rows % 32 == 0 else 16
   output_tiles = 1 if out_features <= 1024 else 2 if out_features <= 6144 else 1 if out_features < 8192 else 2
   layout = _wmma_layout(out, out_features, token_tile, output_tiles, tokens)
   output_waves, _, _, lane, wave, half, _, _, _ = layout
@@ -396,7 +396,8 @@ def _iq4_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, lut:UOp, out_features:i
 @functools.cache
 def _quant_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, *grids:UOp,
                                   out_features:int, in_features:int, ggml_type:int, tokens:int|UOp, rdna4:bool=False) -> UOp:
-  token_tile = 64 if out.shape[0] % 64 == 0 else 32 if out.shape[0] % 32 == 0 else 16
+  rows = out.shape[0] if isinstance(tokens, int) else 32
+  token_tile = 64 if rows % 64 == 0 else 32 if rows % 32 == 0 else 16
   layout = _wmma_layout(out, out_features, token_tile, 2, tokens)
   output_waves, _, _, lane, wave, physical_half, _, _, _ = layout
   word_indices = (physical_half, physical_half+2) if rdna4 else tuple(range(4))
