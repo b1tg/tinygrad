@@ -443,8 +443,10 @@ class Transformer:
       q_dim = kv[f'{arch}.ssm.state_size'] * kv[f'{arch}.ssm.group_count']
       for fused, stem in (('attn_qkv', 'attn_'), ('ssm_conv1d', 'ssm_conv1d_')):
         for name in [n for n in entries if n.startswith('blk.') and n.endswith(f'.{fused}.weight')]:
-          data, shape, typ = entries.pop(name); parts = data.reshape(shape[0], -1).split([q_dim, q_dim, shape[0]-2*q_dim])
-          for p, t in zip('qkv', parts): entries[name.replace(fused, stem+p)] = (t.reshape(-1), (t.shape[0], shape[1]), typ)
+          data, shape, typ = entries.pop(name)
+          parts = data.reshape(shape[0], -1).split([q_dim, q_dim, shape[0]-2*q_dim])
+          for part, size, t in zip('qkv', (q_dim, q_dim, shape[0]-2*q_dim), parts):
+            entries[name.replace(fused, stem+part)] = (t.reshape(-1), (size, shape[1]), typ)
     shard_map:dict[str, int] = {}
     if shard > 1:
       heads = n_heads if kv.get(f'{arch}.attention.kv_lora_rank') else n_kv_heads
@@ -480,7 +482,7 @@ class Transformer:
       for i, is_ssm in enumerate(ssm_layers):
         if not is_ssm: continue
         # conv is stored with a size-1 middle dim, ssm_out is the output projection
-        for p in ('q', 'k', 'v'): state_dict[f"blk.{i}.ssm_conv1d_{p}.weight"] = state_dict[f"blk.{i}.ssm_conv1d_{p}.weight"].squeeze(1)
+        for part in ('q', 'k', 'v'): state_dict[f"blk.{i}.ssm_conv1d_{part}.weight"] = state_dict[f"blk.{i}.ssm_conv1d_{part}.weight"].squeeze(1)
         state_dict[f"blk.{i}.ssm_out.weight"] = state_dict.pop(f"blk.{i}.attn_output.weight")
     if arch in ('qwen35', 'qwen35moe', 'glm4moe', 'gpt-oss'):
       state_dict = {k.replace('post_attention_norm', 'ffn_norm'):v for k,v in state_dict.items()}
