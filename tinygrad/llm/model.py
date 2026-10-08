@@ -342,8 +342,7 @@ class GatedDeltaNetBlock(FFNBlock):
     # the last conv_kernel-1 columns of the window become the next conv state
     conv_state_store = self.conv_state.uop.store(conv_window[:, T:T+self.ssm_conv_kernel-1].cast(self.conv_state.dtype).uop)
 
-    conv_out = functools.reduce(lambda a,b: a+b,
-      (conv_window[:, i:i+T] * self.ssm_conv1d["weight"][:, i] for i in range(self.ssm_conv_kernel))).silu()
+    conv_out = functools.reduce(lambda a,b: a+b, (conv_window[:, i:i+T]*self.ssm_conv1d["weight"][:, i] for i in range(self.ssm_conv_kernel))).silu()
     q, k, v = conv_out.split([self.q_dim, self.q_dim, self.conv_channels - 2*self.q_dim], dim=-1)
     qk_eps = 1e-12 if is_kda else 1e-6
     q, k = (z.reshape(B, T, self.num_k_heads, self.head_k_dim).normalize(dim=-1, eps=qk_eps)
