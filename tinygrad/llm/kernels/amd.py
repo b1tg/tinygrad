@@ -798,8 +798,10 @@ def _gated_delta_prefill_kernel(core:UOp, q:UOp, k:UOp, v:UOp, beta:UOp, alpha:U
                   for row_idx,row in enumerate(rows) for i,col in enumerate(cols))
   return UOp.group(*state_stores).end(lane, bh_row).sink(arg=KernelInfo(name="gated_delta_prefill", opts_to_apply=()))
 
-def gated_delta_prefill(q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:Tensor, state:Tensor, start_pos:Tensor|None=None,
-                        n_tokens:Tensor|None=None) -> Tensor:
+def gated_delta_prefill(q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:Tensor, state:Tensor, start_pos:Tensor|None=None) -> Tensor:
+  # symbolic token count: the buffers are padded to the max chunk, the scan only runs the real tokens
+  n_tokens = Tensor(q.shape[2]) if isinstance(q.shape[2], UOp) else None
+  if n_tokens is not None: q, k, v, beta, alpha = (z.pad_to((*z.shape[:2], z.max_shape[2], *z.shape[3:])) for z in (q, k, v, beta, alpha))
   batch, heads, tokens, key_dim = q.shape
   value_dim = v.shape[-1]
   assert q.shape == k.shape and v.shape[:3] == beta.shape == (batch, heads, tokens) and state.shape == (batch, heads, value_dim, key_dim)
@@ -816,4 +818,5 @@ def gated_delta_prefill(q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:Tensor,
   params = tuple(UOp.placeholder_like(x, slot=i) for i,x in enumerate(contig))
   call = _gated_delta_prefill_kernel(*params, None if start_pos is None else start_pos.uop.unbound(),
                                      None if n_tokens is None else _unbind(n_tokens.uop)).call(*contig)
-  return Tensor(contig[0].after(call))
+  core = Tensor(contig[0].after(call))
+  return core if n_tokens is None else core[:, :, :n_tokens.uop]
