@@ -617,6 +617,7 @@ class Transformer:
         sample = not prefill or any(positions[i]+n_toks == lengths[i] for i in rows)
         if prefill: out = Tensor.cat(*(cast(Tensor, inputs[i])[:, sp:sp+v_toks.bind(n_toks)] for i, sp in zip(rows, bound)), dim=0)
         elif changed: out = Tensor([history[i][-1] for i in rows], dtype="int32").reshape(len(rows), 1)
+        for i in rows: self._models.get((i,), self)._cached_tokens = []  # state writes may succeed before inference raises
         out = self._models.get(rows, self)(out, bound[0], temp if sample else None, *bound[1:]).realize()
         tokens_out = cast(list[int], out.flatten().tolist()) if sample else []
         for j, i in enumerate(rows):

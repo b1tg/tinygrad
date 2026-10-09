@@ -91,8 +91,11 @@ class Handler(VizHandler):
     if request_st is None: request_st = st
     dec = self.server.tok.stream_decoder()
     router = StreamRouter(reasoning)
-    self.server.pending.put(req := Request(ids, temperature, max_tokens, self.server.tok.is_end))
+    req = Request(ids, temperature, max_tokens, self.server.tok.is_end)
     try:
+      with self.server.admission:
+        if self.server.stopping.is_set(): raise RuntimeError("server is stopping")
+        self.server.pending.put(req)
       yield chunk({"role":"assistant", "content":""})
       for next_id in iter(req.output.get, None):
         if isinstance(next_id, Exception): raise next_id
@@ -118,9 +121,9 @@ class Handler(VizHandler):
       if include_usage:
         yield {"choices": [], "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": len(out),
                                         "total_tokens": prompt_tokens + len(out)}, **tmpl}
-    except Exception:
+    except Exception as exc:
       finish_reason = "error"
-      raise
+      yield {"error":{"message":str(exc), "type":"server_error"}}
     finally:
       ttft = f"{pt-request_st:.2f}s" if pt is not None else "-"
       decode = f"{(len(out)-1)/(last-pt):.0f} tok/s" if len(out) > 1 and pt is not None and last > pt else "-"
@@ -134,6 +137,10 @@ class Handler(VizHandler):
     body: dict[str, typing.Any] = json.loads(raw_body.decode("utf-8"))
     if DEBUG >= 1: print(json.dumps(body, indent=2))
     if self.path == "/v1/chat/completions":
+      for param in ("max_tokens", "max_completion_tokens"):
+        if (value := body.get(param)) is not None and (type(value) is not int or value <= 0):
+          return self.send_data(json.dumps({"error":{"message":f"{param} must be a positive integer", "type":"invalid_request_error",
+                                                     "param":param, "code":"invalid_value"}}).encode(), status_code=400)
       # render and tokenize
       normalize_messages(body["messages"])
       rendered = self.server.template.render(messages=body["messages"], tools=body.get("tools"), add_generation_prompt=True, preserve_thinking=True)
@@ -153,6 +160,7 @@ class Handler(VizHandler):
       else:
         out, reasoning, tool_calls, finish_reason = [], [], [], "stop"
         for c in chunks:
+          if "error" in c: return self.send_data(json.dumps(c).encode(), status_code=500)
           if not c["choices"]: continue
           choice = c["choices"][0]
           if (delta := choice.get("delta", {})):
@@ -172,7 +180,7 @@ class LLMServer(socketserver.ThreadingMixIn, TCPServerWithReuse):
   daemon_threads = True
   def __init__(self, server_address:tuple, model:Transformer, model_name:str, tok:SimpleTokenizer, template:typing.Any, batch_size:int=1):
     self.model, self.model_name, self.tok, self.template = model, model_name, tok, template
-    self.pending, self.stopping = queue.Queue[Request](), threading.Event()
+    self.pending, self.stopping, self.admission = queue.Queue[Request](), threading.Event(), threading.Lock()
     super().__init__(server_address, Handler)
     self.worker = threading.Thread(target=self.run, args=(batch_size,), name='llm-inference')
     self.worker.start()
@@ -196,9 +204,13 @@ class LLMServer(socketserver.ThreadingMixIn, TCPServerWithReuse):
         if tokens[i] is not None: job.output.put(tokens[i])
         if job.finish_reason is not None: job.output.put(None)
     source.close()
-    for job in jobs + list(self.pending.queue): job.output.put(None)
+    for job in jobs + list(self.pending.queue):
+      if job.finish_reason is None:
+        job.finish_reason = "error"
+        job.output.put(RuntimeError("server is stopping"))
+      job.output.put(None)
 
   def server_close(self):
-    self.stopping.set()
+    with self.admission: self.stopping.set()
     self.worker.join()
     super().server_close()
