@@ -5,7 +5,7 @@ from tinygrad import Tensor, UOp, nn, Device, Context
 from tinygrad.llm.gguf import ggml_data_to_tensor
 from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.helpers import prod, getenv
-from tinygrad.uop.ops import AxisType, KernelInfo, Ops, resolve, sint
+from tinygrad.uop.ops import AxisType, KernelInfo, Ops, resolve
 from tinygrad.renderer.cstyle import HIPRenderer
 
 BLOCK_M, BLOCK_N, WARP_SIZE = 32, 32, 32
@@ -57,15 +57,9 @@ class Linear(nn.Linear):
   ggml_type:int|None = None
   use_custom_quant = True
   shard_axis:int|None = None
-  def __init__(self, in_features:int|tuple[int, ...], out_features:int|tuple[int, ...], bias=True):
-    # the weight is (*out_shape, *in_shape): the call reduces the last axes of x like in_shape
-    self.in_shape = (in_features,) if isinstance(in_features, int) else in_features
-    self.out_shape = (out_features,) if isinstance(out_features, int) else out_features
-    super().__init__(prod(self.in_shape), prod(self.out_shape), bias)
-    self.in_features, self.out_features = prod(self.in_shape), prod(self.out_shape)
-    if len(self.in_shape) + len(self.out_shape) > 2:
-      self.weight = self.weight.reshape(*self.out_shape, *self.in_shape)
-      if self.bias is not None: self.bias = self.bias.reshape(self.out_shape)
+  def __init__(self, in_features:int, out_features:int, bias=True):
+    super().__init__(in_features, out_features, bias)
+    self.in_features, self.out_features = in_features, out_features
   def set_quantized(self, decoded:Tensor):
     if self.in_features % GGML_BLOCK_SIZE: return
     packed_sizes = {typ: decoded.numel() // 256 * type_size for typ,type_size in QUANT_SIZES.items()}
@@ -102,22 +96,18 @@ class Linear(nn.Linear):
         # tiny dense fp16 matmul (e.g. the ssm beta/alpha head rows): single fp16 gemv kernel instead of a
         # generic matmul schedule, and realize the densely packed weight once if it is still a lazy ggml view
         if self.weight.dtype in (dtypes.half, dtypes.float, dtypes.bfloat16) and self.out_features <= 2048 \
-          and self.in_features % (WARP_SIZE*4) == 0 and ((axis:=self.weight.uop.axis) is None or axis < len(self.out_shape)):
+          and self.in_features % (WARP_SIZE*4) == 0 and self.weight.uop.axis is None:
           numel, max_shape = x.numel(), x.max_shape
           if isinstance(numel, int) or prod(max_shape) // self.in_features <= 32:
             out = f16_gemv(self, x if isinstance(numel, int) else x.pad_to(max_shape))
-            return out if isinstance(numel, int) else out.shrink(tuple((0, s) for s in self._out_shape_of(x)))
+            return out if isinstance(numel, int) else out.shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
         self.use_custom_quant = supported = False  # not a supported quant format
     if self.ggml_type in QUANT_SIZES and supported:
       if isinstance(x.numel(), int): return q8_linear(self, x)
       # symbolic token count: pad to the max chunk size so the kernels see static shapes, garbage rows are sliced off
       out = q8_linear(self, x.pad_to(x.max_shape))
-      return out.shrink(tuple((0, s) for s in self._out_shape_of(x)))
-    if len(self.in_shape) + len(self.out_shape) == 2: return super().__call__(x)
-    out = (x.reshape(*x.shape[:x.ndim-len(self.in_shape)], *(1,)*len(self.out_shape), *self.in_shape) * self.weight) \
-      .sum(tuple(range(-len(self.in_shape), 0)))
-    return out if self.bias is None else out + self.bias
-  def _out_shape_of(self, x:Tensor) -> tuple[sint, ...]: return (*x.shape[:x.ndim-len(self.in_shape)], *self.out_shape)
+      return out.shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
+    return super().__call__(x)
 
 def _amd_dp4a(a:UOp, b:UOp, c:UOp) -> UOp:
   return UOp(Ops.CUSTOMI, src=(a, b, c), arg=("__builtin_amdgcn_sudot4(true, {}, true, {}, {}, false)", dtypes.int32))
@@ -449,17 +439,14 @@ def _quant_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, *grids:UOp,
 def q8_linear(layer:Linear, x:Tensor) -> Tensor:
   assert layer.ggml_type in QUANT_SIZES
   tokens = int(x.numel()) // layer.in_features
-  batch, x = x.shape[:x.ndim-len(layer.in_shape)], x.reshape(tokens, *layer.in_shape)
-  out_features, in_features = layer.out_features, int(prod(x.uop.shard_shape[1:]))
+  out_features, in_features = layer.out_features, int(x.uop.shard_shape[-1])
   splits = layer.in_features // in_features
-  row = layer.shard_axis is not None and layer.shard_axis >= len(layer.out_shape)
-  assert row == (splits > 1), f"input features split over {splits} devices, weight split on axis {layer.shard_axis}"
-  out_shape:tuple[int, ...] = (splits*tokens, out_features) if row else (tokens, *layer.out_shape)
+  assert (layer.shard_axis == 1) == (splits > 1), f"input features split over {splits} devices, weight split on axis {layer.shard_axis}"
+  out_shape:tuple[int, ...] = (splits*tokens, out_features)
   fxn:Callable[..., UOp]
-  chunks:tuple[int, ...] = ()
   extra = (_iq_grid(x.device, layer.ggml_type),) if layer.ggml_type in (IQ2_XS, IQ3_XXS, IQ3_S, IQ2_S) else ()
   # the kernels write the output features of their own device
-  local_out = out_features // len(dev) if isinstance(dev:=layer.weight.device, tuple) and layer.shard_axis is not None and not row else out_features
+  local_out = out_features // len(dev) if isinstance(dev:=layer.weight.device, tuple) and layer.shard_axis == 0 else out_features
   if tokens % 16 == 0 and local_out % 16 == 0:
     if layer.ggml_type == IQ4_XS:
       fxn, extra = _iq4_linear_f16_wmma_kernel, (iq4_half_lut(x.device),)
@@ -471,18 +458,13 @@ def q8_linear(layer:Linear, x:Tensor) -> Tensor:
   else:
     fxn = functools.partial(_quant_decode_kernel, ggml_type=layer.ggml_type)
     srcs = (*q8_quantize(x, tokens, in_features), *extra)
-    chunks = ((in_features+1023)//1024,)
-  axis = None if layer.shard_axis is None else 0 if row else 1+layer.shard_axis
-  out = Tensor.empty(*out_shape, *chunks, dtype=dtypes.float32, device=x.device, axis=axis)
-  # the kernels are built for one device and its flat rows of output features
-  def kernel(o:UOp, *args:UOp) -> UOp:
-    o = o.reshape(o.shape[0], -1, *chunks)
-    return fxn(o, *args, out_features=o.shape[1], in_features=in_features)
-  result = Tensor.custom_kernel(out, layer.weight, *srcs, fxn=kernel)[0]
-  if chunks: result = result.sum(-1)
+    out_shape += ((in_features+1023)//1024,)
+  out = Tensor.empty(out_shape, dtype=dtypes.float32, device=x.device, axis=None if layer.shard_axis is None else 1-layer.shard_axis)
+  result = Tensor.custom_kernel(out, layer.weight, *srcs, fxn=functools.partial(fxn, out_features=local_out, in_features=in_features))[0]
+  if len(result.shape) == 3: result = result.sum(-1)
   # row parallel: every device wrote the partial sum of its input features, the sum over the devices is the allreduce
   if splits > 1: result = result.reshape(splits, tokens, out_features).sum(0)
-  result = result.reshape(*batch, *layer.out_shape)
+  result = result.reshape(*x.shape[:-1], out_features)
   return result if layer.bias is None else result + layer.bias
 
 # ******** tiny dense fp16 gemv ********
@@ -513,19 +495,14 @@ def _view_back(t:Tensor) -> Tensor:
   return Tensor(uop).reshape(t.shape)
 
 def f16_gemv(layer:Linear, x:Tensor) -> Tensor:
-  batch = x.shape[:x.ndim-len(layer.in_shape)]
-  tokens = prod(batch)
+  tokens = prod(x.shape[:-1])
   assert isinstance(tokens, int)
   weight = _view_back(layer.weight)
   x = x.contiguous()
-  out = Tensor.empty(tokens, *layer.out_shape, dtype=dtypes.float32, device=x.device, axis=None if (axis:=weight.uop.axis) is None else 1+axis)
-  def fxn(o:UOp, w:UOp, xs:UOp, *rest:UOp) -> UOp:
-    return _amd_f16_gemv_kernel(o.reshape(tokens, -1), w.reshape(-1), xs, *(b.reshape(-1) for b in rest), in_features=layer.in_features,
-                                out_features=prod(o.shape[1:]), tokens=tokens)
-  # a sharded weight adds the bias after the kernel: the kernel only sees the output features of its device
-  bias = () if layer.bias is None or axis is not None else (_view_back(layer.bias),)
-  result = Tensor.custom_kernel(out, weight, x.reshape(tokens, layer.in_features), *bias, fxn=fxn)[0].reshape(*batch, *layer.out_shape)
-  return result if layer.bias is None or bias else result + layer.bias
+  out = Tensor.empty(tokens, layer.out_features, dtype=dtypes.float32, device=x.device)
+  fxn = functools.partial(_amd_f16_gemv_kernel, in_features=layer.in_features, out_features=layer.out_features, tokens=tokens)
+  srcs = (out, weight.reshape(-1), x.reshape(tokens, layer.in_features)) + (() if layer.bias is None else (_view_back(layer.bias),))
+  return Tensor.custom_kernel(*srcs, fxn=fxn)[0].reshape(*x.shape[:-1], layer.out_features)
 
 # ******** flash attention on the KV cache ********
 
@@ -813,11 +790,10 @@ def _gated_delta_prefill_kernel(core:UOp, q:UOp, k:UOp, v:UOp, beta:UOp, alpha:U
   return UOp.group(*state_stores).end(lane, bh_row).sink(arg=KernelInfo(name="gated_delta_prefill", opts_to_apply=()))
 
 def gated_delta_prefill(q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:Tensor, state:Tensor, start_pos:Tensor|None=None) -> Tensor:
-  # the heads can be several axes, e.g. (repeats, k heads) sharded on the k heads: the kernel sees the heads of one device as one axis
-  batch, *heads, value_dim, key_dim = state.shape
-  tokens, n = q.shape[-2], len(heads)
-  assert q.shape == k.shape == (batch, *heads, tokens, key_dim) and v.shape == (batch, *heads, tokens, value_dim)
-  assert beta.shape == (batch, *heads, tokens) and alpha.shape[:n+2] == (batch, *heads, tokens) and alpha.ndim in (n+2, n+3)
+  batch, heads, tokens, key_dim = q.shape
+  value_dim = v.shape[-1]
+  assert q.shape == k.shape and v.shape[:3] == beta.shape == (batch, heads, tokens) and state.shape == (batch, heads, value_dim, key_dim)
+  assert alpha.shape[:3] == (batch, heads, tokens) and (len(alpha.shape) == 3 or alpha.shape[-1] in (1, key_dim))
   assert key_dim % 32 == 0 and value_dim % 4 == 0
   assert q.dtype == k.dtype == dtypes.float32, "recurrent Q/K must be float32"
   assert state.uop.contiguous_view_offset() is not None, "recurrent state must be contiguous"
@@ -827,6 +803,6 @@ def gated_delta_prefill(q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:Tensor,
   core, kq = Tensor.empty_like(v), (q*k).sum(-1).contiguous()
   srcs = (core, q.contiguous(), k.contiguous(), v.contiguous(), beta.contiguous(), alpha.contiguous(), state, kq)
   contig = tuple(x.uop if x.uop.op is Ops.AFTER else x.uop.contiguous() for x in srcs)
-  params = tuple(UOp.placeholder_like(x, slot=i).reshape(batch, -1, *x.max_shard_shape[n+1:]) for i,x in enumerate(contig))
+  params = tuple(UOp.placeholder_like(x, slot=i) for i,x in enumerate(contig))
   call = _gated_delta_prefill_kernel(*params, None if start_pos is None else start_pos.uop.unbound()).call(*contig)
   return Tensor(contig[0].after(call))

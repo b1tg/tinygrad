@@ -101,31 +101,27 @@ class TestTensorParallel(unittest.TestCase):
   def test_model(self):
     rng = np.random.default_rng(42)
     config = TransformerConfig(num_blocks=2, dim=256, hidden_dim=512, n_heads=4, n_kv_heads=2, norm_eps=1e-5, vocab_size=64, head_dim=64,
-      v_head_dim=64, rope_theta=10000, rope_dim=16, max_context=64, qk_norm=64, attn_output_gate=True, ssm=SSMConfig(4, 32, 2, 4, 128),
+      v_head_dim=64, rope_theta=10000, rope_dim=16, max_context=64, qk_norm=64, attn_output_gate=True, ssm=SSMConfig(4, 32, 4, 8, 1024),
       ssm_layers=(True, False))
     with tempfile.TemporaryDirectory() as folder:
       writer = GGUFWriter(path:=pathlib.Path(folder)/'model.gguf', 'qwen35')
       for key,value in {'context_length':64, 'embedding_length':256, 'feed_forward_length':512, 'block_count':2, 'full_attention_interval':2,
-                        'ssm.conv_kernel':4, 'ssm.state_size':32, 'ssm.group_count':2, 'ssm.time_step_rank':4, 'ssm.inner_size':128,
+                        'ssm.conv_kernel':4, 'ssm.state_size':32, 'ssm.group_count':4, 'ssm.time_step_rank':8, 'ssm.inner_size':1024,
                         'attention.head_count':4, 'attention.head_count_kv':2, 'attention.key_length':64, 'rope.dimension_count':16}.items():
         writer.add_uint32('qwen35.'+key, value)
       writer.add_float32('qwen35.rope.freq_base', 10000)
       writer.add_float32('qwen35.attention.layer_norm_rms_epsilon', 1e-5)
       writer.add_array('tokenizer.ggml.tokens', [str(i) for i in range(64)])
-      values = {name: -rng.random(w.shape) if name.endswith('ssm_a') else rng.normal(1, .1, w.shape) if 'norm' in name else
-                rng.normal(0, .5 if 'token_embd' in name else .05, w.shape) for name,w in nn.state.get_state_dict(Transformer(config)).items()}
-      # the gguf layout: flat v heads, flat q|k|v
-      for name in ('blk.0.attn_qkv.weight', 'blk.0.ssm_conv1d.weight', 'blk.0.attn_gate.weight', 'blk.0.ssm_alpha.weight', 'blk.0.ssm_beta.weight',
-                   'blk.0.ssm_a', 'blk.0.ssm_dt.bias'):
-        values[name] = values[name].reshape(-1, *values[name].shape[2:])
-      values['blk.0.ssm_out.weight'] = values['blk.0.ssm_out.weight'].reshape(256, -1)
-      for name, value in values.items(): writer.add_tensor(name.replace('ffn_norm', 'post_attention_norm'), value.astype(np.float32))
+      for name,weight in nn.state.get_state_dict(Transformer(config)).items():
+        value = -rng.random(weight.shape) if name.endswith('ssm_a') else rng.normal(1, .1, weight.shape) if 'norm' in name else \
+                rng.normal(0, .5 if 'token_embd' in name else .05, weight.shape)
+        writer.add_tensor(name.replace('ffn_norm', 'post_attention_norm'), value.astype(np.float32))
       write_gguf(writer)
       single, parallel = Transformer.from_gguf(path, 64)[0], Transformer.from_gguf(path, 64, shard=2)[0]
       prompt = [int(x) for x in rng.integers(0, 64, 40)]
       self.assertEqual(list(itertools.islice(parallel.generate(list(prompt)), 6)), list(itertools.islice(single.generate(list(prompt)), 6)))
-      # the kv cache is sharded on its heads, the gated deltanet on its k heads
+      # the kv cache is sharded on its heads, the gated deltanet on its k head groups
       self.assertEqual(parallel.blk[1].cache_kv.uop.axis, 2)
-      self.assertEqual((parallel.blk[0].attn_qkv.weight.uop.axis, parallel.blk[0].recurrent_state.uop.axis), (1, 2))
+      self.assertEqual((parallel.blk[0].attn_qkv.weight.uop.axis, parallel.blk[0].recurrent_state.uop.axis), (0, 1))
 
 if __name__ == '__main__': unittest.main()
