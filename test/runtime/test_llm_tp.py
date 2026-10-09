@@ -40,21 +40,6 @@ class TestGGUFShard(unittest.TestCase):
           self.assertEqual((out[name].device, out[name].uop.axis), (DEVICES, axis))
           np.testing.assert_array_equal(out[name].to(Device.DEFAULT).numpy(), full[name].numpy())
 
-  def test_segments(self):
-    # every segment of the axis is split over the devices, the axis is ordered by device
-    tensors = {'rows': ((12, 512), Q.Q4_K, 0, 3), 'cols': ((8, 1536), Q.Q8_0, 1, 3), 'vector': ((12,), Q.F32, 0, 2)}
-    with tempfile.TemporaryDirectory() as folder:
-      writer = GGUFWriter(path:=pathlib.Path(folder)/'model.gguf', 'test')
-      for name, (shape, typ, _, _) in tensors.items(): writer.add_tensor(name, random_data(shape, typ), raw_dtype=typ)
-      write_gguf(writer)
-      full = gguf_load(path)[1]
-      out = gguf_shard(gguf_parse(path)[1], DEVICES, {name: (axis, segments) for name, (_, _, axis, segments) in tensors.items()})
-      for name, (shape, _, axis, segments) in tensors.items():
-        with self.subTest(name=name):
-          self.assertEqual((out[name].device, out[name].uop.axis), (DEVICES, axis))
-          expected = full[name].numpy().reshape(*shape[:axis], segments, len(DEVICES), -1, *shape[axis+1:]).swapaxes(axis, axis+1).reshape(shape)
-          np.testing.assert_array_equal(out[name].to(Device.DEFAULT).numpy(), expected)
-
   def test_split_quantization_block(self):
     # two devices would each get one and a half Q4_K blocks of every row
     data = Tensor(random_data((8, 768), Q.Q4_K).reshape(-1), device='CPU')
@@ -116,28 +101,36 @@ class TestTensorParallel(unittest.TestCase):
   def test_model(self):
     rng = np.random.default_rng(42)
     config = TransformerConfig(num_blocks=2, dim=256, hidden_dim=512, n_heads=4, n_kv_heads=2, norm_eps=1e-5, vocab_size=64, head_dim=64,
-      v_head_dim=64, rope_theta=10000, rope_dim=16, max_context=64, qk_norm=64, attn_output_gate=True, ssm=SSMConfig(4, 32, 4, 8, 256),
+      v_head_dim=64, rope_theta=10000, rope_dim=16, max_context=64, qk_norm=64, attn_output_gate=True, ssm=SSMConfig(4, 128, 4, 8, 1024),
       ssm_layers=(True, False))
     with tempfile.TemporaryDirectory() as folder:
       writer = GGUFWriter(path:=pathlib.Path(folder)/'model.gguf', 'qwen35')
       for key,value in {'context_length':64, 'embedding_length':256, 'feed_forward_length':512, 'block_count':2, 'full_attention_interval':2,
-                        'ssm.conv_kernel':4, 'ssm.state_size':32, 'ssm.group_count':4, 'ssm.time_step_rank':8, 'ssm.inner_size':256,
+                        'ssm.conv_kernel':4, 'ssm.state_size':128, 'ssm.group_count':4, 'ssm.time_step_rank':8, 'ssm.inner_size':1024,
                         'attention.head_count':4, 'attention.head_count_kv':2, 'attention.key_length':64, 'rope.dimension_count':16}.items():
         writer.add_uint32('qwen35.'+key, value)
       writer.add_float32('qwen35.rope.freq_base', 10000)
       writer.add_float32('qwen35.attention.layer_norm_rms_epsilon', 1e-5)
       writer.add_array('tokenizer.ggml.tokens', [str(i) for i in range(64)])
-      for name,weight in nn.state.get_state_dict(Transformer(config)).items():
+      # the reference gets the gated deltanet regrouped by k head (4 k heads, 2 v heads each), the gguf has it in segments of all of them
+      reference = Transformer(config)
+      regroup = {'attn_qkv.weight': 4, 'ssm_conv1d.weight': 4, 'attn_gate.weight': 2, 'ssm_alpha.weight': 2, 'ssm_beta.weight': 2,
+                 'ssm_dt.bias': 2, 'ssm_a': 2}
+      for name,weight in nn.state.get_state_dict(reference).items():
         value = -rng.random(weight.shape) if name.endswith('ssm_a') else rng.normal(1, .1, weight.shape) if 'norm' in name else \
                 rng.normal(0, .5 if 'token_embd' in name else .05, weight.shape)
         writer.add_tensor(name.replace('ffn_norm', 'post_attention_norm'), value.astype(np.float32))
+        if (segments:=regroup.get(name.split('.', 2)[-1])): value = value.reshape(segments, 4, -1).swapaxes(0, 1).reshape(value.shape)
+        weight.replace(Tensor(value.astype(np.float16)))
       write_gguf(writer)
       single, parallel = Transformer.from_gguf(path, 64)[0], Transformer.from_gguf(path, 64, shard=2)[0]
       prompt = [int(x) for x in rng.integers(0, 64, 40)]
-      self.assertEqual(list(itertools.islice(parallel.generate(list(prompt)), 6)), list(itertools.islice(single.generate(list(prompt)), 6)))
-      # the kv cache is sharded on its heads, the gated deltanet on its k heads
+      expected = list(itertools.islice(reference.generate(list(prompt)), 6))
+      self.assertEqual(list(itertools.islice(single.generate(list(prompt)), 6)), expected)
+      self.assertEqual(list(itertools.islice(parallel.generate(list(prompt)), 6)), expected)
+      # the kv cache is sharded on its heads, the gated deltanet on its k heads, ssm_out is copied
       self.assertEqual(parallel.blk[1].cache_kv.uop.axis, 2)
       self.assertEqual((parallel.blk[0].attn_qkv.weight.uop.axis, parallel.blk[0].ssm_out.weight.uop.axis, parallel.blk[0].recurrent_state.uop.axis),
-                       (0, 1, 1))
+                       (0, None, 1))
 
 if __name__ == '__main__': unittest.main()

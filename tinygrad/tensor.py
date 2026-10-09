@@ -358,7 +358,8 @@ class Tensor(RandMixin):
     Moves the tensor to the given device. `force=True` inserts a transfer even for device-less values.
     """
     if self.uop.device is None and not force: return self
-    if (device:=canonicalize_device(device)) == self.device: return self
+    # a sharded tensor moved to its own devices is gathered on every device
+    if (device:=canonicalize_device(device)) == self.device and (isinstance(device, str) or self.uop.axis is None): return self
     if isinstance(device, str) and is_disk_device(device):
       if isinstance(self.device, tuple): raise RuntimeError("gather to a single device before storing to DISK")
       if self.grad is not None: raise RuntimeError("tensor and gradient need separate DISK destinations; use explicit STOREs")

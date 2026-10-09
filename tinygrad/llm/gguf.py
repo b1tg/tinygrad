@@ -249,27 +249,24 @@ def gguf_load(fn: Tensor|str|pathlib.Path) -> tuple[dict, dict[str, Tensor]]:
   return kv, gguf_shard(entries, (Device.DEFAULT,))
 
 def gguf_shard(entries:dict[str, tuple[Tensor, tuple[int, ...], int]], devices:tuple[str, ...],
-               shard_map:dict[str, int|tuple[int, int]]|None=None) -> dict[str, Tensor]:
+               shard_map:dict[str, int]|None=None) -> dict[str, Tensor]:
   """
   Loads the parsed `entries` on `devices`: a tensor in `shard_map` is sharded on the given axis, the others are copied to every device.
-  An `(axis, segments)` axis is that many equal segments that are each split over the devices: the axis is ordered by device.
   """
   n, packed, shard_map = len(devices), {}, shard_map or {}
   for name, (data, shape, typ) in entries.items():
-    if (spec:=shard_map.get(name)) is None: packed[name] = data.shard(devices)
+    if (axis:=shard_map.get(name)) is None: packed[name] = data.shard(devices)
     else:
-      axis, segments = spec if isinstance(spec, tuple) else (spec, 1)
-      if shape[axis] % (segments*n) or (axis == len(shape)-1 and shape[axis]//(segments*n) % _GGML_QUANT.get(typ, (1,))[0]):
-        raise ValueError(f"{name}: can't split {shape} on axis {axis} in {segments} segments over {n} devices")
-      parts = (data.to("CPU") if prod(shape[:axis])*segments > 1 else data).reshape(*shape[:axis], segments, n, -1)
-      packed[name] = parts.permute(axis+1, *range(axis+1), axis+2).shard(devices, 0)
+      if shape[axis] % n or (axis == len(shape)-1 and shape[axis]//n % _GGML_QUANT.get(typ, (1,))[0]):
+        raise ValueError(f"{name}: can't split {shape} on axis {axis} over {n} devices")
+      parts = (data.to("CPU") if prod(shape[:axis]) > 1 else data).reshape(*shape[:axis], n, -1)
+      packed[name] = parts.permute(axis, *range(axis), axis+1).shard(devices, 0)
   # TODO: shard copies the full tensor to every device
   for t in packed.values(): t.realize()
   for d in devices: Device[d].allocator.free_cache()
   def decode(name:str, shape:tuple[int, ...], typ:int) -> Tensor:
     decoded = ggml_data_to_tensor(packed[name].flatten(), prod(shape), typ)
-    if (spec:=shard_map.get(name)) is None: return decoded.reshape(shape)
-    axis = spec[0] if isinstance(spec, tuple) else spec
+    if (axis:=shard_map.get(name)) is None: return decoded.reshape(shape)
     local = decoded.reshape(n, *shape[:axis], shape[axis]//n, *shape[axis+1:])
     return local.permute(*range(1, axis+1), 0, *range(axis+1, local.ndim)).reshape(shape)
   return {name: decode(name, shape, typ) for name, (_, shape, typ) in entries.items()}

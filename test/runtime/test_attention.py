@@ -154,20 +154,19 @@ class TestGatedDeltaNetBlock(unittest.TestCase):
                      ssm_a.reshape(1, block.num_v_heads, 1, 1))
       conv_window = np.concatenate([conv_state, self._linear_np(x_half, qkv_weight)], axis=1)
       conv_out = self._silu_np((conv_window * conv_weight).sum(axis=1))
-      q, k, v = np.split(conv_out, [block.q_dim, 2 * block.q_dim], axis=-1)
-      q = self._normalize_np(q.reshape(B, block.num_k_heads, block.head_k_dim))
-      k = self._normalize_np(k.reshape(B, block.num_k_heads, block.head_k_dim))
+      # the channels are grouped by k head: q, k and the r v heads of every k head
+      r = block.num_v_heads // block.num_k_heads
+      q, k, v = np.split(conv_out.reshape(B, block.num_k_heads, -1), [block.head_k_dim, 2 * block.head_k_dim], axis=-1)
+      q, k = (np.repeat(self._normalize_np(z), r, axis=1) for z in (q, k))
       v = v.reshape(B, block.num_v_heads, block.head_v_dim)
-      if block.num_v_heads != block.num_k_heads:
-        k_repeat = block.num_v_heads // block.num_k_heads
-        q = np.repeat(q[:, None, :, :], k_repeat, axis=1).reshape(B, block.num_v_heads, block.head_k_dim)
-        k = np.repeat(k[:, None, :, :], k_repeat, axis=1).reshape(B, block.num_v_heads, block.head_k_dim)
       q, k, v = (q * (block.head_k_dim ** -0.5))[..., None], k[..., None], v[..., None]
       recurrent_state = recurrent_state * alpha
       recurrent_state = recurrent_state + np.matmul((v - np.matmul(recurrent_state, k)) * beta, np.swapaxes(k, -1, -2))
       core_attn_out = np.matmul(recurrent_state, q).squeeze(-1).reshape(B, 1, block.num_v_heads, block.head_v_dim)
       core_attn_out = self._rms_norm_np(core_attn_out, ssm_norm_weight, block.ssm_norm.eps)
-      out = self._linear_np((core_attn_out * self._silu_np(out_gate)).reshape(B, 1, -1).astype(np.float16), out_weight)
+      # ssm_out has the v heads in the gguf order, tiled over the k heads
+      z = (core_attn_out * self._silu_np(out_gate)).reshape(B, 1, block.num_k_heads, r, block.head_v_dim).swapaxes(2, 3)
+      out = self._linear_np(z.reshape(B, 1, -1).astype(np.float16), out_weight)
       conv_state = conv_window[:, 1:, :]
       outputs.append(out)
       conv_states.append(conv_state.copy())
@@ -178,7 +177,7 @@ class TestGatedDeltaNetBlock(unittest.TestCase):
   def test_gatedeltanet_reference_and_reset(self): self._check_reference_and_reset(self._make_config(max_context=3))
 
   def test_gatedeltanet_repeated_k_heads(self):
-    # v head j*K+i uses k head i
+    # v head i*r+j uses k head i
     ssm = SSMConfig(conv_kernel=2, state_size=4, group_count=2, time_step_rank=6, inner_size=24)
     self._check_reference_and_reset(self._make_config(max_context=3, ssm=ssm))
 

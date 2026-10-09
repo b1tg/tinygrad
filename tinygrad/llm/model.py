@@ -352,14 +352,12 @@ class GatedDeltaNetBlock(FFNBlock):
     if symbolic:
       out_gate = out_gate.pad_to((B, T_pad, self.num_v_heads, self.head_v_dim))
       beta, log_alpha = beta.pad_to((B, T_pad, self.num_v_heads)), log_alpha.pad_to((B, T_pad, *log_alpha.shape[2:]))
-    # with tensor parallel gguf_shard orders the q|k|v segments of the channels and the v head repeats by device, a device holds g k heads
-    G = len(x.device) if isinstance(x.device, tuple) else 1
-    g, r = self.num_k_heads//G, self.num_v_heads//self.num_k_heads
-    q, k, v = conv_out.reshape(B, T_pad, G, -1).split([g*self.head_k_dim, g*self.head_k_dim, r*g*self.head_v_dim], dim=-1)
+    K, r = self.num_k_heads, self.num_v_heads//self.num_k_heads
+    q, k, v = conv_out.reshape(B, T_pad, K, -1).split([self.head_k_dim, self.head_k_dim, r*self.head_v_dim], dim=-1)
     qk_eps = 1e-12 if is_kda else 1e-6
-    # v head (device, repeat, i) uses k head (device, i)
-    q, k = (z.reshape(B, T_pad, G, 1, g, self.head_k_dim).normalize(dim=-1, eps=qk_eps)
-            .expand(B, T_pad, G, r, g, self.head_k_dim).reshape(B, T_pad, self.num_v_heads, self.head_k_dim) for z in (q, k))
+    # the v heads are grouped by their k head
+    q, k = (z.normalize(dim=-1, eps=qk_eps).expand(B, T_pad, K, r, self.head_k_dim).reshape(B, T_pad, self.num_v_heads, self.head_k_dim)
+            for z in (q.unsqueeze(3), k.unsqueeze(3)))
     v = v.reshape(B, T_pad, self.num_v_heads, self.head_v_dim)
     # layout the per-step operands to broadcast against the (B, H, V, K) state
     q, k, v, beta = (z.transpose(1, 2).float() for z in (q, k, v, beta))
@@ -389,7 +387,8 @@ class GatedDeltaNetBlock(FFNBlock):
     # output; undo the padding before the output projection
     z = (self.ssm_norm(core) * (out_gate.sigmoid() if is_kda else out_gate.silu())).cast(x.dtype).contiguous()
     if symbolic: z = z[:, :T]
-    return self.ssm_out(z.reshape(B, T, -1))
+    # ssm_out keeps the gguf order of the v heads (tiled over the k heads), it is copied to every device and needs all of z
+    return self.ssm_out(z.to(x.device).reshape(B, T, K, r, self.head_v_dim).transpose(2, 3).reshape(B, T, -1))
 
   def _init_state(self, x):
     if not hasattr(self, "conv_state"):
@@ -446,20 +445,27 @@ class Transformer:
       ssm_layers = tuple(x == 0 for x in n_kv_heads)
       n_kv_heads = max(n_kv_heads)
       ssm = SSMConfig(kv[f'{arch}.ssm.conv_kernel'], kv[f'{arch}.kda.head_dim'], n_heads, n_heads, n_heads*kv[f'{arch}.kda.head_dim'], kda=True)
-    shard_map:dict[str, int|tuple[int, int]] = {}
+    if ssm is not None:
+      # llama.cpp stores the gated deltanet as segments over all the k heads: q|k|v of the conv channels and the v heads tiled over
+      # the k heads. regroup the rows by k head (s: segment, k: k head, c: its rows in a segment), a k head holds all its segments
+      r = ssm.time_step_rank // ssm.group_count
+      assert ssm.state_size*ssm.time_step_rank == ssm.inner_size, "the k and v heads need the same size"
+      regroup = {**{w: 2+r for w in ('attn_qkv.weight', 'ssm_conv1d.weight')},
+                 **{w: r for w in ('attn_gate.weight', 'ssm_alpha.weight', 'ssm_beta.weight', 'ssm_dt.bias', 'ssm_a')}}
+      for name, (data, shape, typ) in entries.items():
+        if (segments:=regroup.get(re.sub(r"^blk\.\d+\.", "", name))) is not None:
+          entries[name] = (data.to("CPU").reshape(*shape[:-1], -1).rearrange("(s k c) ... -> (k s c) ...", s=segments, k=ssm.group_count), shape, typ)
+    shard_map:dict[str, int] = {}
     if shard > 1:
       heads = n_heads if kv.get(f'{arch}.attention.kv_lora_rank') else n_kv_heads
       assert heads % shard == 0, f"tensor parallel needs the attention heads to split over {shard} devices"
-      # the gated deltanet is sharded on its k heads: segments of them are q|k|v of the conv channels and the repeats of the v heads
-      r = 1 if ssm is None else ssm.time_step_rank // ssm.group_count
-      assert ssm is None or (ssm.group_count % shard == 0 and ssm.state_size*ssm.time_step_rank == ssm.inner_size), "can't shard the k heads"
+      assert ssm is None or ssm.group_count % shard == 0, f"tensor parallel needs the k heads to split over {shard} devices"
       # shard MLA heads and routed experts while replicating latent projections, KV cache and shared experts
-      rules:dict[str, int|tuple[int, int]] = {**{w: 0 for w in ('token_embd.weight', 'output.weight', 'attn_q.weight', 'attn_k.weight',
-        'attn_v.weight', 'ffn_gate.weight', 'ffn_up.weight', 'attn_q_b.weight', 'attn_k_b.weight', 'attn_v_b.weight')},
-        **{w: 1 for w in ('attn_output.weight', 'ffn_down.weight', 'ffn_gate_exps.weight', 'ffn_up_exps.weight')}, 'ffn_down_exps.weight':2,
-        **{w: (0, 2+r) for w in ('attn_qkv.weight', 'ssm_conv1d.weight')}, **{w: (0, r) for w in ('attn_gate.weight', 'ssm_alpha.weight',
-        'ssm_beta.weight', 'ssm_dt.bias', 'ssm_a', 'ssm_g_b.weight', 'ssm_f_b.weight', 'ssm_conv1d_q.weight', 'ssm_conv1d_k.weight',
-        'ssm_conv1d_v.weight')}, 'ssm_out.weight': (1, r)}
+      rules = {**{w: 0 for w in ('token_embd.weight', 'output.weight', 'attn_q.weight', 'attn_k.weight', 'attn_v.weight', 'ffn_gate.weight',
+        'ffn_up.weight', 'attn_q_b.weight', 'attn_k_b.weight', 'attn_v_b.weight', 'attn_qkv.weight', 'ssm_conv1d.weight', 'attn_gate.weight',
+        'ssm_alpha.weight', 'ssm_beta.weight', 'ssm_dt.bias', 'ssm_a', 'ssm_g_b.weight', 'ssm_f_b.weight', 'ssm_conv1d_q.weight',
+        'ssm_conv1d_k.weight', 'ssm_conv1d_v.weight')}, 'ffn_down_exps.weight':2,
+        **{w: 1 for w in ('attn_output.weight', 'ffn_down.weight', 'ffn_gate_exps.weight', 'ffn_up_exps.weight')}}
       shard_map = {name: rules[k] for name in entries if (k:=re.sub(r"^blk\.\d+\.", "", name)) in rules}
     devices = tuple(Device.canonicalize(f'{Device.DEFAULT}:{i}') for i in range(shard))
     state_dict = gguf_shard(entries, devices, shard_map)
@@ -475,11 +481,11 @@ class Transformer:
     if arch == 'kimi-linear':
       for i, is_ssm in enumerate(ssm_layers):
         if not is_ssm: continue
-        # the fused q|k|v ordered by device like gguf_shard
+        # the fused q|k|v by k head like the gguf
         for fused, part in (("attn_qkv", "attn_{}"), ("ssm_conv1d", "ssm_conv1d_{}")):
           qkv = [state_dict.pop(f"blk.{i}.{part.format(p)}.weight") for p in "qkv"]
           state_dict[f"blk.{i}.{fused}.weight"] = \
-            Tensor.stack(*(t.reshape(shard, -1, t.shape[-1]) for t in qkv), dim=1).reshape(-1, qkv[0].shape[-1]).contiguous()
+            Tensor.stack(*(t.reshape(n_heads, -1, t.shape[-1]) for t in qkv), dim=1).reshape(-1, qkv[0].shape[-1]).contiguous()
         state_dict[f"blk.{i}.ssm_out.weight"] = state_dict.pop(f"blk.{i}.attn_output.weight")
     if arch in ('qwen35', 'qwen35moe', 'glm4moe', 'gpt-oss'):
       state_dict = {k.replace('post_attention_norm', 'ffn_norm'):v for k,v in state_dict.items()}
