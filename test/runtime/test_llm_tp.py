@@ -112,16 +112,20 @@ class TestTensorParallel(unittest.TestCase):
       writer.add_float32('qwen35.rope.freq_base', 10000)
       writer.add_float32('qwen35.attention.layer_norm_rms_epsilon', 1e-5)
       writer.add_array('tokenizer.ggml.tokens', [str(i) for i in range(64)])
-      for name,weight in nn.state.get_state_dict(Transformer(config)).items():
-        value = -rng.random(weight.shape) if name.endswith('ssm_a') else rng.normal(1, .1, weight.shape) if 'norm' in name else \
-                rng.normal(0, .5 if 'token_embd' in name else .05, weight.shape)
-        writer.add_tensor(name.replace('ffn_norm', 'post_attention_norm'), value.astype(np.float32))
+      values = {name: -rng.random(w.shape) if name.endswith('ssm_a') else rng.normal(1, .1, w.shape) if 'norm' in name else
+                rng.normal(0, .5 if 'token_embd' in name else .05, w.shape) for name,w in nn.state.get_state_dict(Transformer(config)).items()}
+      # the gguf layout: flat v heads, flat q|k|v
+      for name in ('blk.0.attn_qkv.weight', 'blk.0.ssm_conv1d.weight', 'blk.0.attn_gate.weight', 'blk.0.ssm_alpha.weight', 'blk.0.ssm_beta.weight',
+                   'blk.0.ssm_a', 'blk.0.ssm_dt.bias'):
+        values[name] = values[name].reshape(-1, *values[name].shape[2:])
+      values['blk.0.ssm_out.weight'] = values['blk.0.ssm_out.weight'].reshape(256, -1)
+      for name, value in values.items(): writer.add_tensor(name.replace('ffn_norm', 'post_attention_norm'), value.astype(np.float32))
       write_gguf(writer)
       single, parallel = Transformer.from_gguf(path, 64)[0], Transformer.from_gguf(path, 64, shard=2)[0]
       prompt = [int(x) for x in rng.integers(0, 64, 40)]
       self.assertEqual(list(itertools.islice(parallel.generate(list(prompt)), 6)), list(itertools.islice(single.generate(list(prompt)), 6)))
-      # the kv cache is sharded on its heads, the gated deltanet is copied to every device
+      # the kv cache is sharded on its heads, the gated deltanet on its k heads
       self.assertEqual(parallel.blk[1].cache_kv.uop.axis, 2)
-      for t in (parallel.blk[0].attn_qkv.weight, parallel.blk[0].recurrent_state): self.assertEqual((t.device, t.uop.axis), (DEVICES, None))
+      self.assertEqual((parallel.blk[0].attn_qkv.weight.uop.axis, parallel.blk[0].recurrent_state.uop.axis), (1, 2))
 
 if __name__ == '__main__': unittest.main()

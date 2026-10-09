@@ -307,18 +307,23 @@ class GatedDeltaNetBlock(FFNBlock):
     assert self.num_v_heads % self.num_k_heads == 0
     self.head_v_dim, self.ssm_conv_kernel = ssm.inner_size // ssm.time_step_rank, ssm.conv_kernel
     self.conv_channels, self.q_dim = ssm.inner_size + 2*ssm.group_count*ssm.state_size, ssm.state_size*ssm.group_count
-    self.attn_qkv = Linear(config.dim, self.conv_channels, bias=False)
+    # the v heads are in tiled order, v head (j, g) uses k head g: weights keep (repeats, k heads) as separate axes, the fused q|k|v
+    # is (2 + repeats) parts of the k heads
+    assert self.head_k_dim == self.head_v_dim, "the fused q|k|v is equal parts of the k heads"
+    self.repeats = r = self.num_v_heads // self.num_k_heads
+    k_v_dim = self.num_k_heads*self.head_v_dim
+    self.attn_qkv = Linear(config.dim, (2+r, self.q_dim), bias=False)
     if ssm.kda:
       self.ssm_g_a, self.ssm_g_b = Linear(config.dim, self.head_v_dim, bias=False), Linear(self.head_v_dim, ssm.inner_size, bias=False)
       self.ssm_f_a, self.ssm_f_b = Linear(config.dim, self.head_k_dim, bias=False), Linear(self.head_k_dim, ssm.inner_size, bias=False)
     else:
-      self.attn_gate = Linear(config.dim, ssm.inner_size, bias=False)
-      self.ssm_alpha = Linear(config.dim, self.num_v_heads, bias=False)
-    self.ssm_beta = Linear(config.dim, self.num_v_heads, bias=False)
-    self.ssm_conv1d = {"weight": Tensor.zeros(self.conv_channels, self.ssm_conv_kernel)}
-    self.ssm_dt = {"bias": Tensor.zeros(ssm.inner_size if ssm.kda else self.num_v_heads)}
-    self.ssm_a = Tensor.zeros(self.num_v_heads, 1) if ssm.kda else Tensor.zeros(self.num_v_heads)
-    self.ssm_norm, self.ssm_out = nn.RMSNorm(self.head_v_dim, config.norm_eps), Linear(ssm.inner_size, config.dim, bias=False)
+      self.attn_gate = Linear(config.dim, (r, k_v_dim), bias=False)
+      self.ssm_alpha = Linear(config.dim, (r, self.num_k_heads), bias=False)
+    self.ssm_beta = Linear(config.dim, (r, self.num_k_heads), bias=False)
+    self.ssm_conv1d = {"weight": Tensor.zeros(2+r, self.q_dim, self.ssm_conv_kernel)}
+    self.ssm_dt = {"bias": Tensor.zeros(r, k_v_dim if ssm.kda else self.num_k_heads)}
+    self.ssm_a = Tensor.zeros(r, self.num_k_heads, 1) if ssm.kda else Tensor.zeros(r, self.num_k_heads)
+    self.ssm_norm, self.ssm_out = nn.RMSNorm(self.head_v_dim, config.norm_eps), Linear((r, k_v_dim), config.dim, bias=False)
 
   def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
     B, T, _ = x.shape
@@ -329,54 +334,57 @@ class GatedDeltaNetBlock(FFNBlock):
     symbolic = isinstance(T, UOp)
     T_pad = x.max_shape[1]  # symbolic chunks are padded to their max size: one graph serves every size
 
+    # the v heads are (repeats, k heads)
+    r, K = self.repeats, self.num_k_heads
+
     # input processing
     x = x.half()
     out_gate = self.ssm_g_b(self.ssm_g_a(x)) if is_kda else self.attn_gate(x)
-    out_gate = out_gate.reshape(B, T, self.num_v_heads, self.head_v_dim)
-    beta = self.ssm_beta(x).sigmoid().reshape(B, T, self.num_v_heads)
+    out_gate = out_gate.reshape(B, T, r, K, self.head_v_dim)
+    beta = self.ssm_beta(x).sigmoid()
     alpha = self.ssm_f_b(self.ssm_f_a(x)) if is_kda else self.ssm_alpha(x)
-    log_alpha = ((alpha.float() + self.ssm_dt["bias"]).softplus().reshape(B, T, self.num_v_heads, -1) *
-                 self.ssm_a.reshape(self.num_v_heads, -1))
+    log_alpha = ((alpha.float().reshape(B, T, r, -1) + self.ssm_dt["bias"]).softplus().reshape(B, T, r, K, -1) *
+                 self.ssm_a.reshape(r, K, -1))
 
     # qkv conv, conv_state is reset when starting from position 0
     conv_state = initial.where(0, self.conv_state)
     # assemble the conv window in a static-size buffer: [conv_state | qkv rows | zero-pad].
     # padded steps are exact no-ops: beta=0 (delta rule off), log_alpha=0 (decay 1 after exp)
     conv_window = conv_state.cat(self.attn_qkv(x).cast(conv_state.dtype), dim=1)
-    conv_window = conv_window.pad_to((B, self.ssm_conv_kernel-1 + T_pad, self.conv_channels)).contiguous()
+    conv_window = conv_window.pad_to((B, self.ssm_conv_kernel-1 + T_pad, *conv_window.shape[2:])).contiguous()
     # the last conv_kernel-1 columns of the window become the next conv state
     conv_state_store = self.conv_state.uop.store(conv_window[:, T:T+self.ssm_conv_kernel-1].cast(self.conv_state.dtype).uop)
 
     conv_out = functools.reduce(lambda a,b: a+b,
-      (conv_window[:, i:i+T_pad] * self.ssm_conv1d["weight"][:, i] for i in range(self.ssm_conv_kernel))).silu()
+      (conv_window[:, i:i+T_pad] * self.ssm_conv1d["weight"][..., i] for i in range(self.ssm_conv_kernel))).silu()
     if symbolic:
-      out_gate = out_gate.pad_to((B, T_pad, self.num_v_heads, self.head_v_dim))
-      beta, log_alpha = beta.pad_to((B, T_pad, self.num_v_heads)), log_alpha.pad_to((B, T_pad, *log_alpha.shape[2:]))
-    q, k, v = conv_out.split([self.q_dim, self.q_dim, self.conv_channels - 2*self.q_dim], dim=-1)
+      out_gate = out_gate.pad_to((B, T_pad, *out_gate.shape[2:]))
+      beta, log_alpha = beta.pad_to((B, T_pad, *beta.shape[2:])), log_alpha.pad_to((B, T_pad, *log_alpha.shape[2:]))
     qk_eps = 1e-12 if is_kda else 1e-6
-    q, k = (z.reshape(B, T_pad, self.num_k_heads, self.head_k_dim).normalize(dim=-1, eps=qk_eps)
-            .repeat(1, 1, self.num_v_heads//self.num_k_heads, 1) for z in (q, k))
-    v = v.reshape(B, T_pad, self.num_v_heads, self.head_v_dim)
-    # layout the per-step operands to broadcast against the (B, H, V, K) state
-    q, k, v, beta = (z.transpose(1, 2).float() for z in (q, k, v, beta))
-    q = q * self.head_k_dim**-0.5
-    alpha = log_alpha.transpose(1, 2).exp()  # per-channel decay for kda, per-head otherwise (B, H, T, K|1)
+    # v head (j, g) uses k head g: the k heads broadcast on the repeats
+    q, k = (conv_out[:, :, i].reshape(B, T_pad, 1, K, self.head_k_dim).normalize(dim=-1, eps=qk_eps).expand(B, T_pad, r, K, self.head_k_dim)
+            for i in range(2))
+    v = conv_out[:, :, 2:].reshape(B, T_pad, r, K, self.head_v_dim)
+    # layout the per-step operands to broadcast against the (B, r, K, V, K) state
+    q, k, v, alpha = (z.permute(0, 2, 3, 1, 4).float() for z in (q, k, v, log_alpha))
+    beta = beta.permute(0, 2, 3, 1).float()
+    q, alpha = q * self.head_k_dim**-0.5, alpha.exp()  # per-channel decay for kda, per-head otherwise (B, r, K, T, K|1)
 
     # recurrent: scan over the (padded) tokens, updating the recurrent state. collect the per-step outputs
     state = Tensor(self.recurrent_state.uop.after(conv_state_store))  # carry the conv write into this graph
     if self.head_k_dim % 32 == 0 and self.head_v_dim % 4 == 0 and amd_custom_kernels_supported(x.device):
       # one fused kernel for the whole scan; it resets and updates the recurrent state in place (RDNA3/4)
-      core = gated_delta_prefill(q, k, v, beta, alpha, state, Tensor(start_pos)).transpose(1, 2)
+      core = gated_delta_prefill(q, k, v, beta, alpha, state, Tensor(start_pos)).permute(0, 3, 1, 2, 4)
     else:
       q, k, v, beta = q.unsqueeze(-2), k.unsqueeze(-2), v.unsqueeze(-1), beta.unsqueeze(-1).unsqueeze(-1)
       alpha = alpha.unsqueeze(-2)
       state = initial.where(0, state.float())
       outs = []
       for t in range(T_pad):
-        s1 = state * alpha[:, :, t]  # decay the state
-        delta = (v[:, :, t] - (s1*k[:, :, t]).sum(-1, keepdim=True)) * beta[:, :, t]  # the delta rule update
-        state = s1 + delta * k[:, :, t]
-        outs.append((state * q[:, :, t]).sum(-1))
+        s1 = state * alpha[:, :, :, t]  # decay the state
+        delta = (v[:, :, :, t] - (s1*k[:, :, :, t]).sum(-1, keepdim=True)) * beta[:, :, :, t]  # the delta rule update
+        state = s1 + delta * k[:, :, :, t]
+        outs.append((state * q[:, :, :, t]).sum(-1))
 
       # store the updated recurrent state in place, then read the stacked outputs after the write
       state_store = self.recurrent_state.uop.store(state.cast(self.recurrent_state.dtype).uop)
@@ -385,12 +393,16 @@ class GatedDeltaNetBlock(FFNBlock):
     # output; undo the padding before the output projection
     z = (self.ssm_norm(core) * (out_gate.sigmoid() if is_kda else out_gate.silu())).cast(x.dtype).contiguous()
     if symbolic: z = z[:, :T]
-    return self.ssm_out(z.reshape(B, T, -1))
+    return self.ssm_out(z.reshape(B, T, r, K*self.head_v_dim))
 
   def _init_state(self, x):
     if not hasattr(self, "conv_state"):
-      self.conv_state = Tensor.zeros(x.shape[0], self.ssm_conv_kernel-1, self.conv_channels, device=x.device).clone()
-      self.recurrent_state = Tensor.zeros(x.shape[0], self.num_v_heads, self.head_v_dim, self.head_k_dim, device=x.device).clone()
+      device = x.device if isinstance(x.device, str) else None
+      self.conv_state = Tensor.zeros(x.shape[0], self.ssm_conv_kernel-1, 2+self.repeats, self.q_dim, device=device).clone()
+      self.recurrent_state = Tensor.zeros(x.shape[0], self.repeats, self.num_k_heads, self.head_v_dim, self.head_k_dim, device=device).clone()
+      # with tensor parallel every device keeps the states of its own k heads
+      if isinstance(x.device, tuple):
+        self.conv_state, self.recurrent_state = self.conv_state.shard(x.device, 3).realize(), self.recurrent_state.shard(x.device, 2).realize()
 
 class Transformer:
   def __init__(self, config:TransformerConfig):
@@ -431,15 +443,49 @@ class Transformer:
     arch = kv['general.architecture']
     n_heads, n_kv_heads = kv[f'{arch}.attention.head_count'], kv[f'{arch}.attention.head_count_kv']
     assert shard >= 1, f"shard must be at least 1, got {shard}"
-    shard_map:dict[str, int] = {}
     if shard > 1:
       heads = n_heads if kv.get(f'{arch}.attention.kv_lora_rank') else n_kv_heads
       assert heads % shard == 0, f"tensor parallel needs the attention heads to split over {shard} devices"
+
+    ssm = None
+    ssm_layers: tuple[bool, ...] = ()
+    gdn_blocks = {m.group(1) for name in entries if (m:=re.match(r"(blk\.\d+)\.ssm_conv1d", name))}
+    if arch in ('qwen35', 'qwen35moe'):
+      ssm = SSMConfig(**{k: kv[f'{arch}.ssm.{k}'] for k in ('conv_kernel','state_size','group_count','time_step_rank','inner_size')})
+      ssm_layers = tuple((i+1) % kv[f'{arch}.full_attention_interval'] != 0 for i in range(kv[f'{arch}.block_count']))
+    elif arch == 'kimi-linear':
+      ssm_layers = tuple(x == 0 for x in n_kv_heads)
+      n_kv_heads = max(n_kv_heads)
+      ssm = SSMConfig(kv[f'{arch}.ssm.conv_kernel'], kv[f'{arch}.kda.head_dim'], n_heads, n_heads, n_heads*kv[f'{arch}.kda.head_dim'], kda=True)
+    if ssm is not None:
+      # gated deltanet: the v heads, in the tiled order of the gguf (v head j*K+g uses k head g), are (repeats, k heads), and the fused
+      # q|k|v is (2 + repeats) parts of the k heads. the separate q, k and v of kimi-linear are concatenated after loading
+      r, q_dim = ssm.time_step_rank//ssm.group_count, ssm.group_count*ssm.state_size
+      for blk in gdn_blocks:
+        if f'{blk}.attn_output.weight' in entries: entries[f'{blk}.ssm_out.weight'] = entries.pop(f'{blk}.attn_output.weight')
+        for name, (data, shape, typ) in [(n, e) for n, e in entries.items() if n.startswith(f'{blk}.')]:
+          if name.endswith(('attn_q.weight', 'attn_k.weight', 'attn_v.weight', 'ssm_conv1d_q.weight', 'ssm_conv1d_k.weight',
+                            'ssm_conv1d_v.weight')): shape = (1, shape[0], shape[-1])
+          if name.endswith(('attn_qkv.weight', 'ssm_conv1d.weight')): shape = (shape[0]//q_dim, q_dim, shape[-1])
+          if name.endswith(('attn_gate.weight', 'ssm_alpha.weight', 'ssm_beta.weight', 'ssm_a', 'ssm_dt.bias')): shape = (r, shape[0]//r, *shape[1:])
+          if name.endswith('ssm_out.weight'): shape = (*shape[:-1], r, shape[-1]//r)
+          entries[name] = (data, shape, typ)
+
+    shard_map:dict[str, int] = {}
+    if shard > 1:
       # shard MLA heads and routed experts while replicating latent projections, KV cache and shared experts
       rules = {**{w: 0 for w in ('token_embd.weight', 'output.weight', 'attn_q.weight', 'attn_k.weight', 'attn_v.weight', 'ffn_gate.weight',
         'ffn_up.weight', 'attn_q_b.weight', 'attn_k_b.weight', 'attn_v_b.weight')},
         **{w: 1 for w in ('attn_output.weight', 'ffn_down.weight', 'ffn_gate_exps.weight', 'ffn_up_exps.weight')}, 'ffn_down_exps.weight':2}
-      shard_map = {name: rules[k] for name in entries if (k:=re.sub(r"^blk\.\d+\.", "", name)) in rules}
+      # the gated deltanet views are sharded on their k heads: the output features (second to last axis) of the column parallel
+      # weights, the input features (last axis) of the row parallel ones
+      gdn_rules = {**{w: -2 for w in ('attn_qkv.weight', 'attn_q.weight', 'attn_k.weight', 'attn_v.weight', 'attn_gate.weight', 'ssm_alpha.weight',
+        'ssm_beta.weight', 'ssm_conv1d.weight', 'ssm_conv1d_q.weight', 'ssm_conv1d_k.weight', 'ssm_conv1d_v.weight')},
+        **{w: -1 for w in ('ssm_out.weight', 'ssm_a', 'ssm_dt.bias')}}
+      for name, (_, shape, _) in entries.items():
+        blk, k = (m.group(1), m.group(2)) if (m:=re.match(r"(blk\.\d+)\.(.*)", name)) else (None, name)
+        if blk in gdn_blocks and k in gdn_rules: shard_map[name] = gdn_rules[k] % len(shape)
+        elif k in rules: shard_map[name] = rules[k]
     devices = tuple(Device.canonicalize(f'{Device.DEFAULT}:{i}') for i in range(shard))
     state_dict = gguf_shard(entries, devices, shard_map)
 
@@ -450,23 +496,11 @@ class Transformer:
     if 'output.weight' not in state_dict: state_dict['output.weight'] = state_dict['token_embd.weight']
 
     max_context = min(max_context, kv[f'{arch}.context_length']) if max_context is not None else kv[f'{arch}.context_length']
-
-    ssm = None
-    ssm_layers: tuple[bool, ...] = ()
-    if arch in ('qwen35', 'qwen35moe'):
-      ssm = SSMConfig(**{k: kv[f'{arch}.ssm.{k}'] for k in ('conv_kernel','state_size','group_count','time_step_rank','inner_size')})
-      ssm_layers = tuple((i+1) % kv[f'{arch}.full_attention_interval'] != 0 for i in range(kv[f'{arch}.block_count']))
-    elif arch == 'kimi-linear':
-      ssm_layers = tuple(x == 0 for x in n_kv_heads)
-      n_kv_heads = max(n_kv_heads)
-      ssm = SSMConfig(kv[f'{arch}.ssm.conv_kernel'], kv[f'{arch}.kda.head_dim'], n_heads, n_heads, n_heads*kv[f'{arch}.kda.head_dim'], kda=True)
+    if arch == 'kimi-linear':
       for i, is_ssm in enumerate(ssm_layers):
         if not is_ssm: continue
-        state_dict[f"blk.{i}.attn_qkv.weight"] = state_dict.pop(f"blk.{i}.attn_q.weight").cat(
-          state_dict.pop(f"blk.{i}.attn_k.weight"), state_dict.pop(f"blk.{i}.attn_v.weight"), dim=0).contiguous()
-        state_dict[f"blk.{i}.ssm_conv1d.weight"] = state_dict.pop(f"blk.{i}.ssm_conv1d_q.weight").cat(
-          state_dict.pop(f"blk.{i}.ssm_conv1d_k.weight"), state_dict.pop(f"blk.{i}.ssm_conv1d_v.weight"), dim=0).squeeze(1).contiguous()
-        state_dict[f"blk.{i}.ssm_out.weight"] = state_dict.pop(f"blk.{i}.attn_output.weight")
+        for fused, parts in ((f"blk.{i}.attn_qkv.weight", "attn_{}"), (f"blk.{i}.ssm_conv1d.weight", "ssm_conv1d_{}")):
+          state_dict[fused] = Tensor.cat(*(state_dict.pop(f"blk.{i}.{parts.format(p)}.weight") for p in "qkv")).contiguous()
     if arch in ('qwen35', 'qwen35moe', 'glm4moe', 'gpt-oss'):
       state_dict = {k.replace('post_attention_norm', 'ffn_norm'):v for k,v in state_dict.items()}
 
