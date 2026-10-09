@@ -2,7 +2,7 @@ import unittest
 import numpy as np
 from tinygrad import Tensor, dtypes, nn
 from tinygrad.llm.model import (
-  GDN_WEIGHTS, GatedDeltaNetBlock, gdn_grouped, SSMConfig, TransformerBlock, TransformerConfig,
+  GatedDeltaNetBlock, SSMConfig, TransformerBlock, TransformerConfig,
   apply_rope as apply_rope_new, precompute_freqs_cis, pairwise_topk,
 )
 from test.helpers import slow
@@ -79,29 +79,18 @@ class TestGatedDeltaNetBlock(unittest.TestCase):
                                  "rope_dim":8, "v_head_dim":8, "max_context":4, "ssm_layers":(True,),
                                  "ssm":SSMConfig(conv_kernel=2, state_size=4, group_count=1, time_step_rank=1, inner_size=4)} | kwargs))
 
-  def _gguf_weights(self, block:GatedDeltaNetBlock) -> dict[str, Tensor]:
-    # the weights in the gguf order: v head j*K+i uses k head i
-    dim, inner_size = block.config.dim, block.config.ssm.inner_size
-    return {"attn_norm.weight": self._tensor_linspace(0.8, 1.2, (dim,)),
-            "attn_qkv.weight": self._tensor_linspace(-0.15, 0.2, (block.conv_channels, dim)),
-            "attn_gate.weight": self._tensor_linspace(-0.1, 0.15, (inner_size, dim)),
-            "ssm_alpha.weight": self._tensor_linspace(-0.08, 0.12, (block.num_v_heads, dim)),
-            "ssm_beta.weight": self._tensor_linspace(-0.12, 0.07, (block.num_v_heads, dim)),
-            "ssm_conv1d.weight": self._tensor_linspace(-0.05, 0.05, (block.conv_channels, block.ssm_conv_kernel)),
-            "ssm_dt.bias": self._tensor_linspace(-0.1, 0.1, (block.num_v_heads,)),
-            "ssm_a": self._tensor_linspace(-0.1, -0.05, (block.num_v_heads,)),
-            "ssm_norm.weight": self._tensor_linspace(0.9, 1.1, (block.head_v_dim,)),
-            "ssm_out.weight": self._tensor_linspace(-0.2, 0.18, (dim, inner_size))}
-
-  def _grouped(self, block:GatedDeltaNetBlock, name:str, x:np.ndarray, axis:int=0) -> np.ndarray:
-    # reorder an axis from the gguf order to the block order like from_gguf
-    t = np.ascontiguousarray(np.moveaxis(x, axis, 0))
-    return np.moveaxis(gdn_grouped(block.config.ssm, name, Tensor(t), t.shape[0]).numpy().reshape(t.shape), 0, axis)
-
   def _make_block(self, config:TransformerConfig) -> GatedDeltaNetBlock:
     block = GatedDeltaNetBlock(config, config.ssm)
-    weights = {k:Tensor(self._grouped(block, k, v.numpy()) if k in GDN_WEIGHTS else v.numpy()) for k,v in self._gguf_weights(block).items()}
-    nn.state.load_state_dict(block, weights, strict=False, verbose=False)
+    block.attn_norm.weight = self._tensor_linspace(0.8, 1.2, (config.dim,))
+    block.attn_qkv.weight = self._tensor_linspace(-0.15, 0.2, (block.conv_channels, config.dim))
+    block.attn_gate.weight = self._tensor_linspace(-0.1, 0.15, (config.ssm.inner_size, config.dim))
+    block.ssm_alpha.weight = self._tensor_linspace(-0.08, 0.12, (block.num_v_heads, config.dim))
+    block.ssm_beta.weight = self._tensor_linspace(-0.12, 0.07, (block.num_v_heads, config.dim))
+    block.ssm_conv1d["weight"] = self._tensor_linspace(-0.05, 0.05, (block.conv_channels, block.ssm_conv_kernel))
+    block.ssm_dt["bias"] = self._tensor_linspace(-0.1, 0.1, (block.num_v_heads,))
+    block.ssm_a = self._tensor_linspace(-0.1, -0.05, (block.num_v_heads,))
+    block.ssm_norm.weight = self._tensor_linspace(0.9, 1.1, (block.head_v_dim,))
+    block.ssm_out.weight = self._tensor_linspace(-0.2, 0.18, (config.dim, config.ssm.inner_size))
     return block
 
   def _run_attention(self, block:GatedDeltaNetBlock, x:Tensor, start_pos:int):
@@ -144,10 +133,16 @@ class TestGatedDeltaNetBlock(unittest.TestCase):
     B, T, _ = x_np.shape
     conv_state = np.zeros((B, block.ssm_conv_kernel - 1, block.conv_channels), dtype=np.float32)
     recurrent_state = np.zeros((B, block.num_v_heads, block.head_v_dim, block.head_k_dim), dtype=np.float32)
-    w = {k:v.numpy().astype(np.float32) for k,v in self._gguf_weights(block).items()}
-    conv_weight, qkv_weight, gate_weight = w["ssm_conv1d.weight"].T[None, :, :], w["attn_qkv.weight"], w["attn_gate.weight"]
-    alpha_weight, beta_weight, out_weight = w["ssm_alpha.weight"], w["ssm_beta.weight"], w["ssm_out.weight"]
-    dt_bias, ssm_a, attn_norm_weight, ssm_norm_weight = w["ssm_dt.bias"], w["ssm_a"], w["attn_norm.weight"], w["ssm_norm.weight"]
+    conv_weight = block.ssm_conv1d["weight"].numpy().astype(np.float32).T[None, :, :]
+    qkv_weight = block.attn_qkv.weight.numpy().astype(np.float32)
+    gate_weight = block.attn_gate.weight.numpy().astype(np.float32)
+    alpha_weight = block.ssm_alpha.weight.numpy().astype(np.float32)
+    beta_weight = block.ssm_beta.weight.numpy().astype(np.float32)
+    out_weight = block.ssm_out.weight.numpy().astype(np.float32)
+    dt_bias = block.ssm_dt["bias"].numpy().astype(np.float32)
+    ssm_a = block.ssm_a.numpy().astype(np.float32)
+    attn_norm_weight = block.attn_norm.weight.numpy().astype(np.float32)
+    ssm_norm_weight = block.ssm_norm.weight.numpy().astype(np.float32)
     outputs, conv_states, recurrent_states = [], [], []
 
     for t in range(T):
@@ -175,18 +170,16 @@ class TestGatedDeltaNetBlock(unittest.TestCase):
       out = self._linear_np((core_attn_out * self._silu_np(out_gate)).reshape(B, 1, -1).astype(np.float16), out_weight)
       conv_state = conv_window[:, 1:, :]
       outputs.append(out)
-      # the states in the block order
-      conv_states.append(self._grouped(block, "attn_qkv.weight", conv_state, axis=2))
-      recurrent_states.append(self._grouped(block, "ssm_a", recurrent_state, axis=1))
+      conv_states.append(conv_state.copy())
+      recurrent_states.append(recurrent_state.copy())
 
     return outputs, conv_states, recurrent_states
 
   def test_gatedeltanet_reference_and_reset(self): self._check_reference_and_reset(self._make_config(max_context=3))
 
-  def test_gatedeltanet_grouped_k_heads(self):
-    # 4 k heads in groups of 2 (2*128 v features fill a quant block), each used by 3 v heads
-    ssm = SSMConfig(conv_kernel=2, state_size=4, group_count=4, time_step_rank=12, inner_size=12*128)
-    self.assertEqual(ssm.k_group, 2)
+  def test_gatedeltanet_repeated_k_heads(self):
+    # v head j*K+i uses k head i
+    ssm = SSMConfig(conv_kernel=2, state_size=4, group_count=2, time_step_rank=6, inner_size=24)
     self._check_reference_and_reset(self._make_config(max_context=3, ssm=ssm))
 
   def _check_reference_and_reset(self, config:TransformerConfig):
