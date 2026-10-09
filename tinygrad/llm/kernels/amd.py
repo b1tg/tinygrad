@@ -98,9 +98,8 @@ class Linear(nn.Linear):
         if self.weight.dtype in (dtypes.half, dtypes.float, dtypes.bfloat16) and self.out_features <= 2048 \
           and self.in_features % (WARP_SIZE*4) == 0 and self.weight.uop.axis is None:
           numel, max_shape = x.numel(), x.max_shape
-          if isinstance(numel, int) or prod(max_shape) // self.in_features <= 32:
-            out = f16_gemv(self, x if isinstance(numel, int) else x.pad_to(max_shape))
-            return out if isinstance(numel, int) else out.shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
+          out = f16_gemv(self, x if isinstance(numel, int) else x.pad_to(max_shape))
+          return out if isinstance(numel, int) else out.shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
         self.use_custom_quant = supported = False  # not a supported quant format
     if self.ggml_type in QUANT_SIZES and supported:
       if isinstance(x.numel(), int): return q8_linear(self, x)
@@ -151,10 +150,10 @@ def _q5_scales(raw:UOp, base:UOp, subgroup:UOp) -> tuple[UOp, UOp, UOp, UOp]:
   d, dmin = (raw[base] & 0xffff).cast(dtypes.uint16), (raw[base] >> 16).cast(dtypes.uint16)
   return _half(d), _half(dmin), scale.float(), minimum.float()
 
-def _iq4_scale(raw:UOp, base:UOp, subgroup:UOp) -> UOp:
+def _iq4_scales(raw:UOp, base:UOp, subgroup:UOp) -> tuple[UOp, UOp]:
   header, low = raw[base].load(), raw[base+1].load()
   scale = ((low >> (4*subgroup)) & 15) | (((header >> (16+2*subgroup)) & 3) << 4)
-  return _half(header) * (scale.cast(dtypes.int32)-32).float()
+  return _half(header), (scale.cast(dtypes.int32)-32).float()
 
 def iq4_half_lut(device:str|tuple[str, ...]|None) -> Tensor:
   from tinygrad.runtime.autogen.ggml_common import kvalues_iq4nl
@@ -188,20 +187,22 @@ def q8_quantize(x:Tensor, tokens:int, in_features:int) -> tuple[Tensor, Tensor, 
   q, scale, xsum = Tensor.custom_kernel(q, scale, xsum, x, fxn=functools.partial(_q8_quantize_kernel, tokens=tokens, in_features=in_features))[:3]
   return q, scale, xsum
 
-def _decode_linear(out:UOp, out_features:int, group_count:int, group_dot, name:str) -> UOp:
+def _decode_linear(out:UOp, out_features:int, group_count:int, group_dot, name:str, token_tile:int=1) -> UOp:
   chunks = out.shape[2]
   # One wave per output/chunk; group neighboring rows to amortize workgroup scheduling.
   rows = math.gcd(out_features, 4)
-  row = UOp.range(out.shape[0]*out_features//rows, 0, AxisType.GLOBAL)
+  row = UOp.range(out.shape[0]//token_tile*out_features//rows, 0, AxisType.GLOBAL)
   wave = UOp.range(rows, 3, AxisType.LOCAL)
   token_output = row*rows+wave
-  chunk, lane = UOp.range(chunks, 1, AxisType.GLOBAL), UOp.range(32, 2, AxisType.LOCAL)
-  token, output = token_output // out_features, token_output % out_features
+  chunk, lane = UOp.range(chunks, 1, AxisType.GLOBAL), UOp.range(32, 2, AxisType.WARP)
+  token, output = token_output // out_features * token_tile, token_output % out_features
   group = lane+chunk*32
-  value = (group < group_count).where(group_dot(token, output, group.minimum(group_count-1)), UOp.const(0, dtypes.float32))
-  total = warp_reduce(value, full_wave=True)
-  return out[token, output, chunk.valid(lane.eq(0))].store(total.cast(out.dtype)).end(row, wave, chunk, lane).sink(
-    arg=KernelInfo(name=name, opts_to_apply=()))
+  # Token-independent weight loads and unpacking are shared between the accumulators in this wave.
+  stores = []
+  for t in range(token_tile):
+    value = (group < group_count).where(group_dot(token+t, output, group.minimum(group_count-1)), UOp.const(0, dtypes.float32))
+    stores.append(out[token+t, output, chunk.valid(lane.eq(0))].store(warp_reduce(value, full_wave=True).cast(out.dtype)))
+  return UOp.group(*stores).end(row, wave, chunk, lane).sink(arg=KernelInfo(name=name, opts_to_apply=()))
 
 def _iq_grid(device:str|tuple[str, ...]|None, ggml_type:int) -> Tensor:
   from tinygrad.runtime.autogen import ggml_common as ggml
@@ -278,7 +279,8 @@ def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, *grids:UOp,
       d, dmin, scale, minimum = _q5_scales(raw, base, subgroup)
       total = dots[0].float()*d*scale - (xs[token, group, 0].load()+xs[token, group, 1].load())*dmin*minimum
     elif ggml_type == IQ4_XS:
-      total = dots[0].float() * _iq4_scale(raw, base, subgroup)
+      # Preserve the single-token multiplication order when scales are shared by two tokens.
+      total = UOp(Ops.CUSTOM, src=(dots[0].float(), *_iq4_scales(raw, base, subgroup)), arg=("({0}*{1}*{2})", dtypes.float))
     elif ggml_type == Q6_K:
       # Subtract the quant offset via the activation sums instead of unpacking signed bytes.
       scales = [(raw[base+96+subgroup] >> (h*8)).cast(dtypes.uint8).bitcast(dtypes.int8).float() for h in range(2)]
@@ -303,7 +305,8 @@ def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, *grids:UOp,
       if ggml_type == IQ3_S: total *= (1+2*((byte(106+subgroup//2) >> ((subgroup%2)*4)) & 15)).float()
       if ggml_type == IQ3_XXS: total *= ((word(66+subgroup*4) >> 28).float()+0.5)*0.5
     return total * xd[token, group]
-  return _decode_linear(out, out_features, in_features//32, group_dot, "linear_"+QUANT_NAMES[ggml_type])
+  return _decode_linear(out, out_features, in_features//32, group_dot, "linear_"+QUANT_NAMES[ggml_type],
+                        token_tile=2 if ggml_type in (Q5_K, Q6_K, IQ4_XS) and out.shape[0] == 2 else 1)
 
 def _wmma_layout(out:UOp, out_features:int, token_tile:int, output_tiles:int):
   if out_features % (16*output_tiles): output_tiles = 1
@@ -392,7 +395,7 @@ def _iq4_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, lut:UOp, out_features:i
   tid, lut_items = wave*32+lane, 256//(32*output_waves)
   lut = local_lut.after(*(local_lut[tid*lut_items+i].store(lut[tid*lut_items+i]) for i in range(lut_items)))
   def dequant(base:UOp, subgroup:UOp, half:int) -> tuple[UOp, ...]:
-    scale = _iq4_scale(raw, base, subgroup)
+    scale = prod(_iq4_scales(raw, base, subgroup))
     pairs = tuple(lut[((raw[base + 2 + subgroup*4 + word] >> (byte*8)) & 255).cast(dtypes.weakint)]
                   for word in word_indices for byte in range(4))
     return tuple((_half((pair >> (half*16)) & 0xffff)*scale).cast(dtypes.float16) for pair in pairs)
@@ -756,7 +759,8 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
 # ******** gated delta net: fused recurrent scan ********
 
 @functools.cache
-def _gated_delta_prefill_kernel(core:UOp, q:UOp, k:UOp, v:UOp, beta:UOp, alpha:UOp, state:UOp, kq:UOp, start_pos:UOp|None=None) -> UOp:
+def _gated_delta_prefill_kernel(core:UOp, q:UOp, k:UOp, v:UOp, beta:UOp, alpha:UOp, state:UOp, kq:UOp,
+                               start_pos:UOp|tuple[UOp, ...]|None=None) -> UOp:
   batch, heads, tokens, value_dim, row_tile = *core.shape, 4
   key_dim, alpha_dim = q.shape[-1], alpha.shape[-1] if len(alpha.shape) == 4 else 1
   assert all(isinstance(x, int) for x in (batch, heads, tokens, value_dim, key_dim)) and key_dim % 32 == 0 and value_dim % row_tile == 0
@@ -769,6 +773,8 @@ def _gated_delta_prefill_kernel(core:UOp, q:UOp, k:UOp, v:UOp, beta:UOp, alpha:U
   bh, row_base = bh_row // (value_dim//row_tile), (bh_row % (value_dim//row_tile))*row_tile
   rows, cols = tuple(row_base+i for i in range(row_tile)), tuple(lane + i*32 for i in range(key_dim//32))
   current = UOp.alloc((row_tile*key_dim//32,), dtypes.float32, addrspace=AddrSpace.REG)
+  if isinstance(start_pos, tuple):
+    start_pos = functools.reduce(lambda a, ip: (bh//heads).eq(ip[0]).where(ip[1], a), enumerate(start_pos), start_pos[0])
   initial = None if start_pos is None else start_pos.eq(0)
   current = current.after(current.store(UOp.stack(*(state[bh, row, col].float() if initial is None else
     initial.where(0, state[bh, row, col].float()) for row in rows for col in cols))))
@@ -789,20 +795,27 @@ def _gated_delta_prefill_kernel(core:UOp, q:UOp, k:UOp, v:UOp, beta:UOp, alpha:U
                   for row_idx,row in enumerate(rows) for i,col in enumerate(cols))
   return UOp.group(*state_stores).end(lane, bh_row).sink(arg=KernelInfo(name="gated_delta_prefill", opts_to_apply=()))
 
-def gated_delta_prefill(q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:Tensor, state:Tensor, start_pos:Tensor|None=None) -> Tensor:
+def gated_delta_prefill(q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:Tensor, state:Tensor,
+                       start_pos:Tensor|tuple[Tensor, ...]|None=None) -> Tensor:
   batch, heads, tokens, key_dim = q.shape
   value_dim = v.shape[-1]
   assert q.shape == k.shape and v.shape[:3] == beta.shape == (batch, heads, tokens) and state.shape == (batch, heads, value_dim, key_dim)
   assert alpha.shape[:3] == (batch, heads, tokens) and (len(alpha.shape) == 3 or alpha.shape[-1] in (1, key_dim))
   assert key_dim % 32 == 0 and value_dim % 4 == 0
   assert q.dtype == k.dtype == dtypes.float32, "recurrent Q/K must be float32"
-  assert state.uop.contiguous_view_offset() is not None, "recurrent state must be contiguous"
-  if start_pos is not None:
-    assert start_pos.uop.is_bound_var
-    state = Tensor(state.uop.after(start_pos.uop))
+  state_view = (state.uop.src[0] if state.uop.op is Ops.AFTER else state.uop).contiguous_view()
+  assert state_view is not None, "recurrent state must be contiguous"
+  # Preserve dependencies without rewriting the stores when computing the view offset.
+  if state_view[0].numel() == state.numel(): state_view = (state.uop, 0)
+  elif state.uop.op is Ops.AFTER: state_view = (state_view[0].after(*state.uop.src[1:]), state_view[1])
+  positions = start_pos if isinstance(start_pos, tuple) else (start_pos,) if start_pos is not None else ()
+  assert all(pos.uop.is_bound_var for pos in positions)
+  if positions: state_view = (state_view[0].after(*(pos.uop for pos in positions)), state_view[1])
   core, kq = Tensor.empty_like(v), (q*k).sum(-1).contiguous()
-  srcs = (core, q.contiguous(), k.contiguous(), v.contiguous(), beta.contiguous(), alpha.contiguous(), state, kq)
+  srcs = (core, q.contiguous(), k.contiguous(), v.contiguous(), beta.contiguous(), alpha.contiguous(), Tensor(state_view[0]), kq)
   contig = tuple(x.uop if x.uop.op is Ops.AFTER else x.uop.contiguous() for x in srcs)
-  params = tuple(UOp.placeholder_like(x, slot=i) for i,x in enumerate(contig))
-  call = _gated_delta_prefill_kernel(*params, None if start_pos is None else start_pos.uop.unbound()).call(*contig)
+  params = [UOp.placeholder_like(x, slot=i) for i,x in enumerate(contig)]
+  params[6] = params[6].flatten()[state_view[1]:state_view[1]+state.numel()].reshape(state.shape)
+  bound = tuple(pos.uop.unbound() for pos in positions)
+  call = _gated_delta_prefill_kernel(*params, bound if isinstance(start_pos, tuple) else bound[0] if bound else None).call(*contig)
   return Tensor(contig[0].after(call))

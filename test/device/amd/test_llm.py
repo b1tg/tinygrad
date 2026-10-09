@@ -60,6 +60,27 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
   def test_iq4_linear(self): self._test_quant_linear(23, 136)
   def test_q5_linear(self): self._test_quant_linear(13, 176)
   def test_q6_linear_odd_blocks(self): self._test_quant_linear(14, 210, in_features=768, out_features=3, token_counts=(1, 3, 16))
+  def test_quant_linear_two_tokens(self):
+    for typ in (13, 14, 23):
+      for in_features, out_features in ((256, 1), (768, 3), (2048, 64), (6144, 64)):
+        with self.subTest(ggml_type=typ, in_features=in_features, out_features=out_features):
+          self._test_quant_linear(typ, QUANT_SIZES[typ], in_features=in_features, out_features=out_features, token_counts=(1, 2), bias=True)
+
+  def test_quant_decode_batch_invariance(self):
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3/4 required")
+    rng = np.random.default_rng(42)
+    for typ in (13, 14, 23):
+      for width in (2048, 6144):
+        with self.subTest(ggml_type=typ, in_features=width):
+          packed = rng.integers(0, 256, (64*width//256, QUANT_SIZES[typ]), dtype=np.uint8)
+          offset = QUANT_SIZES[typ]-2 if typ == 14 else 0
+          packed[:, offset:offset+2] = rng.uniform(.0001, .01, len(packed)).astype(np.float16).view(np.uint8).reshape(-1, 2)
+          if typ == 13: packed[:, 2:4] = rng.uniform(.0001, .01, len(packed)).astype(np.float16).view(np.uint8).reshape(-1, 2)
+          linear = Linear(width, 64, bias=False)
+          linear.weight = ggml_data_to_tensor(Tensor(packed.flatten()).realize(), 64*width, typ).reshape(64, width)
+          x = rng.normal(size=(2, width)).astype(np.float16)
+          expected = np.concatenate([linear(Tensor(row[None])).numpy() for row in x])
+          np.testing.assert_array_equal(linear(Tensor(x)).numpy(), expected)
   def test_q2_k_linear(self): self._test_quant_linear(10, 84, in_features=768, token_counts=(1, 3, 16))
   def test_q3_k_linear(self): self._test_quant_linear(11, 110, in_features=768, token_counts=(1, 3, 16))
   def test_iq2_xs_linear(self): self._test_quant_linear(17, 74, in_features=768, token_counts=(1, 3, 16))
@@ -221,20 +242,36 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
         np.testing.assert_array_equal(out.numpy(), 32)
         np.testing.assert_array_equal(state.numpy(), 1)
 
+  def test_gated_delta_shared_state(self):
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3/4 required")
+    for row in (0, 1):
+      with self.subTest(row=row):
+        bank = Tensor([2., 3.]).reshape(2, 1, 1, 1).expand(2, 1, 4, 32).contiguous().realize()
+        state, q = bank[row:row+1], Tensor.ones(1, 1, 1, 32).realize()
+        run = TinyJit(lambda pos: gated_delta_prefill(q, q, Tensor.ones(1, 1, 1, 4), Tensor.zeros(1, 1, 1),
+                                                     Tensor.full((1, 1, 1), 0.5), state, Tensor(pos)).realize())
+        expected = bank.numpy().copy()
+        for _ in range(3):  # uncaptured, capture, replay: update only the selected row in the shared buffer
+          expected[row] *= 0.5
+          out = run(UOp.variable("start_pos", 0, 10).bind(3))
+          np.testing.assert_array_equal(out.numpy(), expected[row, 0, 0, 0]*32)
+          np.testing.assert_array_equal(bank.numpy(), expected)
+
   def test_gated_delta_random_scan(self):
     if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3/4 required")
     rng = np.random.default_rng(42)
-    q, k = (rng.normal(0, 0.1, (1, 2, 4, 32)).astype(np.float32) for _ in range(2))
-    v = rng.normal(size=(1, 2, 4, 8)).astype(np.float32)
-    beta = rng.uniform(0, 1, (1, 2, 4)).astype(np.float32)
+    q, k = (rng.normal(0, 0.1, (2, 2, 4, 32)).astype(np.float32) for _ in range(2))
+    v = rng.normal(size=(2, 2, 4, 8)).astype(np.float32)
+    beta = rng.uniform(0, 1, (2, 2, 4)).astype(np.float32)
     beta[:, :, -1] = 0  # padded step must leave the recurrent state unchanged
-    initial = rng.normal(0, 0.1, (1, 2, 8, 32)).astype(np.float32)
+    initial = rng.normal(0, 0.1, (2, 2, 8, 32)).astype(np.float32)
     for per_channel in (False, True):
-      alpha = rng.uniform(0.8, 1, (1, 2, 4, 32) if per_channel else (1, 2, 4)).astype(np.float32)
+      alpha = rng.uniform(0.8, 1, (2, 2, 4, 32) if per_channel else (2, 2, 4)).astype(np.float32)
       alpha[:, :, -1] = 1
-      for start in (0, 3):
+      for start in (0, 3, (0, 3), (3, 0)):
         with self.subTest(per_channel=per_channel, start=start):
           expected_state = np.zeros_like(initial) if start == 0 else initial.copy()
+          if isinstance(start, tuple): expected_state[[i for i, pos in enumerate(start) if pos == 0]] = 0
           outputs = []
           for t in range(4):
             decay = alpha[:, :, t, None, :] if per_channel else alpha[:, :, t, None, None]
@@ -243,7 +280,9 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
             expected_state += delta[..., None]*k[:, :, t, None]
             outputs.append((expected_state*q[:, :, t, None]).sum(-1))
           state = Tensor(initial).contiguous().realize()
-          out = gated_delta_prefill(*map(Tensor, (q, k, v, beta, alpha)), state, Tensor(UOp.variable("start", 0, 3).bind(start)))
+          positions = tuple(Tensor(UOp.variable(f"start_{i}", 0, 3).bind(pos)) for i, pos in enumerate(start)) if isinstance(start, tuple) else \
+            Tensor(UOp.variable("start", 0, 3).bind(start))
+          out = gated_delta_prefill(*map(Tensor, (q, k, v, beta, alpha)), state, positions)
           np.testing.assert_allclose(out.numpy(), np.stack(outputs, axis=2), rtol=2e-4, atol=2e-6)
           np.testing.assert_allclose(state.numpy(), expected_state, rtol=2e-4, atol=2e-6)
 
@@ -257,6 +296,18 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
       with self.subTest(tokens=tokens):
         x = rng.normal(size=(tokens, 128)).astype(np.float16)
         np.testing.assert_allclose(linear(Tensor(x)).numpy(), x.astype(np.float32) @ w.astype(np.float32).T + bias, rtol=2e-3, atol=2e-3)
+
+  def test_dense_gemv_after_symbolic_prefill(self):
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3/4 required")
+    rng = np.random.default_rng(42)
+    linear = Linear(128, 32, bias=False)
+    linear.weight = Tensor(rng.normal(size=(32, 128)).astype(np.float16))
+    x = Tensor(rng.normal(size=(64, 128)).astype(np.float16)).realize()
+    expected = linear(x).numpy()
+    symbolic = x[:UOp.variable("tokens", 1, 64).bind(33)]
+    np.testing.assert_array_equal(linear(symbolic)[:33].numpy(), expected[:33])
+    self.assertTrue(linear.use_custom_quant)
+    np.testing.assert_array_equal(linear(x[:1]).numpy(), expected[:1])
 
   def test_q6_linear_multiple_tokens(self):
     if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")

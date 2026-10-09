@@ -6,6 +6,24 @@ from tinygrad.llm.serve import StreamRouter, parse_tool_call
 TEST_CONFIG = TransformerConfig(num_blocks=1, dim=64, hidden_dim=128, n_heads=2, n_kv_heads=2,
                            norm_eps=1e-5, vocab_size=100, head_dim=32, rope_theta=10000.0, rope_dim=32, v_head_dim=32, max_context=32)
 
+def mock_batch(model):
+  def generate_batch(requests):
+    known, sources, counts = [None]*len(requests), [None]*len(requests), [0]*len(requests)
+    while any(r.finish_reason is None for r in requests):
+      tokens = [None]*len(requests)
+      for i, req in enumerate(requests):
+        if req.finish_reason is not None: continue
+        if req is not known[i]:
+          known[i], sources[i], counts[i] = req, iter(model.generate(req.tokens.copy(), temperature=req.temperature)), 0
+        token = next(sources[i], None)
+        if token is None or req.stop(token): req.finish_reason = 'stop'
+        else:
+          tokens[i] = token
+          counts[i] += 1
+          if counts[i] >= min(req.max_tokens or model.max_context, model.max_context-len(req.tokens)): req.finish_reason = 'length'
+      yield tokens
+  model.generate_batch = generate_batch
+
 class TestParseToolCall(unittest.TestCase):
   def test_argument_newlines(self):
     for value in ("", "text", " text ", "\n", "\nfirst\nsecond\n\n", "\r\nfirst\r\nsecond\r\n\r\n"):
@@ -51,7 +69,8 @@ class TestLLMServer(unittest.TestCase):
     cls.mock_tok.is_end = Mock(side_effect=lambda tid: tid in (999,))
 
     cls.mock_model = Mock()
-    cls.mock_model.max_context = 4
+    cls.mock_model.max_context = 1024
+    mock_batch(cls.mock_model)
     cls.mock_model.generate = Mock(side_effect=lambda ids, **kwargs: iter([300, 301, 999]))
     cls.mock_model.get_start_pos = Mock(return_value=0)
 
@@ -160,7 +179,7 @@ class TestLLMServer(unittest.TestCase):
 
   def test_interrupted_stream_logs_tokens(self):
     with patch.object(self.mock_model, "generate", side_effect=lambda ids, **kwargs: iter([300, 301, 999])), \
-         patch("tinygrad.llm.serve.stderr_log") as log, patch("tinygrad.llm.serve.colored", side_effect=lambda text, color: text) as color:
+         patch("tinygrad.llm.serve.stderr_log") as log:
       stream = self.server.RequestHandlerClass.run_model(Mock(server=self.server), [200, 201, 202], "test")
       next(stream)
       next(stream)
@@ -168,9 +187,20 @@ class TestLLMServer(unittest.TestCase):
     interrupt = log.call_args.args[0]
     self.assertFalse(interrupt.startswith("\n"))
     self.assertTrue(interrupt.endswith("\n"))
-    self.assertIn("gen:", interrupt)
-    self.assertIn("out:    1", interrupt)
-    self.assertTrue(any(args[0].startswith("total:") and args[1] == "red" for args, _ in color.call_args_list))
+    log.assert_called_once()
+    self.assertIn("decode:-", interrupt)
+    self.assertIn("out:1", interrupt)
+    self.assertIn("finish:cancelled", interrupt)
+
+  def test_empty_tool_call_log(self):
+    with patch.object(self.mock_model, "generate", side_effect=lambda ids, **kwargs: iter([300, 999])), \
+         patch.object(self.mock_tok, "stream_decoder", return_value=lambda tid=None: "<tool_call>\n" if tid == 300 else ""), \
+         patch("tinygrad.llm.serve.stderr_log") as log:
+      list(self.server.RequestHandlerClass.run_model(Mock(server=self.server), [200], "test"))
+    warning, stats = [c.args[0] for c in log.call_args_list]
+    self.assertIn("invalid tool call: '<tool_call>\\n'", warning)
+    self.assertEqual(warning.count('\n'), 1)
+    self.assertEqual(warning.split()[0], stats.split()[0])
 
   def test_stream_disconnect_closes_source(self):
     from tinygrad.llm.serve import Handler
@@ -201,7 +231,7 @@ class TestLLMServer(unittest.TestCase):
 
   def test_context_length_error(self):
     from openai import BadRequestError
-    self.mock_tok.encode.return_value = [200, 201, 202, 203]
+    self.mock_tok.encode.return_value = [200]*self.mock_model.max_context
     try:
       with self.assertRaises(BadRequestError) as err:
         self.client.chat.completions.create(model="test-model", messages=[{"role":"user", "content":"too long"}])
@@ -250,7 +280,8 @@ class TestLLMToolCalls(unittest.TestCase):
     cls.mock_tok.is_end = Mock(return_value=False)
 
     cls.mock_model = Mock()
-    cls.mock_model.max_context = 4
+    cls.mock_model.max_context = 1024
+    mock_batch(cls.mock_model)
     cls.mock_model.get_start_pos = Mock(return_value=0)
 
     from tinygrad.llm.serve import LLMServer

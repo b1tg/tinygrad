@@ -1,7 +1,9 @@
 from __future__ import annotations
-import json, pathlib, re, time, typing, uuid
+import itertools, json, pathlib, queue, re, socketserver, threading, time, typing, uuid
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 from tinygrad.helpers import DEBUG, colored, stderr_log
+from tinygrad.llm.model import Generation
 from tinygrad.viz.serve import TCPServerWithReuse, Handler as VizHandler
 if TYPE_CHECKING:
   from tinygrad.llm.cli import SimpleTokenizer
@@ -68,6 +70,10 @@ class StreamRouter:
     if emit: yield "content", emit
     if found: self.mode, self.buf = "tool", "<tool_call>" + self.buf
 
+@dataclass
+class Request(Generation):
+  output: queue.SimpleQueue = field(default_factory=queue.SimpleQueue)
+
 class Handler(VizHandler):
   server: LLMServer
   def log_request(self, code='-', size='-'): pass
@@ -76,40 +82,30 @@ class Handler(VizHandler):
     elif self.path.startswith("/assets/"): super().do_GET()
     else: self.send_data((pathlib.Path(__file__).parent / "chat.html").read_bytes(), content_type="text/html")
   def run_model(self, ids:list[int], model_name:str, include_usage=False, max_tokens:int|None=None, temperature:float=0.0,
-                reasoning:bool=False):
-    model, tok = self.server.model, self.server.tok
+                reasoning:bool=False, request_st:float|None=None):
     prompt_tokens = len(ids)
-    cache_start_pos = model.get_start_pos(ids)
-    stderr_log(f"in:{colored(f'{cache_start_pos:5d}', 'green')} +{len(ids)-cache_start_pos:5d}  {colored('--', 'BLACK')}  ")
-    tmpl = {"id":f"chatcmpl-{uuid.uuid4().hex[:24]}", "object":"chat.completion.chunk", "created":int(time.time()), "model":model_name}
+    tmpl: dict = {"id":f"chatcmpl-{uuid.uuid4().hex[:24]}", "object":"chat.completion.chunk", "created":int(time.time()), "model":model_name}
     def chunk(d:dict): return {"choices": [{"index":0, "delta":d, "finish_reason":None}], **tmpl}
-    out: list[int] = []
-    finish_reason = "stop"
-    st = pt = time.perf_counter()
-    dec = tok.stream_decoder()
+    out, finish_reason, pt = [], "cancelled", None
+    st = last = time.perf_counter()
+    if request_st is None: request_st = st
+    dec = self.server.tok.stream_decoder()
     router = StreamRouter(reasoning)
-    def log_stats(interrupted:bool=False):
-      et = time.perf_counter()
-      total = f"total:{et-st:6.2f}s"
-      stderr_log(f"gen:{len(out)/(et-pt) if len(out) > 1 else 0:4.0f} tok/s  {colored('--', 'BLACK')}  "
-                 f"out:{len(out):5d}  {colored('--', 'BLACK')}  {colored(total, 'red') if interrupted else total}\n")
-    completed = False
+    self.server.pending.put(req := Request(ids, temperature, max_tokens, self.server.tok.is_end))
     try:
       yield chunk({"role":"assistant", "content":""})
-      for next_id in model.generate(ids, temperature=temperature):
-        if len(out) == 0:
-          stderr_log(f"prefill:{(prompt_tokens-cache_start_pos)/((pt:=time.perf_counter())-st):4.0f} tok/s  {colored('--', 'BLACK')}  ")
-        if tok.is_end(next_id): break
+      for next_id in iter(req.output.get, None):
+        if isinstance(next_id, Exception): raise next_id
+        if pt is None: pt = time.perf_counter()
         out.append(next_id)
+        last = time.perf_counter()
         for field, delta in router.route(dec(next_id)): yield chunk({field:delta})
-        if max_tokens is not None and len(out) >= max_tokens:
-          finish_reason = "length"
-          break
+      finish_reason = req.finish_reason or "cancelled"
       for field, delta in router.route(dec(), final=True): yield chunk({field:delta})
       tool_calls: list[dict] = []
       for m in re.finditer(r"<tool_call>\s*(.*?)\s*(?:</tool_call>|$)", router.buf, re.DOTALL):
         if (parsed := parse_tool_call(m.group(1))) is None:
-          stderr_log(f"failed to parse tool call: {m.group(1)[:200]}")
+          stderr_log(f"[{tmpl['id'][-8:]}] /v1/chat/completions invalid tool call: {m.group(0)[:200]!r}\n")
           yield chunk({"content":m.group(0)})  # don't silently drop output the client can't use
         else:
           name, args = parsed
@@ -118,19 +114,22 @@ class Handler(VizHandler):
       if tool_calls:
         yield chunk({"tool_calls":tool_calls})
         if finish_reason == "stop": finish_reason = "tool_calls"
-      completed = True
       yield {"choices": [{"index":0, "delta":{},"finish_reason":finish_reason}], **tmpl}
       if include_usage:
         yield {"choices": [], "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": len(out),
                                         "total_tokens": prompt_tokens + len(out)}, **tmpl}
-      log_stats()
-    except GeneratorExit:
-      if not completed: log_stats(interrupted=True)
+    except Exception:
+      finish_reason = "error"
       raise
+    finally:
+      ttft = f"{pt-request_st:.2f}s" if pt is not None else "-"
+      decode = f"{(len(out)-1)/(last-pt):.0f} tok/s" if len(out) > 1 and pt is not None and last > pt else "-"
+      stderr_log(f"[{tmpl['id'][-8:]}] /v1/chat/completions in:{prompt_tokens} out:{len(out)} prep:{(st-request_st)*1e3:.0f}ms "
+                 f"ttft:{ttft} decode:{decode} total:{time.perf_counter()-request_st:.2f}s finish:{finish_reason}\n")
+      req.finish_reason = req.finish_reason or finish_reason
 
   def do_POST(self):
     request_st = time.perf_counter()
-    stderr_log(f"{self.path}  {colored('--', 'BLACK')}  ")
     raw_body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
     body: dict[str, typing.Any] = json.loads(raw_body.decode("utf-8"))
     if DEBUG >= 1: print(json.dumps(body, indent=2))
@@ -139,7 +138,6 @@ class Handler(VizHandler):
       normalize_messages(body["messages"])
       rendered = self.server.template.render(messages=body["messages"], tools=body.get("tools"), add_generation_prompt=True, preserve_thinking=True)
       ids: list[int] = self.server.tok.encode(rendered)
-      stderr_log(f"prep:{(time.perf_counter()-request_st)*1e3:5.0f} ms  {colored('--', 'BLACK')}  ")
       if len(ids) >= self.server.model.max_context:
         stderr_log(f"{colored('context length exceeded', 'red')}  in:{len(ids):5d}  max:{self.server.model.max_context:5d}\n")
         return self.send_data(json.dumps({"error":{"message":f"prompt has {len(ids)} tokens, but the model context is "
@@ -150,7 +148,7 @@ class Handler(VizHandler):
       max_tokens = body.get("max_completion_tokens") or body.get("max_tokens")
       chunks = self.run_model(ids, body["model"], not body.get("stream") or body.get("stream_options",{}).get("include_usage", False),
                               max_tokens=max_tokens, temperature=float(body.get("temperature", 0.0)),
-                              reasoning=rendered.rstrip().endswith("<think>"))
+                              reasoning=rendered.rstrip().endswith("<think>"), request_st=request_st)
       if body.get("stream"): self.stream_json(chunks)
       else:
         out, reasoning, tool_calls, finish_reason = [], [], [], "stop"
@@ -170,7 +168,37 @@ class Handler(VizHandler):
     else:
       raise RuntimeError(f"unhandled path {self.path}")
 
-class LLMServer(TCPServerWithReuse):
-  def __init__(self, server_address:tuple, model:Transformer, model_name:str, tok:SimpleTokenizer, template:typing.Any):
+class LLMServer(socketserver.ThreadingMixIn, TCPServerWithReuse):
+  daemon_threads = True
+  def __init__(self, server_address:tuple, model:Transformer, model_name:str, tok:SimpleTokenizer, template:typing.Any, batch_size:int=1):
     self.model, self.model_name, self.tok, self.template = model, model_name, tok, template
+    self.pending, self.stopping = queue.Queue[Request](), threading.Event()
     super().__init__(server_address, Handler)
+    self.worker = threading.Thread(target=self.run, args=(batch_size,), name='llm-inference')
+    self.worker.start()
+
+  def run(self, batch_size):
+    jobs = [Request([], finish_reason="stop") for _ in range(batch_size)]
+    source = self.model.generate_batch(jobs)
+    while not self.stopping.is_set():
+      while free := [i for i, job in enumerate(jobs) if job.finish_reason is not None]:
+        try: job = self.pending.get(timeout=0.1 if len(free) == len(jobs) else 0)
+        except queue.Empty: break
+        i = max(free, key=lambda i: sum(1 for _ in itertools.takewhile(lambda ab: ab[0] == ab[1], zip(job.tokens, jobs[i].tokens))))
+        jobs[i] = job
+      if not (active := [(i, job) for i, job in enumerate(jobs) if job.finish_reason is None]): continue
+      try: tokens = next(source)
+      except Exception as exc:
+        tokens = [None if isinstance(exc, StopIteration) else exc]*batch_size
+        for _, job in active: job.finish_reason = job.finish_reason or "error"
+        source = self.model.generate_batch(jobs)
+      for i, job in active:
+        if tokens[i] is not None: job.output.put(tokens[i])
+        if job.finish_reason is not None: job.output.put(None)
+    source.close()
+    for job in jobs + list(self.pending.queue): job.output.put(None)
+
+  def server_close(self):
+    self.stopping.set()
+    self.worker.join()
+    super().server_close()

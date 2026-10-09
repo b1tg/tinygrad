@@ -3,7 +3,7 @@ import sys, argparse, codecs, itertools, typing, re, unicodedata, json, time
 from typing import TYPE_CHECKING
 from tinygrad import nn
 from tinygrad.uop.ops import UOp, Ops
-from tinygrad.helpers import partition, DEBUG, Timing, GlobalCounters, Context, fetch, profile_marker, getenv, round_up
+from tinygrad.helpers import partition, Timing, GlobalCounters, fetch, profile_marker, getenv, round_up
 from tinygrad.llm.model import Transformer
 if TYPE_CHECKING:
   import jinja2
@@ -144,6 +144,7 @@ def main():
   parser.add_argument("--model", "-m", default=list(models.keys())[0], help=f"Model choice ({', '.join(models.keys())}) or path to a local GGUF file")
   parser.add_argument("--max_context", type=int, default=4096, help="Max Context Length")
   parser.add_argument("--serve", nargs='?', type=int, const=8000, metavar="PORT", help="Run OpenAI compatible API (optional port, default 8000)")
+  parser.add_argument("--batch-size", type=int, choices=(1, 2), default=1, help="Serve up to this many queued requests in one batch")
   parser.add_argument("--warmup", action="store_true", help="warmup the JIT")
   parser.add_argument("--benchmark", nargs='?', type=lambda s: tuple(int(x) for x in (s if "," in s else f"0,{s}").split(",", 1)), const=(0, 20),
                       metavar="[PREFILL,]DECODE", help="Benchmark tok/s (PREFILL prompt tokens then DECODE new tokens, default 0,20)")
@@ -154,8 +155,7 @@ def main():
 
   # load the model
   st = time.perf_counter()
-  with Context(DEBUG=max(DEBUG.value, 1 if args.serve else 0)):
-    model, kv = Transformer.from_gguf(fetch(models.get(args.model, args.model)), args.max_context, shard=args.shard)
+  model, kv = Transformer.from_gguf(fetch(models.get(args.model, args.model)), args.max_context, shard=args.shard)
   model_name = kv.get('general.name') or kv.get('general.basename') or args.model
   file_sizes = [y.nbytes()*args.shard for y in UOp.sink(*[x.uop for x in nn.state.get_parameters(model)]).toposort() if y.op is Ops.BUFFER]
   print(f"loaded model \"{model_name}\" at {sum(file_sizes)*1e-9/(time.perf_counter()-st):.2f} GB/s with {sum(file_sizes):,} bytes "
@@ -180,11 +180,11 @@ def main():
     except ImportError: print("warning: jinja2 is not installed, the model's chat template is disabled")
 
   # warmup the JIT
-  if args.warmup or args.serve:
-    with Context(DEBUG=max(DEBUG.value, 1)): model.warmup()
+  if args.warmup or args.serve: model.warmup()
 
   # start server
-  if args.serve: LLMServer(('', args.serve), model, model_name, tok, template).serve_forever()
+  if args.serve:
+    with LLMServer(('', args.serve), model, model_name, tok, template, args.batch_size) as server: server.serve_forever()
 
   # do benchmark
   if args.benchmark is not None:
@@ -220,4 +220,6 @@ def main():
       sys.stdout.flush()
     messages.append({"role":"assistant", "content":reply})
 
-if __name__ == "__main__": main()
+if __name__ == "__main__":
+  try: main()
+  except KeyboardInterrupt: sys.exit(1)
