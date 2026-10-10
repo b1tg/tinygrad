@@ -5,6 +5,7 @@ from tinygrad import Tensor, UOp, dtypes, nn, function, Device, TinyJit
 from tinygrad.llm.kernels.amd import (Linear, amd_custom_kernels_supported, q8_quantize, flash_attention, gated_delta_prefill,
                                       QUANT_SIZES, HALFWORD_QUANTS, _wmma_rdna4)
 from tinygrad.llm.gguf import ggml_data_to_tensor
+from tinygrad.llm.model import FFNBlock, TransformerConfig
 from test.runtime.test_llm_quantized import QuantLinearMixin
 
 class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
@@ -424,5 +425,23 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
     values = np.concatenate([old_kv[1, 0, 0], new_kv[1, 0, 0]]).astype(np.float16).astype(np.float32)
     expected = np.stack([values[:start_pos+i+1].mean(0) for i in range(32)])[None, None].repeat(8, axis=1)
     np.testing.assert_allclose(out.numpy(), expected, rtol=2e-3, atol=2e-3)
+
+class TestDenseFFN(unittest.TestCase):
+  def test_symbolic_tokens_match_static(self):
+    # symbolic chunks run the dense FFN padded to their max size, the padded rows must not change the real ones
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
+    config = TransformerConfig(num_blocks=1, dim=256, hidden_dim=512, n_heads=4, n_kv_heads=4, norm_eps=1e-5, vocab_size=16, head_dim=64,
+                               rope_theta=10000.0, rope_dim=64, v_head_dim=64, max_context=32)
+    block, rng = FFNBlock(config), np.random.default_rng(0)
+    for linear in (block.ffn_gate, block.ffn_up, block.ffn_down):
+      linear.weight = Tensor(rng.normal(scale=0.05, size=linear.weight.shape).astype(np.float16))
+    x = rng.normal(size=(1, 32, 256)).astype(np.float16)
+    @function(allow_implicit=True)
+    def run(x:Tensor): return block._feed_forward(x)
+    for tokens in (5, 32):
+      with self.subTest(tokens=tokens):
+        expected = block._feed_forward(Tensor(x[:, :tokens])).numpy()
+        actual = run(Tensor(x).contiguous()[:, :UOp.variable("tokens", 1, 32).bind(tokens)])[:, :tokens].numpy()
+        np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-3)
 
 if __name__ == "__main__": unittest.main()
