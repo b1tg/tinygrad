@@ -381,8 +381,7 @@ def _q5_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, out_features:int, in_fea
 
 @functools.cache
 def _iq4_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, lut:UOp, out_features:int, in_features:int, rdna4:bool=False) -> UOp:
-  token_tile = 32 if out_features <= 1024 and out.shape[0] % 32 == 0 else 64 if out.shape[0] % 64 == 0 and \
-    out_features <= 6144 else 128 if out.shape[0] % 128 == 0 else \
+  token_tile = 32 if out_features <= 1024 and out.shape[0] % 32 == 0 else 64 if out.shape[0] % 64 == 0 else \
     32 if out.shape[0] % 32 == 0 else 16
   output_tiles = 1 if out_features <= 1024 else 2 if out_features <= 6144 else 1 if out_features < 8192 else 2
   layout = _wmma_layout(out, out_features, token_tile, output_tiles)
