@@ -10,8 +10,8 @@ from tinygrad.renderer.cstyle import HIPRenderer
 
 BLOCK_M, BLOCK_N, WARP_SIZE = 32, 32, 32
 WMMA_M, WMMA_N, WMMA_K = 16, 16, 16
-WAVES_M, WAVES_N, LANES_PER_WAVE_M, LANES_PER_WAVE_N = 2, 2, 2, 16
-WMMA_ACC, THREADS_PER_BLOCK = WMMA_M // LANES_PER_WAVE_M, WARP_SIZE * WAVES_M * WAVES_N
+LANES_PER_WAVE_M, LANES_PER_WAVE_N = 2, 16
+WMMA_ACC = WMMA_M // LANES_PER_WAVE_M
 LDS_PAD, WMMA_ARG, LOG2E = 4, ((WMMA_N, WMMA_M, WMMA_K), 32), math.log2(math.e)
 GGML_BLOCK_SIZE, Q8_GROUP_SIZE = 256, 32
 Q2_K, Q3_K, Q4_K, Q5_K, Q6_K = 10, 11, 12, 13, 14
@@ -38,6 +38,11 @@ def amd_custom_kernels_supported(device:str|tuple[str, ...]|None) -> bool:
 def _wmma_rdna4(device:str|tuple[str, ...]) -> bool:
   if isinstance(device, tuple): device = device[0]
   with Context(ALLOW_DEVICE_USAGE=1): return getattr(Device[device], "target")[0] == 12
+
+@functools.cache
+def _cu_count(device:str|tuple[str, ...]) -> int:
+  if isinstance(device, tuple): device = device[0]
+  with Context(ALLOW_DEVICE_USAGE=1): return getattr(Device[device], "cu_cnt", 96)
 
 def warp_reduce(val:UOp, maximum:bool=False, full_wave:bool=False) -> UOp:
   for offset in ((16, 8, 4, 2, 1) if full_wave else (8, 4, 2, 1)):
@@ -639,102 +644,98 @@ def amd_flash_attention_decode(q:Tensor, cache_kv:Tensor, valid_kv_len:int|UOp, 
 def _wmma_fragment(fragment:UOp, lane:UOp, rdna4:bool) -> UOp:
   return fragment.reshape(2, 2, 4)[:, lane//16, :].reshape(8) if rdna4 else fragment
 
+FA_WAVES = 8  # 16 query rows per wave
+
 @functools.cache
-def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:int|UOp|None=None, rdna4:bool=False) -> UOp:
+def _amd_flash_attention_prefill(part:UOp, stats:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:int|UOp|None=None,
+                                 rdna4:bool=False) -> UOp:
+  # the queries of a KV head group are folded into rows (token, head): a workgroup streams each K/V tile through LDS once
+  # for all of its rows. The keys are split over `splits` workgroups, their unnormalized outputs are combined afterwards.
   valid_kv_len, q_start = _unbind(valid_kv_len), _unbind(q_start) if q_start is not None else None
-  BH, M, D = q.shape
-  _, B, H_KV, physical_n, cache_dim = cache.shape
-  k, v = cache[0].reshape(B*H_KV, physical_n, cache_dim), cache[1].reshape(B*H_KV, physical_n, cache_dim)
-  assert k.shape == v.shape and BH % k.shape[0] == 0 and k.shape[2] == D
-  gqa_group = BH // k.shape[0]
-  if isinstance(M, int): assert M % BLOCK_M == 0
-  assert isinstance(D, int) and D % WMMA_K == 0 and D % LANES_PER_WAVE_N == 0
-  TM, TN, TD, SCALE = BLOCK_M//(WAVES_M*LANES_PER_WAVE_M), BLOCK_N//LANES_PER_WAVE_N, D//(WAVES_N*LANES_PER_WAVE_N), 1/math.sqrt(D)
-  # query row 0 sits at sequence position q_base (the queries may be padded beyond valid_kv_len - q_base rows)
+  BH, M, D = cast(tuple[int, int, int], q.shape)
+  _, B, H_KV, physical_n, _ = cast(tuple[int, int, int, int, int], cache.shape)
+  BKV, G, splits = B*H_KV, BH // (B*H_KV), part.shape[2]
+  rows = G*M
+  part, stats = part.reshape(BKV, rows, splits, D), stats.reshape(BKV, rows, splits, 2)
+  k, v = cache[0].reshape(BKV, physical_n, D), cache[1].reshape(BKV, physical_n, D)
+  waves = next(w for w in (FA_WAVES, 4, 2, 1) if rows % (w*WMMA_M) == 0)
+  block_rows, threads, TN, TD, SCALE = waves*WMMA_M, waves*WARP_SIZE, BLOCK_N//WMMA_N, D//WMMA_N, 1/math.sqrt(D)
   q_base = valid_kv_len - M if q_start is None else q_start
-  block_bh, block_m = UOp.range(BH, 0, AxisType.GLOBAL), UOp.range(M // BLOCK_M, 1, AxisType.GLOBAL)
-  kv_head = block_bh // gqa_group
-  q, o = (x.reshape(BH, M//BLOCK_M, BLOCK_M, D)[block_bh, block_m] for x in (q, o))
-  k, v = k[kv_head], v[kv_head]
-  wave_m, wave_n, lane = UOp.range(WAVES_M, 2, AxisType.LOCAL), UOp.range(WAVES_N, 3, AxisType.LOCAL), UOp.range(WARP_SIZE, -1, AxisType.WARP)
-  tid, lane_m, lane_n = (wave_m * WAVES_N + wave_n) * WARP_SIZE + lane, lane // LANES_PER_WAVE_N, lane % LANES_PER_WAVE_N
-  Q_ELEMS_PER_THREAD, KV_ELEMS_PER_THREAD = BLOCK_M * D // THREADS_PER_BLOCK, BLOCK_N * D // THREADS_PER_BLOCK
-  QP_lds = UOp.alloc((BLOCK_M, D + LDS_PAD), dtypes.half, addrspace=AddrSpace.LOCAL)
-  KV_lds = UOp.alloc((BLOCK_N, D + LDS_PAD), dtypes.half, addrspace=AddrSpace.LOCAL)[:, :D]
-  acc, m_i, l_i = _reg((TM, TD), 0), _reg((TM,), -math.inf), _reg((TM,), 0)
-  n_tile = UOp.range(((q_base + (block_m + 1) * BLOCK_M).minimum(valid_kv_len) + BLOCK_N - 1) // BLOCK_N, 100, AxisType.LOOP)
-  Q_lds = QP_lds[:, :D]
-  Q_store = Q_lds.after(n_tile).reshape(THREADS_PER_BLOCK, Q_ELEMS_PER_THREAD)[tid].store(q.reshape(THREADS_PER_BLOCK, Q_ELEMS_PER_THREAD)[tid])
-  load_k = UOp.range(KV_ELEMS_PER_THREAD, 90)
-  kval = k.reshape(physical_n*D)[n_tile*BLOCK_N*D + tid*KV_ELEMS_PER_THREAD + load_k].float()
-  K_store = KV_lds.reshape(THREADS_PER_BLOCK, KV_ELEMS_PER_THREAD)[tid, load_k].store(kval).end(load_k)
-  Q_lds, KV_lds_k = Q_lds.after(Q_store, K_store), KV_lds.after(Q_store, K_store)
-  S_reg = _reg((TM, TN), 0, n_tile)
-  k_qk, tm1, tn1 = UOp.range(D//WMMA_K, 101, AxisType.LOOP), UOp.range(TM//WMMA_ACC, 200), UOp.range(TN, 201)
-  S_frag = S_reg.reshape(TM // WMMA_ACC, WMMA_ACC, TN).permute(0, 2, 1)[tm1, tn1]
-  q_frag = Q_lds.reshape(WAVES_M, TM // WMMA_ACC, WMMA_M, D // WMMA_K, WMMA_K)[wave_m, tm1, lane_n, k_qk]
-  k_frag = KV_lds_k.reshape(TN, WMMA_N, D // WMMA_K, WMMA_K)[tn1, lane_n, k_qk]
-  # All waves must finish reading Q/K before their shared memory is reused for P/V.
-  q_frag, k_frag = (_wmma_fragment(f, lane, rdna4) for f in (q_frag, k_frag))
-  qk_done = S_frag.store(UOp.wmma(q_frag, k_frag, S_frag.after(k_qk), *WMMA_ARG)).end(tm1, tn1).end(k_qk).barrier()
-  S_reg = S_reg.after(qk_done, S_reg.store(S_reg * SCALE))
-  rm, rn = UOp.range(TM, 250), UOp.range(TN, 251)
-  q_idx = q_base + block_m * BLOCK_M + wave_m * WMMA_M + (lane_m*TM + rm if rdna4 else rm*LANES_PER_WAVE_M + lane_m)
-  k_idx = n_tile * BLOCK_N + rn * LANES_PER_WAVE_N + lane_n
-  causal = (k_idx <= q_idx) & (k_idx < valid_kv_len)
-  S_reg = S_reg.after(S_reg[rm, rn].store(causal.where(S_reg[rm, rn], S_reg[rm, rn].const_like(-math.inf))).end(rm, rn))
-  m_ij, rm2 = _reg((TM,), -math.inf, n_tile), UOp.range(TN, 261, AxisType.LOOP)
-  m_ij = m_ij.after(m_ij.store(m_ij.after(rm2).maximum(S_reg[:, rm2])).end(rm2))
-  ri_w = UOp.range(TM, 270)
-  m_ij = m_ij.after(m_ij[ri_w].store(warp_reduce(m_ij[ri_w], maximum=True)).end(ri_w))
-  tile_max = m_ij.reshape(TM, 1).expand(TM, TN).maximum(-1e30)
-  S_reg = S_reg.after(S_reg.store(((S_reg - tile_max) * LOG2E).exp2()))
-  p_local, ri_ws = _reg((TM,), 0, n_tile), UOp.range(TM, 295)
-  p_sum = p_local.after(p_local[ri_ws].store(sum((warp_reduce(S_reg[ri_ws, rn]) for rn in range(TN)), S_reg.const_like(0))).end(ri_ws))
-  P_lds = QP_lds.flatten()[:WAVES_N * BLOCK_M * BLOCK_N].reshape(WAVES_N, BLOCK_M, BLOCK_N)
-  # gfx11 distributes even/odd rows between half-waves; gfx12 distributes the low/high eight rows.
-  row_shape = (LANES_PER_WAVE_M, TM) if rdna4 else (TM, LANES_PER_WAVE_M)
-  row_lane, row_elem = (2, 3) if rdna4 else (3, 2)
-  P_write = P_lds.reshape(WAVES_N, WAVES_M, *row_shape, TN, LANES_PER_WAVE_N).permute(1, 0, row_lane, 5, row_elem, 4) \
-    .reshape(THREADS_PER_BLOCK, TM, TN)
-  P_store = P_write[tid].store(S_reg.cast(dtypes.half))
-  beta_i, ri4, rj4 = UOp.alloc((TM,), dtypes.float, addrspace=AddrSpace.REG), UOp.range(TM, 330), UOp.range(TD, 331)
-  m_new = m_i[ri4].maximum(m_ij[ri4])
-  alpha_val, beta_val = ((m_i[ri4] - m_new) * LOG2E).exp2(), ((m_ij[ri4] - m_new) * LOG2E).exp2()
-  correction = UOp.group(acc[ri4, rj4].store(alpha_val * acc[ri4, rj4]).end(rj4),
-                         l_i[ri4].store(alpha_val * l_i[ri4] + beta_val * p_sum[ri4]),
-                         m_i[ri4].store(m_new), beta_i[ri4].store(beta_val)).end(ri4)
-  acc, l_i, m_i, beta_i = acc.after(correction), l_i.after(correction), m_i.after(correction), beta_i.after(correction)
+  kvh, rb = UOp.range(BKV, 0, AxisType.GLOBAL), UOp.range(rows//block_rows, 1, AxisType.GLOBAL)
+  split = UOp.range(splits, 2, AxisType.GLOBAL)
+  wave, lane = UOp.range(waves, 3, AxisType.LOCAL), UOp.range(WARP_SIZE, -1, AxisType.WARP)
+  tid, lane_m, lane_n = wave*WARP_SIZE + lane, lane // LANES_PER_WAVE_N, lane % LANES_PER_WAVE_N
+  # gfx11 distributes even/odd accumulator rows between half-waves; gfx12 distributes the low/high eight rows
+  def wave_row(i:int) -> UOp: return lane_m*WMMA_ACC + i if rdna4 else lane_m + i*LANES_PER_WAVE_M
+  def row(i:int) -> UOp: return rb*block_rows + wave*WMMA_M + wave_row(i)
+  # the keys up to the last query of the row block, split evenly over the split workgroups
+  kv_end = (q_base + ((rb+1)*block_rows-1)//G + 1).minimum(valid_kv_len)
+  n_tiles = (kv_end + BLOCK_N - 1)//BLOCK_N
+  per_split = (n_tiles + splits - 1)//splits
+  acc, m_i, l_i = _reg((WMMA_ACC, TD), 0), _reg((WMMA_ACC,), -1e30), _reg((WMMA_ACC,), 0)
+  n_tile = UOp.range((n_tiles - split*per_split).maximum(0).minimum(per_split), 100, AxisType.LOOP)
+  tile = split*per_split + n_tile
+  # stage K and V (transposed for the PV fragments) of this tile; V past the valid keys is zeroed (P is 0 there)
+  K_lds = UOp.alloc((BLOCK_N, D + LDS_PAD), dtypes.half, addrspace=AddrSpace.LOCAL)[:, :D]
   V_lds = UOp.alloc((D, BLOCK_N + LDS_PAD), dtypes.half, addrspace=AddrSpace.LOCAL)[:, :BLOCK_N]
-  V_copy, load_v = V_lds.after(qk_done).permute(1, 0), UOp.range(KV_ELEMS_PER_THREAD, 390)
-  v_pos = n_tile*BLOCK_N + (tid*KV_ELEMS_PER_THREAD + load_v)//D
-  vval = (v_pos < valid_kv_len).where(v.reshape(physical_n*D)[n_tile*BLOCK_N*D + tid*KV_ELEMS_PER_THREAD + load_v].float(), 0)
-  V_store = V_copy.reshape(THREADS_PER_BLOCK, KV_ELEMS_PER_THREAD)[tid, load_v].store(vval).end(load_v)
-  P_lds, V_lds = P_lds.after(P_store, V_store), V_lds.after(P_store, V_store)
-  pv_acc = _reg((TM, TD), 0, n_tile)
-  k_pv, tm2, tn2 = UOp.range(BLOCK_N//WMMA_K, 400, AxisType.LOOP), UOp.range(TM//WMMA_ACC, 401), UOp.range(TD, 402)
-  pv_frag = pv_acc.reshape(TM // WMMA_ACC, WMMA_ACC, TD).permute(0, 2, 1)[tm2, tn2]
-  p_frag = P_lds[wave_n].reshape(WAVES_M, TM // WMMA_ACC, WMMA_M, BLOCK_N // WMMA_K, WMMA_K)[wave_m, tm2, lane_n, k_pv]
-  v_frag = V_lds.reshape(WAVES_N, TD, WMMA_N, BLOCK_N // WMMA_K, WMMA_K)[wave_n, tn2, lane_n, k_pv]
+  per_thread, vec = BLOCK_N*D//threads, 8
+  key_l, d0 = (tid*per_thread)//D, (tid*per_thread)%D
+  key, kv_stores = tile*BLOCK_N + key_l, []
+  for c in range(per_thread//vec):
+    kvec, vvec = _amd_load(k[kvh, key, d0 + c*vec], vec), _amd_load(v[kvh, key, d0 + c*vec], vec)
+    for i in range(vec):
+      kv_stores.append(K_lds[key_l, d0 + c*vec + i].store(kvec[i]))
+      kv_stores.append(V_lds[d0 + c*vec + i, key_l].store((key < valid_kv_len).where(vvec[i], vvec[i].const_like(0))))
+  K_lds, V_lds = K_lds.after(*kv_stores), V_lds.after(*kv_stores)
+  # S = Q K^T, the query fragments come straight from global memory (cached)
+  # up to four steps per loop trip are unrolled, so their query fragment loads can be in flight together
+  S_reg = _reg((WMMA_ACC, TN), 0, n_tile)
+  qrow = rb*block_rows + wave*WMMA_M + lane_n
+  QU = next(u for u in (4, 2, 1) if (D//WMMA_K) % u == 0)
+  k_outer = UOp.range(D//WMMA_K//QU, 101, AxisType.LOOP)
+  s_acc = [S_reg.permute(1, 0)[t].after(k_outer) for t in range(TN)]
+  for ku in range(QU):
+    kk = k_outer*QU + ku
+    q_frag = _wmma_fragment(q.reshape(BH, M, D//WMMA_K, WMMA_K)[kvh*G + qrow % G, qrow // G, kk], lane, rdna4)
+    for t in range(TN):
+      s_acc[t] = UOp.wmma(q_frag, _wmma_fragment(K_lds.reshape(TN, WMMA_N, D//WMMA_K, WMMA_K)[t, lane_n, kk], lane, rdna4), s_acc[t], *WMMA_ARG)
+  S_reg = S_reg.after(UOp.group(*(S_reg.permute(1, 0)[t].store(s_acc[t]) for t in range(TN))).end(k_outer))
+  # online softmax (natural log units, like the decode partials). l is summed per lane and reduced once at the end
+  scores = [[(tile*BLOCK_N + t*WMMA_N + lane_n <= q_base + row(i)//G).where(S_reg[i, t].load()*SCALE, -math.inf) for t in range(TN)]
+            for i in range(WMMA_ACC)]
+  m_prev, l_prev, acc_prev = m_i.after(n_tile), l_i.after(n_tile), acc.after(n_tile)
+  m_new = [m_prev[i].load().maximum(warp_reduce(functools.reduce(UOp.maximum, scores[i]), maximum=True)) for i in range(WMMA_ACC)]
+  alpha = [((m_prev[i].load()-m_new[i])*LOG2E).exp2() for i in range(WMMA_ACC)]
+  p = [[((s-m_new[i])*LOG2E).exp2() for s in scores[i]] for i in range(WMMA_ACC)]
+  correction = UOp.group(*(m_i[i].store(m_new[i]) for i in range(WMMA_ACC)),
+                         *(l_i[i].store(alpha[i]*l_prev[i].load() + sum(p[i][1:], p[i][0])) for i in range(WMMA_ACC)),
+                         *(acc[i, d].store(alpha[i]*acc_prev[i, d].load()) for i in range(WMMA_ACC) for d in range(TD)))
+  acc = acc.after(correction)
+  # O += P V, P goes through LDS to turn the accumulator layout into an A fragment
+  P_lds = UOp.alloc((waves, WMMA_M, BLOCK_N), dtypes.half, addrspace=AddrSpace.LOCAL)
+  P_lds = P_lds.after(*(P_lds[wave, wave_row(i), t*WMMA_N + lane_n].store(p[i][t].cast(dtypes.half))
+                        for i in range(WMMA_ACC) for t in range(TN)))
+  k_pv, tn2 = UOp.range(BLOCK_N//WMMA_K, 400, AxisType.LOOP), UOp.range(TD, 402)
+  acc_frag = acc.permute(1, 0)[tn2]
+  p_frag = P_lds[wave].reshape(WMMA_M, BLOCK_N//WMMA_K, WMMA_K)[lane_n, k_pv]
+  v_frag = V_lds.reshape(TD, WMMA_N, BLOCK_N//WMMA_K, WMMA_K)[tn2, lane_n, k_pv]
   p_frag, v_frag = (_wmma_fragment(f, lane, rdna4) for f in (p_frag, v_frag))
-  pv_done = pv_frag.store(UOp.wmma(p_frag, v_frag, pv_frag.after(k_pv), *WMMA_ARG)).end(tm2, tn2).end(k_pv)
-  pv_acc = pv_acc.after(pv_done)
-  ri5, rj5 = UOp.range(TM, 410), UOp.range(TD, 411)
-  n_tile_end = acc[ri5, rj5].store(acc[ri5, rj5] + beta_i[ri5] * pv_acc[ri5, rj5]).end(ri5, rj5).end(n_tile)
-  acc, l_i, m_i = acc.after(n_tile_end), l_i.after(n_tile_end), m_i.after(n_tile_end)
-  acc = acc.after(acc.store(acc * (1 / l_i).reshape(TM, 1).expand(TM, TD)))
-  o = o.reshape(WAVES_M, *row_shape, WAVES_N, TD, LANES_PER_WAVE_N) \
-    .permute(0, 3, row_lane-1, 5, row_elem-1, 4).reshape(THREADS_PER_BLOCK, TM, TD)
-  return o[tid].store(acc).end(wave_m, wave_n, lane).end(block_m, block_bh).sink(arg=KernelInfo(opts_to_apply=()))
+  tile_end = acc_frag.store(UOp.wmma(p_frag, v_frag, acc_frag.after(k_pv), *WMMA_ARG)).end(tn2).end(k_pv).end(n_tile)
+  acc, m_i, l_i = acc.after(tile_end), m_i.after(tile_end), l_i.after(tile_end)
+  stores = [part[kvh, row(i), split, d*WMMA_N + lane_n].store(acc[i, d].load()) for i in range(WMMA_ACC) for d in range(TD)]
+  stores += [stats[kvh, row(i).valid(lane_n.eq(0)), split, j].store(x) for i in range(WMMA_ACC)
+             for j,x in enumerate((m_i[i].load(), warp_reduce(l_i[i].load())))]
+  return UOp.group(*stores).end(wave, lane).end(split, rb, kvh).sink(arg=KernelInfo(name="flash_attention_prefill", opts_to_apply=()))
 
 def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
   # cached flash attention on the half KV cache (already written through assigned_kv); valid_end stays bound at the graph level
   T_real, q_start = q.shape[2], None
   D, N, group = q.shape[3], assigned_kv.shape[3], q.shape[1] // assigned_kv.shape[2]
   decode = resolve(T_real == 1, False)
-  # Non-power-of-two decode dimensions can lose tail-store masks. Q/P, K, and V use separate LDS allocations.
+  # Non-power-of-two decode dimensions can lose tail-store masks. Prefill keeps K, V and P in separate LDS allocations.
   supported = D % 32 == 0 and (D & (D-1) == 0 and N % 64 == 0 and group*((D+LDS_PAD)*2+8) <= 65536 if decode else
-    D >= 64 and 2*(2*BLOCK_M*(D+LDS_PAD) + D*(BLOCK_N+LDS_PAD)) <= 65536 and N % BLOCK_N == 0 and q.max_shape[2] % BLOCK_M == 0)
+    D >= 64 and 2*(BLOCK_N*(D+LDS_PAD) + D*(BLOCK_N+LDS_PAD) + FA_WAVES*WMMA_M*BLOCK_N) <= 65536 and N % BLOCK_N == 0 and
+    q.max_shape[2] % BLOCK_M == 0)
   if not supported:
     k, v = (assigned_kv[i, :, :, :valid_end].float() for i in range(2))
     mask = None if decode else Tensor.full((T_real, valid_end), -math.inf, dtype=dtypes.float32, device=q.device).triu(valid_end-T_real+1)
@@ -746,10 +747,21 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
     assert T_pad % BLOCK_M == 0, "chunk_size must be a multiple of 32"
     q, q_start = q.pad_to((*q.shape[:2], T_pad, q.shape[3])), valid_end - T_real
   B, H, T, D = q.shape
-  out = Tensor.empty(B, H, T, D, dtype="float32", device=q.device, axis=q.uop.axis).reshape(B*H, T, D)
-  fxn = functools.partial(_amd_flash_attention, valid_kv_len=valid_end, q_start=q_start, rdna4=_wmma_rdna4(q.device))
+  H_KV, axis, devices = assigned_kv.shape[2], q.uop.axis, q.device if isinstance(q.device, tuple) else (q.device,)
+  assert axis in (None, 1), "tensor parallel attention shards the heads"
+  G = H // H_KV
+  # split the keys until the workgroups of a device cover its CUs (tensor parallel devices hold H_KV/len(devices) KV heads)
+  row_blocks = B*H_KV//len(devices)*G*T // (next(w for w in (FA_WAVES, 4, 2, 1) if G*T % (w*WMMA_M) == 0)*WMMA_M)
+  splits = max(1, min(16, _cu_count(q.device) // row_blocks))
   if isinstance(valid_end, UOp): assigned_kv = Tensor(assigned_kv.uop.after(valid_end))
-  out = Tensor.custom_kernel(out, q.half().reshape(B*H, T, D), assigned_kv, fxn=fxn)[0].reshape(B, H, T, D)
+  # (kv head, folded row) share an axis so that sharding the heads gives every device its own KV heads
+  part = Tensor.empty(B, H_KV*G*T, splits, D, dtype="float32", device=q.device, axis=axis)
+  stats = Tensor.empty(B, H_KV*G*T, splits, 2, dtype="float32", device=q.device, axis=axis)
+  fxn = functools.partial(_amd_flash_attention_prefill, valid_kv_len=valid_end, q_start=q_start, rdna4=_wmma_rdna4(q.device))
+  part, stats = Tensor.custom_kernel(part, stats, q.half().reshape(B*H, T, D), assigned_kv, fxn=fxn)[:2]
+  out = Tensor.empty(B, H_KV*G*T, 1, D, dtype="float32", device=q.device, axis=axis)
+  out = Tensor.custom_kernel(out, part, stats, fxn=functools.partial(_amd_flash_decode_combine, live=splits))[0]
+  out = out.reshape(B, H_KV, T, G, D).permute(0, 1, 3, 2, 4).reshape(B, H, T, D)
   return out if q_start is None else out[:, :, :T_real]
 
 # ******** gated delta net: fused recurrent scan ********
