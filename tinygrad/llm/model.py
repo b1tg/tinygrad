@@ -540,7 +540,7 @@ class Transformer:
     prefix_len = sum(1 for _ in itertools.takewhile(lambda ab: ab[0] == ab[1], zip(tokens[:-1], self._cached_tokens)))
     return min(block._reusable_prefix_len(prefix_len, len(self._cached_tokens)) for block in self.blk)
 
-  def generate(self, tokens:list[int], chunk_size:int=32, temperature:float=0.0):
+  def generate(self, tokens:list[int], chunk_size:int=128, temperature:float=0.0):
     if self.has_recurrent_block and not amd_custom_kernels_supported(self.token_embd.weight.device): chunk_size = 1
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
     v_toks = UOp.variable("toks", 1, chunk_size)
