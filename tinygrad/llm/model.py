@@ -130,6 +130,24 @@ class TransformerConfig:
   hc: HCConfig|None = None
   indexer: IndexerConfig|None = None
 
+class HyperConnection:
+  def __init__(self, dim:int, norm_eps:float, hc:HCConfig):
+    self.count, self.eps, self.iters, self.norm_eps = hc.count, hc.eps, hc.sinkhorn_iters, norm_eps
+    self.fn = Linear(hc.count * dim, (2 + hc.count) * hc.count, bias=False)
+    self.base, self.scale = {"weight": Tensor.zeros((2 + self.count) * self.count)}, {"weight": Tensor.zeros(3)}
+
+  def __call__(self, xs:Tensor, sublayer:Callable[[Tensor], Tensor]) -> Tensor:
+    """mHC: the sublayer sees a pre-weighted sum of the (B, T, hc, D) streams, its output is added back by post onto the streams mixed by comb"""
+    base, scale = self.base["weight"], self.scale["weight"]
+    mix = self.fn(xs.flatten(2).rmsnorm(eps=self.norm_eps))
+    pre = (mix[..., :self.count] * scale[0] + base[:self.count]).sigmoid() + self.eps
+    post = (mix[..., self.count:2*self.count] * scale[1] + base[self.count:2*self.count]).sigmoid() * 2
+    comb = (mix[..., 2*self.count:] * scale[2] + base[2*self.count:]).reshape(*mix.shape[:-1], self.count, self.count).softmax(-1) + self.eps
+    # sinkhorn: normalize the columns then the rows, alternating, to make comb doubly stochastic
+    for i in range(2 * self.iters - 1): comb = comb / (comb.sum(-1 if i % 2 else -2, keepdim=True) + self.eps)
+    out = sublayer((xs * pre.unsqueeze(-1)).sum(2))
+    return out.unsqueeze(2) * post.unsqueeze(-1) + (comb.transpose(-1, -2).unsqueeze(-1) * xs.unsqueeze(2)).sum(3)
+
 class FFNBlock:
   def __init__(self, config:TransformerConfig):
     self.config = config
@@ -137,11 +155,8 @@ class FFNBlock:
     # --- RMSNorms --------------------------------------------------------
     self.attn_norm   = nn.RMSNorm(config.dim, config.norm_eps)
     self.ffn_norm    = nn.RMSNorm(config.dim, config.norm_eps)
-    if config.hc is not None:
-      for name in ('attn', 'ffn'):
-        setattr(self, f'hc_{name}_fn', Linear(config.hc.count * config.dim, (2 + config.hc.count) * config.hc.count, bias=False))
-        setattr(self, f'hc_{name}_base', {"weight": Tensor.zeros((2 + config.hc.count) * config.hc.count)})
-        setattr(self, f'hc_{name}_scale', {"weight": Tensor.zeros(3)})
+    if (hc:=config.hc) is not None:
+      self.hc_attn, self.hc_ffn = HyperConnection(config.dim, config.norm_eps, hc), HyperConnection(config.dim, config.norm_eps, hc)
 
     # --- feed-forward (MoE or dense) -------------------------------------
     if config.num_experts > 0:
@@ -203,24 +218,12 @@ class FFNBlock:
     @function(precompile=True, allow_implicit=True)
     def _run(x:Tensor, start_pos:int|UOp):
       if self.config.hc is not None:
-        xs = self._hyper_connection('attn', x, lambda h: self._attention(self.attn_norm(h), start_pos))
-        return self._hyper_connection('ffn', xs, lambda h: self._feed_forward(self.ffn_norm(h))).contiguous()
+        xs = self.hc_attn(x, lambda h: self._attention(self.attn_norm(h), start_pos))
+        return self.hc_ffn(xs, lambda h: self._feed_forward(self.ffn_norm(h))).contiguous()
       h =     x + self._attention(self.attn_norm(x), start_pos)
       return (h + self._feed_forward(self.ffn_norm(h))).contiguous()
     return _run(x, start_pos)
 
-  def _hyper_connection(self, name:str, xs:Tensor, sublayer:Callable[[Tensor], Tensor]) -> Tensor:
-    """mHC: the sublayer sees a pre-weighted sum of the (B, T, hc, D) streams, its output is added back by post onto the streams mixed by comb"""
-    hc, eps, iters = (cfg:=unwrap(self.config.hc)).count, cfg.eps, cfg.sinkhorn_iters
-    base, scale = getattr(self, f'hc_{name}_base')["weight"], getattr(self, f'hc_{name}_scale')["weight"]
-    mix = getattr(self, f'hc_{name}_fn')(xs.flatten(2).rmsnorm(eps=self.config.norm_eps))
-    pre = (mix[..., :hc] * scale[0] + base[:hc]).sigmoid() + eps
-    post = (mix[..., hc:2*hc] * scale[1] + base[hc:2*hc]).sigmoid() * 2
-    comb = (mix[..., 2*hc:] * scale[2] + base[2*hc:]).reshape(*mix.shape[:-1], hc, hc).softmax(-1) + eps  # (..., src, dst)
-    # sinkhorn: normalize the columns then the rows, alternating, to make comb doubly stochastic
-    for i in range(2 * iters - 1): comb = comb / (comb.sum(-1 if i % 2 else -2, keepdim=True) + eps)
-    out = sublayer((xs * pre.unsqueeze(-1)).sum(2))
-    return out.unsqueeze(2) * post.unsqueeze(-1) + (comb.transpose(-1, -2).unsqueeze(-1) * xs.unsqueeze(2)).sum(3)
 
 class TransformerBlock(FFNBlock):
   def __init__(self, config:TransformerConfig):
@@ -543,6 +546,7 @@ class Transformer:
       n_kv_heads = max(n_kv_heads)
       ssm = SSMConfig(kv[f'{arch}.ssm.conv_kernel'], kv[f'{arch}.kda.head_dim'], n_heads, n_heads, n_heads*kv[f'{arch}.kda.head_dim'], kda=True,
                       gate_lower_bound=kv.get(f'{arch}.kda.gate_lower_bound'))
+      if arch == 'glm5-next': state_dict = {k.replace('.hc_attn_', '.hc_attn.').replace('.hc_ffn_', '.hc_ffn.'):v for k,v in state_dict.items()}
       for i, is_ssm in enumerate(ssm_layers):
         if not is_ssm: continue
         state_dict[f"blk.{i}.ssm_a"] = state_dict[f"blk.{i}.ssm_a"].reshape(n_heads, 1)
