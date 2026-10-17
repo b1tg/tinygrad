@@ -225,22 +225,70 @@ def require_rdna3_hw():
   if TARGET_TO_ARCH.get(arch) != "rdna3": raise unittest.SkipTest(f"requires RDNA3 hardware, got {arch}")
 
 def run_program_hw(instructions: list, n_lanes: int = 1) -> WaveState:
-  """Run instructions on real RDNA3 hardware via the HCQ2 runtime."""
+  """Run instructions on real RDNA3 hardware via HIPCompiler and the HCQ2 runtime."""
   from tinygrad.device import Device, Buffer
   from tinygrad.dtype import dtypes
-  from tinygrad.uop.ops import UOp, Ops, KernelInfo
+  from tinygrad.runtime.support.compiler_amd import HIPCompiler
+  from tinygrad.uop.ops import UOp, Ops, KernelInfo, ProgramInfo
   from tinygrad.engine.realize import run_linear
+  from tinygrad.helpers import Target
 
   dev = Device["AMD"]
+  compiler = HIPCompiler(dev.arch)  # type: ignore[attr-defined]
 
   buf_sz = _out_bytes(n_lanes)
   out_gpu = Buffer(dev.device, buf_sz).ensure_allocated()
   assert out_gpu._buf % 16 == 0, f"buffer not 16-byte aligned: 0x{out_gpu._buf:x}"
 
   prologue, epilogue = get_prologue_epilogue(n_lanes, out_gpu._buf)
-  insts = prologue + instructions + epilogue
+  code = assemble(prologue + instructions + epilogue)
+
+  byte_str = ', '.join(f'0x{b:02x}' for b in code)
+  asm_src = f""".text
+.globl test
+.p2align 8
+.type test,@function
+test:
+.byte {byte_str}
+
+.rodata
+.p2align 6
+.amdhsa_kernel test
+  .amdhsa_next_free_vgpr 256
+  .amdhsa_next_free_sgpr 96
+  .amdhsa_wavefront_size32 1
+  .amdhsa_user_sgpr_kernarg_segment_ptr 1
+  .amdhsa_kernarg_size 8
+  .amdhsa_group_segment_fixed_size 65536
+  .amdhsa_private_segment_fixed_size 65536
+  .amdhsa_enable_private_segment 1
+.end_amdhsa_kernel
+
+.amdgpu_metadata
+---
+amdhsa.version:
+  - 1
+  - 0
+amdhsa.kernels:
+  - .name: test
+    .symbol: test.kd
+    .kernarg_segment_size: 8
+    .group_segment_fixed_size: 65536
+    .private_segment_fixed_size: 65536
+    .kernarg_segment_align: 8
+    .wavefront_size: 32
+    .sgpr_count: 96
+    .vgpr_count: 256
+    .max_flat_workgroup_size: 1024
+...
+.end_amdgpu_metadata
+"""
+
+  lib = compiler.compile(asm_src)
   sink = UOp.sink(UOp.param(0, dtypes.uint32, (n_lanes,)), UOp.special(n_lanes, "lidx0"), arg=KernelInfo("test"))
-  prg = UOp(Ops.PROGRAM, src=(sink, UOp(Ops.LINEAR, src=tuple(UOp(Ops.INS, arg=(x, dtypes.void)) for x in insts))))
+  body = UOp(Ops.LINEAR, src=())  # the precompiled BINARY is used, the body is not lowered
+  prg = UOp(Ops.PROGRAM, arg=ProgramInfo.from_sink(sink, Target("AMD", arch=dev.arch)),
+           src=(sink, body, UOp(Ops.SOURCE, arg=asm_src), UOp(Ops.BINARY, arg=lib)))
   run_linear(UOp(Ops.LINEAR, src=(prg.call(UOp.from_buffer(out_gpu, dtypes.uint32)),)), wait=True)
 
   return parse_output(bytes(out_gpu.as_memoryview()), n_lanes)
