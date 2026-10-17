@@ -3,15 +3,16 @@
 Exercises generated CDNA pcode end-to-end in the emulator and compares against
 gfx950 hardware when USE_HW=1.
 """
-import ctypes, unittest
+import ctypes, struct, unittest
 import tinygrad.runtime.autogen.amd.cdna.ins as cdna
+from tinygrad.helpers import Target
 from tinygrad.renderer.amd.dsl import NULL
 from test.amd.hw.helpers import USE_HW, assemble
 from test.mockgpu.amd.emu import run_asm
 
 LANES = 1
 
-def _insts(instructions: list, out_reg: int = 2, out_addr: int | None = None) -> list:
+def _code(instructions: list, out_reg: int = 2, out_addr: int | None = None) -> bytes:
   load_out_addr = [
     cdna.s_mov_b32(cdna.s[92], out_addr & 0xffffffff),
     cdna.s_mov_b32(cdna.s[93], out_addr >> 32),
@@ -19,20 +20,17 @@ def _insts(instructions: list, out_reg: int = 2, out_addr: int | None = None) ->
     cdna.s_load_dwordx2(cdna.s[92:93], cdna.s[80:81], 0, soffset=NULL),
     cdna.s_waitcnt(0),
   ]
-  return [
+  return assemble([
     cdna.s_mov_b32(cdna.s[80], cdna.s[0]),
     cdna.s_mov_b32(cdna.s[81], cdna.s[1]),
     cdna.v_mov_b32_e32(cdna.v[255], cdna.v[0]),
     *instructions,
     *load_out_addr,
     cdna.v_lshlrev_b32_e32(cdna.v[240], 2, cdna.v[255]),
-    cdna.v_mov_b32_e32(cdna.v[241], 0),  # the store address is v[240:241]
+    cdna.v_mov_b32_e32(cdna.v[241], 0),
     cdna.global_store_dword(addr=cdna.v[240], data=cdna.v[out_reg], saddr=cdna.s[92:93], offset=0),
     cdna.s_endpgm(),
-  ]
-
-def _code(instructions: list, out_reg: int = 2, out_addr: int | None = None) -> bytes:
-  return assemble(_insts(instructions, out_reg, out_addr))
+  ])
 
 def _run_emu(instructions: list, out_reg: int = 2) -> int:
   out_buf = (ctypes.c_uint32 * LANES)(*([0] * LANES))
@@ -47,17 +45,58 @@ def _run_emu(instructions: list, out_reg: int = 2) -> int:
 def _run_hw(instructions: list, out_reg: int = 2) -> int:
   from tinygrad.device import Device, Buffer
   from tinygrad.dtype import dtypes
-  from tinygrad.uop.ops import UOp, Ops, KernelInfo
+  from tinygrad.runtime.support.compiler_amd import HIPCompiler
+  from tinygrad.uop.ops import UOp, Ops, KernelInfo, ProgramInfo
   from tinygrad.engine.realize import run_linear
 
   dev = Device["AMD"]
   if dev.arch != "gfx950": raise unittest.SkipTest("requires gfx950 hardware")
-  out_gpu = Buffer(dev.device, LANES * 4).ensure_allocated()
-  insts = _insts(instructions, out_reg, out_gpu._buf)
+  out_gpu = Buffer(dev.device, LANES * 4, preallocate=True)
+  code = _code(instructions, out_reg, out_gpu._buf)
+  byte_str = ", ".join(f"0x{b:02x}" for b in code)
+  asm_src = f""".text
+.globl test
+.p2align 8
+.type test,@function
+test:
+.byte {byte_str}
+
+.rodata
+.p2align 6
+.amdhsa_kernel test
+  .amdhsa_next_free_vgpr 256
+  .amdhsa_next_free_sgpr 96
+  .amdhsa_accum_offset 256
+  .amdhsa_kernarg_size 0
+.end_amdhsa_kernel
+
+.amdgpu_metadata
+---
+amdhsa.version:
+  - 1
+  - 0
+amdhsa.kernels:
+  - .name: test
+    .symbol: test.kd
+    .kernarg_segment_size: 0
+    .group_segment_fixed_size: 0
+    .private_segment_fixed_size: 0
+    .kernarg_segment_align: 8
+    .wavefront_size: 64
+    .sgpr_count: 96
+    .vgpr_count: 256
+    .max_flat_workgroup_size: 1024
+...
+.end_amdgpu_metadata
+"""
+  lib = HIPCompiler(dev.arch).compile(asm_src)
   sink = UOp.sink(UOp.param(0, dtypes.uint32, (LANES,)), UOp.special(LANES, "lidx0"), arg=KernelInfo("test"))
-  prg = UOp(Ops.PROGRAM, src=(sink, UOp(Ops.LINEAR, src=tuple(UOp(Ops.INS, arg=(x, dtypes.void)) for x in insts))))
+  body = UOp(Ops.LINEAR, src=())  # the precompiled BINARY is used, the body is not lowered
+  prg = UOp(Ops.PROGRAM, arg=ProgramInfo.from_sink(sink, Target("AMD", arch=dev.arch)),
+           src=(sink, body, UOp(Ops.SOURCE, arg=asm_src), UOp(Ops.BINARY, arg=lib)))
   run_linear(UOp(Ops.LINEAR, src=(prg.call(UOp.from_buffer(out_gpu, dtypes.uint32)),)), wait=True)
-  return out_gpu.as_memoryview().cast("I")[0]
+  out = out_gpu.as_memoryview()
+  return struct.unpack("<I", out)[0]
 
 def run_cdna(instructions: list, out_reg: int = 2) -> int:
   emu = _run_emu(instructions, out_reg)

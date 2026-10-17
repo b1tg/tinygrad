@@ -124,12 +124,8 @@ class WaveState:
     self.vcc = 0
     self.scc = 0
 
-def get_prologue_epilogue(n_lanes: int, out_addr: int | None = None) -> tuple[list, list]:
-  """Generate prologue and epilogue instructions for state capture.
-
-  If out_addr is given, the epilogue stores to that absolute address. Otherwise it loads the
-  output pointer from the first kernarg (used by the emulator).
-  """
+def get_prologue_epilogue(n_lanes: int) -> tuple[list, list]:
+  """Generate prologue and epilogue instructions for state capture."""
   prologue = [
     s_mov_b32(s[80], s[0]),
     s_mov_b32(s[81], s[1]),
@@ -141,13 +137,6 @@ def get_prologue_epilogue(n_lanes: int, out_addr: int | None = None) -> tuple[li
     prologue.append(s_mov_b32(s[i], 0))
   prologue.append(s_mov_b32(VCC_LO, 0))
 
-  load_out_addr = [
-    s_load_b64(s[92:93], s[80:81], 0, soffset=NULL),
-    s_waitcnt(0),  # simm16=0 waits for all
-  ] if out_addr is None else [
-    s_mov_b32(s[92], out_addr & 0xffffffff),
-    s_mov_b32(s[93], out_addr >> 32),
-  ]
   epilogue = [
     s_mov_b32(s[90], VCC_LO),
     s_cselect_b32(s[91], 1, 0),
@@ -155,9 +144,10 @@ def get_prologue_epilogue(n_lanes: int, out_addr: int | None = None) -> tuple[li
     s_mov_b32(s[95], EXEC_LO),
     # Restore EXEC to all active lanes for VGPR stores (test may have modified EXEC)
     s_mov_b32(EXEC_LO, (1 << min(n_lanes, WAVE_SIZE)) - 1),
-    *load_out_addr,
+    s_load_b64(s[92:93], s[80:81], 0, soffset=NULL),
+    s_waitcnt(0),  # simm16=0 waits for all
     v_lshlrev_b32_e32(v[240], 2, v[255]),
-    v_mov_b32_e32(v[241], 0),  # the store address is v[240:241]
+    v_mov_b32_e32(v[241], 0),
   ]
   vgpr_bytes = N_VGPRS * n_lanes * 4
   for i in range(N_VGPRS):
@@ -218,14 +208,8 @@ def run_program_emu(instructions: list, n_lanes: int = 1) -> WaveState:
 
   return parse_output(bytes(out_buf), n_lanes)
 
-def require_rdna3_hw():
-  from tinygrad.device import Device
-  from test.amd.helpers import TARGET_TO_ARCH
-  arch = Device["AMD"].arch
-  if TARGET_TO_ARCH.get(arch) != "rdna3": raise unittest.SkipTest(f"requires RDNA3 hardware, got {arch}")
-
 def run_program_hw(instructions: list, n_lanes: int = 1) -> WaveState:
-  """Run instructions on real RDNA3 hardware via HIPCompiler and the HCQ2 runtime."""
+  """Run instructions on real AMD hardware via HIPCompiler and the HCQ2 runtime."""
   from tinygrad.device import Device, Buffer
   from tinygrad.dtype import dtypes
   from tinygrad.runtime.support.compiler_amd import HIPCompiler
@@ -236,11 +220,7 @@ def run_program_hw(instructions: list, n_lanes: int = 1) -> WaveState:
   dev = Device["AMD"]
   compiler = HIPCompiler(dev.arch)  # type: ignore[attr-defined]
 
-  buf_sz = _out_bytes(n_lanes)
-  out_gpu = Buffer(dev.device, buf_sz).ensure_allocated()
-  assert out_gpu._buf % 16 == 0, f"buffer not 16-byte aligned: 0x{out_gpu._buf:x}"
-
-  prologue, epilogue = get_prologue_epilogue(n_lanes, out_gpu._buf)
+  prologue, epilogue = get_prologue_epilogue(n_lanes)
   code = assemble(prologue + instructions + epilogue)
 
   byte_str = ', '.join(f'0x{b:02x}' for b in code)
@@ -285,13 +265,19 @@ amdhsa.kernels:
 """
 
   lib = compiler.compile(asm_src)
+
+  buf_sz = _out_bytes(n_lanes)
+  out_gpu = Buffer(dev.device, buf_sz).ensure_allocated()
+  assert out_gpu._buf % 16 == 0, f"buffer not 16-byte aligned: 0x{out_gpu._buf:x}"
   sink = UOp.sink(UOp.param(0, dtypes.uint32, (n_lanes,)), UOp.special(n_lanes, "lidx0"), arg=KernelInfo("test"))
   body = UOp(Ops.LINEAR, src=())  # the precompiled BINARY is used, the body is not lowered
   prg = UOp(Ops.PROGRAM, arg=ProgramInfo.from_sink(sink, Target("AMD", arch=dev.arch)),
            src=(sink, body, UOp(Ops.SOURCE, arg=asm_src), UOp(Ops.BINARY, arg=lib)))
   run_linear(UOp(Ops.LINEAR, src=(prg.call(UOp.from_buffer(out_gpu, dtypes.uint32)),)), wait=True)
 
-  return parse_output(bytes(out_gpu.as_memoryview()), n_lanes)
+  out_buf = out_gpu.as_memoryview()
+
+  return parse_output(bytes(out_buf), n_lanes)
 
 def compare_wave_states(emu_st: WaveState, hw_st: WaveState, n_lanes: int, n_vgprs: int = N_VGPRS, ulp_tolerance: int = 0) -> list[str]:
   """Compare two WaveStates and return list of differences.
@@ -335,7 +321,6 @@ def run_program(instructions: list, n_lanes: int = 1, ulp_tolerance: int = 0) ->
   Args:
     ulp_tolerance: Allow up to this many ULPs difference for float comparisons (0 = exact match required)
   """
-  if USE_HW: require_rdna3_hw()
   emu_st = run_program_emu(instructions, n_lanes)
   if USE_HW:
     hw_st = run_program_hw(instructions, n_lanes)

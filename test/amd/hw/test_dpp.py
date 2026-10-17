@@ -7,27 +7,21 @@ when USE_HW=1.
 import ctypes, unittest
 from tinygrad.runtime.autogen.amd.rdna3.ins import *
 from tinygrad.helpers import Target
-from test.amd.hw.helpers import USE_HW, assemble, require_rdna3_hw
+from test.amd.hw.helpers import USE_HW, assemble
 from test.mockgpu.amd.emu import run_asm
 
 WAVE64 = 64
 
-def _wave64_code(instructions: list, out_reg: int = 1, out_addr: int | None = None) -> bytes:
-  load_out_addr = [
-    s_mov_b32(s[92], out_addr & 0xffffffff),
-    s_mov_b32(s[93], out_addr >> 32),
-  ] if out_addr is not None else [
-    s_load_b64(s[92:93], s[80:81], 0, soffset=NULL),
-    s_waitcnt(0),
-  ]
+def _wave64_code(instructions: list, out_reg: int = 1) -> bytes:
   return assemble([
     s_mov_b32(s[80], s[0]),
     s_mov_b32(s[81], s[1]),
     v_mov_b32_e32(v[255], v[0]),
     *instructions,
-    *load_out_addr,
+    s_load_b64(s[92:93], s[80:81], 0, soffset=NULL),
+    s_waitcnt(0),
     v_lshlrev_b32_e32(v[240], 2, v[255]),
-    v_mov_b32_e32(v[241], 0),  # the store address is v[240:241]
+    v_mov_b32_e32(v[241], 0),
     global_store_b32(addr=v[240], data=v[out_reg], saddr=s[92:93], offset=0),
     s_endpgm(),
   ])
@@ -52,8 +46,7 @@ def _run_wave64_hw(instructions: list, out_reg: int = 1) -> list[int]:
 
   dev = Device["AMD"]
   compiler = HIPCompiler(dev.arch)  # type: ignore[attr-defined]
-  out_gpu = Buffer(dev.device, WAVE64 * 4).ensure_allocated()
-  code = _wave64_code(instructions, out_reg, out_gpu._buf)
+  code = _wave64_code(instructions, out_reg)
   byte_str = ', '.join(f'0x{b:02x}' for b in code)
   asm_src = f""".text
 .globl test
@@ -94,6 +87,7 @@ amdhsa.kernels:
 .end_amdgpu_metadata
 """
   lib = compiler.compile(asm_src)
+  out_gpu = Buffer(dev.device, WAVE64 * 4).ensure_allocated()
   sink = UOp.sink(UOp.param(0, dtypes.uint32, (WAVE64,)), UOp.special(WAVE64, "lidx0"), arg=KernelInfo("test"))
   body = UOp(Ops.LINEAR, src=())  # the precompiled BINARY is used, the body is not lowered
   prg = UOp(Ops.PROGRAM, arg=ProgramInfo.from_sink(sink, Target("AMD", arch=dev.arch)),
@@ -103,7 +97,6 @@ amdhsa.kernels:
   return [int.from_bytes(out[i*4:(i+1)*4], 'little') for i in range(WAVE64)]
 
 def run_wave64(instructions: list, out_reg: int = 1) -> list[int]:
-  if USE_HW: require_rdna3_hw()
   emu = _run_wave64_emu(instructions, out_reg)
   if not USE_HW: return emu
   hw = _run_wave64_hw(instructions, out_reg)
