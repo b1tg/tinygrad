@@ -124,8 +124,12 @@ class WaveState:
     self.vcc = 0
     self.scc = 0
 
-def get_prologue_epilogue(n_lanes: int) -> tuple[list, list]:
-  """Generate prologue and epilogue instructions for state capture."""
+def get_prologue_epilogue(n_lanes: int, out_addr: int | None = None) -> tuple[list, list]:
+  """Generate prologue and epilogue instructions for state capture.
+
+  If out_addr is given, the epilogue stores to that absolute address. Otherwise it loads the
+  output pointer from the first kernarg (used by the emulator).
+  """
   prologue = [
     s_mov_b32(s[80], s[0]),
     s_mov_b32(s[81], s[1]),
@@ -137,6 +141,13 @@ def get_prologue_epilogue(n_lanes: int) -> tuple[list, list]:
     prologue.append(s_mov_b32(s[i], 0))
   prologue.append(s_mov_b32(VCC_LO, 0))
 
+  load_out_addr = [
+    s_load_b64(s[92:93], s[80:81], 0, soffset=NULL),
+    s_waitcnt(0),  # simm16=0 waits for all
+  ] if out_addr is None else [
+    s_mov_b32(s[92], out_addr & 0xffffffff),
+    s_mov_b32(s[93], out_addr >> 32),
+  ]
   epilogue = [
     s_mov_b32(s[90], VCC_LO),
     s_cselect_b32(s[91], 1, 0),
@@ -144,14 +155,13 @@ def get_prologue_epilogue(n_lanes: int) -> tuple[list, list]:
     s_mov_b32(s[95], EXEC_LO),
     # Restore EXEC to all active lanes for VGPR stores (test may have modified EXEC)
     s_mov_b32(EXEC_LO, (1 << min(n_lanes, WAVE_SIZE)) - 1),
-    s_load_b64(s[92:93], s[80:81], 0, soffset=NULL),
-    s_waitcnt(0),  # simm16=0 waits for all
+    *load_out_addr,
     v_lshlrev_b32_e32(v[240], 2, v[255]),
+    v_mov_b32_e32(v[241], 0),  # the store address is v[240:241]
   ]
   vgpr_bytes = N_VGPRS * n_lanes * 4
   for i in range(N_VGPRS):
     epilogue.append(global_store_b32(addr=v[240], data=v[i], saddr=s[92:93], offset=i * n_lanes * 4))
-  epilogue.append(v_mov_b32_e32(v[241], 0))
   epilogue.append(v_cmp_eq_u32_e32(v[255], v[241]))
   epilogue.append(s_and_saveexec_b32(s[94], VCC_LO))
   # Scalar stores: only thread 0. Use v[240]=vgpr_bytes as base offset so immediate offsets stay small.
@@ -208,70 +218,32 @@ def run_program_emu(instructions: list, n_lanes: int = 1) -> WaveState:
 
   return parse_output(bytes(out_buf), n_lanes)
 
+def require_rdna3_hw():
+  from tinygrad.device import Device
+  from test.amd.helpers import TARGET_TO_ARCH
+  arch = Device["AMD"].arch
+  if TARGET_TO_ARCH.get(arch) != "rdna3": raise unittest.SkipTest(f"requires RDNA3 hardware, got {arch}")
+
 def run_program_hw(instructions: list, n_lanes: int = 1) -> WaveState:
-  """Run instructions on real AMD hardware via HIPCompiler and the AMD runtime."""
-  from tinygrad.device import Device, TinyELF, Buffer
-  from tinygrad.runtime.support.compiler_amd import HIPCompiler
-  from tinygrad.helpers import Target
+  """Run instructions on real RDNA3 hardware via the HCQ2 runtime."""
+  from tinygrad.device import Device, Buffer
+  from tinygrad.dtype import dtypes
+  from tinygrad.uop.ops import UOp, Ops, KernelInfo
+  from tinygrad.engine.realize import run_linear
 
   dev = Device["AMD"]
-  compiler = HIPCompiler(dev.arch)  # type: ignore[attr-defined]
-
-  prologue, epilogue = get_prologue_epilogue(n_lanes)
-  code = assemble(prologue + instructions + epilogue)
-
-  byte_str = ', '.join(f'0x{b:02x}' for b in code)
-  asm_src = f""".text
-.globl test
-.p2align 8
-.type test,@function
-test:
-.byte {byte_str}
-
-.rodata
-.p2align 6
-.amdhsa_kernel test
-  .amdhsa_next_free_vgpr 256
-  .amdhsa_next_free_sgpr 96
-  .amdhsa_wavefront_size32 1
-  .amdhsa_user_sgpr_kernarg_segment_ptr 1
-  .amdhsa_kernarg_size 8
-  .amdhsa_group_segment_fixed_size 65536
-  .amdhsa_private_segment_fixed_size 65536
-  .amdhsa_enable_private_segment 1
-.end_amdhsa_kernel
-
-.amdgpu_metadata
----
-amdhsa.version:
-  - 1
-  - 0
-amdhsa.kernels:
-  - .name: test
-    .symbol: test.kd
-    .kernarg_segment_size: 8
-    .group_segment_fixed_size: 65536
-    .private_segment_fixed_size: 65536
-    .kernarg_segment_align: 8
-    .wavefront_size: 32
-    .sgpr_count: 96
-    .vgpr_count: 256
-    .max_flat_workgroup_size: 1024
-...
-.end_amdgpu_metadata
-"""
-
-  lib = compiler.compile(asm_src)
-  prg = dev.runtime(TinyELF(lib, "test", Target("AMD", arch=dev.arch), ()))
 
   buf_sz = _out_bytes(n_lanes)
-  out_gpu = Buffer(dev.device, buf_sz, preallocate=True)
+  out_gpu = Buffer(dev.device, buf_sz).ensure_allocated()
   assert out_gpu._buf % 16 == 0, f"buffer not 16-byte aligned: 0x{out_gpu._buf:x}"
-  prg(out_gpu._buf, global_size=(1, 1, 1), local_size=(n_lanes, 1, 1), wait=True)
 
-  out_buf = out_gpu.as_memoryview()
+  prologue, epilogue = get_prologue_epilogue(n_lanes, out_gpu._buf)
+  insts = prologue + instructions + epilogue
+  sink = UOp.sink(UOp.param(0, dtypes.uint32, (n_lanes,)), UOp.special(n_lanes, "lidx0"), arg=KernelInfo("test"))
+  prg = UOp(Ops.PROGRAM, src=(sink, UOp(Ops.LINEAR, src=tuple(UOp(Ops.INS, arg=(x, dtypes.void)) for x in insts))))
+  run_linear(UOp(Ops.LINEAR, src=(prg.call(UOp.from_buffer(out_gpu, dtypes.uint32)),)), wait=True)
 
-  return parse_output(bytes(out_buf), n_lanes)
+  return parse_output(bytes(out_gpu.as_memoryview()), n_lanes)
 
 def compare_wave_states(emu_st: WaveState, hw_st: WaveState, n_lanes: int, n_vgprs: int = N_VGPRS, ulp_tolerance: int = 0) -> list[str]:
   """Compare two WaveStates and return list of differences.
@@ -315,6 +287,7 @@ def run_program(instructions: list, n_lanes: int = 1, ulp_tolerance: int = 0) ->
   Args:
     ulp_tolerance: Allow up to this many ULPs difference for float comparisons (0 = exact match required)
   """
+  if USE_HW: require_rdna3_hw()
   emu_st = run_program_emu(instructions, n_lanes)
   if USE_HW:
     hw_st = run_program_hw(instructions, n_lanes)
