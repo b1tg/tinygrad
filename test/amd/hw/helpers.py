@@ -208,6 +208,12 @@ def run_program_emu(instructions: list, n_lanes: int = 1) -> WaveState:
 
   return parse_output(bytes(out_buf), n_lanes)
 
+def require_rdna3_hw():
+  from tinygrad.device import Device
+  from test.amd.helpers import TARGET_TO_ARCH
+  arch = Device["AMD"].arch
+  if TARGET_TO_ARCH.get(arch) != "rdna3": raise unittest.SkipTest(f"requires RDNA3 hardware, got {arch}")
+
 def run_program_hw(instructions: list, n_lanes: int = 1) -> WaveState:
   """Run instructions on real AMD hardware via HIPCompiler and the HCQ2 runtime."""
   from tinygrad.device import Device, Buffer
@@ -323,6 +329,7 @@ def run_program(instructions: list, n_lanes: int = 1, ulp_tolerance: int = 0) ->
   """
   emu_st = run_program_emu(instructions, n_lanes)
   if USE_HW:
+    require_rdna3_hw()
     hw_st = run_program_hw(instructions, n_lanes)
     diffs = compare_wave_states(emu_st, hw_st, n_lanes, ulp_tolerance=ulp_tolerance)
     if diffs:

@@ -7,7 +7,7 @@ when USE_HW=1.
 import ctypes, unittest
 from tinygrad.runtime.autogen.amd.rdna3.ins import *
 from tinygrad.helpers import Target
-from test.amd.hw.helpers import USE_HW, assemble
+from test.amd.hw.helpers import USE_HW, assemble, require_rdna3_hw
 from test.mockgpu.amd.emu import run_asm
 
 WAVE64 = 64
@@ -99,6 +99,7 @@ amdhsa.kernels:
 def run_wave64(instructions: list, out_reg: int = 1) -> list[int]:
   emu = _run_wave64_emu(instructions, out_reg)
   if not USE_HW: return emu
+  require_rdna3_hw()
   hw = _run_wave64_hw(instructions, out_reg)
   if emu != hw:
     diffs = [f"lane {i}: emu=0x{e:08x} hw=0x{h:08x}" for i, (e, h) in enumerate(zip(emu, hw)) if e != h]
