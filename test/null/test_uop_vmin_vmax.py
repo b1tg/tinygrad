@@ -125,6 +125,10 @@ class TestVminVmaxProperties(unittest.TestCase):
     self.assertEqual(uop.vmin, 1)
     self.assertEqual(uop.vmax, 12)
 
+  def test_vmin_vmax_clip(self):
+    x = UOp.variable('x', dtypes.int32.min, dtypes.int32.max, dtypes.int32)
+    self.assertEqual(((u:=x.clip(0, 63).simplify()).vmin, u.vmax), (0, 63))
+
   def test_vmin_vmax_shl(self):
     x = UOp.variable('x', 0, 10) << 5
     self.assertEqual(x.vmin, 0)
