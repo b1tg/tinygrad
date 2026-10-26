@@ -1,7 +1,7 @@
 from __future__ import annotations
 import enum, functools, itertools, math, pathlib, re
 from dataclasses import dataclass, replace
-from typing import Callable, TypeVar
+from typing import Callable
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
 from tinygrad.llm.kernels.amd import Linear, ExpertWeights, fp8_matmul, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
 from tinygrad.llm.gguf import gguf_parse, gguf_shard
@@ -135,7 +135,7 @@ class TransformerConfig:
   indexer_shared: tuple[bool, ...] = ()
   rope_interleave: bool = False
 
-HCOut = TypeVar("HCOut", Tensor, tuple[Tensor, Tensor|None])
+ResidualUpdate = Callable[[Tensor], Tensor]  # sublayer output -> new residual streams
 
 class HyperConnection:
   def __init__(self, config:TransformerConfig):
@@ -143,7 +143,7 @@ class HyperConnection:
     self.fn = Linear(self.count * config.dim, (2 + self.count) * self.count, bias=False)
     self.base, self.scale = {"weight": Tensor.zeros((2 + self.count) * self.count)}, {"weight": Tensor.zeros(3)}
 
-  def __call__(self, xs:Tensor, sublayer:Callable[[Tensor], HCOut]) -> HCOut:
+  def __call__(self, xs:Tensor) -> tuple[Tensor, ResidualUpdate]:
     """mHC: the sublayer sees a pre-weighted sum of the (B, T, hc, D) streams, its output is added back by post onto the streams mixed by comb"""
     base, scale, mix = self.base["weight"], self.scale["weight"], self.fn(xs.flatten(2).rmsnorm(eps=self.norm_eps))
     pre  = (mix[..., :self.count] * scale[0] + base[:self.count]).sigmoid() + self.eps
@@ -151,10 +151,7 @@ class HyperConnection:
     comb = (mix[..., 2*self.count:] * scale[2] + base[2*self.count:]).reshape(*mix.shape[:-1], self.count, self.count).softmax(-1) + self.eps
     # sinkhorn: normalize the columns then the rows, alternating, to make comb doubly stochastic
     for i in range(2 * self.iters - 1): comb = comb / (comb.sum(-1 if i % 2 else -2, keepdim=True) + self.eps)
-    ret = sublayer((xs * pre.unsqueeze(-1)).sum(2))
-    out = ret[0] if isinstance(ret, tuple) else ret
-    out = out.unsqueeze(2) * post.unsqueeze(-1) + (comb.transpose(-1, -2) @ xs)
-    return (out, ret[1]) if isinstance(ret, tuple) else out
+    return (xs * pre.unsqueeze(-1)).sum(2), lambda out: out.unsqueeze(2) * post.unsqueeze(-1) + (comb.transpose(-1, -2) @ xs)
 
 class FFNBlock:
   def __init__(self, config:TransformerConfig):
@@ -226,18 +223,15 @@ class FFNBlock:
     # we pass in the weights implicitly so we unpack the GGUF on the fly
     @function(precompile=True, allow_implicit=True)
     def _run(x:Tensor, start_pos:int|UOp, idx_mask:Tensor|None):
-      def attend(h:Tensor) -> tuple[Tensor, Tensor|None]:
-        h = self.attn_norm(h)
-        mask = self._indexer_mask(h, start_pos, idx_mask)
-        return self._attention(h, start_pos, mask), mask
-      if self.config.hc is not None:
-        xs, idx_mask = self.hc_attn(x, attend)
-        out = self.hc_ffn(xs, lambda h: self._feed_forward(self.ffn_norm(h))).contiguous()
-      else:
-        attn, idx_mask = attend(x)
-        h = x + attn
-        out = (h + self._feed_forward(self.ffn_norm(h))).contiguous()
-      return (out, idx_mask) if idx_mask is not None else out
+      res_attn = res_ffn = lambda xs: (xs, lambda out: xs + out)
+      if self.config.hc is not None: res_attn, res_ffn = self.hc_attn, self.hc_ffn
+      h, update = res_attn(x)
+      h = self.attn_norm(h)
+      mask = self._indexer_mask(h, start_pos, idx_mask)
+      x = update(self._attention(h, start_pos, mask))
+      h, update = res_ffn(x)
+      out = update(self._feed_forward(self.ffn_norm(h))).contiguous()
+      return (out, mask) if mask is not None else out
     out = _run(x, start_pos, idx_mask)
     return out if isinstance(out, tuple) else (out, None)
 

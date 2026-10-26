@@ -77,13 +77,9 @@ class TestAttention(unittest.TestCase):
     # pre averages streams [1, 3] to 2, the sublayer squares it to 4, and post adds 4 to both streams
     # mixing rows [3/4, 1/4], [1/2, 1/2] normalize to [3/5, 1/3], [2/5, 2/3]
     expected = [[[[4 + (3/5 + 3*2/5)], [4 + (1/3 + 3*2/3)]]]]
-    actual = hc(Tensor([[[[1.], [3.]]]]), lambda x: x.square())
-    np.testing.assert_allclose(actual.numpy(), expected, rtol=1e-6, atol=1e-7)
-    for mask in (None, Tensor([0., -np.inf])):
-      with self.subTest(mask=mask is not None):
-        actual, returned_mask = hc(Tensor([[[[1.], [3.]]]]), lambda x: (x.square(), mask))
-        self.assertIs(returned_mask, mask)
-        np.testing.assert_allclose(actual.numpy(), expected, rtol=1e-6, atol=1e-7)
+    h, update = hc(Tensor([[[[1.], [3.]]]]))
+    np.testing.assert_allclose(h.numpy(), [[[2.]]], rtol=1e-6, atol=1e-7)
+    np.testing.assert_allclose(update(h.square()).numpy(), expected, rtol=1e-6, atol=1e-7)
 
   def test_indexer(self):
     indexer = Indexer(self._make_config(dim=2, q_lora_rank=2, indexer=IndexerConfig(n_heads=1, head_dim=2, top_k=2, kpool=2, norm_eps=1e-6)))
@@ -124,6 +120,15 @@ class TestAttention(unittest.TestCase):
     # every query prefers the first pool, and incomplete pools contribute only their visible tail
     expected = np.where([[1, 0, 0, 0, 0], [1, 1, 0, 0, 0], [1, 1, 1, 0, 0], [1, 1, 0, 0, 0], [1, 1, 0, 0, 1]], 0., -np.inf)
     np.testing.assert_array_equal(block._indexer_mask(x, 0, None).numpy(), expected[None, None])
+
+  def test_shared_indexer_mask(self):
+    mask = Tensor(np.triu(np.full((3, 3), -np.inf), 1)[None, None]).float()
+    for hc in (None, HCConfig(count=2, sinkhorn_iters=1, eps=1e-6)):
+      with self.subTest(hc=hc is not None):
+        block = MLATransformerBlock(self._make_config(dim=2, kv_lora_rank=2, q_lora_rank=2, head_dim=4, hc=hc))
+        x = Tensor.ones(1, 3, *((2,) if hc else ()), 2)
+        np.testing.assert_array_equal(block(x, 0, mask)[1].numpy(), mask.numpy())
+        self.assertIsNone(block(x, 0)[1])
 
 class TestGatedDeltaNetBlock(unittest.TestCase):
   def _tensor_linspace(self, start:float, stop:float, shape:tuple[int, ...]) -> Tensor:
