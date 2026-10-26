@@ -496,7 +496,23 @@ class TestUOpEmpty(unittest.TestCase):
     u = UOp.empty((4,), dtype=dtypes.float32, device=("NULL:0",))
     self.assertEqual((u.shape, u.device, u.axis), ((4,), "NULL", None))
 
+  def test_empty_like_axis(self):
+    t = Tensor.ones(4, 6).shard(("NULL:0", "NULL:1"), axis=0)
+    for src in (t, t.uop):
+      self.assertEqual(src.empty_like()._uop.axis, 0)
+      self.assertEqual(src.empty_like(axis=None)._uop.axis, 0)
+      u = src.empty_like(axis=-1)._uop
+      self.assertEqual((u.shape, u.device, u.axis, u.shard_shape), ((4, 6), t.device, 1, (4, 3)))
+
 class TestTensorUOpCreation(unittest.TestCase):
+  def test_full_axis_without_buffer(self):
+    for cls in (Tensor, UOp):
+      for fill in (0, UOp.empty(4, device="NULL")):
+        self.assertIs(cls.full((4,), fill, buffer=False, axis=None)._uop, cls.full((4,), fill, buffer=False)._uop)
+        for axis in (0, -1):
+          with self.assertRaisesRegex(ValueError, "buffer=False does not support axis"):
+            cls.full((4,), fill, buffer=False, axis=axis)
+
   def test_empty(self):
     self.assertIs(_strip_unique(Tensor.empty(2, 3).uop), _strip_unique(UOp.empty(2, 3)))
   def test_full(self):

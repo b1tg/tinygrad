@@ -834,11 +834,10 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
     assert opaque.nbytes % dtype.itemsize == 0, f"{opaque.nbytes} bytes is not divisible by {dtype.itemsize} for {dtype}"
     # Both storage identity and interpretation are part of the UOp key.
     return UOp._buffer(opaque.nbytes // dtype.itemsize, dtype, -id(opaque), device=device or opaque.device, buffer=opaque)
-  def empty_like(self, dtype:DTypeLike|None=None, device:str|tuple[str, ...]|None=None) -> UOp:
+  def empty_like(self, dtype:DTypeLike|None=None, device:str|tuple[str, ...]|None=None, axis:int|None=None) -> UOp:
     device = canonicalize_device(self.device if device is None else device)
-    axis = self.axis if isinstance(device, tuple) else None
-    ret = UOp.empty(self.shard_shape if axis is not None else self.shape, dtype=self.commit_dtype() if dtype is None else dtype, device=device)
-    return ret.unshard(axis) if axis is not None else ret
+    if axis is None and isinstance(device, tuple): axis = self.axis
+    return UOp.empty(self.shape, dtype=self.commit_dtype() if dtype is None else dtype, device=device, axis=axis)
   @staticmethod
   def _frompy(x:list|tuple|bytes, dtype:DType) -> UOp:
     if isinstance(x, bytes): ret, data = UOp.new_buffer("PYTHON", len(x)//dtype.itemsize, dtype), x

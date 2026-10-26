@@ -91,6 +91,28 @@ class TestMultiTensor(unittest.TestCase):
     self.assertEqual(scalar.shape, ())
     self.assertEqual(scalar.uop.base.buffer.nbytes, scalar.dtype.itemsize)
 
+  def test_zeros_axis(self):
+    x = Tensor.zeros(4, 6, device=devices_2, axis=1).realize()
+    self.assertEqual((x.shape, x.uop.axis), ((4, 6), 1))
+    self.assertEqual(x.uop.base.buffer.nbytes, 12 * x.dtype.itemsize)
+    np.testing.assert_equal(x.numpy(), np.zeros((4, 6)))
+
+  def test_full_axis_device_fill(self):
+    data = np.arange(24, dtype=np.int32).reshape(4, 6)
+    src = Tensor(data).realize()
+    for cls in (Tensor, UOp):
+      for fill in (src, src.shard(devices_2), src.shard(devices_2, 0).realize()):
+        for device in (None, devices_2, (src.device,)):
+          for kwargs in ({}, {"axis": None}, {"axis": 1}, {"axis": -1}):
+            with self.subTest(cls=cls.__name__, fill_axis=fill.uop.axis, device=device, kwargs=kwargs):
+              x = cls.full(data.shape, fill.uop, device=device, **kwargs)
+              x = x if isinstance(x, Tensor) else Tensor(x)
+              expected_axis = fill.uop.axis if kwargs.get("axis") is None else kwargs["axis"]
+              self.assertEqual(x.uop.axis, expected_axis % 2 if isinstance(x.device, tuple) and expected_axis is not None else None)
+              np.testing.assert_equal(x.numpy(), data)
+              if isinstance(x.device, tuple) and x.uop.axis is None:
+                for i in range(len(x.device)): np.testing.assert_equal(Tensor(x.uop.mselect(i)).numpy(), data)
+
   @unittest.expectedFailure # TODO: fix
   def test_shard_empty(self):
     GlobalCounters.reset()

@@ -46,12 +46,13 @@ class CreationMixin(DTypeMixin, MovementMixin):
         return cls._wrap_uop(cls.empty(*local, device=dev, dtype=dt)._uop.unshard(axis))
     return cls._wrap_uop(UOp.alloc(new_shape, dt, device=dev, bind_on_realize=True))
 
-  def empty_like(self, dtype: DTypeLike|None=None, device: str|tuple[str, ...]|None=None) -> Self:
+  def empty_like(self, dtype: DTypeLike|None=None, device: str|tuple[str, ...]|None=None, axis:int|None=None) -> Self:
     """
     Creates an empty tensor with the same shape as `self`.
     If `dtype` is not specified, the dtype of `self` is used.
+    With multiple devices, a non-None `axis` overrides the inherited sharding axis.
     """
-    return self._wrap_uop(self._uop.empty_like(dtype, device))
+    return self._wrap_uop(self._uop.empty_like(dtype, device, axis))
 
   @classmethod
   def invalids(cls, *shape, device:str|tuple[str, ...]|None=None, dtype:DTypeLike|None=None) -> Self:
@@ -66,12 +67,13 @@ class CreationMixin(DTypeMixin, MovementMixin):
 
   @classmethod
   def full(cls, shape:'tuple[sint, ...]', fill_value:'ConstType|UOp', dtype:DTypeLike|None=None,
-           device:str|tuple[str, ...]|None=None, buffer=True) -> Self:
+           device:str|tuple[str, ...]|None=None, buffer=True, axis:int|None=None) -> Self:
     """
     Creates a tensor with the given shape, filled with the given value.
 
     You can pass in `dtype` and `device` keyword arguments to control the data type and device of the tensor.
-    Pass `buffer=False` to get a broadcast const value instead of a materialized buffer.
+    With multiple devices, a non-None `axis` overrides the inherited sharding axis.
+    Pass `buffer=False` to get a broadcast const value instead of a materialized buffer; this requires `axis=None`.
 
     ```python exec="true" source="above" session="tensor" result="python"
     print(Tensor.full((2, 3), 42).numpy())
@@ -86,8 +88,13 @@ class CreationMixin(DTypeMixin, MovementMixin):
     new_shape = argfix(shape)
     dt = to_dtype(dtype) if dtype is not None else fill_value.dtype if isinstance(fill_value, UOp) else dtypes.from_py(fill_value)
     val = cls.const(fill_value, dt).expand(new_shape)
-    if not buffer: return val
-    ret = val.empty_like(None if dt in dtypes.weaks else dt, device)
+    if not buffer:
+      if axis is not None: raise ValueError("buffer=False does not support axis")
+      return val
+    ret = val.empty_like(None if dt in dtypes.weaks else dt, device, axis)
+    if val._uop.device is not None and (dev:=ret._uop.device) is not None:
+      if val._uop.axis != ret._uop.axis or (isinstance(dev, tuple) and val._uop.device != dev):
+        val = cls._wrap_uop(val._uop.cast(ret.dtype).copy_to_device(dev))
     return cls._wrap_uop(ret._uop.after(ret._uop.store(val._uop)))
 
   def full_like(self, fill_value:ConstType, dtype:DTypeLike|None=None, device:str|tuple[str, ...]|None=None, buffer=True) -> Self:
