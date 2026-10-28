@@ -1,7 +1,7 @@
 from __future__ import annotations
 import enum, functools, itertools, json, math, pathlib, re
 from dataclasses import dataclass, replace
-from typing import Any, Callable
+from typing import Callable
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
 from tinygrad.llm.kernels.amd import Linear, ExpertWeights, fp8_matmul, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
 from tinygrad.llm.gguf import gguf_parse, gguf_shard
@@ -215,21 +215,21 @@ class FFNBlock:
     # a full indexer layer selects the top-k tokens for itself and the shared layers after it (MLATransformerBlock)
     return idx_mask
 
-  def __call__(self, x: Tensor, start_pos: int|UOp, idx_mask: Tensor|None=None, src:UOp|None=None):
+  def __call__(self, x: Tensor, start_pos: int|UOp, idx_mask: Tensor|None=None):
     self._init_state(x)
     # we pass in the weights implicitly so we unpack the GGUF on the fly
     @function(precompile=True, allow_implicit=True)
-    def _run(x:Tensor, start_pos:int|UOp, idx_mask:Tensor|None, src:UOp|None):
+    def _run(x:Tensor, start_pos:int|UOp, idx_mask:Tensor|None):
       def attend(h:Tensor) -> tuple[Tensor, Tensor|None]:
         h = self.attn_norm(h)
         mask = self._indexer_mask(h, start_pos, idx_mask)
-        return self._attention(h, start_pos, mask, *(() if src is None else (src,))), mask
+        return self._attention(h, start_pos, mask), mask
       res_attn = res_ffn = lambda xs, sublayer: (xs + (ret:=sublayer(xs))[0], ret[1])
       if self.config.hc is not None: res_attn, res_ffn = self.hc_attn, self.hc_ffn
       x, idx_mask = res_attn(x, attend)
       out = res_ffn(x, lambda h: (self._feed_forward(self.ffn_norm(h)), None))[0].contiguous()
       return (out, idx_mask) if idx_mask is not None else out
-    out = _run(x, start_pos, idx_mask, src)
+    out = _run(x, start_pos, idx_mask)
     return out if isinstance(out, tuple) else (out, None)
 
 class TransformerBlock(FFNBlock):
@@ -429,8 +429,12 @@ class GatedDeltaNetBlock(FFNBlock):
     self.ssm_a = Tensor.zeros(self.num_v_heads, 1) if ssm.kda else Tensor.zeros(self.num_v_heads)
     self.ssm_norm, self.ssm_out = nn.RMSNorm(self.head_v_dim, config.norm_eps), Linear(ssm.inner_size, config.dim, bias=False)
 
-  def _attention(self, x:Tensor, start_pos:int|UOp, idx_mask:Tensor|None=None, src:UOp|None=None) -> Tensor:
+  # set while speculative decoding: the states are read from slot spec_src, the state after each token is written to its slot
+  spec_src:UOp|None = None
+
+  def _attention(self, x:Tensor, start_pos:int|UOp, idx_mask:Tensor|None=None) -> Tensor:
     B, T, _ = x.shape
+    src = self.spec_src
     # bind ints to a variable so the reset flag stays a runtime value (it toggles when generation restarts at position 0)
     start_pos = start_pos if isinstance(start_pos, UOp) else UOp.variable("start_pos", 0, self.config.max_context-1).bind(start_pos)
     initial = Tensor(start_pos).eq(0)
@@ -454,7 +458,7 @@ class GatedDeltaNetBlock(FFNBlock):
       # padded steps are exact no-ops: beta=0 (delta rule off), log_alpha=0 (decay 1 after exp)
       conv_window = initial.where(0, conv_state if src is None else conv_state[src]).cat(proj.cast(conv_state.dtype), dim=1)
       conv_window = conv_window.pad_to((B, self.ssm_conv_kernel-1 + T_pad, proj.shape[-1])).contiguous()
-      # the last conv_kernel-1 columns of the window become the next conv state, with src every token's into its slot
+      # the last conv_kernel-1 columns of the window become the next conv state, while speculating every token's into its slot
       store = conv_state.uop.store(conv_window[:, T:T+self.ssm_conv_kernel-1].cast(conv_state.dtype).uop) if src is None else \
         conv_state.uop.store(Tensor.stack(*(conv_window[:, t+1:t+self.ssm_conv_kernel] for t in range(T))).uop)
       return functools.reduce(lambda a,b: a+b, (conv_window[:, i:i+T_pad] * weight[:, i] for i in range(self.ssm_conv_kernel))).silu(), store
@@ -518,6 +522,15 @@ class GatedDeltaNetBlock(FFNBlock):
     return [d.assign(s.unsqueeze(0).expand(d.shape)) for d, s in zip(self.spec_slots, self._states())]
   def spec_commit(self, i:int) -> list[Tensor]: return [s.assign(d[i]) for s, d in zip(self._states(), self.spec_slots)]
 
+class MTP:
+  # a plain (no hyper-connection) block with a head that mixes the next token embedding with the hidden state
+  def __init__(self, blk:FFNBlock, config:TransformerConfig):
+    self.blk, self.eh_proj = blk, Linear(2*config.dim, config.dim, bias=False)
+    self.enorm, self.hnorm, self.shared_head_norm = (nn.RMSNorm(config.dim, config.norm_eps) for _ in range(3))
+
+  def __call__(self, emb:Tensor, h:Tensor, start_pos:int|UOp) -> Tensor:
+    return self.shared_head_norm(self.blk(self.eh_proj(self.enorm(emb).cat(self.hnorm(h), dim=-1)), start_pos)[0])
+
 class Transformer:
   def __init__(self, config:TransformerConfig):
     dense_config = replace(config, num_experts=0, num_experts_per_tok=0, shared_expert_dim=0, hidden_dim=config.dense_hidden_dim or config.hidden_dim)
@@ -534,11 +547,7 @@ class Transformer:
     self.output_norm = nn.RMSNorm(config.dim, config.norm_eps)
     self.output = Linear(config.dim, config.vocab_size, bias=False)
     if config.spec_drafts:
-      # the mtp block is a plain (no hyper-connection) block with a head that mixes the next token embedding with the hidden state
-      mtp:Any = block_cls(replace(config, hc=None))
-      mtp.eh_proj = Linear(2*config.dim, config.dim, bias=False)
-      mtp.enorm, mtp.hnorm, mtp.shared_head_norm = (nn.RMSNorm(config.dim, config.norm_eps) for _ in range(3))
-      self.mtp, self.spec_jit = mtp, TinyJit(self.forward_spec)
+      self.mtp, self.spec_jit = MTP(block_cls(replace(config, hc=None)), config), TinyJit(self.forward_spec)
     self.max_context = config.max_context
     self.has_recurrent_block = any(isinstance(b, GatedDeltaNetBlock) for b in self.blk)
     self._cached_tokens: list[int] = []
@@ -546,16 +555,15 @@ class Transformer:
     self.prefill_jit = TinyJit(self.forward)
     self.rollout_jit = TinyJit(self.forward)
 
-  def _blocks(self, tokens:Tensor, start_pos:int|UOp, src:UOp|None=None) -> Tensor:
+  def _blocks(self, tokens:Tensor, start_pos:int|UOp) -> Tensor:
     x = self.token_embd(tokens.to(self.token_embd.weight.device)).float()  # (B, T, D)
     if (hc:=self.config.hc) is not None: x = x.unsqueeze(2).expand(*x.shape[:2], hc.count, x.shape[-1]).contiguous()
     idx_mask = None
-    for block in self.blk: x, idx_mask = block(x, start_pos, idx_mask, src if isinstance(block, GatedDeltaNetBlock) else None)
+    for block in self.blk: x, idx_mask = block(x, start_pos, idx_mask)
     return x.mean(2) if hc is not None else x
 
   def _mtp(self, tokens:Tensor, h:Tensor, start_pos:int|UOp) -> Tensor:
-    emb = self.mtp.enorm(self.token_embd(tokens).float()).cat(self.mtp.hnorm(h), dim=-1)
-    return self.mtp.shared_head_norm(self.mtp(self.mtp.eh_proj(emb), start_pos)[0])
+    return self.mtp(self.token_embd(tokens).float(), h, start_pos)
 
   def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
     x = self._blocks(tokens, start_pos)
@@ -580,7 +588,11 @@ class Transformer:
     m = self._mtp(self._spec_g, self._spec_hn, mtp_pos).shrink((None, (j, j+1), None))
     drafts = [self.output(m).argmax(-1).cast(dtypes.int32)]
     for i in range(k-1): drafts.append(self.output(m:=self._mtp(drafts[-1], m, start_pos+i+1)).argmax(-1).cast(dtypes.int32))
-    hn = self.output_norm(self._blocks(self._spec_g.shrink((None, (j, j+1))).cat(*drafts, dim=1), start_pos, j))
+    gdn = [b for b in self.blk if isinstance(b, GatedDeltaNetBlock)]
+    for b in gdn: b.spec_src = j
+    try: hn = self.output_norm(self._blocks(self._spec_g.shrink((None, (j, j+1))).cat(*drafts, dim=1), start_pos))
+    finally:
+      for b in gdn: b.spec_src = None
     out, hn = self._sample(self.output(hn), temperature).squeeze(-1).cast(dtypes.int32).cat(*drafts, dim=1), hn.contiguous()
     Tensor.realize(out, self._spec_hn.assign(hn), self._spec_g.assign(out[:, :k+1]))
     return out
@@ -660,7 +672,7 @@ class Transformer:
     if arch in ('qwen35', 'qwen35moe', 'glm4moe', 'gpt-oss'):
       state_dict = {k.replace('post_attention_norm', 'ffn_norm'):v for k,v in state_dict.items()}
     spec_drafts = getenv("SPEC_DRAFTS", 0) if arch in ('qwen35', 'qwen35moe', 'glm5-next') and kv.get(f'{arch}.nextn_predict_layers', 0) else 0
-    if spec_drafts: state_dict = {re.sub(rf"^blk\.{num_blocks}\.(nextn\.)?", "mtp.", k):v for k,v in state_dict.items()}
+    if spec_drafts: state_dict = {re.sub(rf"^blk\.{num_blocks}\.", "mtp.blk.", k).replace("mtp.blk.nextn.", "mtp."):v for k,v in state_dict.items()}
 
     kv_lora_rank = kv.get(f'{arch}.attention.kv_lora_rank', 0)
     head_dim = kv.get(f'{arch}.attention.key_length_mla', kv.get(f'{arch}.attention.key_length', kv[f'{arch}.embedding_length'] // n_heads))

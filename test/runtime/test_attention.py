@@ -351,7 +351,8 @@ class TestGatedDeltaNetBlock(unittest.TestCase):
     Tensor.realize(*block.spec_seed(2))
     # the first step starts from the seeded state, the second after its draft was accepted
     for start in (0, 2):
-      out = block._attention(Tensor(x_norm[:, start:start+2]), pos.bind(start), src=src.bind(1)).numpy()
+      block.spec_src = src.bind(1)
+      out = block._attention(Tensor(x_norm[:, start:start+2]), pos.bind(start)).numpy()
       np.testing.assert_allclose(out, np.concatenate(outs[start:start+2], axis=1), rtol=1e-3, atol=1e-3)
       for slots, expected in zip(block.spec_slots, (convs, recurrents)):
         for t in range(2): np.testing.assert_allclose(slots[t].numpy(), expected[start+t], rtol=1e-3, atol=1e-3)
