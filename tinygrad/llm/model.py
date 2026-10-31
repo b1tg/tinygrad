@@ -585,8 +585,8 @@ class Transformer:
     if config.spec_drafts: self.mtp, self.spec_jit = MTP(block_cls(replace(config, hc=None)), config), TinyJit(self.forward)
 
   def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor, accepted:UOp|None=None) -> Tensor:
-    k, drafts = self.config.spec_drafts, []
-    x = emb = self.token_embd(tokens.to(self.token_embd.weight.device)).float()  # (B, T, D)
+    x = self.token_embd(tokens.to(self.token_embd.weight.device)).float()  # (B, T, D)
+    k, drafts, emb = self.config.spec_drafts, [], x
     if accepted is not None:
       # the mtp layer drafts k tokens, the model verifies them. tokens (1, k+1): the tokens the last step sampled from start_pos, the first `accepted`
       # matched its drafts. a sum, not start_pos - accepted: hcq2 renders launch sizes with llvm, which has no SUB
@@ -840,26 +840,29 @@ class Transformer:
     t = Tensor(tokens + [0] * (self.max_context - len(tokens)), dtype="int32").reshape(1, self.max_context)
     # recompute start_pos from what's currently valid in the caches
     start_pos = self.get_start_pos(tokens)
-    out, prompt_len, k, accepted, res = None, len(tokens), self.config.spec_drafts, 0, [0]
-    v_acc = UOp.variable("spec_accepted", 0, k)
+    out, prompt_len = None, len(tokens)
+    res:list[int] = []
+    accepted, v_acc = 0, UOp.variable("spec_accepted", 0, k:=self.config.spec_drafts)
     if start_pos == 0 and hasattr(self, "_mtp_hidden"): self._mtp_hidden.assign(Tensor.zeros_like(self._mtp_hidden)).realize()
     while len(tokens) < self.max_context:
       # speculative decoding after the first token: it stops before the end of the context, the last tokens are decoded one at a time
       if k and prompt_len <= start_pos < self.max_context-k-1:
-        inp = Tensor([res[:k+1]], dtype=dtypes.int32, device=(dev:=self._mtp_hidden.device))
+        inp = Tensor([res[:k+1] or [tokens[-1]]+[0]*k], dtype=dtypes.int32, device=(dev:=self._mtp_hidden.device))
         res = [int(x) for x in self(inp, v_start_pos.bind(start_pos - accepted), temp.to(dev), v_acc.bind(accepted)).numpy()[0]]
         accepted = next((i for i in range(k) if res[k+1+i] != res[i]), k)
         start_pos += accepted + 1
         out = Tensor([[res[accepted]]], dtype="int32")
-      else:
-        n_toks = min(chunk_size, len(tokens) - start_pos)
-        sp, nt = v_start_pos.bind(start_pos), v_toks.bind(n_toks)
-        out = self(t[:, sp:sp+nt] if start_pos < prompt_len or out is None else out, sp, temp).realize()
-        start_pos += n_toks
-        # chunked prefill: keep processing until all prompt tokens are consumed
-        if start_pos < len(tokens): continue
-        res, accepted = [int(out.item())] + [0]*k, 0
-      for tok in res[:accepted+1]:
-        tokens.append(tok)
-        self._cached_tokens = tokens[:-1]
-        yield tok
+        for tok in res[:accepted+1]:
+          tokens.append(tok)
+          self._cached_tokens = tokens[:-1]
+          yield tok
+        continue
+      n_toks = min(chunk_size, len(tokens) - start_pos)
+      sp, nt = v_start_pos.bind(start_pos), v_toks.bind(n_toks)
+      out = self(t[:, sp:sp+nt] if start_pos < prompt_len or out is None else out, sp, temp).realize()
+      start_pos += n_toks
+      # chunked prefill: keep processing until all prompt tokens are consumed
+      if start_pos < len(tokens): continue
+      tokens.append(int(out.item()))
+      self._cached_tokens = tokens[:-1]
+      yield tokens[-1]
