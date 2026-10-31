@@ -1,6 +1,6 @@
 import unittest
 import numpy as np
-from tinygrad import Tensor, UOp, dtypes, nn
+from tinygrad import Tensor, dtypes, nn
 from tinygrad.llm.model import (
   GatedDeltaNetBlock, SSMConfig, TransformerBlock, TransformerConfig, MLATransformerBlock, Indexer, IndexerConfig,
   HyperConnection, HCConfig,
@@ -152,11 +152,11 @@ class TestGatedDeltaNetBlock(unittest.TestCase):
     block._init_state(x_norm)
     return block._attention(x_norm, start_pos).realize().numpy()
 
-  def _cache_views(self, block:GatedDeltaNetBlock) -> tuple[np.ndarray, np.ndarray]:
+  def _cache_views(self, block:GatedDeltaNetBlock, slot:int=0) -> tuple[np.ndarray, np.ndarray]:
     if hasattr(block, 'conv_state'):
-      return block.conv_state.numpy(), block.recurrent_state.numpy()
+      return block.conv_state[slot].numpy(), block.recurrent_state[slot].numpy()
     elif hasattr(block, 'conv_states'):
-      return np.concatenate([s.numpy() for s in block.conv_states], -1), block.recurrent_state.numpy()
+      return np.concatenate([s[slot].numpy() for s in block.conv_states], -1), block.recurrent_state[slot].numpy()
     else:
       conv_flat = (block.ssm_conv_kernel - 1) * block.conv_channels
       cache = block.delta_cache.numpy()
@@ -292,7 +292,7 @@ class TestGatedDeltaNetBlock(unittest.TestCase):
     block.ssm_f_a.weight = Tensor([[1., 0., 0., 0.], [0., 1., 0., 0.]])
     block.ssm_f_b.weight = Tensor([[1., 0.], [0., 1.], [1., 1.], [2., 1.]])
     block._init_state(x)
-    initial_state = Tensor.arange(8, dtype=dtypes.float32).reshape(1, 2, 2, 2)
+    initial_state = Tensor.arange(8, dtype=dtypes.float32).reshape(1, 1, 2, 2, 2)
     block.recurrent_state.assign(initial_state).realize()
     block.ssm_a = Tensor([[-1.], [-1.]])
     block._attention(x, x.shape[1]).realize()
@@ -340,22 +340,21 @@ class TestGatedDeltaNetBlock(unittest.TestCase):
         np.testing.assert_allclose(chunked_conv, decode_conv, rtol=1e-3, atol=1e-3, err_msg=f"{kda=} {chunking=}")
         np.testing.assert_allclose(chunked_recurrent, decode_recurrent, rtol=1e-3, atol=1e-3, err_msg=f"{kda=} {chunking=}")
 
-  def test_spec_slots_match_decode(self):
-    # a spec step runs from slot src and leaves the state after each of its tokens in that token's slot
-    config = self._make_config(max_context=8)
+  def test_state_ring_takes_back_tokens(self):
+    # a call reads the states at its start_pos and writes the ones after each of its tokens into their slots (p%S): the next call can start
+    # after any of them (speculative decoding: the drafts that weren't accepted are taken back)
+    config = self._make_config(max_context=8, spec_drafts=1)
     block, x = self._make_block(config), self._tensor_linspace(-1, 1, (1, 4, config.dim))
     outs, convs, recurrents = self._naive_attention(block, x)
     x_norm = self._rms_norm_np(x.numpy(), block.attn_norm.weight.numpy(), block.attn_norm.eps)
-    pos, src = UOp.variable("start_pos", 0, 7), UOp.variable("spec_j", 0, 1)
     block._init_state(Tensor(x_norm))
-    Tensor.realize(*block.spec_seed(2))
-    # the first step starts from the seeded state, the second after its draft was accepted
-    for start in (0, 2):
-      block.spec_src = src.bind(1)
-      out = block._attention(Tensor(x_norm[:, start:start+2]), pos.bind(start)).numpy()
+    # the first call at position 0 (the states reset), the second after only its first token
+    for start in (0, 1):
+      out = block._attention(Tensor(x_norm[:, start:start+2]), start).numpy()
       np.testing.assert_allclose(out, np.concatenate(outs[start:start+2], axis=1), rtol=1e-3, atol=1e-3)
-      for slots, expected in zip(block.spec_slots, (convs, recurrents)):
-        for t in range(2): np.testing.assert_allclose(slots[t].numpy(), expected[start+t], rtol=1e-3, atol=1e-3)
+      for t in range(2):
+        for state, expected in zip(self._cache_views(block, (start+t+1) % 3), (convs, recurrents)):
+          np.testing.assert_allclose(state, expected[start+t], rtol=1e-3, atol=1e-3)
 
   def test_start_zero_resets_realized_state(self):
     config = self._make_config(max_context=3)

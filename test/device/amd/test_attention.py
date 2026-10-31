@@ -21,22 +21,22 @@ class TestGatedDeltaNetBlock(unittest.TestCase):
     np.testing.assert_allclose(out.numpy(), expected_out, rtol=1e-4, atol=1e-4)
     np.testing.assert_allclose(state.numpy(), expected_state, rtol=1e-4, atol=1e-4)
 
-  def test_gated_delta_state_slots(self):
-    # with src: start from state slot src, the state after token t goes to slot t, the other slots are untouched
+  def test_gated_delta_state_ring(self):
+    # a ring of 4 states at position 5 (a sum of variables, as in speculative decoding): read slot 1, the states after the 3 tokens into slots 2, 3, 0
     if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
     rng = np.random.default_rng(0)
     q, k = (rng.normal(size=(1, 2, 3, 32)).astype(np.float32)*0.3 for _ in range(2))
     v, beta = rng.normal(size=(1, 2, 3, 8)).astype(np.float32), rng.uniform(0.1, 0.9, size=(1, 2, 3)).astype(np.float32)
-    alpha, slots = rng.uniform(0.5, 1, size=(1, 2, 3, 1)).astype(np.float32), rng.normal(size=(4, 1, 2, 8, 32)).astype(np.float32)
-    expected_state, expected_out, expected_slots = slots[1].copy(), np.empty_like(v), slots.copy()
+    alpha, ring = rng.uniform(0.5, 1, size=(1, 2, 3, 1)).astype(np.float32), rng.normal(size=(4, 1, 2, 8, 32)).astype(np.float32)
+    expected_state, expected_out, expected_ring = ring[1].copy(), np.empty_like(v), ring.copy()
     for t in range(3):
       decayed = expected_state * alpha[:, :, t, None, :]
       delta = (v[:, :, t] - (decayed*k[:, :, t, None, :]).sum(-1)) * beta[:, :, t, None]
-      expected_slots[t] = expected_state = decayed + delta[..., None]*k[:, :, t, None, :]
+      expected_ring[(5+t+1) % 4] = expected_state = decayed + delta[..., None]*k[:, :, t, None, :]
       expected_out[:, :, t] = (expected_state*q[:, :, t, None, :]).sum(-1)
-    state, src = Tensor(slots).contiguous().realize(), UOp.variable("spec_j", 0, 3).bind(1)
-    out = gated_delta_prefill(Tensor(q), Tensor(k), Tensor(v), Tensor(beta), Tensor(alpha), state, src=Tensor(src)).realize()
+    state, start_pos = Tensor(ring).contiguous().realize(), UOp.variable("mtp_pos", 0, 7).bind(3) + UOp.variable("accepted", 0, 2).bind(2)
+    out = gated_delta_prefill(Tensor(q), Tensor(k), Tensor(v), Tensor(beta), Tensor(alpha), state, Tensor(start_pos), 3, 3).realize()
     np.testing.assert_allclose(out.numpy(), expected_out, rtol=1e-4, atol=1e-4)
-    np.testing.assert_allclose(state.numpy(), expected_slots, rtol=1e-4, atol=1e-4)
+    np.testing.assert_allclose(state.numpy(), expected_ring, rtol=1e-4, atol=1e-4)
 
 if __name__ == "__main__": unittest.main()

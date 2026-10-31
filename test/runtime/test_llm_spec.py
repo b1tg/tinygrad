@@ -6,11 +6,11 @@ from tinygrad.llm.model import Transformer, TransformerConfig, SSMConfig
 
 class TestSpeculativeDecoding(unittest.TestCase):
   def _models(self, drafts:int, max_context:int) -> tuple[Transformer, Transformer]:
-    ssm = SSMConfig(conv_kernel=4, state_size=8, group_count=1, time_step_rank=2, inner_size=16)
+    ssm = SSMConfig(conv_kernel=4, state_size=32, group_count=1, time_step_rank=2, inner_size=16)  # the fused kernel on AMD: head_k_dim % 32
     config = TransformerConfig(num_blocks=2, dim=16, hidden_dim=32, n_heads=2, n_kv_heads=1, norm_eps=1e-5, vocab_size=8, head_dim=8,
                                rope_theta=10000.0, rope_dim=8, v_head_dim=8, max_context=max_context, ssm_layers=(True, False), ssm=ssm,
-                               spec_drafts=drafts)
-    spec, plain = Transformer(config), Transformer(replace(config, spec_drafts=0))
+                               mtp=True, spec_drafts=drafts)
+    spec, plain = Transformer(config), Transformer(replace(config, mtp=False, spec_drafts=0))
     rng = np.random.default_rng(0)
     state_dict = nn.state.get_state_dict(spec)
     for p in state_dict.values(): p.replace(Tensor(rng.normal(size=p.shape).astype(np.float32)*0.5).cast(p.dtype)).realize()
