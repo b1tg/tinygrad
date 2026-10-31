@@ -614,12 +614,11 @@ class Transformer:
     if not hasattr(self, "_mtp_hidden"):
       self._mtp_hidden:Tensor = Tensor.zeros(1, k+1, self.config.dim, device=x.device).contiguous().realize()
     carry = self._mtp_hidden[:, :1]
-    m = self.mtp(emb, carry.cat(hn, dim=1)[:, :-1], start_pos)
+    m = self.mtp(emb, Tensor(start_pos).eq(0).where(0, carry).cat(hn, dim=1)[:, :-1], start_pos)
     # realized with the token: the model runs once. a column of the output is realized for the cache writes
     return tok.realize(m[:, :1, :1].contiguous(), carry.assign(hn[:, -1:]))
 
-  def __call__(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor, accepted:UOp|None=None) -> Tensor:
-    if accepted is not None: return self.spec_jit(tokens, start_pos, temperature, accepted)
+  def __call__(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
     return (self.prefill_jit if resolve(tokens.shape[1] != 1) else self.rollout_jit)(tokens.contiguous(), start_pos, temperature)
 
   @staticmethod
@@ -841,28 +840,22 @@ class Transformer:
     # recompute start_pos from what's currently valid in the caches
     start_pos = self.get_start_pos(tokens)
     out, prompt_len = None, len(tokens)
-    res:list[int] = []
-    accepted, v_acc = 0, UOp.variable("spec_accepted", 0, k:=self.config.spec_drafts)
-    if start_pos == 0 and hasattr(self, "_mtp_hidden"): self._mtp_hidden.assign(Tensor.zeros_like(self._mtp_hidden)).realize()
+    accepted, res, v_acc = 0, [0], UOp.variable("spec_accepted", 0, k:=self.config.spec_drafts)
     while len(tokens) < self.max_context:
-      # speculative decoding after the first token: it stops before the end of the context, the last tokens are decoded one at a time
-      if k and prompt_len <= start_pos < self.max_context-k-1:
-        inp = Tensor([res[:k+1] or [tokens[-1]]+[0]*k], dtype=dtypes.int32, device=(dev:=self._mtp_hidden.device))
-        res = [int(x) for x in self(inp, v_start_pos.bind(start_pos - accepted), temp.to(dev), v_acc.bind(accepted)).numpy()[0]]
-        accepted = next((i for i in range(k) if res[k+1+i] != res[i]), k)
-        start_pos += accepted + 1
-        out = Tensor([[res[accepted]]], dtype="int32")
-        for tok in res[:accepted+1]:
-          tokens.append(tok)
-          self._cached_tokens = tokens[:-1]
-          yield tok
-        continue
       n_toks = min(chunk_size, len(tokens) - start_pos)
       sp, nt = v_start_pos.bind(start_pos), v_toks.bind(n_toks)
-      out = self(t[:, sp:sp+nt] if start_pos < prompt_len or out is None else out, sp, temp).realize()
+      # speculative decoding after the first token: it stops before the end of the context, the last tokens are decoded one at a time
+      if k and prompt_len <= start_pos < self.max_context-k-1:
+        inp = Tensor([(res+[0]*k)[:k+1]], dtype=dtypes.int32, device=(dev:=self._mtp_hidden.device))
+        out = self.spec_jit(inp, v_start_pos.bind(start_pos-accepted), temp.to(dev), v_acc.bind(accepted))
+      else: out = self(t[:, sp:sp+nt] if start_pos < prompt_len or out is None else Tensor([[tokens[-1]]]) if k else out, sp, temp).realize()
       start_pos += n_toks
       # chunked prefill: keep processing until all prompt tokens are consumed
       if start_pos < len(tokens): continue
-      tokens.append(int(out.item()))
-      self._cached_tokens = tokens[:-1]
-      yield tokens[-1]
+      res = out.numpy()[0].tolist()
+      # the sampled tokens, up to the first that isn't the draft before it
+      start_pos += (accepted:=sum(1 for _ in itertools.takewhile(lambda ab: ab[0] == ab[1], zip(res[k+1:], res))))
+      for tok in res[:accepted+1]:
+        tokens.append(tok)
+        self._cached_tokens = tokens[:-1]
+        yield tok
