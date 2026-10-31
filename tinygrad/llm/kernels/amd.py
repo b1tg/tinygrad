@@ -233,13 +233,20 @@ def _q8_quantize_kernel(q:UOp, scale:UOp, xsum:UOp, x:UOp, tokens:int, in_featur
             xsum[token, group, (lane//16).valid((lane%16).eq(0))].store(warp_reduce(quant.float())))
   return UOp.group(*stores).end(token_group, lane).sink(arg=KernelInfo(name="q8_quantize", opts_to_apply=()))
 
+_q8_quantized:dict[tuple[UOp, int, int], tuple[Tensor, Tensor, Tensor]] = {}
 def q8_quantize(x:Tensor, tokens:int, in_features:int) -> tuple[Tensor, Tensor, Tensor]:
+  # the layers reading one activation share its quantization
+  u = x.uop
+  while u.op is Ops.RESHAPE: u = u.src[0]  # reshapes of one activation are the same rows
+  if (ret:=_q8_quantized.get(key:=(u, tokens, in_features))) is not None: return ret
   groups = in_features//Q8_GROUP_SIZE
   q = Tensor.empty(tokens, groups, 8, dtype=dtypes.uint32, device=x.device)
   scale = Tensor.empty(tokens, groups, dtype=dtypes.float32, device=x.device)
   xsum = Tensor.empty(tokens, groups, 2, dtype=dtypes.float32, device=x.device)
   q, scale, xsum = Tensor.custom_kernel(q, scale, xsum, x, fxn=functools.partial(_q8_quantize_kernel, tokens=tokens, in_features=in_features))[:3]
-  return q, scale, xsum
+  if len(_q8_quantized) >= 16: _q8_quantized.pop(next(iter(_q8_quantized)))
+  _q8_quantized[key] = ret = (q, scale, xsum)
+  return ret
 
 def _decode_linear(out:UOp, out_features:int, group_count:int, group_dot, name:str) -> UOp:
   chunks = out.shape[2]
@@ -387,7 +394,7 @@ def moe_linear(layer:ExpertWeights, sel:Tensor, x:Tensor) -> Tensor:
   local_out, global_out, ggml_type = int(layer.weight.uop.max_shard_shape[1]), int(layer.weight.shape[1]), unwrap(layer.ggml_type)
   splits, ndev = layer.in_features // in_features, int(layer.weight.shape[0]) // int(layer.weight.uop.shard_shape[0])
   assert (layer.weight.uop.axis == 2) == (splits > 1), f"input features split over {splits} devices, weight split on axis {layer.weight.uop.axis}"
-  xq, xd, xs = q8_quantize(x.contiguous(), B*T*x_slots, in_features)
+  xq, xd, xs = q8_quantize(x, B*T*x_slots, in_features)
   out = Tensor.empty(ndev*B*T*slots, global_out, splits*((in_features+1023)//1024), dtype=dtypes.float32, device=x.device, axis=layer.weight.uop.axis)
   fxn = functools.partial(_moe_decode_kernel, out_features=local_out, in_features=in_features, ggml_type=ggml_type, x_share=slots//x_slots,
                           cdna=_is_cdna(x.device), ndev=ndev)
@@ -592,7 +599,6 @@ def f16_gemv(layer:Linear, x:Tensor) -> Tensor:
   tokens = prod(x.shape[:-1])
   assert isinstance(tokens, int)
   weight = _view_back(layer.weight)
-  x = x.contiguous()
   out = Tensor.empty(tokens, layer.out_features, dtype=dtypes.float32, device=x.device)
   fxn = functools.partial(_amd_f16_gemv_kernel, in_features=layer.in_features, out_features=layer.out_features, tokens=tokens)
   srcs = (out, weight.reshape(-1), x.reshape(tokens, layer.in_features)) + (() if layer.bias is None else (_view_back(layer.bias),))
