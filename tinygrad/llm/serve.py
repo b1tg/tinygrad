@@ -1,7 +1,7 @@
 from __future__ import annotations
 import json, pathlib, re, time, typing, uuid
 from typing import TYPE_CHECKING
-from tinygrad.helpers import DEBUG, colored, stderr_log, getenv
+from tinygrad.helpers import DEBUG, colored, stderr_log
 from tinygrad.viz.serve import TCPServerWithReuse, Handler as VizHandler
 if TYPE_CHECKING:
   from tinygrad.llm.cli import SimpleTokenizer
@@ -93,12 +93,6 @@ class Handler(VizHandler):
     model, tok = self.server.model, self.server.tok
     prompt_tokens = len(ids)
     cache_start_pos = model.get_start_pos(ids)
-    if getenv("PREFIX_LOG"):  # TODO: remove (debug): where the new prompt leaves the cache, back = how far before the end of the cache
-      cached, prev = model._cached_tokens, getattr(self.server, "prev_prompt", 0)
-      p = next((i for i, (a, b) in enumerate(zip(ids, cached)) if a != b), min(len(ids), len(cached)))
-      stderr_log(f"\nprefix: prev_prompt:{prev} cached:{len(cached)} new:{len(ids)} common:{p} back:{len(cached)-p} start:{cache_start_pos}\n"
-                 f"  cached[common:]={tok.decode(cached[p:p+12])!r}\n  new[common:]   ={tok.decode(ids[p:p+12])!r}\n")
-      setattr(self.server, "prev_prompt", len(ids))
     stderr_log(f"in:{colored(f'{cache_start_pos:5d}', 'green')} +{len(ids)-cache_start_pos:5d}  {colored('--', 'BLACK')}  ")
     tmpl = {"id":f"chatcmpl-{uuid.uuid4().hex[:24]}", "object":"chat.completion.chunk", "created":int(time.time()), "model":model_name}
     def chunk(d:dict): return {"choices": [{"index":0, "delta":d, "finish_reason":None}], **tmpl}

@@ -5,7 +5,7 @@ from tinygrad import Tensor, UOp, nn, Device, Context
 from tinygrad.llm.gguf import ggml_data_to_tensor
 from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.helpers import prod, getenv, unwrap
-from tinygrad.uop.ops import AxisType, KernelInfo, Ops, resolve
+from tinygrad.uop.ops import AxisType, KernelInfo, Ops
 from tinygrad.renderer.cstyle import HIPRenderer
 
 BLOCK_M, BLOCK_N, WARP_SIZE = 32, 32, 32
@@ -254,10 +254,8 @@ def _decode_linear(out:UOp, out_features:int, group_count:int, group_dot, name:s
   output = token_output % out_features
   tokens = [token_output // out_features] if per_wave == 1 else [UOp.const(t, dtypes.weakint) for t in range(per_wave)]
   group = lane+chunk*32
-  def total(token:UOp) -> UOp:
-    value = (group < group_count).where(group_dot(token, output, group.minimum(group_count-1)), UOp.const(0, dtypes.float32))
-    return warp_reduce(value, full_wave=True)
-  stores = [out[t, output, chunk.valid(lane.eq(0))].store(total(t).cast(out.dtype)) for t in tokens]
+  stores = [out[t, output, chunk.valid(lane.eq(0))].store(warp_reduce((group < group_count).where(
+    group_dot(t, output, group.minimum(group_count-1)), UOp.const(0, dtypes.float32)), full_wave=True).cast(out.dtype)) for t in tokens]
   return UOp.group(*stores).end(row, wave, chunk, lane).sink(arg=KernelInfo(name=name, opts_to_apply=()))
 
 def _iq_grid(device:str|tuple[str, ...]|None, ggml_type:int) -> Tensor:
@@ -830,18 +828,16 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
   # cached flash attention on the half KV cache (already written through assigned_kv); valid_end stays bound at the graph level
   T_real, q_start = q.shape[2], None
   D, N, group = q.shape[3], cast(int, assigned_kv.shape[3]), q.shape[1] // assigned_kv.shape[2]
-  decode = resolve(T_real == 1, False)
   rows = T_real if isinstance(T_real, int) and T_real < BLOCK_M else 0
   # Non-power-of-two decode dimensions can lose tail-store masks. Q/P, K, and V use separate LDS allocations.
-  supported = D % 32 == 0 and (D & (D-1) == 0 and N % 64 == 0 and group*((D+LDS_PAD)*2+8) <= 65536 if decode or rows else
+  supported = D % 32 == 0 and (D & (D-1) == 0 and N % 64 == 0 and group*((D+LDS_PAD)*2+8) <= 65536 if rows else
     D >= 64 and 2*(2*BLOCK_M*(D+LDS_PAD) + D*(BLOCK_N+LDS_PAD)) <= 65536 and N % BLOCK_N == 0 and q.max_shape[2] % BLOCK_M == 0)
-  if not (decode or rows) and _is_cdna(q.device): supported = False  # the prefill kernel is RDNA WMMA only
+  if not rows and _is_cdna(q.device): supported = False  # the prefill kernel is RDNA WMMA only
   if not supported:
     k, v = (assigned_kv[i, :, :, :valid_end].float() for i in range(2))
-    mask = None if decode else Tensor.full((T_real, valid_end), -math.inf, dtype=dtypes.float32, device=q.device).triu(valid_end-T_real+1)
+    mask = None if rows == 1 else Tensor.full((T_real, valid_end), -math.inf, dtype=dtypes.float32, device=q.device).triu(valid_end-T_real+1)
     return q.float().scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)
-  if decode: return amd_flash_attention_decode(q.half(), assigned_kv, valid_end, N)
-  # a few queries (the drafts of speculative decoding): the decode kernel on each, causal (query i sees the cache up to its position)
+  # a few queries: the decode kernel on each, query i sees the cache up to its position
   if rows: return Tensor.cat(*[amd_flash_attention_decode(q[:, :, i:i+1].half(), assigned_kv, valid_end-rows+1+i, N) for i in range(rows)], dim=2)
   if isinstance(T_real, UOp):
     # symbolic chunk: pad the queries to the static tile; garbage rows are sliced off
@@ -890,20 +886,14 @@ def _gated_delta_prefill_kernel(core:UOp, q:UOp, k:UOp, v:UOp, beta:UOp, alpha:U
     delta = (v[bh, token, row].load() - state_k) * bv
     updates += [x + delta*y for x,y in zip(decayed, keys)]
     stores.append(core[bh, token, row.valid(lane.eq(0))].store(state_q + delta*kq[bh, token]))
-  if writes > 1:  # (the state after the last token too: no store after the loop)
-    slot, last = (end + token + 1 - tokens) % ring, token >= tokens - writes
-    stores += [state[slot, bh, row.valid(last), col].store(updates[row_idx*key_dim//32+i].cast(state.dtype))
-               for row_idx,row in enumerate(rows) for i,col in enumerate(cols)]
+  slot, last = (end + token + 1 - tokens) % ring, token >= tokens - writes
+  stores += [state[slot, bh, row.valid(last), col].store(updates[row_idx*key_dim//32+i].cast(state.dtype))
+             for row_idx,row in enumerate(rows) for i,col in enumerate(cols)]
   step = UOp.group(*stores, current.store(UOp.stack(*updates))).end(token)
-  if writes > 1: return step.end(lane, bh_row).sink(arg=KernelInfo(name="gated_delta_prefill", opts_to_apply=()))
-  state_stores = (state[end % ring, bh, row, col].store(current.after(step)[row_idx*key_dim//32+i].load().cast(state.dtype))
-                  for row_idx,row in enumerate(rows) for i,col in enumerate(cols))
-  return UOp.group(*state_stores).end(lane, bh_row).sink(arg=KernelInfo(name="gated_delta_prefill", opts_to_apply=()))
+  return step.end(lane, bh_row).sink(arg=KernelInfo(name="gated_delta_prefill", opts_to_apply=()))
 
 def gated_delta_prefill(q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:Tensor, state:Tensor, start_pos:Tensor|None=None,
                         length:Tensor|int|None=None, writes:int=1) -> Tensor:
-  """state (B, H, V, K), or a ring of them (S, B, H, V, K): the one at start_pos is read, the ones after the last `writes` tokens (of length,
-  the rest are padding) are written into the slots of the positions after them"""
   batch, heads, tokens, key_dim = q.shape
   value_dim = v.shape[-1]
   assert q.shape == k.shape and v.shape[:3] == beta.shape == (batch, heads, tokens) and state.shape[-4:] == (batch, heads, value_dim, key_dim)
@@ -911,11 +901,7 @@ def gated_delta_prefill(q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:Tensor,
   assert key_dim % 32 == 0 and value_dim % 4 == 0
   assert q.dtype == k.dtype == dtypes.float32, "recurrent Q/K must be float32"
   assert state.uop.contiguous_view_offset() is not None, "recurrent state must be contiguous"
-  assert start_pos is not None or len(state.shape) == 4, "a ring of states is read at start_pos"
-  # start_pos and length are bound variables or sums of them (speculative decoding: mtp_pos + accepted)
-  bound = [u for x in (start_pos, length) if isinstance(x, Tensor) for u in x.uop.backward_slice_with_self if u.is_bound_var]
-  assert start_pos is None or bound, "start_pos is a bound variable"
-  if bound: state = Tensor(state.uop.after(*bound))
+  if start_pos is not None: state = Tensor(state.uop.after(*(x.uop for x in (start_pos, length) if isinstance(x, Tensor))))
   core, kq = Tensor.empty_like(v), (q*k).sum(-1).contiguous()
   srcs = (core, q.contiguous(), k.contiguous(), v.contiguous(), beta.contiguous(), alpha.contiguous(), state, kq)
   contig = tuple(x.uop if x.uop.op is Ops.AFTER else x.uop.contiguous() for x in srcs)

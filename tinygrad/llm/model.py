@@ -134,7 +134,6 @@ class TransformerConfig:
   indexer: IndexerConfig|None = None
   indexer_shared: tuple[bool, ...] = ()
   rope_interleave: bool = False
-  mtp: bool = False  # the next token prediction layer (MTP)
   spec_drafts: int = 0  # speculative decoding: the tokens the mtp layer drafts for every step of the model
   expert_latent_dim: int = 0
   situ: tuple[float, float]|None = None
@@ -471,12 +470,11 @@ class GatedDeltaNetBlock(FFNBlock):
     is_kda = unwrap(self.config.ssm).kda
     symbolic = isinstance(T, UOp)
     T_pad = x.max_shape[1]  # symbolic chunks are padded to their max size: one graph serves every size
-    # the states are rings (_init_state), the state at a position p in slot p%S: a call reads the one at start_pos and writes the ones after its
-    # last W tokens, the next call can start after any of them (a padded chunk writes the one after its last: the next call starts there)
+    # the state at position p is in slot p%S: a call reads start_pos and writes the states after its last W tokens, the next call starts after any
     S = int(self.recurrent_state.shape[0])
     W = min(T, S) if isinstance(T, int) else 1
-    def put(ring:Tensor, states:list[Tensor]) -> UOp:  # states[d]: the one after the token d before the last, into its slot
-      for d, state in enumerate(states):  # (one after another: the stores into a buffer are ordered)
+    def put(ring:Tensor, states:list[Tensor]) -> UOp:  # states[d]: the state after the token d before the last
+      for d, state in enumerate(states):
         ring = Tensor(ring.uop.after(ring[(p:=(start_pos+T-d) % S):p+1].uop.store(state.cast(ring.dtype).unsqueeze(0).uop)))
       return ring.uop
 
@@ -533,7 +531,7 @@ class GatedDeltaNetBlock(FFNBlock):
         outs.append((state * q[:, :, t]).sum(-1))
         steps.append(state)
 
-      # store the updated recurrent states in place, then read the stacked outputs after the state and conv writes
+      # store the updated recurrent state in place, then read the stacked outputs after the state and conv writes
       state_store = put(self.recurrent_state, [steps[T_pad-1-d] for d in range(W)])
       core = Tensor(outs[0].stack(*outs[1:], dim=1).contiguous().uop.after(state_store, *conv_state_stores))
 
@@ -544,8 +542,7 @@ class GatedDeltaNetBlock(FFNBlock):
 
   def _init_state(self, x):
     if not hasattr(self, "recurrent_state"):
-      # rings of S states (_attention): speculative decoding takes back the drafts that weren't accepted by starting after the last accepted
-      # token, a step of k+1 tokens writes k+1 slots but not the one it reads
+      # rings of states (_attention) to take back rejected drafts: a step of k+1 tokens writes k+1 slots but not the one it reads
       S = self.config.spec_drafts + 2 if self.config.spec_drafts else 1
       if kda:=unwrap(self.config.ssm).kda:
         self.conv_states = [Tensor.zeros(S, x.shape[0], self.ssm_conv_kernel-1, d, device=x.device, axis=-1).clone() for d in self.qkv_dims]
@@ -554,8 +551,7 @@ class GatedDeltaNetBlock(FFNBlock):
                                           axis=2 if kda else None).clone()
 
 class MTP:
-  # a block of the model's kind (no hyper-connections, its own kv cache) with a head that mixes the next token embedding with the hidden
-  # state. its cache needs every position before the ones it predicts: the model runs it on every chunk too (_mtp_prefill)
+  # a block of the model's kind with a head that mixes the next token embedding with the hidden state
   def __init__(self, blk:FFNBlock, config:TransformerConfig):
     self.blk, self.eh_proj = blk, Linear(2*config.dim, config.dim, bias=False)
     self.enorm, self.hnorm, self.shared_head_norm = (nn.RMSNorm(config.dim, config.norm_eps) for _ in range(3))
@@ -580,9 +576,7 @@ class Transformer:
     self.output_norm = nn.RMSNorm(config.dim, config.norm_eps)
     if config.attn_res_block_size: self.output_res_score = AttentionResidual(config)
     self.output = Linear(config.dim, config.vocab_size, bias=False)
-    assert config.mtp or not config.spec_drafts, "speculative decoding drafts with the mtp layer"
-    if config.mtp: self.mtp = MTP(block_cls(replace(config, hc=None)), config)
-    if config.spec_drafts: self.spec_jit = TinyJit(self.forward_spec)
+    if config.spec_drafts: self.mtp, self.spec_jit = MTP(block_cls(replace(config, hc=None)), config), TinyJit(self.forward)
     self.max_context = config.max_context
     self.has_recurrent_block = any(isinstance(b, GatedDeltaNetBlock) for b in self.blk)
     self._cached_tokens: list[int] = []
@@ -590,80 +584,43 @@ class Transformer:
     self.prefill_jit = TinyJit(self.forward)
     self.rollout_jit = TinyJit(self.forward)
 
-  def _hidden(self, tokens:Tensor, start_pos:int|UOp) -> Tensor:
+  def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor, accepted:UOp|None=None) -> Tensor:
+    k, drafts = self.config.spec_drafts, []
+    if accepted is not None:
+      # the mtp layer drafts k tokens, the model verifies them. tokens (1, k+1): the tokens the last step sampled from start_pos, the first `accepted`
+      # matched its drafts. a sum, not start_pos - accepted: hcq2 renders launch sizes with llvm, which has no SUB
+      mtp_pos, start_pos = start_pos, start_pos + accepted
+      m = self.mtp(self.token_embd(tokens).float(), self._mtp_hidden, mtp_pos)[:, accepted:accepted+1]
+      for i in range(k):
+        drafts.append(self.output(m).argmax(-1).cast(dtypes.int32))
+        if i < k-1: m = self.mtp(self.token_embd(drafts[-1]).float(), m, start_pos+i+1)
+      tokens = tokens[:, accepted:accepted+1].cat(*drafts, dim=1)
     x = self.token_embd(tokens.to(self.token_embd.weight.device)).float()  # (B, T, D)
     if (hc:=self.config.hc) is not None: x = x.unsqueeze(2).expand(*x.shape[:2], hc.count, x.shape[-1]).contiguous()
     elif self.config.attn_res_block_size: x = x.unsqueeze(2)
     idx_mask = None
     for block in self.blk: x, idx_mask = block(x, start_pos, idx_mask)
-    if hc is not None: return x.mean(2)
-    return self.output_res_score.mix(x) if self.config.attn_res_block_size else x
-
-  def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
-    x = self._hidden(tokens, start_pos)
-    # only run the output projection on the last token
-    tok = self._sample(self.output(self.output_norm(x[:, -1:]))[:, -1, :].to(tokens.device), temperature)
-    # (realized with the token: the model runs once)
-    if self.config.spec_drafts: Tensor.realize(tok, *self._mtp_prefill(tokens, x, start_pos))
-    return tok
-
-  def _mtp_prefill(self, tokens:Tensor, x:Tensor, start_pos:int|UOp) -> list[Tensor]:
-    """
-    the mtp layer on a chunk of the model (x: its hidden states) to fill its cache, on every chunk: single tokens too (decoding after speculating,
-    prefill without the fused kernels). row 0 of _mtp_hidden is the hidden state before the chunk, then the one of its last token
-    """
-    if not hasattr(self, "_mtp_hidden"):
-      self._mtp_hidden = Tensor.zeros(1, self.config.spec_drafts+1, self.config.dim, device=x.device).contiguous().realize()
-    T, hn, carry = x.shape[1], self.output_norm(x), self._mtp_hidden[:, :1]
-    m = self.mtp(self.token_embd(tokens.to(x.device)).float(), carry.cat(hn, dim=1)[:, :T], start_pos)
-    # a column of its output is realized for the cache writes
-    return [m[:, :1, :1].contiguous(), carry.assign(hn[:, T-1:T])]
-
-  def _sample(self, logits:Tensor, temperature:Tensor) -> Tensor:
+    if hc is not None: x = x.mean(2)
+    elif self.config.attn_res_block_size: x = self.output_res_score.mix(x)
+    # only run the output projection on the last token, or on the k+1 verified ones
+    logits = self.output(self.output_norm(x if drafts else x[:, -1:])).to(tokens.device)
     # Gumbel-max trick: argmax(logits/temp - log(-log(uniform))) is equivalent to sampling from softmax(logits/temp)
-    return (logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1, keepdim=True)
+    tok = (logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1)
+    if not k: return tok
+    hn = self.output_norm(x)
+    # (1, 2k+1): the k+1 tokens sampled, then the k drafts. _mtp_hidden: the hidden states of these k+1
+    if drafts: return tok.cast(dtypes.int32).cat(*drafts, dim=1).realize(self._mtp_hidden.assign(hn.contiguous()))
+    # the mtp cache needs every position before the ones it predicts. row 0 of _mtp_hidden: the hidden state before the chunk
+    if not hasattr(self, "_mtp_hidden"):
+      self._mtp_hidden:Tensor = Tensor.zeros(1, k+1, self.config.dim, device=x.device).contiguous().realize()
+    T, carry = x.shape[1], self._mtp_hidden[:, :1]
+    m = self.mtp(self.token_embd(tokens.to(x.device)).float(), carry.cat(hn, dim=1)[:, :T], start_pos)
+    # realized with the token: the model runs once. a column of the output is realized for the cache writes
+    return tok.realize(m[:, :1, :1].contiguous(), carry.assign(hn[:, T-1:T]))
 
-  def __call__(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
+  def __call__(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor, accepted:UOp|None=None) -> Tensor:
+    if accepted is not None: return self.spec_jit(tokens, start_pos, temperature, accepted)
     return (self.prefill_jit if resolve(tokens.shape[1] != 1) else self.rollout_jit)(tokens.contiguous(), start_pos, temperature)
-
-  def forward_spec(self, sampled:Tensor, mtp_pos:UOp, accepted:UOp, temperature:Tensor) -> Tensor:
-    """
-    a step of speculative decoding: the mtp layer drafts k tokens, the model verifies them. sampled (1, k+1): the tokens the last step sampled
-    after the ones it verified (from mtp_pos), the first `accepted` matched its drafts, sampled[accepted] is the newest (at start_pos)
-    returns (1, 2k+1): the k+1 tokens sampled after the newest token and the drafts, then the k drafts. _mtp_hidden: the hidden states of these k+1
-    """
-    # (a sum, not start_pos - accepted: hcq2 renders a difference of variables in launch sizes with llvm, which has no SUB)
-    k, start_pos = self.config.spec_drafts, mtp_pos + accepted
-    # the mtp layer catches up from mtp_pos (row i: the token at mtp_pos+i, the hidden state before it), its prediction at start_pos
-    m = self.mtp(self.token_embd(sampled).float(), self._mtp_hidden, mtp_pos)[:, accepted:accepted+1]
-    drafts = [self.output(m).argmax(-1).cast(dtypes.int32)]
-    for i in range(k-1):
-      m = self.mtp(self.token_embd(drafts[-1]).float(), m, start_pos+i+1)
-      drafts.append(self.output(m).argmax(-1).cast(dtypes.int32))
-    # (the recurrent blocks start after the last accepted token, their states of the drafts that weren't accepted are left in their rings)
-    hn = self.output_norm(self._hidden(sampled[:, accepted:accepted+1].cat(*drafts, dim=1), start_pos))
-    out, hn = self._sample(self.output(hn), temperature).squeeze(-1).cast(dtypes.int32).cat(*drafts, dim=1), hn.contiguous()
-    Tensor.realize(out, self._mtp_hidden.assign(hn))
-    return out
-
-  def _spec_generate(self, tokens:list[int], temperature:Tensor):
-    k, dev, temperature = self.config.spec_drafts, self._mtp_hidden.device, temperature.to(self._mtp_hidden.device).realize()
-    # given: the tokens the last step gave (1 before a step: row 0, the hidden state before tokens[-1], stays)
-    start_pos, accepted, given, sampled = len(tokens) - 1, 0, 1, [tokens[-1]] + [0]*k
-    v_pos, v_acc = UOp.variable("mtp_pos", 0, self.max_context-1), UOp.variable("spec_accepted", 0, k)
-    try:
-      while start_pos + k + 1 < self.max_context:
-        inp = Tensor([sampled], dtype=dtypes.int32, device=dev)
-        out = [int(t) for t in self.spec_jit(inp, v_pos.bind(start_pos - accepted), v_acc.bind(accepted), temperature).numpy()[0]]
-        accepted, sampled = next((i for i in range(k) if out[k+1+i] != out[i]), k), out[:k+1]
-        start_pos += accepted + 1
-        for given, tok in enumerate(out[k+1:k+1+accepted] + [out[accepted]], 1):
-          tokens.append(tok)
-          self._cached_tokens = tokens[:-1]
-          yield tok
-    finally:
-      # row given-1 is the hidden state before the last token given: the next call starts at that token
-      self._mtp_hidden[:, :1].assign(self._mtp_hidden[:, given-1:given].contiguous()).realize()
 
   @staticmethod
   def from_gguf(gguf:Tensor|str|pathlib.Path, max_context:int|None=None,
@@ -722,8 +679,8 @@ class Transformer:
         state_dict[f"blk.{i}.ssm_out.weight"] = state_dict.pop(f"blk.{i}.attn_output.weight")
     if arch in ('qwen35', 'qwen35moe', 'glm4moe', 'gpt-oss'):
       state_dict = {k.replace('post_attention_norm', 'ffn_norm'):v for k,v in state_dict.items()}
-    mtp = bool(getenv("MTP", 0)) and arch in ('qwen35', 'qwen35moe', 'glm5-next') and kv.get(f'{arch}.nextn_predict_layers', 0) > 0
-    if mtp: state_dict = {re.sub(rf"^blk\.{num_blocks}\.", "mtp.blk.", k).replace("mtp.blk.nextn.", "mtp."):v for k,v in state_dict.items()}
+    spec_drafts = getenv("SPEC_DRAFTS", 2) if getenv("MTP", 0) and kv.get(f'{arch}.nextn_predict_layers', 0) else 0
+    if spec_drafts: state_dict = {re.sub(rf"^blk\.{num_blocks}\.", "mtp.blk.", k).replace("mtp.blk.nextn.", "mtp."):v for k,v in state_dict.items()}
 
     kv_lora_rank = kv.get(f'{arch}.attention.kv_lora_rank', 0)
     head_dim = kv.get(f'{arch}.attention.key_length_mla', kv.get(f'{arch}.attention.key_length', kv[f'{arch}.embedding_length'] // n_heads))
@@ -770,7 +727,7 @@ class Transformer:
       expert_proj_bias='blk.0.ffn_gate_exps.bias' in state_dict, attn_output_bias='blk.0.attn_output.bias' in state_dict,
       swiglu_alpha=1.702 if arch == 'gpt-oss' else 1.0, swiglu_limit=7.0 if arch == 'gpt-oss' else kv.get(f'{arch}.swiglu_clamp_exp', [None])[0],
       swiglu_up_bias=1.0 if arch == 'gpt-oss' else 0.0, attn_sinks='blk.0.attn_sinks.weight' in state_dict,
-      sliding_window=kv.get(f'{arch}.attention.sliding_window', 0), mtp=mtp, spec_drafts=getenv("SPEC_DRAFTS", 2) if mtp else 0,
+      sliding_window=kv.get(f'{arch}.attention.sliding_window', 0), spec_drafts=spec_drafts,
       sliding_window_pattern=kv.get(f'{arch}.attention.sliding_window_pattern', 2 if arch == 'gpt-oss' else 0), hc=hc, indexer=indexer,
       expert_latent_dim=kv.get(f'{arch}.expert_latent_length', 0), attn_res_block_size=kv.get(f'{arch}.attn_res.block_size', 0),
       situ=(kv[f'{arch}.activation.situ_beta'], kv[f'{arch}.activation.situ_linear_beta']) if f'{arch}.activation.situ_beta' in kv else None)
@@ -883,19 +840,26 @@ class Transformer:
     t = Tensor(tokens + [0] * (self.max_context - len(tokens)), dtype="int32").reshape(1, self.max_context)
     # recompute start_pos from what's currently valid in the caches
     start_pos = self.get_start_pos(tokens)
-    out, prompt_len, speculate = None, len(tokens), self.config.spec_drafts > 0
+    out, prompt_len, k, accepted, res = None, len(tokens), self.config.spec_drafts, 0, [0]
+    v_pos, v_acc = UOp.variable("mtp_pos", 0, self.max_context-1), UOp.variable("spec_accepted", 0, k)
     if start_pos == 0 and hasattr(self, "_mtp_hidden"): self._mtp_hidden.assign(Tensor.zeros_like(self._mtp_hidden)).realize()
     while len(tokens) < self.max_context:
-      n_toks = min(chunk_size, len(tokens) - start_pos)
-      sp, nt = v_start_pos.bind(start_pos), v_toks.bind(n_toks)
-      out = self(t[:, sp:sp+nt] if start_pos < prompt_len or out is None else out, sp, temp).realize()
-      start_pos += n_toks
-      # chunked prefill: keep processing until all prompt tokens are consumed
-      if start_pos < len(tokens): continue
-      tokens.append(int(out.item()))
-      self._cached_tokens = tokens[:-1]
-      yield tokens[-1]
-      if speculate:
-        yield from self._spec_generate(tokens, temp)
-        # speculating stops before the end of the context: the last tokens are decoded one at a time, from the last token given
-        speculate, start_pos, out = False, len(tokens)-1, Tensor([[tokens[-1]]], dtype="int32")
+      # speculative decoding after the first token: it stops before the end of the context, the last tokens are decoded one at a time
+      if k and prompt_len <= start_pos < self.max_context-k-1:
+        inp = Tensor([res[:k+1]], dtype=dtypes.int32, device=(dev:=self._mtp_hidden.device))
+        res = [int(x) for x in self(inp, v_pos.bind(start_pos - accepted), temp.to(dev), v_acc.bind(accepted)).numpy()[0]]
+        accepted = next((i for i in range(k) if res[k+1+i] != res[i]), k)
+        start_pos += accepted + 1
+        out = Tensor([[res[accepted]]], dtype="int32")
+      else:
+        n_toks = min(chunk_size, len(tokens) - start_pos)
+        sp, nt = v_start_pos.bind(start_pos), v_toks.bind(n_toks)
+        out = self(t[:, sp:sp+nt] if start_pos < prompt_len or out is None else out, sp, temp).realize()
+        start_pos += n_toks
+        # chunked prefill: keep processing until all prompt tokens are consumed
+        if start_pos < len(tokens): continue
+        res, accepted = [int(out.item())] + [0]*k, 0
+      for tok in res[k+1:k+1+accepted] + [res[accepted]]:
+        tokens.append(tok)
+        self._cached_tokens = tokens[:-1]
+        yield tok

@@ -222,23 +222,19 @@ class TestTransformerGenerate(unittest.TestCase):
 
   def test_spec_accepts_drafts_until_mismatch(self):
     # a spec step yields its accepted drafts and the token verified after them, the next step starts after them
-    model, calls = Transformer(replace(TEST_CONFIG, mtp=True, spec_drafts=2)), []
+    model, calls = Transformer(replace(TEST_CONFIG, spec_drafts=2)), []
     model._mtp_hidden = Tensor.zeros(1, 3, TEST_CONFIG.dim).contiguous().realize()
-    # verified tokens then drafts: both drafts accepted, the second rejected, the first rejected
-    steps = [[7, 8, 9, 7, 8], [10, 11, 12, 10, 5], [13, 14, 15, 6, 14]]
-    def spec_jit(sampled, mtp_pos, accepted, temperature):
+    # verified tokens then drafts: both drafts accepted, the second rejected, the first rejected, the second rejected
+    steps = [[7, 8, 9, 7, 8], [10, 11, 12, 10, 5], [13, 14, 15, 6, 14], [16, 17, 18, 16, 5]]
+    def spec_jit(sampled, mtp_pos, temperature, accepted):
       calls.append((sampled.tolist()[0], mtp_pos.unbind()[1], accepted.unbind()[1], temperature.item()))
-      model._mtp_hidden.assign(Tensor.arange(1, 4).float().reshape(1, 3, 1).expand(model._mtp_hidden.shape)).realize()
       return Tensor([steps[len(calls)-1]])
-    model.spec_jit = spec_jit
-    with patch.object(Transformer, '__call__', return_value=Tensor([[6]])):
-      gen = model.generate([1, 2, 3], temperature=0.5)
-      self.assertEqual([next(gen) for _ in range(7)], [6, 7, 8, 9, 10, 11, 13])
-      gen.close()
-    self.assertEqual(calls, [([6, 0, 0], 3, 0, 0.5), ([7, 8, 9], 4, 2, 0.5), ([10, 11, 12], 7, 1, 0.5)])
-    # the last token was sampled after row 0 of its step: the next turn continues from that row's hidden state
-    self.assertEqual(model._cached_tokens, [1, 2, 3, 6, 7, 8, 9, 10, 11])
-    np.testing.assert_equal(model._mtp_hidden[:, :1].numpy(), 1.0)
+    model.spec_jit, model.prefill_jit = spec_jit, lambda *_: Tensor([[6]])
+    gen = model.generate([1, 2, 3], temperature=0.5)
+    self.assertEqual([next(gen) for _ in range(9)], [6, 7, 8, 9, 10, 11, 13, 16, 17])
+    gen.close()
+    self.assertEqual(calls, [([6, 0, 0], 3, 0, 0.5), ([7, 8, 9], 4, 2, 0.5), ([10, 11, 12], 7, 1, 0.5), ([13, 14, 15], 9, 0, 0.5)])
+    self.assertEqual(model._cached_tokens, [1, 2, 3, 6, 7, 8, 9, 10, 11, 13, 16])
 
 if __name__ == '__main__':
   unittest.main()
