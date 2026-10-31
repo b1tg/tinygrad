@@ -1,7 +1,7 @@
 import unittest
 from tinygrad import Tensor, UOp, dtypes
 from tinygrad.codegen.opt import Opt, OptOps, KernelOptError
-from tinygrad.codegen.opt.postrange import Scheduler
+from tinygrad.codegen.opt.postrange import Scheduler, apply_opts
 from tinygrad.renderer.llvmir import AMDLLVMRenderer
 from tinygrad.helpers import Target
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops
@@ -84,6 +84,13 @@ class TestReductionAxes(unittest.TestCase):
     inp = Tensor([float(i) for i in range(32)], device="PYTHON").reshape(4, 8).contiguous().realize()
     out = Tensor.empty(4, device="PYTHON").custom_kernel(inp, fxn=kernel)[0]
     self.assertEqual(out.tolist(), [float(sum(range(i*8, (i+1)*8))) for i in range(4)])
+
+class TestSymbolicAxisLocal(unittest.TestCase):
+  def test_symbolic_axis_local(self):
+    i = UOp.range(UOp.variable("n", 1, 64)*16, 0)
+    inp, out = UOp.param(0, dtypes.float, (1024,)), UOp.param(1, dtypes.float, (1024,))
+    ast = apply_opts(out[i].store(inp[i] + 1).end(i).sink(arg=KernelInfo()), AMDLLVMRenderer(Target("AMD", arch="gfx1100")))
+    self.assertEqual(ast.arg.applied_opts, (Opt(OptOps.SPLIT, 0, (16, AxisType.LOCAL)),))
 
 if __name__ == '__main__':
   unittest.main()
