@@ -859,7 +859,7 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
 
 @functools.cache
 def _gated_delta_prefill_kernel(core:UOp, q:UOp, k:UOp, v:UOp, beta:UOp, alpha:UOp, state:UOp, kq:UOp, start_pos:UOp|None=None,
-                                length:UOp|int|None=None, writes:int=1) -> UOp:
+                                length:UOp|None=None, writes:int=1) -> UOp:
   batch, heads, tokens, value_dim, row_tile = *core.shape, 4
   key_dim, alpha_dim = q.shape[-1], alpha.shape[-1] if len(alpha.shape) == 4 else 1
   assert all(isinstance(x, int) for x in (batch, heads, tokens, value_dim, key_dim)) and key_dim % 32 == 0 and value_dim % row_tile == 0
@@ -897,7 +897,7 @@ def _gated_delta_prefill_kernel(core:UOp, q:UOp, k:UOp, v:UOp, beta:UOp, alpha:U
   return step.end(lane, bh_row).sink(arg=KernelInfo(name="gated_delta_prefill", opts_to_apply=()))
 
 def gated_delta_prefill(q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:Tensor, state:Tensor, start_pos:Tensor|None=None,
-                        length:Tensor|int|None=None, writes:int=1) -> Tensor:
+                        length:Tensor|None=None, writes:int=1) -> Tensor:
   batch, heads, tokens, key_dim = q.shape
   value_dim = v.shape[-1]
   assert q.shape == k.shape and v.shape[:3] == beta.shape == (batch, heads, tokens) and state.shape[-4:] == (batch, heads, value_dim, key_dim)
@@ -905,11 +905,11 @@ def gated_delta_prefill(q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:Tensor,
   assert key_dim % 32 == 0 and value_dim % 4 == 0
   assert q.dtype == k.dtype == dtypes.float32, "recurrent Q/K must be float32"
   assert state.uop.contiguous_view_offset() is not None, "recurrent state must be contiguous"
-  if start_pos is not None: state = Tensor(state.uop.after(*(x.uop for x in (start_pos, length) if isinstance(x, Tensor))))
+  if start_pos is not None: state = Tensor(state.uop.after(*(x.uop for x in (start_pos, length) if x is not None)))
   core, kq = Tensor.empty_like(v), (q*k).sum(-1).contiguous()
   srcs = (core, q.contiguous(), k.contiguous(), v.contiguous(), beta.contiguous(), alpha.contiguous(), state, kq)
   contig = tuple(x.uop if x.uop.op is Ops.AFTER else x.uop.contiguous() for x in srcs)
   params = tuple(UOp.placeholder_like(x, slot=i) for i,x in enumerate(contig))
-  pos_args = (x.uop.unbind_all()[0] if isinstance(x, Tensor) else x for x in (start_pos, length))
+  pos_args = (None if x is None else x.uop.unbind_all()[0] for x in (start_pos, length))
   call = _gated_delta_prefill_kernel(*params, *pos_args, writes).call(*contig)
   return Tensor(contig[0].after(call))

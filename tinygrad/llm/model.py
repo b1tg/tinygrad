@@ -518,7 +518,7 @@ class GatedDeltaNetBlock(FFNBlock):
     if self.head_k_dim % 32 == 0 and self.head_v_dim % 4 == 0 and amd_custom_kernels_supported(x.device):
       # one fused kernel for the whole scan; it resets and updates the recurrent state in place (RDNA3/4)
       state = Tensor(self.recurrent_state.uop.after(*conv_state_stores))  # carry the conv write into this graph
-      core = gated_delta_prefill(q, k, v, beta, alpha, state, Tensor(start_pos), T if isinstance(T, int) else Tensor(T), W).transpose(1, 2)
+      core = gated_delta_prefill(q, k, v, beta, alpha, state, Tensor(start_pos), Tensor(T), W).transpose(1, 2)
     else:
       q, k, v, beta = q.unsqueeze(-2), k.unsqueeze(-2), v.unsqueeze(-1), beta.unsqueeze(-1).unsqueeze(-1)
       alpha = alpha.unsqueeze(-2)
@@ -595,7 +595,7 @@ class Transformer:
       for i in range(k):
         m = self.mtp(self.token_embd(drafts[-1]).float(), m, start_pos+i) if i else self.mtp(x, m, mtp_pos)[:, accepted:accepted+1]
         drafts.append(self.output(m).argmax(-1))
-      x = self.token_embd(tokens[:, accepted:accepted+1].cat(*drafts, dim=1)).float()
+      x = self.token_embd(tokens[:, accepted:accepted+1].to(x.device).cat(*drafts, dim=1)).float()
     if (hc:=self.config.hc) is not None: x = x.unsqueeze(2).expand(*x.shape[:2], hc.count, x.shape[-1]).contiguous()
     elif self.config.attn_res_block_size: x = x.unsqueeze(2)
     idx_mask = None
@@ -609,7 +609,7 @@ class Transformer:
     tok = (logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1)
     if not k: return tok
     # (1, 2k+1): the k+1 tokens sampled, then the k drafts. _mtp_hidden: the hidden states of these k+1
-    if drafts: return tok.cat(*drafts, dim=1).realize(self._mtp_hidden.assign(hn.contiguous()))
+    if drafts: return tok.to(x.device).cat(*drafts, dim=1).realize(self._mtp_hidden.assign(hn.contiguous()))
     # the mtp cache needs every position before the ones it predicts. row 0 of _mtp_hidden: the hidden state before the chunk
     if not hasattr(self, "_mtp_hidden"):
       self._mtp_hidden:Tensor = Tensor.zeros(1, k+1, self.config.dim, device=x.device).contiguous().realize()
@@ -618,8 +618,9 @@ class Transformer:
     # realized with the token: the model runs once. a column of the output is realized for the cache writes
     return tok.realize(m[:, :1, :1].contiguous(), carry.assign(hn[:, -1:]))
 
-  def __call__(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
-    return (self.prefill_jit if resolve(tokens.shape[1] != 1) else self.rollout_jit)(tokens.contiguous(), start_pos, temperature)
+  def __call__(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor, accepted:UOp|None=None) -> Tensor:
+    jit = self.spec_jit if accepted is not None else self.prefill_jit if resolve(tokens.shape[1] != 1) else self.rollout_jit
+    return jit(tokens.contiguous(), start_pos, temperature, accepted)
 
   @staticmethod
   def from_gguf(gguf:Tensor|str|pathlib.Path, max_context:int|None=None,
@@ -845,10 +846,10 @@ class Transformer:
       n_toks = min(chunk_size, len(tokens) - start_pos)
       sp, nt = v_start_pos.bind(start_pos), v_toks.bind(n_toks)
       # speculative decoding after the first token: it stops before the end of the context, the last tokens are decoded one at a time
-      if k and prompt_len <= start_pos < self.max_context-k-1:
-        inp = Tensor([tokens[-1-accepted:]+[0]*(k-accepted)], dtype=dtypes.int32, device=(dev:=self._mtp_hidden.device))
-        out = self.spec_jit(inp, v_start_pos.bind(start_pos-accepted), temp.to(dev), v_acc.bind(accepted))
-      else: out = self(t[:, sp:sp+nt] if start_pos < prompt_len or out is None else Tensor([[tokens[-1]]]) if k else out, sp, temp).realize()
+      if spec:=k and prompt_len <= start_pos < self.max_context-k-1:
+        inp, sp = Tensor([tokens[-1-accepted:]+[0]*(k-accepted)], dtype=dtypes.int32), v_start_pos.bind(start_pos-accepted)
+      else: inp = t[:, sp:sp+nt] if start_pos < prompt_len or out is None else Tensor([[tokens[-1]]]) if k else out
+      out = self(inp, sp, temp, accepted=v_acc.bind(accepted) if spec else None).realize()
       start_pos += n_toks
       # chunked prefill: keep processing until all prompt tokens are consumed
       if start_pos < len(tokens): continue
