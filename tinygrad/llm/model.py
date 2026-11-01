@@ -605,7 +605,7 @@ class Transformer:
     if config.spec_drafts: self.mtp, self.spec_jit = block_cls(replace(config, hc=None, nextn=True)), TinyJit(self.forward)
 
   def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor, spec:bool=False) -> Tensor:
-    x = self.token_embd(tokens.to(self.token_embd.weight.device)).float()  # (B, T, D)
+    x = emb = self.token_embd(tokens.to(self.token_embd.weight.device)).float()  # (B, T, D)
     k = self.config.spec_drafts
     drafts:list[Tensor] = []
     if spec:
@@ -613,8 +613,7 @@ class Transformer:
       for i in range(k):
         m = self.mtp.predict(x[:, -1:], m, start_pos+i)
         drafts.append(self.output(m).argmax(-1))
-        x = x.cat(self.token_embd(drafts[-1]).float(), dim=1) # (1, i+2, D)
-    emb = x
+        x = emb = x.cat(self.token_embd(drafts[-1]).float(), dim=1) # (1, i+2, D)
     if (hc:=self.config.hc) is not None: x = x.unsqueeze(2).expand(*x.shape[:2], hc.count, x.shape[-1]).contiguous()
     elif self.config.attn_res_block_size: x = x.unsqueeze(2)
     idx_mask = None
