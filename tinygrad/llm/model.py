@@ -611,9 +611,9 @@ class Transformer:
     if spec:
       m = self.mtp.nextn.hidden_before(x, start_pos)
       for i in range(k):
-        m = self.mtp.predict(self.token_embd(drafts[-1]).float() if i else x, m, start_pos+i)
+        m = self.mtp.predict(x[:, -1:], m, start_pos+i)
         drafts.append(self.output(m).argmax(-1))
-      x = self.token_embd(tokens.to(x.device).cat(*drafts, dim=1)).float() # (1, k+1, D)
+        x = x.cat(self.token_embd(drafts[-1]).float(), dim=1) # (1, i+2, D)
     emb = x
     if (hc:=self.config.hc) is not None: x = x.unsqueeze(2).expand(*x.shape[:2], hc.count, x.shape[-1]).contiguous()
     elif self.config.attn_res_block_size: x = x.unsqueeze(2)
