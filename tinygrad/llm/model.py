@@ -134,7 +134,7 @@ class TransformerConfig:
   indexer: IndexerConfig|None = None
   indexer_shared: tuple[bool, ...] = ()
   rope_interleave: bool = False
-  spec_drafts: int = 0  # speculative decoding: the tokens the mtp layer drafts for every step of the model
+  spec_drafts: int = 0
   nextn: bool = False
   expert_latent_dim: int = 0
   situ: tuple[float, float]|None = None
@@ -476,7 +476,6 @@ class GatedDeltaNetBlock(FFNBlock):
     is_kda = unwrap(self.config.ssm).kda
     symbolic = isinstance(T, UOp)
     T_pad = x.max_shape[1]  # symbolic chunks are padded to their max size: one graph serves every size
-    # the state at position p is in slot p%S: a call reads start_pos and writes the states after its last W tokens, the next call starts after any
     S = int(self.recurrent_state.shape[0])
     W = min(T, S) if isinstance(T, int) else 1
     def put(ring:Tensor, states:list[Tensor]) -> UOp:
@@ -548,7 +547,7 @@ class GatedDeltaNetBlock(FFNBlock):
 
   def _init_state(self, x):
     if not hasattr(self, "recurrent_state"):
-      # rings of states (_attention) to take back rejected drafts: a step of k+1 tokens writes k+1 slots but not the one it reads
+      # a step of k+1 tokens writes k+1 slots but not the one it reads, to take back rejected drafts
       S = self.config.spec_drafts + 2 if self.config.spec_drafts else 1
       if kda:=unwrap(self.config.ssm).kda:
         self.conv_states = [Tensor.zeros(S, x.shape[0], self.ssm_conv_kernel-1, d, device=x.device, axis=-1).clone() for d in self.qkv_dims]
@@ -561,14 +560,19 @@ class NextN:
     self.config, self.eh_proj = config, Linear(2*config.dim, config.dim, bias=False)
     self.enorm, self.hnorm, self.shared_head_norm = (nn.RMSNorm(config.dim, config.norm_eps) for _ in range(3))
 
-  # slot p+1: the hidden state at position p, a turn can restart at any position. slot 0 (before the first token) stays 0
-  def read(self, x:Tensor, start_pos:int|UOp, T:int) -> Tensor:
+  def _init_state(self, x:Tensor):
+    # hidden[:, p]: the hidden state before position p, 0 before the first token
     if not hasattr(self, "hidden"):
       self.hidden = Tensor.zeros(x.shape[0], self.config.max_context+1, self.config.dim, device=x.device).clone()
-    return self.hidden[:, start_pos:start_pos+T]
 
-  def write(self, h:Tensor, start_pos:int|UOp) -> Tensor:
-    return self.hidden[:, start_pos+1:start_pos+1+h.shape[1]].assign(h.contiguous())
+  def hidden_before(self, x:Tensor, start_pos:int|UOp) -> Tensor:
+    self._init_state(x)
+    return self.hidden[:, start_pos:start_pos+1]
+
+  def shift_in(self, h:Tensor, start_pos:int|UOp) -> Tensor:
+    self._init_state(h)
+    store = self.hidden[:, start_pos+1:start_pos+1+h.shape[1]].uop.store(h.uop)
+    return Tensor(self.hidden.uop.after(store))[:, start_pos:start_pos+h.shape[1]]
 
 class Transformer:
   def __init__(self, config:TransformerConfig):
@@ -600,7 +604,7 @@ class Transformer:
     k = self.config.spec_drafts
     drafts:list[Tensor] = []
     if spec:
-      m = self.mtp.nextn.read(x, start_pos, 1)
+      m = self.mtp.nextn.hidden_before(x, start_pos)
       for i in range(k):
         m = self.mtp.predict(self.token_embd(drafts[-1]).float() if i else x, m, start_pos+i)
         drafts.append(self.output(m).argmax(-1))
@@ -613,15 +617,15 @@ class Transformer:
     if hc is not None: x = x.mean(2)
     elif self.config.attn_res_block_size: x = self.output_res_score.mix(x)
     hn = self.output_norm(x)
-    # only run the output projection on the last token, or on the k+1 verified ones
+    # only run the output projection on the last token
     logits = self.output(hn if drafts else hn[:, -1:]).to(tokens.device)
     # Gumbel-max trick: argmax(logits/temp - log(-log(uniform))) is equivalent to sampling from softmax(logits/temp)
     tok = (logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1)
     if not k: return tok
-    # the mtp cache takes the hidden states of the model at every position, the drafts that weren't accepted are overwritten by the next steps
-    m = self.mtp.predict(emb, self.mtp.nextn.read(hn, start_pos, 1).cat(hn, dim=1)[:, :-1], start_pos)
-    # the tokens sampled, then the drafts. a value of the output is realized for the cache writes
-    return tok.to(x.device).cat(*drafts, dim=1).realize(m[:, :1, :1].contiguous(), self.mtp.nextn.write(hn, start_pos))
+    # the mtp cache needs every position
+    m = self.mtp.predict(emb, self.mtp.nextn.shift_in(hn, start_pos), start_pos)
+    # a value of the output is realized for the cache writes
+    return tok.to(x.device).cat(*drafts, dim=1).realize(m[:, :1, :1].contiguous())
 
   def __call__(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor, spec:bool=False) -> Tensor:
     jit = self.spec_jit if spec else self.prefill_jit if resolve(tokens.shape[1] != 1) else self.rollout_jit
