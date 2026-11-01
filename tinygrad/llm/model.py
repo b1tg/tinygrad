@@ -859,4 +859,4 @@ class Transformer:
       for tok in res[:accepted+1]:
         tokens.append(tok)
         self._cached_tokens = tokens[:-1]
-        yield tok
+        yield tokens[-1]

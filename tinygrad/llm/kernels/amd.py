@@ -251,8 +251,8 @@ def _decode_linear(out:UOp, out_features:int, group_count:int, group_dot, name:s
   wave = UOp.range(rows, 3, AxisType.LOCAL)
   token_output = row*rows+wave
   chunk, lane = UOp.range(chunks, 1, AxisType.GLOBAL), UOp.range(32, 2, AxisType.LOCAL)
-  output = token_output % out_features
-  tokens = [token_output // out_features] if per_wave == 1 else [UOp.const(t, dtypes.weakint) for t in range(per_wave)]
+  token, output = token_output // out_features, token_output % out_features
+  tokens = [token] if per_wave == 1 else [UOp.const(t, dtypes.weakint) for t in range(per_wave)]
   group = lane+chunk*32
   stores = [out[t, output, chunk.valid(lane.eq(0))].store(warp_reduce((group < group_count).where(
     group_dot(t, output, group.minimum(group_count-1)), UOp.const(0, dtypes.float32)), full_wave=True).cast(out.dtype)) for t in tokens]
@@ -827,18 +827,19 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
 def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
   # cached flash attention on the half KV cache (already written through assigned_kv); valid_end stays bound at the graph level
   T_real, q_start = q.shape[2], None
-  D, N, group = q.shape[3], cast(int, assigned_kv.shape[3]), q.shape[1] // assigned_kv.shape[2]
-  rows = T_real if isinstance(T_real, int) and T_real < BLOCK_M else 0
+  D, N, group = q.shape[3], assigned_kv.shape[3], q.shape[1] // assigned_kv.shape[2]
+  decode = T_real if isinstance(T_real, int) and T_real < BLOCK_M else 0
   # Non-power-of-two decode dimensions can lose tail-store masks. Q/P, K, and V use separate LDS allocations.
-  supported = D % 32 == 0 and (D & (D-1) == 0 and N % 64 == 0 and group*((D+LDS_PAD)*2+8) <= 65536 if rows else
+  supported = D % 32 == 0 and (D & (D-1) == 0 and N % 64 == 0 and group*((D+LDS_PAD)*2+8) <= 65536 if decode else
     D >= 64 and 2*(2*BLOCK_M*(D+LDS_PAD) + D*(BLOCK_N+LDS_PAD)) <= 65536 and N % BLOCK_N == 0 and q.max_shape[2] % BLOCK_M == 0)
-  if not rows and _is_cdna(q.device): supported = False  # the prefill kernel is RDNA WMMA only
+  if not decode and _is_cdna(q.device): supported = False  # the prefill kernel is RDNA WMMA only
   if not supported:
     k, v = (assigned_kv[i, :, :, :valid_end].float() for i in range(2))
-    mask = None if rows == 1 else Tensor.full((T_real, valid_end), -math.inf, dtype=dtypes.float32, device=q.device).triu(valid_end-T_real+1)
+    mask = None if decode == 1 else Tensor.full((T_real, valid_end), -math.inf, dtype=dtypes.float32, device=q.device).triu(valid_end-T_real+1)
     return q.float().scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)
   # a few queries: the decode kernel on each, query i sees the cache up to its position
-  if rows: return Tensor.cat(*[amd_flash_attention_decode(q[:, :, i:i+1].half(), assigned_kv, valid_end-rows+1+i, N) for i in range(rows)], dim=2)
+  if decode: return Tensor.cat(*[amd_flash_attention_decode(q[:, :, i:i+1].half(), assigned_kv, valid_end-decode+1+i, cast(int, N))
+                                 for i in range(decode)], dim=2)
   if isinstance(T_real, UOp):
     # symbolic chunk: pad the queries to the static tile; garbage rows are sliced off
     T_pad = q.max_shape[2]
