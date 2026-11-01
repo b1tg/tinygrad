@@ -349,14 +349,11 @@ class TestGatedDeltaNetBlock(unittest.TestCase):
         np.testing.assert_allclose(chunked_recurrent, decode_recurrent, rtol=1e-3, atol=1e-3, err_msg=f"{kda=} {chunking=}")
 
   def test_state_ring_takes_back_tokens(self):
-    # a call reads the states at its start_pos and writes the ones after each of its tokens into their slots (p%S): the next call can start
-    # after any of them (speculative decoding: the drafts that weren't accepted are taken back)
     config = self._make_config(max_context=8, spec_drafts=1)
     block, x = self._make_block(config), self._tensor_linspace(-1, 1, (1, 4, config.dim))
     outs, convs, recurrents = self._naive_attention(block, x)
     x_norm = self._rms_norm_np(x.numpy(), block.attn_norm.weight.numpy(), block.attn_norm.eps)
     block._init_state(Tensor(x_norm))
-    # the first call at position 0 (the states reset), the second after only its first token
     for start in (0, 1):
       out = block._attention(Tensor(x_norm[:, start:start+2]), start).numpy()
       np.testing.assert_allclose(out, np.concatenate(outs[start:start+2], axis=1), rtol=1e-3, atol=1e-3)

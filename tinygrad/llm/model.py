@@ -135,7 +135,7 @@ class TransformerConfig:
   indexer_shared: tuple[bool, ...] = ()
   rope_interleave: bool = False
   spec_drafts: int = 0  # speculative decoding: the tokens the mtp layer drafts for every step of the model
-  nextn: bool = False  # the block is the mtp layer, it has the head (NextN)
+  nextn: bool = False
   expert_latent_dim: int = 0
   situ: tuple[float, float]|None = None
   attn_res_block_size: int = 0
@@ -479,7 +479,7 @@ class GatedDeltaNetBlock(FFNBlock):
     # the state at position p is in slot p%S: a call reads start_pos and writes the states after its last W tokens, the next call starts after any
     S = int(self.recurrent_state.shape[0])
     W = min(T, S) if isinstance(T, int) else 1
-    def put(ring:Tensor, states:list[Tensor]) -> UOp:  # states[d]: the state after the token d before the last
+    def put(ring:Tensor, states:list[Tensor]) -> UOp:
       for d, state in enumerate(states):
         ring = Tensor(ring.uop.after(ring[(start_pos+T-d) % S].uop.store(state.cast(ring.dtype).uop)))
       return ring.uop
@@ -500,7 +500,7 @@ class GatedDeltaNetBlock(FFNBlock):
       # padded steps are exact no-ops: beta=0 (delta rule off), log_alpha=0 (decay 1 after exp)
       conv_window = initial.where(0, conv_state[start_pos % S]).cat(proj.cast(conv_state.dtype), dim=1)
       conv_window = conv_window.pad_to((B, self.ssm_conv_kernel-1 + T_pad, proj.shape[-1])).contiguous()
-      # the conv_kernel-1 columns of the window after a token become the conv state after it
+      # the last conv_kernel-1 columns of the window become the next conv state
       store = put(conv_state, [conv_window[:, T-d:T-d+self.ssm_conv_kernel-1] for d in range(W)])
       return functools.reduce(lambda a,b: a+b, (conv_window[:, i:i+T_pad] * weight[:, i] for i in range(self.ssm_conv_kernel))).silu(), store
     projs = (self.attn_q, self.attn_k, self.attn_v) if is_kda else (self.attn_qkv,)
@@ -557,14 +557,18 @@ class GatedDeltaNetBlock(FFNBlock):
                                           axis=2 if kda else None).clone()
 
 class NextN:
-  # the head of the mtp layer: mixes the next token embedding with the hidden state
   def __init__(self, config:TransformerConfig):
     self.config, self.eh_proj = config, Linear(2*config.dim, config.dim, bias=False)
     self.enorm, self.hnorm, self.shared_head_norm = (nn.RMSNorm(config.dim, config.norm_eps) for _ in range(3))
 
-  def _init_state(self, x:Tensor):
+  # slot p+1: the hidden state at position p, a turn can restart at any position. slot 0 (before the first token) stays 0
+  def read(self, x:Tensor, start_pos:int|UOp, T:int) -> Tensor:
     if not hasattr(self, "hidden"):
-      self.hidden:Tensor = Tensor.zeros(x.shape[0], self.config.spec_drafts+1, self.config.dim, device=x.device).contiguous().realize()
+      self.hidden = Tensor.zeros(x.shape[0], self.config.max_context+1, self.config.dim, device=x.device).clone()
+    return self.hidden[:, start_pos:start_pos+T]
+
+  def write(self, h:Tensor, start_pos:int|UOp) -> Tensor:
+    return self.hidden[:, start_pos+1:start_pos+1+h.shape[1]].assign(h.contiguous())
 
 class Transformer:
   def __init__(self, config:TransformerConfig):
@@ -594,12 +598,10 @@ class Transformer:
   def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor, accepted:UOp|None=None) -> Tensor:
     x = self.token_embd(tokens.to(self.token_embd.weight.device)).float()  # (B, T, D)
     k, emb = self.config.spec_drafts, x
-    if k: self.mtp.nextn._init_state(x)
     drafts:list[Tensor] = []
     if accepted is not None:
-      # the mtp layer drafts k tokens, the model verifies them. tokens (1, k+1): the tokens the last step sampled from start_pos, the first `accepted`
-      # matched its drafts. a sum, not start_pos - accepted: hcq2 renders launch sizes with llvm, which has no SUB
-      mtp_pos, start_pos, m = start_pos, start_pos + accepted, self.mtp.nextn.hidden
+      # a sum, not start_pos - accepted: hcq2 renders launch sizes with llvm, which has no SUB
+      mtp_pos, start_pos, m = start_pos, start_pos + accepted, self.mtp.nextn.read(x, start_pos, k+1)
       for i in range(k):
         m = self.mtp.predict(self.token_embd(drafts[-1]).float(), m, start_pos+i) if i else self.mtp.predict(x, m, mtp_pos)[:, accepted:accepted+1]
         drafts.append(self.output(m).argmax(-1))
@@ -616,13 +618,12 @@ class Transformer:
     # Gumbel-max trick: argmax(logits/temp - log(-log(uniform))) is equivalent to sampling from softmax(logits/temp)
     tok = (logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1)
     if not k: return tok
-    # (1, 2k+1): the k+1 tokens sampled, then the k drafts. nextn.hidden: the hidden states of these k+1
-    if drafts: return tok.to(x.device).cat(*drafts, dim=1).realize(self.mtp.nextn.hidden.assign(hn.contiguous()))
-    # the mtp cache needs every position before the ones it predicts. row 0 of nextn.hidden: the hidden state before the chunk
-    carry = self.mtp.nextn.hidden[:, :1]
-    m = self.mtp.predict(emb, Tensor(start_pos).eq(0).where(0, carry).cat(hn, dim=1)[:, :-1], start_pos)
-    # realized with the token: the model runs once. a column of the output is realized for the cache writes
-    return tok.realize(m[:, :1, :1].contiguous(), carry.assign(hn[:, -1:]))
+    # (1, 2k+1): the k+1 tokens sampled, then the k drafts
+    if drafts: return tok.to(x.device).cat(*drafts, dim=1).realize(self.mtp.nextn.write(hn, start_pos))
+    # the mtp cache needs every position before the ones it predicts
+    m = self.mtp.predict(emb, self.mtp.nextn.read(hn, start_pos, 1).cat(hn, dim=1)[:, :-1], start_pos)
+    # a column of the output is realized for the cache writes
+    return tok.realize(m[:, :1, :1].contiguous(), self.mtp.nextn.write(hn, start_pos))
 
   def __call__(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor, accepted:UOp|None=None) -> Tensor:
     jit = self.spec_jit if accepted is not None else self.prefill_jit if resolve(tokens.shape[1] != 1) else self.rollout_jit
@@ -840,7 +841,8 @@ class Transformer:
     if self.has_recurrent_block and not amd_custom_kernels_supported(self.token_embd.weight.device): chunk_size = 1
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
     v_toks = UOp.variable("toks", 1, chunk_size)
-    v_accepted = UOp.variable("spec_accepted", 0, k:=self.config.spec_drafts)
+    k = self.config.spec_drafts
+    v_accepted = UOp.variable("accepted", 0, k)
     # TODO: use UOp.variable for temperature once float variables are supported
     temp = Tensor([temperature])
     # assign all input tokens once, then slice from start_pos for the model call
@@ -851,16 +853,14 @@ class Transformer:
     while len(tokens) < self.max_context:
       n_toks = min(chunk_size, len(tokens) - start_pos)
       sp, nt = v_start_pos.bind(start_pos), v_toks.bind(n_toks)
-      # speculative decoding after the first token: it stops before the end of the context, the last tokens are decoded one at a time
       if spec:=k and prompt_len <= start_pos < self.max_context-k-1:
-        inp, sp = Tensor([tokens[-1-accepted:]+[0]*(k-accepted)], dtype=dtypes.int32), v_start_pos.bind(start_pos-accepted)
+        inp, sp = Tensor([tokens[-1-accepted:]+[0]*(k-accepted)]), v_start_pos.bind(start_pos-accepted)
       else: inp = t[:, sp:sp+nt] if start_pos < prompt_len or out is None else Tensor([[tokens[-1]]]) if k else out
       out = self(inp, sp, temp, accepted=v_accepted.bind(accepted) if spec else None).realize()
       start_pos += n_toks
       # chunked prefill: keep processing until all prompt tokens are consumed
       if start_pos < len(tokens): continue
       res = out.numpy().flatten().tolist()
-      # the sampled tokens are kept up to the first that isn't its draft (the last has no draft)
       accepted = next(i for i, (tok, draft) in enumerate(zip(res, res[k+1:]+[-1])) if tok != draft)
       start_pos += accepted
       for tok in res[:accepted+1]:

@@ -840,7 +840,6 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
     k, v = (assigned_kv[i, :, :, :valid_end].float() for i in range(2))
     mask = None if decode == 1 else Tensor.full((T_real, valid_end), -math.inf, dtype=dtypes.float32, device=q.device).triu(valid_end-T_real+1)
     return q.float().scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)
-  # a few queries: the decode kernel on each, query i sees the cache up to its position
   if decode: return Tensor.cat(*[amd_flash_attention_decode(q[:, :, i:i+1].half(), assigned_kv, valid_end-decode+1+i, cast(int, N))
                                  for i in range(decode)], dim=2)
   if isinstance(T_real, UOp):
@@ -868,7 +867,6 @@ def _gated_delta_prefill_kernel(core:UOp, q:UOp, k:UOp, v:UOp, beta:UOp, alpha:U
   q, k = (x.reshape(batch*heads, tokens, key_dim) for x in (q, k))
   beta, kq = (x.reshape(batch*heads, tokens) for x in (beta, kq))
   alpha, state = alpha.reshape(batch*heads, tokens, alpha_dim), state.reshape(*state.shape[:-4] or (1,), batch*heads, value_dim, key_dim)
-  # a ring of states: the one at start_pos read, the ones after the last `writes` tokens (of length, the rest are padding) into their slots
   ring = state.shape[0]
   read, end = (0, 0) if start_pos is None else (start_pos % ring, start_pos + (tokens if length is None else length))
   bh_row, lane = UOp.range(batch*heads*value_dim//row_tile, 0), UOp.range(32, 1, axis_type=AxisType.LOCAL)

@@ -22,7 +22,6 @@ class TestGatedDeltaNetBlock(unittest.TestCase):
     np.testing.assert_allclose(state.numpy(), expected_state, rtol=1e-4, atol=1e-4)
 
   def test_gated_delta_state_ring(self):
-    # a ring of 4 states at position 5 (a sum of variables, as in speculative decoding): read slot 1, the states after the 3 tokens into slots 2, 3, 0
     if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
     rng = np.random.default_rng(0)
     q, k = (rng.normal(size=(1, 2, 3, 32)).astype(np.float32)*0.3 for _ in range(2))
