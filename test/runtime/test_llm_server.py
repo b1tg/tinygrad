@@ -223,7 +223,6 @@ class TestTransformerGenerate(unittest.TestCase):
   def test_spec_accepts_drafts_until_mismatch(self):
     # a spec step yields its accepted drafts and the token verified after them, the next step starts after them
     model, calls = Transformer(replace(TEST_CONFIG, spec_drafts=2)), []
-    model._mtp_hidden = Tensor.zeros(1, 3, TEST_CONFIG.dim).contiguous().realize()
     # verified tokens then drafts: both drafts accepted, the second rejected, the first rejected, the second rejected
     steps = [[7, 8, 9, 7, 8], [10, 11, 12, 10, 5], [13, 14, 15, 6, 14], [16, 17, 18, 16, 5]]
     def spec_jit(sampled, mtp_pos, temperature, accepted):
