@@ -233,7 +233,7 @@ class TestTransformerGenerate(unittest.TestCase):
     gen = model.generate([1, 2, 3], temperature=0.5)
     self.assertEqual([next(gen) for _ in range(9)], [6, 7, 8, 9, 10, 11, 13, 16, 17])
     gen.close()
-    self.assertEqual(calls, [([6, 0, 0], 3, 0, 0.5), ([7, 8, 9], 4, 2, 0.5), ([10, 11, 12], 7, 1, 0.5), ([13, 14, 15], 9, 0, 0.5)])
+    self.assertEqual(calls, [([6, 0, 0], 3, 0, 0.5), ([7, 8, 9], 4, 2, 0.5), ([10, 11, 0], 7, 1, 0.5), ([13, 0, 0], 9, 0, 0.5)])
     self.assertEqual(model._cached_tokens, [1, 2, 3, 6, 7, 8, 9, 10, 11, 13, 16])
 
 if __name__ == '__main__':

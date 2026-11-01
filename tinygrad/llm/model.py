@@ -475,7 +475,7 @@ class GatedDeltaNetBlock(FFNBlock):
     W = min(T, S) if isinstance(T, int) else 1
     def put(ring:Tensor, states:list[Tensor]) -> UOp:  # states[d]: the state after the token d before the last
       for d, state in enumerate(states):
-        ring = Tensor(ring.uop.after(ring[(p:=(start_pos+T-d) % S):p+1].uop.store(state.cast(ring.dtype).unsqueeze(0).uop)))
+        ring = Tensor(ring.uop.after(ring[(start_pos+T-d) % S].uop.store(state.cast(ring.dtype).uop)))
       return ring.uop
 
     # input processing
@@ -586,15 +586,15 @@ class Transformer:
 
   def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor, accepted:UOp|None=None) -> Tensor:
     x = self.token_embd(tokens.to(self.token_embd.weight.device)).float()  # (B, T, D)
-    k, drafts, emb = self.config.spec_drafts, [], x
+    k, emb = self.config.spec_drafts, x
+    drafts:list[Tensor] = []
     if accepted is not None:
       # the mtp layer drafts k tokens, the model verifies them. tokens (1, k+1): the tokens the last step sampled from start_pos, the first `accepted`
       # matched its drafts. a sum, not start_pos - accepted: hcq2 renders launch sizes with llvm, which has no SUB
-      mtp_pos, start_pos = start_pos, start_pos + accepted
-      m = self.mtp(x, self._mtp_hidden, mtp_pos)[:, accepted:accepted+1]
+      mtp_pos, start_pos, m = start_pos, start_pos + accepted, self._mtp_hidden
       for i in range(k):
+        m = self.mtp(self.token_embd(drafts[-1]).float(), m, start_pos+i) if i else self.mtp(x, m, mtp_pos)[:, accepted:accepted+1]
         drafts.append(self.output(m).argmax(-1))
-        if i < k-1: m = self.mtp(self.token_embd(drafts[-1]).float(), m, start_pos+i+1)
       x = self.token_embd(tokens[:, accepted:accepted+1].cat(*drafts, dim=1)).float()
     if (hc:=self.config.hc) is not None: x = x.unsqueeze(2).expand(*x.shape[:2], hc.count, x.shape[-1]).contiguous()
     elif self.config.attn_res_block_size: x = x.unsqueeze(2)
@@ -840,21 +840,22 @@ class Transformer:
     # recompute start_pos from what's currently valid in the caches
     start_pos = self.get_start_pos(tokens)
     out, prompt_len = None, len(tokens)
-    accepted, res, v_acc = 0, [0], UOp.variable("spec_accepted", 0, k:=self.config.spec_drafts)
+    accepted, v_acc = 0, UOp.variable("spec_accepted", 0, k:=self.config.spec_drafts)
     while len(tokens) < self.max_context:
       n_toks = min(chunk_size, len(tokens) - start_pos)
       sp, nt = v_start_pos.bind(start_pos), v_toks.bind(n_toks)
       # speculative decoding after the first token: it stops before the end of the context, the last tokens are decoded one at a time
       if k and prompt_len <= start_pos < self.max_context-k-1:
-        inp = Tensor([(res+[0]*k)[:k+1]], dtype=dtypes.int32, device=(dev:=self._mtp_hidden.device))
+        inp = Tensor([tokens[-1-accepted:]+[0]*(k-accepted)], dtype=dtypes.int32, device=(dev:=self._mtp_hidden.device))
         out = self.spec_jit(inp, v_start_pos.bind(start_pos-accepted), temp.to(dev), v_acc.bind(accepted))
       else: out = self(t[:, sp:sp+nt] if start_pos < prompt_len or out is None else Tensor([[tokens[-1]]]) if k else out, sp, temp).realize()
       start_pos += n_toks
       # chunked prefill: keep processing until all prompt tokens are consumed
       if start_pos < len(tokens): continue
-      res = out.numpy()[0].tolist()
-      # the sampled tokens, up to the first that isn't the draft before it
-      start_pos += (accepted:=sum(1 for _ in itertools.takewhile(lambda ab: ab[0] == ab[1], zip(res[k+1:], res))))
+      res = out.numpy().flatten().tolist()
+      # the sampled tokens are kept up to the first that isn't its draft (the last has no draft)
+      accepted = next(i for i, (tok, draft) in enumerate(zip(res, res[k+1:]+[-1])) if tok != draft)
+      start_pos += accepted
       for tok in res[:accepted+1]:
         tokens.append(tok)
         self._cached_tokens = tokens[:-1]
