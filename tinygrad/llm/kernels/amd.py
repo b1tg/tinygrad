@@ -254,8 +254,11 @@ def _decode_linear(out:UOp, out_features:int, group_count:int, group_dot, name:s
   token, output = token_output // out_features, token_output % out_features
   tokens = [token] if per_wave == 1 else [UOp.const(t, dtypes.weakint) for t in range(per_wave)]
   group = lane+chunk*32
-  stores = [out[t, output, chunk.valid(lane.eq(0))].store(warp_reduce((group < group_count).where(
-    group_dot(t, output, group.minimum(group_count-1)), UOp.const(0, dtypes.float32)), full_wave=True).cast(out.dtype)) for t in tokens]
+  stores = []
+  for token in tokens:
+    value = (group < group_count).where(group_dot(token, output, group.minimum(group_count-1)), UOp.const(0, dtypes.float32))
+    total = warp_reduce(value, full_wave=True)
+    stores.append(out[token, output, chunk.valid(lane.eq(0))].store(total.cast(out.dtype)))
   return UOp.group(*stores).end(row, wave, chunk, lane).sink(arg=KernelInfo(name=name, opts_to_apply=()))
 
 def _iq_grid(device:str|tuple[str, ...]|None, ggml_type:int) -> Tensor:
