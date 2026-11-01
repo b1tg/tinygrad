@@ -24,7 +24,7 @@ class TestSpeculativeDecoding(unittest.TestCase):
       outs.append(first + list(model.generate(list(range(8)) + first + [2])))
     self.assertEqual(outs[0], outs[1])
 
-  def test_hidden_states_by_position(self):
+  def test_hidden_state_after_accepted_drafts(self):
     spec, ref = Transformer(config), Transformer(config)
     random_state(spec, seed=3), random_state(ref, seed=3)  # a seed with accepted drafts
     jit, steps = spec.spec_jit, []
@@ -36,9 +36,19 @@ class TestSpeculativeDecoding(unittest.TestCase):
     toks = list(range(8)) + [t for _,t in zip(range(9), gen)]
     gen.close()
     self.assertLess(len(steps), 8)
-    for p in range(len(spec._cached_tokens)):
-      ref.forward(Tensor([toks[p:p+1]]), p, Tensor([0.0]))
-      np.testing.assert_allclose(spec.mtp.nextn.hidden[:, p+1].numpy(), ref.mtp.nextn.hidden[:, p+1].numpy(), atol=1e-2)
+    n = len(spec._cached_tokens)
+    for p in range(n): ref.forward(Tensor([toks[p:p+1]]), p, Tensor([0.0])).realize()
+    x = Tensor.zeros(1, 1, config.dim)
+    np.testing.assert_allclose(spec.mtp.nextn.hidden_before(x, n).numpy(), ref.mtp.nextn.hidden_before(x, n).numpy(), atol=1e-2)
+
+  def test_chunks_as_long_as_the_ring(self):
+    # the slot a chunk writes last is the one it reads first
+    chunked, ref = Transformer(config), Transformer(config)
+    random_state(chunked, seed=3), random_state(ref, seed=3)
+    toks, S = [i%config.vocab_size for i in range(12)], config.spec_drafts+2
+    for p in range(0, len(toks), S): chunked.forward(Tensor([toks[p:p+S]]), p, Tensor([0.0])).realize()
+    for p in range(len(toks)): ref.forward(Tensor([toks[p:p+1]]), p, Tensor([0.0])).realize()
+    np.testing.assert_allclose(chunked.mtp.cache_kv[:, :, :, :len(toks)].numpy(), ref.mtp.cache_kv[:, :, :, :len(toks)].numpy(), atol=1e-2)
 
 if __name__ == "__main__":
   unittest.main()

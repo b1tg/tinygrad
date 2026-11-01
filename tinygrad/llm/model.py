@@ -251,6 +251,11 @@ class FFNBlock:
     n = self.nextn
     return n.shared_head_norm(self(n.eh_proj(n.enorm(emb).cat(n.hnorm(h), dim=-1)), start_pos)[0])
 
+  def extend(self, emb:Tensor, h:Tensor, start_pos:int|UOp) -> tuple[Tensor, Tensor]:
+    # fills the kv cache with the hidden states of the model, a value of the output is enough to realize the writes
+    m = self.predict(emb, self.nextn.hidden_before(h, start_pos).cat(h, dim=1)[:, :-1], start_pos)
+    return m[:, :1, :1].contiguous(), self.nextn.store_hidden(h, start_pos)
+
   def __call__(self, x: Tensor, start_pos: int|UOp, idx_mask: Tensor|None=None):
     self._init_state(x)
     # we pass in the weights implicitly so we unpack the GGUF on the fly
@@ -561,18 +566,18 @@ class NextN:
     self.enorm, self.hnorm, self.shared_head_norm = (nn.RMSNorm(config.dim, config.norm_eps) for _ in range(3))
 
   def _init_state(self, x:Tensor):
-    # hidden[:, p]: the hidden state before position p, 0 before the first token
+    # slot p%S: the hidden state before position p. a turn that restarts further back than the ring gets a stale one for its first draft
     if not hasattr(self, "hidden"):
-      self.hidden = Tensor.zeros(x.shape[0], self.config.max_context+1, self.config.dim, device=x.device).clone()
+      self.hidden = Tensor.zeros(self.config.spec_drafts+2, x.shape[0], 1, self.config.dim, device=x.device).clone()
 
   def hidden_before(self, x:Tensor, start_pos:int|UOp) -> Tensor:
     self._init_state(x)
-    return self.hidden[:, start_pos:start_pos+1]
+    return Tensor(start_pos).eq(0).where(0, self.hidden[start_pos % self.hidden.shape[0]])
 
-  def shift_in(self, h:Tensor, start_pos:int|UOp) -> Tensor:
-    self._init_state(h)
-    store = self.hidden[:, start_pos+1:start_pos+1+h.shape[1]].uop.store(h.uop)
-    return Tensor(self.hidden.uop.after(store))[:, start_pos:start_pos+h.shape[1]]
+  def store_hidden(self, h:Tensor, start_pos:int|UOp) -> Tensor:
+    S, T = self.hidden.shape[0], h.shape[1]
+    stores = [self.hidden[(start_pos+T-d) % S].uop.store(h[:, T-d-1:T-d].uop) for d in range(min(T, S-1) if isinstance(T, int) else 1)]
+    return Tensor(self.hidden.uop.after(*stores))
 
 class Transformer:
   def __init__(self, config:TransformerConfig):
@@ -608,7 +613,7 @@ class Transformer:
       for i in range(k):
         m = self.mtp.predict(self.token_embd(drafts[-1]).float() if i else x, m, start_pos+i)
         drafts.append(self.output(m).argmax(-1))
-      x = self.token_embd(tokens.to(x.device).cat(*drafts, dim=1)).float()
+      x = self.token_embd(tokens.to(x.device).cat(*drafts, dim=1)).float() # (1, k+1, D)
     emb = x
     if (hc:=self.config.hc) is not None: x = x.unsqueeze(2).expand(*x.shape[:2], hc.count, x.shape[-1]).contiguous()
     elif self.config.attn_res_block_size: x = x.unsqueeze(2)
@@ -622,10 +627,9 @@ class Transformer:
     # Gumbel-max trick: argmax(logits/temp - log(-log(uniform))) is equivalent to sampling from softmax(logits/temp)
     tok = (logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1)
     if not k: return tok
-    # the mtp cache needs every position
-    m = self.mtp.predict(emb, self.mtp.nextn.shift_in(hn, start_pos), start_pos)
-    # a value of the output is realized for the cache writes
-    return tok.to(x.device).cat(*drafts, dim=1).realize(m[:, :1, :1].contiguous())
+    out = tok.to(x.device).cat(*drafts, dim=1)
+    Tensor.realize(out, *self.mtp.extend(emb, hn, start_pos))
+    return out
 
   def __call__(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor, spec:bool=False) -> Tensor:
     jit = self.spec_jit if spec else self.prefill_jit if resolve(tokens.shape[1] != 1) else self.rollout_jit
