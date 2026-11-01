@@ -224,14 +224,14 @@ class TestTransformerGenerate(unittest.TestCase):
     model, calls = Transformer(replace(TEST_CONFIG, spec_drafts=2)), []
     # verified tokens then drafts: both drafts accepted, the second rejected, the first rejected, the second rejected
     steps = [[7, 8, 9, 7, 8], [10, 11, 12, 10, 5], [13, 14, 15, 6, 14], [16, 17, 18, 16, 5]]
-    def spec_jit(sampled, mtp_pos, temperature, accepted):
-      calls.append((sampled.tolist()[0], mtp_pos.unbind()[1], accepted.unbind()[1], temperature.item()))
+    def spec_jit(token, start_pos, temperature, spec):
+      calls.append((token.item(), start_pos.unbind()[1], temperature.item()))
       return Tensor([steps[len(calls)-1]])
     model.spec_jit, model.prefill_jit = spec_jit, lambda *_: Tensor([[6]])
     gen = model.generate([1, 2, 3], temperature=0.5)
     self.assertEqual([next(gen) for _ in range(9)], [6, 7, 8, 9, 10, 11, 13, 16, 17])
     gen.close()
-    self.assertEqual(calls, [([6, 0, 0], 3, 0, 0.5), ([7, 8, 9], 4, 2, 0.5), ([10, 11, 0], 7, 1, 0.5), ([13, 0, 0], 9, 0, 0.5)])
+    self.assertEqual(calls, [(6, 3, 0.5), (9, 6, 0.5), (11, 8, 0.5), (13, 9, 0.5)])
     self.assertEqual(model._cached_tokens, [1, 2, 3, 6, 7, 8, 9, 10, 11, 13, 16])
 
 if __name__ == '__main__':

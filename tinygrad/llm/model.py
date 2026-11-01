@@ -595,17 +595,17 @@ class Transformer:
     self.rollout_jit = TinyJit(self.forward)
     if config.spec_drafts: self.mtp, self.spec_jit = block_cls(replace(config, hc=None, nextn=True)), TinyJit(self.forward)
 
-  def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor, accepted:UOp|None=None) -> Tensor:
+  def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor, spec:bool=False) -> Tensor:
     x = self.token_embd(tokens.to(self.token_embd.weight.device)).float()  # (B, T, D)
-    k, emb = self.config.spec_drafts, x
+    k = self.config.spec_drafts
     drafts:list[Tensor] = []
-    if accepted is not None:
-      # a sum, not start_pos - accepted: hcq2 renders launch sizes with llvm, which has no SUB
-      mtp_pos, start_pos, m = start_pos, start_pos + accepted, self.mtp.nextn.read(x, start_pos, k+1)
+    if spec:
+      m = self.mtp.nextn.read(x, start_pos, 1)
       for i in range(k):
-        m = self.mtp.predict(self.token_embd(drafts[-1]).float(), m, start_pos+i) if i else self.mtp.predict(x, m, mtp_pos)[:, accepted:accepted+1]
+        m = self.mtp.predict(self.token_embd(drafts[-1]).float() if i else x, m, start_pos+i)
         drafts.append(self.output(m).argmax(-1))
-      x = self.token_embd(tokens[:, accepted:accepted+1].to(x.device).cat(*drafts, dim=1)).float()
+      x = self.token_embd(tokens.to(x.device).cat(*drafts, dim=1)).float()
+    emb = x
     if (hc:=self.config.hc) is not None: x = x.unsqueeze(2).expand(*x.shape[:2], hc.count, x.shape[-1]).contiguous()
     elif self.config.attn_res_block_size: x = x.unsqueeze(2)
     idx_mask = None
@@ -618,16 +618,14 @@ class Transformer:
     # Gumbel-max trick: argmax(logits/temp - log(-log(uniform))) is equivalent to sampling from softmax(logits/temp)
     tok = (logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1)
     if not k: return tok
-    # (1, 2k+1): the k+1 tokens sampled, then the k drafts
-    if drafts: return tok.to(x.device).cat(*drafts, dim=1).realize(self.mtp.nextn.write(hn, start_pos))
-    # the mtp cache needs every position before the ones it predicts
+    # the mtp cache takes the hidden states of the model at every position, the drafts that weren't accepted are overwritten by the next steps
     m = self.mtp.predict(emb, self.mtp.nextn.read(hn, start_pos, 1).cat(hn, dim=1)[:, :-1], start_pos)
-    # a column of the output is realized for the cache writes
-    return tok.realize(m[:, :1, :1].contiguous(), self.mtp.nextn.write(hn, start_pos))
+    # the tokens sampled, then the drafts. a value of the output is realized for the cache writes
+    return tok.to(x.device).cat(*drafts, dim=1).realize(m[:, :1, :1].contiguous(), self.mtp.nextn.write(hn, start_pos))
 
-  def __call__(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor, accepted:UOp|None=None) -> Tensor:
-    jit = self.spec_jit if accepted is not None else self.prefill_jit if resolve(tokens.shape[1] != 1) else self.rollout_jit
-    return jit(tokens.contiguous(), start_pos, temperature, accepted)
+  def __call__(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor, spec:bool=False) -> Tensor:
+    jit = self.spec_jit if spec else self.prefill_jit if resolve(tokens.shape[1] != 1) else self.rollout_jit
+    return jit(tokens.contiguous(), start_pos, temperature, spec)
 
   @staticmethod
   def from_gguf(gguf:Tensor|str|pathlib.Path, max_context:int|None=None,
@@ -842,21 +840,18 @@ class Transformer:
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
     v_toks = UOp.variable("toks", 1, chunk_size)
     k = self.config.spec_drafts
-    v_accepted = UOp.variable("accepted", 0, k)
     # TODO: use UOp.variable for temperature once float variables are supported
     temp = Tensor([temperature])
     # assign all input tokens once, then slice from start_pos for the model call
     t = Tensor(tokens + [0] * (self.max_context - len(tokens)), dtype="int32").reshape(1, self.max_context)
     # recompute start_pos from what's currently valid in the caches
     start_pos = self.get_start_pos(tokens)
-    out, prompt_len, accepted = None, len(tokens), 0
+    out, prompt_len = None, len(tokens)
     while len(tokens) < self.max_context:
       n_toks = min(chunk_size, len(tokens) - start_pos)
       sp, nt = v_start_pos.bind(start_pos), v_toks.bind(n_toks)
-      if spec:=k and prompt_len <= start_pos < self.max_context-k-1:
-        inp, sp = Tensor([tokens[-1-accepted:]+[0]*(k-accepted)]), v_start_pos.bind(start_pos-accepted)
-      else: inp = t[:, sp:sp+nt] if start_pos < prompt_len or out is None else Tensor([[tokens[-1]]]) if k else out
-      out = self(inp, sp, temp, accepted=v_accepted.bind(accepted) if spec else None).realize()
+      spec = k > 0 and prompt_len <= start_pos < self.max_context-k-1
+      out = self(t[:, sp:sp+nt] if start_pos < prompt_len or out is None else Tensor([[tokens[-1]]]) if k else out, sp, temp, spec=spec).realize()
       start_pos += n_toks
       # chunked prefill: keep processing until all prompt tokens are consumed
       if start_pos < len(tokens): continue
