@@ -12,7 +12,6 @@ on:
   push:
     branches:
       - master
-      - qwen4exp-min-debug
   pull_request:
   workflow_dispatch:
 
@@ -22,7 +21,6 @@ concurrency:
 
 jobs:
   docs:
-    if: false
     name: Docs
     runs-on: &linux ${{ github.repository == 'tinygrad/tinygrad' && github.event_name == 'pull_request' && github.event.pull_request.author_association == 'COLLABORATOR' && 'turin' || 'ubuntu-24.04' }}
     timeout-minutes: 10
@@ -63,7 +61,6 @@ jobs:
       run: DEBUG=100 python3 -c "from tinygrad import Tensor; N = 1024; a, b = Tensor.rand(N, N), Tensor.rand(N, N); c = (a.reshape(N, 1, N) * b.T.reshape(1, N, N)).sum(axis=2); print((c.numpy() - (a.numpy() @ b.numpy())).mean())"
 
   torchbackend:
-    if: false
     name: Torch Backend Tests
     runs-on: *linux
     timeout-minutes: 15
@@ -88,7 +85,6 @@ jobs:
       run: DEV=CPU:LLVM GPUS=4 TINY_BACKEND=1 python3 -m pytest -nauto extra/torch_backend/test.py extra/torch_backend/test_inplace.py extra/torch_backend/test_multigpu.py extra/torch_backend/test_kernel_fusion.py --durations=20
 
   torchbackendtrain:
-    if: false
     name: Torch Backend Training
     runs-on: *linux
     timeout-minutes: 15
@@ -106,7 +102,6 @@ jobs:
       run: STEPS=20 DEV=CPU TARGET_EVAL_ACC_PCT=90.0 MAX_BUFFER_SIZE=0 TINY_BACKEND=1 python3 examples/other_mnist/beautiful_mnist_torch.py
 
   bepython:
-    if: false
     name: Python Backend
     runs-on: *linux
     timeout-minutes: 15
@@ -146,7 +141,6 @@ jobs:
         DEBUG=2 DEV=PYTHON::sm_80 python3 ./test/null/test_uops_stats.py TestUOpsStatsMatmulHalf
 
   linter:
-    if: false
     name: Linters
     runs-on: *linux
     timeout-minutes: 10
@@ -178,7 +172,6 @@ jobs:
       run: CHECK_OOB=0 DEV=CPU TYPED=1 python test/test_tiny.py
 
   nulltest:
-    if: false
     name: Null Tests
     runs-on: *linux
     timeout-minutes: 15
@@ -213,7 +206,6 @@ jobs:
     #  run: DEV=NULL python3 examples/llama.py --gen 1 --size 7B --shard 4 --prompt "Hello." --count 3 --temperature 0 --timing
 
   unittest:
-    if: false
     name: Backend Tests (CPU)
     runs-on: *linux
     timeout-minutes: 15
@@ -245,7 +237,6 @@ jobs:
       run: MAX_LINE_COUNT=26500 python sz.py
 
   spec:
-    if: false
     strategy:
       fail-fast: false
       matrix:
@@ -266,7 +257,6 @@ jobs:
       run: DEV=CPU SPEC=2 pytest --maxfail=10 -n auto --durations=30 test/runtime test/device/cpu --splits 2 --group ${{ matrix.group }}
 
   fuzzing:
-    if: false
     name: Fuzzing
     runs-on: *linux
     timeout-minutes: 10
@@ -285,7 +275,6 @@ jobs:
         parallel --tagstring '[{}]' 'python test/external/fuzz_{}.py' ::: symbolic symbolic_div fast_idiv shape_ops
 
   testopenclimage:
-    if: false
     name: CL IMAGE Tests
     runs-on: *linux
     timeout-minutes: 15
@@ -306,7 +295,6 @@ jobs:
         uses: ./.github/actions/process-replay
 
   testopenpilot:
-    if: false
     name: openpilot compile tests
     env:
       LFS_SHA: "51b12d20a25b76fa8a5717c2e5af01f148e469e2"
@@ -352,7 +340,6 @@ jobs:
 # ****** ONNX Tests ******
 
   testonnxcpu:
-    if: false
     name: ONNX (CPU) Tests
     runs-on: *linux
     timeout-minutes: 20
@@ -372,7 +359,6 @@ jobs:
         uses: ./.github/actions/process-replay
 
   testoptim:
-    if: false
     name: Optimization Tests
     runs-on: *linux
     timeout-minutes: 20
@@ -408,10 +394,6 @@ jobs:
     name: Test LLM
     runs-on: *linux
     timeout-minutes: 15
-    strategy:
-      fail-fast: false
-      matrix:
-        attempt: [1, 2, 3, 4]
     env:
       CHECK_OOB: 0
       DEV: CPU
@@ -435,11 +417,15 @@ jobs:
                 $'echo "What\'s a male chicken called? Answer with only one word." | python3 -m tinygrad.llm --no_chat_template --model qwen3.5:0.8b | tee -a /dev/stderr | grep -i rooster' \
                 $'echo "What\'s a female chicken called? Answer with only one word." | python3 -m tinygrad.llm --no_chat_template --model qwen3:0.6b | tee -a /dev/stderr | grep -i hen'
                 # NOTE: qwen is dumb and only knows about female chickens
+      - name: Debug fp16 after
+        if: always()
+        env:
+          MAX_BUFFER_SIZE: 0
+        run: bash .github/debug_fp16/after.sh
 
 # ****** Models Tests ******
 
   testmodels:
-    if: false
     name: Models
     runs-on: *linux
     timeout-minutes: 15
@@ -460,7 +446,6 @@ jobs:
 # ****** Feature Tests ******
 
   testdsp:
-    if: false
     name: Linux (DSP)
     runs-on: *linux
     timeout-minutes: 15
@@ -478,7 +463,6 @@ jobs:
       run: MOCKDSP=1 DEV=DSP python -m pytest -n=auto test/test_tiny.py test/runtime/test_transcendental.py::TestTranscendentalVectorized test/device/dsp
 
   testlinux:
-    if: false
     strategy:
       fail-fast: false
       matrix:
@@ -516,7 +500,6 @@ jobs:
       uses: ./.github/actions/process-replay
 
   testamdasm:
-    if: false
     name: AMD ASM IDE
     runs-on: *linux
     timeout-minutes: 20
@@ -563,7 +546,6 @@ jobs:
         run: DEV=MOCKKFD+AMD:LLVM python test/device/amd/test_llvm.py
 
   testmockam:
-    if: false
     name: Linux (am)
     runs-on: *linux
     timeout-minutes: 15
@@ -597,7 +579,6 @@ jobs:
         run: DEV=MOCK+HIP python -m pytest -n=auto test/test_tiny.py test/runtime/test_jit.py test/runtime/test_hcq2.py test/runtime/test_dtype.py
 
   testamd:
-    if: false
     strategy:
       fail-fast: false
       matrix:
@@ -638,7 +619,6 @@ jobs:
         uses: ./.github/actions/process-replay
 
   testamdmxfp4:
-    if: false
     name: AMD MXFP4 Llama
     runs-on: *linux
     timeout-minutes: 15
@@ -657,7 +637,6 @@ jobs:
         run: MXFP4=1 LLAMA_LAYERS=2 BENCHMARK=3 NULL_ALLOW_COPYOUT=1 NO_HIPCC=1 ROCM_PATH=/opt/rocm JITBEAM=0 examples/mlperf/training_submission_v6.0/tinycorp/benchmarks/llama31_8b/implementations/tinybox_8xMI350X/profile.sh
 
   testnvidia:
-    if: false
     strategy:
       fail-fast: false
       matrix:
@@ -699,7 +678,6 @@ jobs:
 # ****** Compile-only Tests ******
 
   compiletests:
-    if: false
     strategy:
       fail-fast: false
       matrix:
