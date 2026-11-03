@@ -699,19 +699,22 @@ class TestSchedule(unittest.TestCase):
     xt = X[[Tensor([2]), Tensor([1])]]
     check_schedule(xt, 1)
 
-  def test_split_advanced_indexing_not_recomputed(self):
+  def test_advanced_indexing_not_split(self):
     with Context(SPLIT_REDUCEOP=1):
       X = Tensor.empty(32768, 4).realize()
-      idx = Tensor.randint(4, high=X.shape[0])
-      linear, _ = check_schedule(X[idx], 3, [Tensor._device_rng_counters[idx.device]])
-      # The split's final reduction remains, but the one-hot gather should collapse into a direct indexed load.
-      reduce_kernels = 0
-      for call in linear.src:
-        if call.src[0].op is not Ops.SINK: continue
-        sink = full_rewrite_to_sink(call.src[0], Device[call.device].renderer)
-        # a reduce kernel is identified by a STORE into a REG buffer (STORE has void dtype, check the addrspace of its target)
-        reduce_kernels += any(u.op is Ops.STORE and u.src[0].addrspace is AddrSpace.REG and u.ranges for u in sink.toposort())
-      self.assertEqual(reduce_kernels, 1)
+      emb = nn.Embedding(*X.shape)
+      emb.weight = X
+      for gather in (X.__getitem__, emb):
+        idx = Tensor.randint(4, high=X.shape[0])
+        linear, _ = check_schedule(gather(idx), 2, [Tensor._device_rng_counters[idx.device]])
+        # The one-hot gather is not split, it collapses into a direct indexed load with no reduce left.
+        reduce_kernels = 0
+        for call in linear.src:
+          if call.src[0].op is not Ops.SINK: continue
+          sink = full_rewrite_to_sink(call.src[0], Device[call.device].renderer)
+          # a reduce kernel is identified by a STORE into a REG buffer (STORE has void dtype, check the addrspace of its target)
+          reduce_kernels += any(u.op is Ops.STORE and u.src[0].addrspace is AddrSpace.REG and u.ranges for u in sink.toposort())
+        self.assertEqual(reduce_kernels, 0)
 
   def test_push_through_reshape(self):
     x = Tensor.empty(10, 20).realize()

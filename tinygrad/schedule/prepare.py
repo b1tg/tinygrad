@@ -92,6 +92,8 @@ pm_mops = PatternMatcher([
 def split_reduceop(reduce:UOp, x:UOp):
   if prod(reduce.shape) == 0: return None
   if not SPLIT_REDUCEOP or not all_int(x.shape) or prod(x.shape[:reduce.arg[1]])<getenv("REDUCEOP_SPLIT_THRESHOLD", 32768): return None
+  # a one-hot gather (idx == arange).where(val, 0) collapses to a load, splitting it would keep the reduce
+  if (u:=x.base).op is Ops.WHERE and u.src[0].base.op is Ops.CMPEQ and u.src[2].op is Ops.CONST and u.src[2].arg == 0: return None
   # if there are few globals, make some reduces into globals by splitting into two kernels
   # cap output buffer to 2**22: heuristic number of global outputs to achieve max occupancy with enough locals+upcasts for gemm
   #   ~2**10 should be enough if GROUP is used
