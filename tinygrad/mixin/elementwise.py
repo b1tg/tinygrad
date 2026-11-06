@@ -419,8 +419,11 @@ class ElementwiseMixin(CreationMixin):
     Calculates (self.exp()+other.exp()).log(), elementwise.
     """
     a, b = self._broadcasted(other)
-    m = (mx:=a.maximum(b)).isfinite().where(mx, 0)
-    return ((a-m).exp() + (b-m).exp()).log() + m
+    mx = a.maximum(b)
+    t = (a.minimum(b) - mx).exp()
+    # max + log(1+t), but 1+t rounds away small t, so log(1+t) = 2*atanh(s) = 2*(s + s^3/3 + ...) with s = t/(2+t) <= 1/3
+    s = t / (t + 2)
+    return mx.isfinite().where(mx + 2 * s * polyN(s.square(), [1/11, 1/9, 1/7, 1/5, 1/3, 1]), mx)
 
   def where(self, x: 'Self | ConstType | sint', y: 'Self | ConstType | sint') -> Self:
     """
@@ -837,23 +840,6 @@ class ElementwiseMixin(CreationMixin):
     """
     return self.log2()*math.log(2)
 
-  def log1p(self) -> Self:
-    """
-    Computes `log(1+x)` element-wise, without losing the precision of small `x`.
-
-    See: https://en.wikipedia.org/wiki/Natural_logarithm#Series
-
-    ```python exec="true" source="above" session="tensor" result="python"
-    print(Tensor([-0.5, 1e-10, 1., 3.]).log1p().numpy())
-    ```
-    """
-    # 1+x rounds away small x, there use the series log(1+x) = 2*atanh(s) = 2*(s + s^3/3 + s^5/5 + ...), s = x/(2+x)
-    # large x are zeroed in the series to keep the unused branch (and its gradient) finite
-    small = self.abs() < 0.2
-    x = small.where(self, 0)
-    s = x / (x + 2)
-    return small.where(2 * s * polyN(s.square(), [1/7, 1/5, 1/3, 1]), (self + 1).log())
-
   def log10(self) -> Self:
     """
     Computes the base-10 logarithm element-wise.
@@ -1020,9 +1006,7 @@ class ElementwiseMixin(CreationMixin):
     print(Tensor([-3., -2., -1., 0., 1., 2., 3.]).softplus().numpy())
     ```
     """
-    x = self*beta
-    # max(x,0) + log1p(exp(-|x|)), -|x| as min-max to get the gradient 0.5 at 0
-    return (1/beta) * (x.maximum(0) + (x.minimum(0) - x.maximum(0)).exp().log1p())
+    return (1/beta) * (self*beta).logaddexp(0.0)
 
   def mish(self) -> Self:
     """

@@ -5,7 +5,6 @@ Elementwise ops operate on a per element basis. They don't change the shape of t
 ::: tinygrad.Tensor.logical_not
 ::: tinygrad.Tensor.neg
 ::: tinygrad.Tensor.log
-::: tinygrad.Tensor.log1p
 ::: tinygrad.Tensor.log2
 ::: tinygrad.Tensor.log10
 ::: tinygrad.Tensor.exp
