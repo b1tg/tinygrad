@@ -113,14 +113,20 @@ class HCConfig:  # manifold-constrained hyper-connections: count residual stream
   delayed: bool = False  # a sublayer gets the pre mix of the hyper-connection before it
 
 @dataclass(frozen=True)
-class PLEConfig:  # qwen4exp n-gram embeddings: hashed rows of a packed host-side table, mixed into the streams of one layer
-  layer: int
+class PLEConfig:  # n-gram embeddings: hashed rows of a packed host-side table, mixed into the streams of some layers
+  layers: tuple[int, ...]
   head_dim: int
-  multipliers: tuple[int, ...]  # per n-gram position
-  vocab_sizes: tuple[int, ...]  # per head: the bigram heads, then the trigram heads
+  multipliers: tuple[int, ...]  # per layer and n-gram position
+  vocab_sizes: tuple[int, ...]  # per layer and head: the bigram heads, then the trigram heads, ...
   offsets: tuple[int, ...]
   eos: int
-  conv_kernel: int
+  conv_kernel: int  # 0: no conv, one projection gives the key and the value (deepseek41)
+  token_map: tuple[int, ...] = ()  # deepseek41: the tokens that normalize alike map to one id
+
+  def layer(self, i:int) -> PLEConfig:  # the PLE of layer i
+    j, n = self.layers.index(i), len(self.layers)
+    def part(t:tuple[int, ...]) -> tuple[int, ...]: return t[j*len(t)//n:(j+1)*len(t)//n]
+    return replace(self, layers=(i,), multipliers=part(self.multipliers), vocab_sizes=part(self.vocab_sizes), offsets=part(self.offsets))
 
 @dataclass(frozen=True)
 class IndexerConfig:  # select top_k tokens by scoring individual keys or pools of kpool keys
@@ -133,16 +139,6 @@ class IndexerConfig:  # select top_k tokens by scoring individual keys or pools 
   rope_interleave: bool = True
   msa: bool = False
   qsa: bool = False
-
-@dataclass(frozen=True)
-class EngramConfig:  # each (n-gram size, head) of a layer hashes the n-grams ending at a token into its own prime sized range of one table
-  layers: tuple[int, ...]
-  ngram_size: int
-  heads: int
-  dim: int
-  # token map (tokens that normalize alike map to one id), multipliers per (layer, n-gram token), prime sizes and offsets per (layer, n-gram, head)
-  tables: tuple[tuple[int, ...], ...]
-  pad: int
 
 @dataclass(frozen=True)
 class TransformerConfig:
@@ -198,7 +194,6 @@ class TransformerConfig:
   compress_rope_theta: float = 0.0
   o_groups: int = 0
   o_lora_rank: int = 0
-  engram: EngramConfig|None = None
 
 class AttentionResidual:
   def __init__(self, config:TransformerConfig, new_block:bool=False):
@@ -433,17 +428,22 @@ class TransformerBlock(FFNBlock):
                                             device=x.device, yarn=self.config.yarn)
     if self.indexer: self.indexer._init_state(x)
 
-class PLELayer:  # qwen4exp: each stream gates the n-gram row values by their normed key-query score, plus a causal conv dilated by the n-gram size
+class PLELayer:  # each stream gates the n-gram row values by their normed key-query score, qwen4exp adds a causal conv dilated by the n-gram size
   def __init__(self, config:TransformerConfig):
     self.table: GGUFPackedTable  # the packed n-grams in host RAM, set by from_gguf
     self.ple, self.count, self.dim = unwrap(config.ple), unwrap(config.hc).count, config.dim
     self.max_context, self.hist, width = config.max_context, (self.ple.conv_kernel - 1) * len(self.ple.multipliers), self.count * config.dim
-    self.key, self.value = Linear(config.dim, width, bias=False), Linear(config.dim, config.dim, bias=False)
-    self.norm_key, self.norm_query, self.norm_conv = (StreamNorm(self.count, self.dim, config.norm_eps) for _ in range(3))
-    self.conv1d = {"weight": Tensor.zeros(width, self.ple.conv_kernel)}
+    self.norm_key, rows = StreamNorm(self.count, self.dim, config.norm_eps), len(self.ple.vocab_sizes) * self.ple.head_dim
+    if self.ple.conv_kernel:
+      self.key, self.value = Linear(rows, width, bias=False), Linear(rows, config.dim, bias=False)
+      self.norm_query: Callable[[Tensor], Tensor] = StreamNorm(self.count, self.dim, config.norm_eps)
+      self.norm_conv = StreamNorm(self.count, self.dim, config.norm_eps)
+      self.conv1d = {"weight": Tensor.zeros(width, self.ple.conv_kernel)}
+    else: self.kv, self.norm_query = Linear(rows, width + config.dim, bias=False), lambda x: x.rmsnorm(eps=config.norm_eps)
 
   def _init_state(self, x:Tensor):
-    if not hasattr(self, "conv_state"): self.conv_state = Tensor.zeros(x.shape[0], self.hist, self.count*self.dim, device=x.device).clone()
+    if self.ple.conv_kernel and not hasattr(self, "conv_state"):
+      self.conv_state = Tensor.zeros(x.shape[0], self.hist, self.count*self.dim, device=x.device).clone()
 
   def write_rows(self, tokens:list[int], start_pos:int, n_toks:int, chunk_size:int):
     # hash the n-grams ending at each token (t0*m0 ^ t1*m1 ^ ..., EOS before the start or an EOS) and copy their table rows to host RAM
@@ -451,6 +451,7 @@ class PLELayer:  # qwen4exp: each stream gates the n-gram row values by their no
     per_gram = len(ple.vocab_sizes) // (n-1)  # the bigram heads, then the trigram heads
     for p in range(start_pos, start_pos+n_toks):
       ctx = [ple.eos if p < i or ple.eos in tokens[p-i:p] else tokens[p-i] for i in range(n)]
+      if ple.token_map: ctx = [ple.token_map[c] for c in ctx]
       hashes = list(itertools.accumulate((c*m for c,m in zip(ctx, ple.multipliers)), lambda a,b: a^b))[1:]
       ids.append([hashes[j//per_gram] % v + o for j,(v,o) in enumerate(zip(ple.vocab_sizes, ple.offsets))])
     self.table.write(start_pos, ids, self.max_context+chunk_size)
@@ -458,8 +459,10 @@ class PLELayer:  # qwen4exp: each stream gates the n-gram row values by their no
   def __call__(self, x:Tensor, start_pos:int|UOp) -> Tensor:
     (B, T), T_pad, n = x.shape[:2], x.max_shape[1], len(self.ple.multipliers)
     emb = self.table.read(start_pos, T_pad, x.device).reshape(B, T_pad, -1)[:, :T].float()
-    s = (self.norm_key(self.key(emb).unflatten(-1, (self.count, self.dim))) * self.norm_query(x)).sum(-1, keepdim=True) * self.dim**-0.5
-    gated = self.value(emb).unsqueeze(2) * (s.sign() * s.abs().clamp(min_=1e-6).sqrt()).sigmoid()
+    k, v = (self.key(emb), self.value(emb)) if self.ple.conv_kernel else self.kv(emb).split([self.count*self.dim, self.dim], dim=-1)
+    s = (self.norm_key(k.unflatten(-1, (self.count, self.dim))) * self.norm_query(x)).sum(-1, keepdim=True) * self.dim**-0.5
+    gated = v.unsqueeze(2) * (s.sign() * s.abs().clamp(min_=1e-6).sqrt()).sigmoid()
+    if not self.ple.conv_kernel: return gated
     conv, store = short_conv(self.conv_state, self.norm_conv(gated).flatten(2), self.conv1d["weight"], Tensor(start_pos).eq(0), n)
     return Tensor((gated + conv[:, :T].unflatten(-1, (self.count, self.dim))).contiguous().uop.after(store))
 
@@ -617,16 +620,6 @@ class CompressedAttentionBlock(MLATransformerBlock):
       self.attn_compressor_kv = {"weight": Tensor.zeros(config.head_dim, config.dim)}
       self.attn_compressor_norm = nn.RMSNorm(config.head_dim, config.norm_eps)
       if ratio > 1: self.attn_compressor_gate = {"weight": Tensor.zeros(config.head_dim, config.dim)}
-    if (eg:=config.engram) is not None:
-      self.engram_gate = {"weight": Tensor.zeros(unwrap(config.hc).count, config.dim)}
-      self.engram_kv = Linear((eg.ngram_size - 1) * eg.heads * eg.dim, config.dim * (unwrap(config.hc).count + 1), bias=False)
-
-  def engram(self, x:Tensor, rows:Tensor) -> Tensor:
-    # the n-gram rows give a key per stream and a shared value, added by how well the key matches the stream
-    hc, dim, eps = unwrap(self.config.hc).count, self.config.dim, self.config.norm_eps
-    key, value = self.engram_kv(rows.flatten(-2).to(x.device)).split([hc * dim, dim], dim=-1)
-    dot = (x.rmsnorm(eps=eps) * key.reshape(*key.shape[:-1], hc, dim).rmsnorm(eps=eps) * self.engram_gate["weight"]).sum(-1) * dim**-0.5
-    return x + (dot.sign() * dot.abs().maximum(1e-6).sqrt()).sigmoid().unsqueeze(-1) * value.unsqueeze(2)
 
   def _rope(self, x:Tensor, freqs:Tensor) -> Tensor:
     # rotate the adjacent pairs of the last rope_dim features
@@ -772,7 +765,6 @@ class GatedDeltaNetBlock(FFNBlock):
                                           axis=1 if kda else None).clone()
 
 class Transformer:
-  per_layer_token_embd: Tensor  # the engram table, it stays on the CPU
   def __init__(self, config:TransformerConfig):
     dense_config = replace(config, num_experts=0, num_experts_per_tok=0, shared_expert_dim=0, hidden_dim=config.dense_hidden_dim or config.hidden_dim)
     if config.ssm: config = replace(config, qk_norm=config.head_dim)
@@ -784,8 +776,7 @@ class Transformer:
       if config.sliding_window_pattern != 0 and (i+1) % config.sliding_window_pattern == 0: c = replace(c, sliding_window=0)
       if config.indexer_shared and config.indexer_shared[i]: c = replace(c, indexer=None)
       if config.attn_res_block_size and i % config.attn_res_block_size == 0: c = replace(c, attn_res_new_block=True)
-      if config.ple and i != config.ple.layer: c = replace(c, ple=None)
-      if config.engram is not None and i not in config.engram.layers: c = replace(c, engram=None)
+      if config.ple: c = replace(c, ple=config.ple.layer(i) if i in config.ple.layers else None)
       if config.compress_ratios:
         src = max((s for s in config.kv_sources if s <= i), default=i)
         self.blk.append(CompressedAttentionBlock(c, config.compress_ratios[i], cast(CompressedAttentionBlock, self.blk[src]) if src < i else None))
@@ -806,12 +797,9 @@ class Transformer:
     x = self.token_embd(tokens.to(self.token_embd.weight.device)).float()  # (B, T, D)
     if (hc:=self.config.hc) is not None: x = x.unsqueeze(2).expand(*x.shape[:2], hc.count, x.shape[-1]).contiguous()
     elif self.config.attn_res_block_size: x = x.unsqueeze(2)
-    if (eg:=self.config.engram) is not None: rows = self._engram_rows(tokens, start_pos)
     # the streams start as copies of the embedding
     idx_mask, pre = None, x[..., 0].full_like(1 / hc.count) if hc is not None and hc.delayed else None
-    for i, block in enumerate(self.blk):
-      if eg is not None and i in eg.layers: x = cast(CompressedAttentionBlock, block).engram(x, rows[:, :, eg.layers.index(i)])
-      x, idx_mask, pre = block(x, start_pos, idx_mask, pre)
+    for block in self.blk: x, idx_mask, pre = block(x, start_pos, idx_mask, pre)
     if pre is not None: x = (x * pre.unsqueeze(-1)).sum(2)
     elif hc is not None: x = self.output_hc.mix(x)[0] if hc.low_rank else x.mean(2)
     elif self.config.attn_res_block_size: x = self.output_res_score.mix(x)
@@ -819,19 +807,6 @@ class Transformer:
     logits = self.output(self.output_norm(x[:, -1:]))[:, -1, :].to(tokens.device)
     # Gumbel-max trick: argmax(logits/temp - log(-log(uniform))) is equivalent to sampling from softmax(logits/temp)
     return (logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1, keepdim=True)
-
-  def _engram_rows(self, tokens:Tensor, start_pos:int|UOp) -> Tensor:
-    # (B, T, layers, (ngram_size-1)*heads, dim) table rows of the n-grams ending at each token, the table is on the CPU
-    (B, T), eg = tokens.shape, unwrap(self.config.engram)
-    L, n = len(eg.layers), eg.ngram_size
-    if not hasattr(self, "engram_cache"):
-      self.engram_cache = Tensor.full((B, self.max_context+n-1), eg.pad, dtype=dtypes.int64, device="CPU").contiguous()
-      self.engram_tables = [Tensor(t, dtype=dtypes.int64, device="CPU") for t in eg.tables]
-    token_map, mult, primes, offsets = self.engram_tables
-    toks = cache_store(self.engram_cache, start_pos+n-1, token_map[tokens.to("CPU")], 1)[:, start_pos:start_pos+n-1+T]
-    # xor the tokens times their multiplier, after j+1 tokens it hashes the (j+1)-gram
-    hashes = list(itertools.accumulate((toks[:, n-1-j:n-1-j+T].unsqueeze(-1) * mult.reshape(L, n)[:, j] for j in range(n)), lambda a, b: a ^ b))[1:]
-    return self.per_layer_token_embd[(Tensor.stack(*hashes, dim=-1).unsqueeze(-1) % primes.reshape(L, n-1, -1)).flatten(-2) + offsets.reshape(L, -1)]
 
   def __call__(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
     return (self.prefill_jit if resolve(tokens.shape[1] != 1) else self.rollout_jit)(tokens.contiguous(), start_pos, temperature)
@@ -863,8 +838,6 @@ class Transformer:
       shard_map = {name: rules[k] for name in entries if (k:=re.sub(r"^blk\.\d+\.", "", name)) in rules}
     devices = tuple(Device.canonicalize(f'{Device.DEFAULT}:{i}') for i in range(shard))
     ep = any(shape[-1] % (shard*_GGML_QUANT.get(typ, (1,))[0]) for k,(_,shape,typ) in entries.items() if 'ffn_down_exps.' in k)
-    # the engram table is too big for the GPUs, it stays on the CPU
-    engram_table = gguf_shard({'t': ple_entry}, ("CPU",))['t'] if ple_entry and arch == 'deepseek41' else None
     state_dict = gguf_shard(entries, devices, {k: 0 if ep and '_exps.' in k else v for k,v in shard_map.items()}, repeats)
 
     # all state items should be float16, not float32
@@ -877,7 +850,10 @@ class Transformer:
                     kv.get(f'{arch}.hyper_connection.epsilon', 0.0), kv.get(f'{arch}.hyper_connection.low_rank', 0), arch == 'deepseek41')
       state_dict = {re.sub(r'(hc_attn|hc_ffn|output_hc|\.ple)_', r'\1.', k):v for k,v in state_dict.items()}
     else: hc = None
-    if arch == 'deepseek41': state_dict = {k.replace('.attn_kv.', '.attn_kv_a_mqa.'):v for k,v in state_dict.items()}
+    if arch == 'deepseek41':
+      # the engram is the PLE, its gate weighs the normed key of each stream
+      state_dict = {k.replace('.attn_kv.', '.attn_kv_a_mqa.').replace('.engram_kv.', '.ple.kv.').replace('.engram_gate.', '.ple.norm_key.'):
+                    v.flatten() if '.engram_gate.' in k else v for k,v in state_dict.items()}
 
     # an indexer pools kpool keys of its own, or scores the compressed kv in the source layers and shares the pick with the layers after
     sources = kv.get(f'{arch}.attention.indexer.source_layers')
@@ -892,11 +868,6 @@ class Transformer:
       indexer = replace(unwrap(indexer), rope_dim=kv[f'{arch}.rope.dimension_count'], rope_interleave=False, msa=arch == 'minimax-m3',
                         qsa=arch == 'qwen4exp', top_k=kv[f'{arch}.attention.indexer.top_k'] * kv.get(f'{arch}.attention.indexer.block_size', 1))
       state_dict = {k.replace('.indexer.q_proj', '.indexer.attn_q_b').replace('.indexer.k_proj', '.indexer.attn_k'):v for k,v in state_dict.items()}
-
-    engram = EngramConfig(tuple(kv[f'{arch}.ple.layers']), kv[f'{arch}.ple.ngram_size'], kv[f'{arch}.ple.heads_per_ngram'],
-      kv[f'{arch}.embedding_length_per_layer_input'], tuple(tuple(kv[f'{arch}.{k}']) for k in
-      ('engram.token_map', 'ple.layer_multipliers', 'ple.head_vocab_sizes', 'ple.head_offsets')),
-      kv[f'{arch}.engram.token_map'][kv[f'{arch}.engram.pad_token_id']]) if engram_table is not None else None
 
     max_context = min(max_context, kv[f'{arch}.context_length']) if max_context is not None else kv[f'{arch}.context_length']
 
@@ -968,16 +939,18 @@ class Transformer:
       swiglu_up_bias=1.0 if swiglu_oai else 0.0, attn_sinks='blk.0.attn_sinks.weight' in state_dict,
       sliding_window=kv.get(f'{arch}.attention.sliding_window', 0),
       sliding_window_pattern=kv.get(f'{arch}.attention.sliding_window_pattern', 2 if arch == 'gpt-oss' else 0), hc=hc, indexer=indexer,
-      ple=PLEConfig(kv[f'{arch}.ple.layers'][0], ple_entry[1][1], tuple(kv[f'{arch}.ple.layer_multipliers']),
-                    tuple(kv[f'{arch}.ple.head_vocab_sizes']), tuple(kv[f'{arch}.ple.head_offsets']), kv[f'{arch}.ple.eos_token_id'],
-                    kv[f'{arch}.ple.conv_kernel']) if ple_entry and arch == 'qwen4exp' else None,
+      # deepseek41 n-grams start after its pad token, which never shows up in a prompt
+      ple=PLEConfig(tuple(kv[f'{arch}.ple.layers']), ple_entry[1][1], tuple(kv[f'{arch}.ple.layer_multipliers']),
+                    tuple(kv[f'{arch}.ple.head_vocab_sizes']), tuple(kv[f'{arch}.ple.head_offsets']),
+                    kv[f'{arch}.ple.eos_token_id' if arch == 'qwen4exp' else f'{arch}.engram.pad_token_id'], kv.get(f'{arch}.ple.conv_kernel', 0),
+                    tuple(kv.get(f'{arch}.engram.token_map', ()))) if ple_entry else None,
       expert_latent_dim=kv.get(f'{arch}.expert_latent_length', 0), attn_res_block_size=kv.get(f'{arch}.attn_res.block_size', 0),
       situ=(kv[f'{arch}.activation.situ_beta'], kv[f'{arch}.activation.situ_linear_beta']) if f'{arch}.activation.situ_beta' in kv else None,
       indexer_shared=tuple(i not in sources for i in range(num_blocks)) if sources else (),
       compress_ratios=tuple(kv[f'{arch}.attention.compress_ratios']) if arch == 'deepseek41' else (),
       kv_sources=tuple(kv.get(f'{arch}.attention.kv_source_layers', ())),
       compress_rope_theta=kv.get(f'{arch}.attention.compress_rope_freq_base', 0.0), o_groups=kv.get(f'{arch}.attention.output_group_count', 0),
-      o_lora_rank=kv.get(f'{arch}.attention.output_lora_rank', 0), engram=engram)
+      o_lora_rank=kv.get(f'{arch}.attention.output_lora_rank', 0))
     model = Transformer(config)
     for p in (nn.state.get_parameters(model) if shard > 1 else []): p.to_(devices)
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
@@ -985,8 +958,9 @@ class Transformer:
     if realize:
       for s in (params:=nn.state.get_parameters(model)): s.replace(s.contiguous())
       Tensor.realize(*params)
-    if engram_table is not None: model.per_layer_token_embd = engram_table.cast('float16')
-    if config.ple is not None: model.blk[config.ple.layer].ple.table = GGUFPackedTable(unwrap(ple_entry))
+    if config.ple is not None:
+      entry = (unwrap(ple_entry)[0].to("CPU").realize(), *unwrap(ple_entry)[1:])  # one copy in host RAM for the tables of all layers
+      for i in config.ple.layers: model.blk[i].ple.table = GGUFPackedTable(entry)
     return model, kv
 
   @staticmethod
@@ -1092,7 +1066,7 @@ class Transformer:
     out, prompt_len = None, len(tokens)
     while len(tokens) < self.max_context:
       n_toks = min(chunk_size, len(tokens) - start_pos)
-      if self.config.ple: self.blk[self.config.ple.layer].ple.write_rows(tokens, start_pos, n_toks, chunk_size)
+      for i in self.config.ple.layers if self.config.ple else (): self.blk[i].ple.write_rows(tokens, start_pos, n_toks, chunk_size)
       sp, nt = v_start_pos.bind(start_pos), v_toks.bind(n_toks)
       out = self(t[:, sp:sp+nt] if start_pos < prompt_len or out is None else out, sp, temp).realize()
       start_pos += n_toks
