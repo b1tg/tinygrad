@@ -4,7 +4,7 @@ from dataclasses import dataclass, replace
 from typing import Callable, cast
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
 from tinygrad.llm.kernels.amd import Linear, ExpertWeights, fp8_matmul, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
-from tinygrad.llm.gguf import gguf_parse, gguf_shard, _GGML_QUANT
+from tinygrad.llm.gguf import gguf_parse, gguf_shard, GGUFPackedTable, _GGML_QUANT
 from tinygrad.llm.hf import hf_load
 from tinygrad.uop.ops import resolve
 from tinygrad.helpers import unwrap, round_up, get_child
@@ -109,7 +109,18 @@ class HCConfig:  # manifold-constrained hyper-connections: count residual stream
   count: int
   sinkhorn_iters: int
   eps: float
+  low_rank: int = 0  # qwen4exp: the streams are mixed by a sigmoid gated low-rank projection instead (GatedResidual)
   delayed: bool = False  # a sublayer gets the pre mix of the hyper-connection before it
+
+@dataclass(frozen=True)
+class PLEConfig:  # qwen4exp n-gram embeddings: hashed rows of a packed host-side table, mixed into the streams of one layer
+  layer: int
+  head_dim: int
+  multipliers: tuple[int, ...]  # per n-gram position
+  vocab_sizes: tuple[int, ...]  # per head: the bigram heads, then the trigram heads
+  offsets: tuple[int, ...]
+  eos: int
+  conv_kernel: int
 
 @dataclass(frozen=True)
 class IndexerConfig:  # select top_k tokens by scoring individual keys or pools of kpool keys
@@ -121,6 +132,7 @@ class IndexerConfig:  # select top_k tokens by scoring individual keys or pools 
   rope_dim: int = 0
   rope_interleave: bool = True
   msa: bool = False
+  qsa: bool = False
 
 @dataclass(frozen=True)
 class EngramConfig:  # each (n-gram size, head) of a layer hashes the n-grams ending at a token into its own prime sized range of one table
@@ -174,6 +186,7 @@ class TransformerConfig:
   sliding_window_pattern: int = 0
   hc: HCConfig|None = None
   indexer: IndexerConfig|None = None
+  ple: PLEConfig|None = None
   indexer_shared: tuple[bool, ...] = ()
   rope_interleave: bool = False
   expert_latent_dim: int = 0
@@ -206,7 +219,7 @@ class HyperConnection:
     self.fn = Linear(self.count * config.dim, (2 + self.count) * self.count, bias=False)
     self.base, self.scale = {"weight": Tensor.zeros((2 + self.count) * self.count)}, {"weight": Tensor.zeros(3)}
 
-  def mix(self, xs:Tensor) -> tuple[Tensor, Tensor, Tensor]:
+  def weights(self, xs:Tensor) -> tuple[Tensor, Tensor, Tensor]:
     base, scale, mix = self.base["weight"], self.scale["weight"], self.fn(xs.flatten(2).rmsnorm(eps=self.norm_eps))
     pre  = (mix[..., :self.count] * scale[0] + base[:self.count]).sigmoid() + self.eps
     post = (mix[..., self.count:2*self.count] * scale[1] + base[self.count:2*self.count]).sigmoid() * 2
@@ -215,20 +228,47 @@ class HyperConnection:
     for i in range(2 * self.iters - 1): comb = comb / (comb.sum(-1 if i % 2 else -2, keepdim=True) + self.eps)
     return pre, post, comb
 
-  def __call__(self, xs:Tensor, sublayer:Callable[[Tensor], tuple[Tensor, Tensor|None]], pre:Tensor|None=None) -> tuple[Tensor, Tensor|None]:
+  def __call__(self, xs:Tensor, sublayer:Callable[[Tensor], tuple[Tensor, Tensor|None]]) -> tuple[Tensor, Tensor|None]:
+    return self.apply(xs, sublayer)
+
+  def apply(self, xs:Tensor, sublayer:Callable[[Tensor], tuple[Tensor, Tensor|None]], pre:Tensor|None=None) -> tuple[Tensor, Tensor|None]:
     """mHC: the sublayer sees a pre-weighted sum of the (B, T, hc, D) streams, its output is added back by post onto the streams mixed by comb"""
-    own, post, comb = self.mix(xs)
+    own, post, comb = self.weights(xs)
     out, aux = sublayer((xs * (own if pre is None else pre).unsqueeze(-1)).sum(2))
     return out.unsqueeze(2) * post.unsqueeze(-1) + (comb.transpose(-1, -2) @ xs), aux
+
+class StreamNorm:  # rmsnorm of each stream (..., count, dim), the weight is (count*dim,)
+  def __init__(self, count:int, dim:int, eps:float): self.weight, self.eps = Tensor.zeros(count*dim), eps
+  def __call__(self, x:Tensor) -> Tensor: return x.rmsnorm(eps=self.eps) * self.weight.reshape(x.shape[-2:])
+
+class GatedResidual(HyperConnection):
+  def __init__(self, config:TransformerConfig, inject:bool=True):
+    self.count, self.dim, low_rank = (hc:=unwrap(config.hc)).count, config.dim, hc.low_rank
+    self.norm = StreamNorm(self.count, self.dim, config.norm_eps)
+    self.down, self.up = Linear(self.count*self.dim, low_rank, bias=False), Linear(low_rank, self.count*self.dim, bias=False)
+    if inject: self.inject = Linear(self.count*self.dim, self.count, bias=False)
+
+  def mix(self, xs:Tensor) -> tuple[Tensor, Tensor]:
+    xn = self.norm(xs).flatten(2)
+    return (self.up((self.down(xn) / self.count).silu()).sigmoid() * xn).unflatten(-1, (self.count, self.dim)).mean(2), xn
+
+  def __call__(self, xs:Tensor, sublayer:Callable[[Tensor], tuple[Tensor, Tensor|None]]) -> tuple[Tensor, Tensor|None]:
+    mixed, xn = self.mix(xs)
+    out, aux = sublayer(mixed)
+    return xs + out.unsqueeze(2) * (self.inject(xn) / self.count).sigmoid().unsqueeze(-1) * 2, aux
 
 class FFNBlock:
   def __init__(self, config:TransformerConfig):
     self.config = config
 
     # --- RMSNorms --------------------------------------------------------
-    self.attn_norm   = nn.RMSNorm(config.dim, config.norm_eps)
-    self.ffn_norm    = nn.RMSNorm(config.dim, config.norm_eps)
-    if config.hc is not None: self.hc_attn, self.hc_ffn = HyperConnection(config), HyperConnection(config)
+    self.attn_norm: Callable[[Tensor], Tensor] = nn.RMSNorm(config.dim, config.norm_eps)
+    self.ffn_norm:  Callable[[Tensor], Tensor] = nn.RMSNorm(config.dim, config.norm_eps)
+    if config.hc is not None:
+      hc = GatedResidual if config.hc.low_rank else HyperConnection
+      self.hc_attn, self.hc_ffn = hc(config), hc(config)
+      if config.hc.low_rank: self.attn_norm = self.ffn_norm = lambda x: x  # GatedResidual norms the streams itself
+    if config.ple is not None: self.ple = PLELayer(config)
     if config.attn_res_block_size:
       self.attn_res_score, self.ffn_res_score = AttentionResidual(config, config.attn_res_new_block), AttentionResidual(config)
 
@@ -295,9 +335,11 @@ class FFNBlock:
 
   def __call__(self, x: Tensor, start_pos: int|UOp, idx_mask: Tensor|None=None, pre: Tensor|None=None):
     self._init_state(x)
+    if hasattr(self, 'ple'): self.ple._init_state(x)
     # we pass in the weights implicitly so we unpack the GGUF on the fly
     @function(precompile=True, allow_implicit=True)
     def _run(x:Tensor, start_pos:int|UOp, idx_mask:Tensor|None, pre:Tensor|None):
+      if hasattr(self, 'ple'): x = x + self.ple(x, start_pos)  # (B, T, hc, D)
       def attend(h:Tensor) -> tuple[Tensor, Tensor|None]:
         h = self.attn_norm(h)
         mask = self._indexer_mask(h, start_pos, idx_mask)
@@ -306,9 +348,10 @@ class FFNBlock:
       if self.config.hc is not None: res_attn, res_ffn = self.hc_attn, self.hc_ffn
       elif self.config.attn_res_block_size: res_attn, res_ffn = self.attn_res_score, self.ffn_res_score
       # delayed hyper-connections get the pre mix of the one before, the block before gave it for the attention
-      if pre is not None: res_attn, res_ffn = functools.partial(self.hc_attn, pre=pre), functools.partial(self.hc_ffn, pre=self.hc_attn.mix(x)[0])
+      if pre is not None:
+        res_attn, res_ffn = functools.partial(self.hc_attn.apply, pre=pre), functools.partial(self.hc_ffn.apply, pre=self.hc_attn.weights(x)[0])
       x, idx_mask = res_attn(x, attend)
-      if pre is not None: pre = self.hc_ffn.mix(x)[0]
+      if pre is not None: pre = self.hc_ffn.weights(x)[0]
       out = res_ffn(x, lambda h: (self._feed_forward(self.ffn_norm(h)), None))[0].contiguous()
       return tuple(t for t in (out, pre, idx_mask) if t is not None)
     out, *rest = _run(x, start_pos, idx_mask, pre)
@@ -350,7 +393,7 @@ class TransformerBlock(FFNBlock):
     # NOTE: we don't want to change self.cache_kv, the function API doesn't support this well
     assigned_kv = cache_store(self.cache_kv, start_pos, Tensor.stack(k, v), 3)
     # on RDNA3/4, hybrid models use custom flash attention kernels on the KV cache
-    if amd_custom_kernels_supported(x.device) and self.config.ssm is not None:
+    if idx_mask is None and amd_custom_kernels_supported(x.device) and self.config.ssm is not None:
       attn = flash_attention(q, assigned_kv, start_pos+T)
       attn = attn.transpose(1, 2).reshape(B, T, -1)                                    # back to (B,T,D)
       return self.attn_output(attn if not self.config.attn_output_gate else (attn * gate.sigmoid()))
@@ -385,9 +428,40 @@ class TransformerBlock(FFNBlock):
       self.cache_kv = Tensor.zeros(2, x.shape[0], self.config.n_kv_heads, self.config.max_context, self.config.head_dim,
                                    dtype=dtypes.half, device=x.device if isinstance(x.device, str) else None)
       if isinstance(x.device, tuple): self.cache_kv = self.cache_kv.shard(x.device, 2).realize()
-      self.freqs_cis = precompute_freqs_cis(self.config.rope_dim, self.config.max_context, self.config.rope_theta,
+      # start_pos and T have independent symbolic bounds, the slice can overrun the context by all but one of T
+      self.freqs_cis = precompute_freqs_cis(self.config.rope_dim, self.config.max_context + x.max_shape[1]-1, self.config.rope_theta,
                                             device=x.device, yarn=self.config.yarn)
     if self.indexer: self.indexer._init_state(x)
+
+class PLELayer:  # qwen4exp: each stream gates the n-gram row values by their normed key-query score, plus a causal conv dilated by the n-gram size
+  def __init__(self, config:TransformerConfig):
+    self.table: GGUFPackedTable  # the packed n-grams in host RAM, set by from_gguf
+    self.ple, self.count, self.dim = unwrap(config.ple), unwrap(config.hc).count, config.dim
+    self.max_context, self.hist, width = config.max_context, (self.ple.conv_kernel - 1) * len(self.ple.multipliers), self.count * config.dim
+    self.key, self.value = Linear(config.dim, width, bias=False), Linear(config.dim, config.dim, bias=False)
+    self.norm_key, self.norm_query, self.norm_conv = (StreamNorm(self.count, self.dim, config.norm_eps) for _ in range(3))
+    self.conv1d = {"weight": Tensor.zeros(width, self.ple.conv_kernel)}
+
+  def _init_state(self, x:Tensor):
+    if not hasattr(self, "conv_state"): self.conv_state = Tensor.zeros(x.shape[0], self.hist, self.count*self.dim, device=x.device).clone()
+
+  def write_rows(self, tokens:list[int], start_pos:int, n_toks:int, chunk_size:int):
+    # hash the n-grams ending at each token (t0*m0 ^ t1*m1 ^ ..., EOS before the start or an EOS) and copy their table rows to host RAM
+    ple, n, ids = self.ple, len(self.ple.multipliers), []
+    per_gram = len(ple.vocab_sizes) // (n-1)  # the bigram heads, then the trigram heads
+    for p in range(start_pos, start_pos+n_toks):
+      ctx = [ple.eos if p < i or ple.eos in tokens[p-i:p] else tokens[p-i] for i in range(n)]
+      hashes = list(itertools.accumulate((c*m for c,m in zip(ctx, ple.multipliers)), lambda a,b: a^b))[1:]
+      ids.append([hashes[j//per_gram] % v + o for j,(v,o) in enumerate(zip(ple.vocab_sizes, ple.offsets))])
+    self.table.write(start_pos, ids, self.max_context+chunk_size)
+
+  def __call__(self, x:Tensor, start_pos:int|UOp) -> Tensor:
+    (B, T), T_pad, n = x.shape[:2], x.max_shape[1], len(self.ple.multipliers)
+    emb = self.table.read(start_pos, T_pad, x.device).reshape(B, T_pad, -1)[:, :T].float()
+    s = (self.norm_key(self.key(emb).unflatten(-1, (self.count, self.dim))) * self.norm_query(x)).sum(-1, keepdim=True) * self.dim**-0.5
+    gated = self.value(emb).unsqueeze(2) * (s.sign() * s.abs().clamp(min_=1e-6).sqrt()).sigmoid()
+    conv, store = short_conv(self.conv_state, self.norm_conv(gated).flatten(2), self.conv1d["weight"], Tensor(start_pos).eq(0), n)
+    return Tensor((gated + conv[:, :T].unflatten(-1, (self.count, self.dim))).contiguous().uop.after(store))
 
 class Indexer:
   def __init__(self, config:TransformerConfig, src:Indexer|None=None):
@@ -397,10 +471,10 @@ class Indexer:
     self.src = weakref.ref(src or self)
     if src is None:
       self.attn_k = Linear(config.head_dim if config.compress_ratios else config.dim, idx.head_dim, bias=False)
-      self.k_norm = (nn.RMSNorm if idx.msa or config.compress_ratios else nn.LayerNorm)(idx.head_dim, eps=idx.norm_eps)
-    if idx.msa: self.q_norm = nn.RMSNorm(idx.head_dim, eps=idx.norm_eps)
+      self.k_norm = (nn.RMSNorm if idx.msa or idx.qsa or config.compress_ratios else nn.LayerNorm)(idx.head_dim, eps=idx.norm_eps)
+    if idx.msa or idx.qsa: self.q_norm = nn.RMSNorm(idx.head_dim, eps=idx.norm_eps)
     else: self.proj = Linear(config.dim, idx.n_heads, bias=False)
-    if idx.kpool > 1 and not idx.msa and not config.compress_ratios:
+    if idx.kpool > 1 and not (idx.msa or idx.qsa) and not config.compress_ratios:
       self.compressor_gate, self.compressor_ape = Linear(config.dim, idx.head_dim, bias=False), {"weight": Tensor.zeros(idx.kpool, idx.head_dim)}
 
   def _init_state(self, x:Tensor):
@@ -416,12 +490,13 @@ class Indexer:
                rope:Callable[[Tensor, Tensor], Tensor]|None=None) -> Tensor:
     # compressed attention passes the (B, pools, head_dim) latent of its compressed kv for the keys, and its rope
     (B, T, _), idx, S, src = x.shape, self.idx, start_pos + x.shape[1], unwrap(self.src())
-    k, iq = src.k_norm(src.attn_k(x if latent is None else latent)), self.attn_q_b(q).reshape(B, T, idx.n_heads, idx.head_dim)
-    if idx.msa: iq = self.q_norm(iq)
+    k = src.attn_k(x) if idx.qsa else src.k_norm(src.attn_k(x if latent is None else latent))
+    iq = self.attn_q_b(q).reshape(B, T, idx.n_heads, idx.head_dim)
+    if idx.msa or idx.qsa: iq = self.q_norm(iq)
     if rope is not None or idx.rope_dim:
       # a pool of the latent is at the position of its first token
       rope, rot = rope or self._rope, unwrap(freqs)[start_pos:start_pos+T]
-      k = rope(k.unsqueeze(1), rot if latent is None else unwrap(freqs)[::idx.kpool]).squeeze(1)
+      if not idx.qsa: k = rope(k.unsqueeze(1), rot if latent is None else unwrap(freqs)[::idx.kpool]).squeeze(1)
       iq = rope(iq.transpose(1, 2), rot).transpose(1, 2)
     if hasattr(self, "compressor_gate"):
       # cache an indexer key and a pooling gate per token, a pool's key is the gate softmax weighted sum of its keys
@@ -430,8 +505,12 @@ class Indexer:
       k = gated_pool(kg, idx.kpool, self.compressor_ape["weight"])  # (B, S, D)
     elif latent is None:
       k = cache_store(self.cache_kg, start_pos, k, 1).float()  # (B, S, D)
+    if idx.qsa:
+      k = self.k_norm(k.reshape(B, -1, idx.kpool, idx.head_dim).mean(2))
+      k = self._rope(k.unsqueeze(1), unwrap(freqs)[:self.max_context:idx.kpool]).squeeze(1)
     scores = iq @ k.transpose(-1, -2).unsqueeze(1)
     if idx.msa: scores = scores.reshape(B, T, idx.n_heads, scores.shape[-1] // idx.kpool, idx.kpool).max(-1).transpose(1, 2)
+    elif idx.qsa: scores = (scores.relu() * idx.head_dim**-0.5).sum(2).unsqueeze(1)
     else: scores = (scores.relu() * (self.proj(x) * (idx.n_heads * idx.head_dim)**-0.5).unsqueeze(-1)).sum(2).unsqueeze(1)
     # the query sees the top_k/kpool best complete pools and the tokens of its own pool while incomplete (the tail)
     q_pos, k_pos = positions(start_pos, T)
@@ -705,13 +784,15 @@ class Transformer:
       if config.sliding_window_pattern != 0 and (i+1) % config.sliding_window_pattern == 0: c = replace(c, sliding_window=0)
       if config.indexer_shared and config.indexer_shared[i]: c = replace(c, indexer=None)
       if config.attn_res_block_size and i % config.attn_res_block_size == 0: c = replace(c, attn_res_new_block=True)
+      if config.ple and i != config.ple.layer: c = replace(c, ple=None)
       if config.engram is not None and i not in config.engram.layers: c = replace(c, engram=None)
       if config.compress_ratios:
         src = max((s for s in config.kv_sources if s <= i), default=i)
         self.blk.append(CompressedAttentionBlock(c, config.compress_ratios[i], cast(CompressedAttentionBlock, self.blk[src]) if src < i else None))
       else: self.blk.append(GatedDeltaNetBlock(c, config.ssm) if config.ssm and config.ssm_layers[i] else block_cls(c))
     self.token_embd  = nn.Embedding(config.vocab_size, config.dim)
-    self.output_norm = nn.RMSNorm(config.dim, config.norm_eps)
+    self.output_norm: Callable[[Tensor], Tensor] = nn.RMSNorm(config.dim, config.norm_eps)
+    if config.hc and config.hc.low_rank: self.output_hc, self.output_norm = GatedResidual(config, inject=False), lambda x: x
     if config.attn_res_block_size: self.output_res_score = AttentionResidual(config)
     self.output = Linear(config.dim, config.vocab_size, bias=False)
     self.max_context = config.max_context
@@ -731,7 +812,8 @@ class Transformer:
     for i, block in enumerate(self.blk):
       if eg is not None and i in eg.layers: x = cast(CompressedAttentionBlock, block).engram(x, rows[:, :, eg.layers.index(i)])
       x, idx_mask, pre = block(x, start_pos, idx_mask, pre)
-    if hc is not None: x = x.mean(2) if pre is None else (x * pre.unsqueeze(-1)).sum(2)
+    if pre is not None: x = (x * pre.unsqueeze(-1)).sum(2)
+    elif hc is not None: x = self.output_hc.mix(x)[0] if hc.low_rank else x.mean(2)
     elif self.config.attn_res_block_size: x = self.output_res_score.mix(x)
     # only run the output projection on the last token
     logits = self.output(self.output_norm(x[:, -1:]))[:, -1, :].to(tokens.device)
@@ -760,6 +842,7 @@ class Transformer:
     # TODO: remove the need for copy to default device
     kv, entries = gguf_parse(gguf.to(None).realize() if isinstance(gguf, Tensor) else gguf)
     arch = kv['general.architecture']
+    ple_entry = entries.pop('per_layer_token_embd.weight', None)  # the n-gram table stays in CPU RAM
     n_heads, n_kv_heads = kv[f'{arch}.attention.head_count'], kv[f'{arch}.attention.head_count_kv']
     assert shard >= 1, f"shard must be at least 1, got {shard}"
     shard_map, repeats = {}, {}
@@ -768,7 +851,7 @@ class Transformer:
         # too few KV heads to split: repeat each one so every device holds one
         repeats = {k: shard // n_kv_heads for k in entries if k.split('.', 2)[-1] in ('attn_k.weight', 'attn_v.weight', 'attn_k.bias', 'attn_v.bias')}
         n_kv_heads = shard
-      heads = n_heads if kv.get(f'{arch}.attention.kv_lora_rank') or f'{arch}.attention.compress_ratios' in kv else n_kv_heads
+      heads = n_heads if kv.get(f'{arch}.attention.kv_lora_rank') or arch == 'deepseek41' else n_kv_heads
       assert heads % shard == 0, f"tensor parallel needs the attention heads to split over {shard} devices"
       # shard MLA heads and routed experts while replicating latent projections, KV cache and shared experts
       rules = {**{w: 0 for w in ('token_embd.weight', 'output.weight', 'attn_q.weight', 'attn_k.weight', 'attn_v.weight', 'ffn_gate.weight',
@@ -781,7 +864,7 @@ class Transformer:
     devices = tuple(Device.canonicalize(f'{Device.DEFAULT}:{i}') for i in range(shard))
     ep = any(shape[-1] % (shard*_GGML_QUANT.get(typ, (1,))[0]) for k,(_,shape,typ) in entries.items() if 'ffn_down_exps.' in k)
     # the engram table is too big for the GPUs, it stays on the CPU
-    engram_table = gguf_shard({k: entries.pop(k)}, ("CPU",))[k] if (k:='per_layer_token_embd.weight') in entries else None
+    engram_table = gguf_shard({'t': ple_entry}, ("CPU",))['t'] if ple_entry and arch == 'deepseek41' else None
     state_dict = gguf_shard(entries, devices, {k: 0 if ep and '_exps.' in k else v for k,v in shard_map.items()}, repeats)
 
     # all state items should be float16, not float32
@@ -789,23 +872,25 @@ class Transformer:
 
     # some models like Llama 3.2 don't have an output.weight, they just tie to the token_embd.weight
     if 'output.weight' not in state_dict: state_dict['output.weight'] = state_dict['token_embd.weight']
-
-    hc = HCConfig(kv[f'{arch}.hyper_connection.count'], kv.get(f'{arch}.hyper_connection.sinkhorn_iterations', 0),
-                  kv.get(f'{arch}.hyper_connection.epsilon', 0.0), arch == 'deepseek41') if f'{arch}.hyper_connection.count' in kv else None
-    if hc is not None: state_dict = {k.replace('.hc_attn_', '.hc_attn.').replace('.hc_ffn_', '.hc_ffn.'):v for k,v in state_dict.items()}
+    if f'{arch}.hyper_connection.count' in kv:
+      hc = HCConfig(kv[f'{arch}.hyper_connection.count'], kv.get(f'{arch}.hyper_connection.sinkhorn_iterations', 0),
+                    kv.get(f'{arch}.hyper_connection.epsilon', 0.0), kv.get(f'{arch}.hyper_connection.low_rank', 0), arch == 'deepseek41')
+      state_dict = {re.sub(r'(hc_attn|hc_ffn|output_hc|\.ple)_', r'\1.', k):v for k,v in state_dict.items()}
+    else: hc = None
     if arch == 'deepseek41': state_dict = {k.replace('.attn_kv.', '.attn_kv_a_mqa.'):v for k,v in state_dict.items()}
 
     # an indexer pools kpool keys of its own, or scores the compressed kv in the source layers and shares the pick with the layers after
     sources = kv.get(f'{arch}.attention.indexer.source_layers')
     kpool = kv.get(f'{arch}.attention.indexer.block_size' if arch == 'minimax-m3' else f'{arch}.attention.indexer.kpool')
+    if arch == 'qwen4exp': kpool = max(kv[f'{arch}.attention.compress_ratios'])
     indexer = IndexerConfig(kv[f'{arch}.attention.indexer.head_count'], kv[f'{arch}.attention.indexer.key_length'],
                             kv[f'{arch}.attention.indexer.top_k'], kpool or 1,
                             kv.get(f'{arch}.attention.layer_norm_epsilon') or kv[f'{arch}.attention.layer_norm_rms_epsilon']) \
                             if kpool or sources else None
     if indexer is not None: state_dict = {k.replace('.indexer_compressor_', '.indexer.compressor_'):v for k,v in state_dict.items()}
-    if arch == 'minimax-m3':
-      indexer = replace(unwrap(indexer), rope_dim=kv[f'{arch}.rope.dimension_count'], rope_interleave=False, msa=True,
-                        top_k=kv[f'{arch}.attention.indexer.top_k'] * kv[f'{arch}.attention.indexer.block_size'])
+    if arch in ('minimax-m3', 'qwen4exp'):
+      indexer = replace(unwrap(indexer), rope_dim=kv[f'{arch}.rope.dimension_count'], rope_interleave=False, msa=arch == 'minimax-m3',
+                        qsa=arch == 'qwen4exp', top_k=kv[f'{arch}.attention.indexer.top_k'] * kv.get(f'{arch}.attention.indexer.block_size', 1))
       state_dict = {k.replace('.indexer.q_proj', '.indexer.attn_q_b').replace('.indexer.k_proj', '.indexer.attn_k'):v for k,v in state_dict.items()}
 
     engram = EngramConfig(tuple(kv[f'{arch}.ple.layers']), kv[f'{arch}.ple.ngram_size'], kv[f'{arch}.ple.heads_per_ngram'],
@@ -818,8 +903,9 @@ class Transformer:
     num_blocks = kv[f'{arch}.block_count'] - kv.get(f'{arch}.nextn_predict_layers', 0)
     ssm = None
     ssm_layers: tuple[bool, ...] = ()
-    if arch in ('qwen35', 'qwen35moe'):
-      ssm = SSMConfig(**{k: kv[f'{arch}.ssm.{k}'] for k in ('conv_kernel','state_size','group_count','time_step_rank','inner_size')}, silu_gate=True)
+    if arch in ('qwen35', 'qwen35moe', 'qwen4exp'):
+      ssm = SSMConfig(**{k: kv[f'{arch}.ssm.{k}'] for k in ('conv_kernel','state_size','group_count','time_step_rank','inner_size')},
+                      silu_gate=arch != 'qwen4exp')
       ssm_layers = tuple((i+1) % kv[f'{arch}.full_attention_interval'] != 0 for i in range(num_blocks))
     elif arch in ('kimi-linear', 'glm5-next', 'kimi-k3'):
       ssm_layers = tuple(x == 0 for x in n_kv_heads)[:num_blocks]
@@ -863,7 +949,7 @@ class Transformer:
       max_context=max_context,
       qk_norm=int(state_dict['blk.0.attn_q_norm.weight'].shape[0]) if 'blk.0.attn_q_norm.weight' in state_dict else 0,
       num_experts=kv.get(f'{arch}.expert_count', 0), num_experts_per_tok=kv.get(f'{arch}.expert_used_count', 0),
-      norm_topk_prob=kv.get(f'{arch}.expert_weights_norm', arch in ('qwen3moe', 'qwen35moe', 'kimi-linear')),
+      norm_topk_prob=kv.get(f'{arch}.expert_weights_norm', arch in ('qwen3moe', 'qwen35moe', 'kimi-linear', 'qwen4exp')),
       expert_gating_func=ExpertGating(kv.get(f'{arch}.expert_gating_func',
         ExpertGating.SOFTMAX_WEIGHT if arch == 'gpt-oss' else ExpertGating.SOFTMAX)),
       kv_lora_rank=kv_lora_rank, q_lora_rank=kv.get(f'{arch}.attention.q_lora_rank', 0),
@@ -873,8 +959,8 @@ class Transformer:
         kv.get(f'{arch}.expert_shared_count', 0) * kv.get(f'{arch}.expert_feed_forward_length', 0)),
       shared_expert_gate=f"blk.{kv.get(f'{arch}.leading_dense_block_count', 0)}.ffn_gate_inp_shexp.weight" in state_dict,
       dense_hidden_dim=kv.get(f'{arch}.feed_forward_length', 0) if kv.get(f'{arch}.leading_dense_block_count', 0) else 0,
-      routed_scaling_factor=kv.get(f'{arch}.expert_weights_scale', 1.0), attn_output_gate=arch in ('qwen35', 'qwen35moe', 'kimi-k3'), ssm=ssm,
-      ssm_layers=ssm_layers,
+      routed_scaling_factor=kv.get(f'{arch}.expert_weights_scale', 1.0), attn_output_gate=arch in ('qwen35', 'qwen35moe', 'kimi-k3', 'qwen4exp'),
+      ssm=ssm, ssm_layers=ssm_layers,
       qkv_bias='blk.0.attn_q.bias' in state_dict,
       expert_bias=f"blk.{kv.get(f'{arch}.leading_dense_block_count', 0)}.exp_probs_b.bias" in state_dict,
       expert_proj_bias='blk.0.ffn_gate_exps.bias' in state_dict, attn_output_bias='blk.0.attn_output.bias' in state_dict,
@@ -882,10 +968,13 @@ class Transformer:
       swiglu_up_bias=1.0 if swiglu_oai else 0.0, attn_sinks='blk.0.attn_sinks.weight' in state_dict,
       sliding_window=kv.get(f'{arch}.attention.sliding_window', 0),
       sliding_window_pattern=kv.get(f'{arch}.attention.sliding_window_pattern', 2 if arch == 'gpt-oss' else 0), hc=hc, indexer=indexer,
+      ple=PLEConfig(kv[f'{arch}.ple.layers'][0], ple_entry[1][1], tuple(kv[f'{arch}.ple.layer_multipliers']),
+                    tuple(kv[f'{arch}.ple.head_vocab_sizes']), tuple(kv[f'{arch}.ple.head_offsets']), kv[f'{arch}.ple.eos_token_id'],
+                    kv[f'{arch}.ple.conv_kernel']) if ple_entry and arch == 'qwen4exp' else None,
       expert_latent_dim=kv.get(f'{arch}.expert_latent_length', 0), attn_res_block_size=kv.get(f'{arch}.attn_res.block_size', 0),
       situ=(kv[f'{arch}.activation.situ_beta'], kv[f'{arch}.activation.situ_linear_beta']) if f'{arch}.activation.situ_beta' in kv else None,
       indexer_shared=tuple(i not in sources for i in range(num_blocks)) if sources else (),
-      compress_ratios=tuple(kv.get(f'{arch}.attention.compress_ratios', ())),
+      compress_ratios=tuple(kv[f'{arch}.attention.compress_ratios']) if arch == 'deepseek41' else (),
       kv_sources=tuple(kv.get(f'{arch}.attention.kv_source_layers', ())),
       compress_rope_theta=kv.get(f'{arch}.attention.compress_rope_freq_base', 0.0), o_groups=kv.get(f'{arch}.attention.output_group_count', 0),
       o_lora_rank=kv.get(f'{arch}.attention.output_lora_rank', 0), engram=engram)
@@ -897,6 +986,7 @@ class Transformer:
       for s in (params:=nn.state.get_parameters(model)): s.replace(s.contiguous())
       Tensor.realize(*params)
     if engram_table is not None: model.per_layer_token_embd = engram_table.cast('float16')
+    if config.ple is not None: model.blk[config.ple.layer].ple.table = GGUFPackedTable(unwrap(ple_entry))
     return model, kv
 
   @staticmethod
@@ -1002,6 +1092,7 @@ class Transformer:
     out, prompt_len = None, len(tokens)
     while len(tokens) < self.max_context:
       n_toks = min(chunk_size, len(tokens) - start_pos)
+      if self.config.ple: self.blk[self.config.ple.layer].ple.write_rows(tokens, start_pos, n_toks, chunk_size)
       sp, nt = v_start_pos.bind(start_pos), v_toks.bind(n_toks)
       out = self(t[:, sp:sp+nt] if start_pos < prompt_len or out is None else out, sp, temp).realize()
       start_pos += n_toks
