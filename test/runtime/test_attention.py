@@ -36,7 +36,7 @@ class TestAttention(unittest.TestCase):
       block.attn_q.weight, block.attn_k.weight = Tensor.zeros(2, 2), Tensor.zeros(2, 2)
       block.attn_v.weight, block.attn_output.weight = Tensor.eye(2), Tensor.eye(2)
       block._init_state(x)
-      return block._attention(x, 0)
+      return block._attention(x, 0, {})
     self.assertTrue(attention(False).allclose(x, rtol=0, atol=1e-6).item())
     # the token and zero-value sink have equal weights: ([2,4] + [0,0]) / 2
     self.assertTrue(attention(True).allclose(x / 2, rtol=0, atol=1e-6).item())
@@ -50,7 +50,7 @@ class TestAttention(unittest.TestCase):
     expected = Tensor([[[1., 1.],  # only itself
                         [2., 2.],  # ([1,1] + [3,3]) / 2
                         [4., 4.]]]) # ([3,3] + [5,5]) / 2
-    self.assertTrue(block._attention(x, 0).allclose(expected, rtol=0, atol=1e-6).item())
+    self.assertTrue(block._attention(x, 0, {}).allclose(expected, rtol=0, atol=1e-6).item())
 
   def test_partial_rope_in_attention(self):
     dim, rope_dim, seqlen = 8, 4, 3
@@ -66,7 +66,7 @@ class TestAttention(unittest.TestCase):
     precompute_freqs_cis.cache_clear()
     block.cache_kv = Tensor.empty(2, 1, 1, config.max_context, max(dim, config.v_head_dim), device=x.device)
     block.freqs_cis = precompute_freqs_cis(rope_dim, config.max_context, config.rope_theta)
-    block._attention(x_norm, 0).realize()
+    block._attention(x_norm, 0, {}).realize()
 
     expected = apply_rope_new(k[..., :rope_dim], block.freqs_cis[:seqlen]).cat(k[..., rope_dim:], dim=-1)
     np.testing.assert_allclose(block.cache_kv[0, :, :, :seqlen, :].numpy(), expected.numpy(), rtol=1e-5, atol=1e-5)
@@ -78,18 +78,14 @@ class TestAttention(unittest.TestCase):
     # pre averages streams [1, 3] to 2, the sublayer squares it to 4, and post adds 4 to both streams
     # mixing rows [3/4, 1/4], [1/2, 1/2] normalize to [3/5, 1/3], [2/5, 2/3]
     expected = [[[[4 + (3/5 + 3*2/5)], [4 + (1/3 + 3*2/3)]]]]
-    for mask in (None, Tensor([0., -np.inf])):
-      with self.subTest(mask=mask is not None):
-        actual, returned_mask = hc(Tensor([[[[1.], [3.]]]]), lambda x: (x.square(), mask))
-        self.assertIs(returned_mask, mask)
-        np.testing.assert_allclose(actual.numpy(), expected, rtol=1e-6, atol=1e-7)
+    np.testing.assert_allclose(hc(Tensor([[[[1.], [3.]]]]), lambda x: x.square()).numpy(), expected, rtol=1e-6, atol=1e-7)
 
   def test_attention_residual(self):
     # rmsnorm makes the streams [1, -3] into scores [log 3, -log 3], softmax [9/10, 1/10] mixes them to 0.6, the sublayer squares it
     for new_block, expected in ((True, [1, -3, 0.36]), (False, [1, -3 + 0.36])):
       res = AttentionResidual(self._make_config(dim=1), new_block)
       res.weight = Tensor([np.log(3)])
-      actual, _ = res(Tensor([[[[1.], [-3.]]]]), lambda x: (x.square(), None))
+      actual = res(Tensor([[[[1.], [-3.]]]]), lambda x: x.square())
       np.testing.assert_allclose(actual.numpy().flatten(), expected, rtol=1e-5)
 
   def test_gated_residual(self):
@@ -97,7 +93,7 @@ class TestAttention(unittest.TestCase):
     res.norm.weight, res.down.weight, res.up.weight = Tensor([2., 4.]), Tensor([[np.log(3)/3, np.log(3)/3]]), Tensor([[0.], [4/3]])
     res.inject.weight = Tensor([[0., 0.], [0., np.log(3)/2]])
     # norm [2, 4], gate [1/2, 3/4] mixes to 2, squared to 4, inject gates [1, 3/2] add [4, 6]
-    actual, _ = res(Tensor([[[[1.], [1.]]]]), lambda x: (x.square(), None))
+    actual = res(Tensor([[[[1.], [1.]]]]), lambda x: x.square())
     np.testing.assert_allclose(actual.numpy().flatten(), [5, 7], rtol=1e-4)
 
   def test_indexer(self):
@@ -162,7 +158,8 @@ class TestAttention(unittest.TestCase):
     block._init_state(x)
     # every query prefers the first pool, and incomplete pools contribute only their visible tail
     expected = np.where([[1, 0, 0, 0, 0], [1, 1, 0, 0, 0], [1, 1, 1, 0, 0], [1, 1, 0, 0, 0], [1, 1, 0, 0, 1]], 0., -np.inf)
-    np.testing.assert_array_equal(block._indexer_mask(x, 0, None).numpy(), expected[None, None])
+    block._index(x, 0, carry:={})
+    np.testing.assert_array_equal(carry["idx_mask"].numpy(), expected[None, None])
 
   def test_ple_rows(self):
     # a bigram and a trigram head, EOS (7) before the start or an EOS
@@ -201,7 +198,7 @@ class TestGatedDeltaNetBlock(unittest.TestCase):
   def _run_attention(self, block:GatedDeltaNetBlock, x:Tensor, start_pos:int):
     x_norm = block.attn_norm(x)
     block._init_state(x_norm)
-    return block._attention(x_norm, start_pos).realize().numpy()
+    return block._attention(x_norm, start_pos, {}).realize().numpy()
 
   def _cache_views(self, block:GatedDeltaNetBlock) -> tuple[np.ndarray, np.ndarray]:
     if hasattr(block, 'conv_state'):
@@ -331,7 +328,7 @@ class TestGatedDeltaNetBlock(unittest.TestCase):
     block.ssm_conv1d_q["weight"] = block.ssm_conv1d_k["weight"] = block.ssm_conv1d_v["weight"] = Tensor.ones(16, 4)
     x = Tensor.ones(1, 1, 16)
     block._init_state(x)
-    block._attention(x, 0).realize()
+    block._attention(x, 0, {}).realize()
     # the first token's state is beta * v (x) l2norm(k), with beta = sigmoid(0) and v, k through the conv and silu
     def silu(z): return z / (1 + np.exp(-z))
     np.testing.assert_allclose(block.recurrent_state.numpy(), 0.5 * silu(1.0) * silu(1e-4) / np.sqrt(8 * silu(1e-4)**2 + 1e-6), rtol=1e-3)
@@ -346,7 +343,7 @@ class TestGatedDeltaNetBlock(unittest.TestCase):
     initial_state = Tensor.arange(8, dtype=dtypes.float32).reshape(1, 2, 2, 2)
     block.recurrent_state.assign(initial_state).realize()
     block.ssm_a = Tensor([[-1.], [-1.]])
-    block._attention(x, x.shape[1]).realize()
+    block._attention(x, x.shape[1], {}).realize()
     alpha = np.exp(-self._softplus_np(np.array([[1, 2, 3, 4], [2, 1, 3, 5]])).reshape(2, 2, 2)).prod(0)
     np.testing.assert_allclose(block.recurrent_state.numpy(), initial_state.numpy() * alpha[:, None, :], rtol=1e-5, atol=1e-5)
 
