@@ -433,13 +433,13 @@ class PLELayer:  # each stream gates the n-gram row values by their normed key-q
     self.table: GGUFPackedTable  # the packed n-grams in host RAM, set by from_gguf
     self.ple, self.count, self.dim = unwrap(config.ple), unwrap(config.hc).count, config.dim
     self.max_context, self.hist, width = config.max_context, (self.ple.conv_kernel - 1) * len(self.ple.multipliers), self.count * config.dim
-    self.norm_key, rows = StreamNorm(self.count, self.dim, config.norm_eps), len(self.ple.vocab_sizes) * self.ple.head_dim
+    self.norm_key, self.norm_query = (StreamNorm(self.count, self.dim, config.norm_eps) for _ in range(2))
+    rows = len(self.ple.vocab_sizes) * self.ple.head_dim
     if self.ple.conv_kernel:
       self.key, self.value = Linear(rows, width, bias=False), Linear(rows, config.dim, bias=False)
-      self.norm_query: Callable[[Tensor], Tensor] = StreamNorm(self.count, self.dim, config.norm_eps)
       self.norm_conv = StreamNorm(self.count, self.dim, config.norm_eps)
       self.conv1d = {"weight": Tensor.zeros(width, self.ple.conv_kernel)}
-    else: self.kv, self.norm_query = Linear(rows, width + config.dim, bias=False), lambda x: x.rmsnorm(eps=config.norm_eps)
+    else: self.kv = Linear(rows, width + config.dim, bias=False)
 
   def _init_state(self, x:Tensor):
     if self.ple.conv_kernel and not hasattr(self, "conv_state"):
@@ -851,9 +851,10 @@ class Transformer:
       state_dict = {re.sub(r'(hc_attn|hc_ffn|output_hc|\.ple)_', r'\1.', k):v for k,v in state_dict.items()}
     else: hc = None
     if arch == 'deepseek41':
-      # the engram is the PLE, its gate weighs the normed key of each stream
+      # the engram is the PLE, its gate weighs the normed key of each stream, the query is normed without a weight
       state_dict = {k.replace('.attn_kv.', '.attn_kv_a_mqa.').replace('.engram_kv.', '.ple.kv.').replace('.engram_gate.', '.ple.norm_key.'):
                     v.flatten() if '.engram_gate.' in k else v for k,v in state_dict.items()}
+      state_dict.update({k.replace('.norm_key.', '.norm_query.'):v.ones_like() for k,v in state_dict.items() if '.ple.norm_key.' in k})
 
     # an indexer pools kpool keys of its own, or scores the compressed kv in the source layers and shares the pick with the layers after
     sources = kv.get(f'{arch}.attention.indexer.source_layers')
