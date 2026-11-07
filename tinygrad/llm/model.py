@@ -61,6 +61,12 @@ def causal_mask(x:Tensor, start_pos:int|UOp, window:int=0) -> Tensor:  # (1, 1, 
   mask = Tensor.full((1, 1, T, start_pos+T), float("-inf"), dtype=x.dtype, buffer=False)
   return mask.triu(start_pos+1) + mask.tril(start_pos-window) if window else mask.triu(start_pos+1)
 
+def sink_attention(q:Tensor, k:Tensor, v:Tensor, mask:Tensor, sinks:Tensor) -> Tensor:  # a zero key and value scored by the sink logit of each head
+  k, v = k.cat(k[..., :1, :].const_like(0), dim=-2), v.cat(v[..., :1, :].const_like(0), dim=-2)
+  B, H, T = mask.shape[0], q.shape[1], q.shape[2]
+  mask = mask.expand(B, H, T, mask.shape[-1]).cat(sinks.reshape(1, -1, 1, 1).expand(B, H, T, 1), dim=-1)
+  return q.scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)
+
 def complete_pools(n:int|UOp, size:int, q_pos:Tensor) -> Tensor:  # (T, n): the pools of size tokens a query at q_pos has seen whole
   return (Tensor.arange(n) + 1) * size <= q_pos + 1
 
@@ -403,11 +409,9 @@ class TransformerBlock(FFNBlock):
     if idx_mask is not None: mask = idx_mask.repeat_interleave(self.config.n_heads // int(idx_mask.shape[1]), dim=1)
     elif resolve(T != 1) or window: mask = causal_mask(x, start_pos, window)
     if hasattr(self, 'attn_sinks'):
-      k, v = k.cat(k[..., :1, :].const_like(0), dim=-2), v.cat(v[..., :1, :].const_like(0), dim=-2)
-      sink_col = self.attn_sinks["weight"].reshape(1, -1, 1, 1).expand(1, self.config.n_heads, T, 1)
       if mask is None: mask = Tensor.zeros(1, 1, T, start_pos+T, dtype=x.dtype, buffer=False)
-      mask = mask.expand(1, self.config.n_heads, T, start_pos+T).cat(sink_col, dim=-1)
-    attn = q.scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)     # (B,H,T,Hd)
+      attn = sink_attention(q, k, v, mask, self.attn_sinks["weight"])
+    else: attn = q.scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)     # (B,H,T,Hd)
     attn = attn.transpose(1, 2).reshape(B, T, -1)                                    # back to (B,T,D)
     return self.attn_output(attn if not self.config.attn_output_gate else (attn * gate.sigmoid()))
 
@@ -533,19 +537,23 @@ class MLATransformerBlock(FFNBlock):
       self.attn_q_b = Linear(config.q_lora_rank, config.n_heads * config.head_dim, bias=False)
     else:
       self.attn_q = Linear(config.dim, config.n_heads * config.head_dim, bias=False)
-    self.attn_kv_a_mqa = Linear(config.dim, config.kv_lora_rank + config.rope_dim, bias=False)
-    self.attn_kv_a_norm = nn.RMSNorm(config.kv_lora_rank, config.norm_eps)
-    self.attn_k_b = {"weight": Tensor.zeros(config.n_heads, config.kv_lora_rank, qk_nope_head_dim)}
-    self.attn_v_b = {"weight": Tensor.zeros(config.n_heads, config.v_head_dim, config.kv_lora_rank)}
-    self.attn_output = Linear(config.n_heads * config.v_head_dim, config.dim, bias=False)
+    if config.kv_lora_rank > 0:  # compressed attention (CompressedAttentionBlock) has a single kv head of its own
+      self.attn_kv_a_mqa = Linear(config.dim, config.kv_lora_rank + config.rope_dim, bias=False)
+      self.attn_kv_a_norm = nn.RMSNorm(config.kv_lora_rank, config.norm_eps)
+      self.attn_k_b = {"weight": Tensor.zeros(config.n_heads, config.kv_lora_rank, qk_nope_head_dim)}
+      self.attn_v_b = {"weight": Tensor.zeros(config.n_heads, config.v_head_dim, config.kv_lora_rank)}
+      self.attn_output = Linear(config.n_heads * config.v_head_dim, config.dim, bias=False)
     self.indexer = Indexer(config) if config.indexer else None
     if config.attn_output_gate: self.attn_gate = Linear(config.dim, config.n_heads * config.v_head_dim, bias=False)
+
+  def _q(self, x:Tensor) -> Tensor:  # (B, n_heads, T, head_dim)
+    q_proj = self.attn_q_b(self.attn_q_a_norm(self.attn_q_a(x))) if self.config.q_lora_rank > 0 else self.attn_q(x)
+    return q_proj.reshape(*x.shape[:2], self.config.n_heads, self.config.head_dim).transpose(1, 2)
 
   def _attention(self, x:Tensor, start_pos:int|UOp, idx_mask:Tensor|None=None) -> Tensor:
     B, T, _ = x.shape
     q_nope_head_dim = self.config.head_dim - self.config.rope_dim
-    q_proj = self.attn_q_b(self.attn_q_a_norm(self.attn_q_a(x))) if self.config.q_lora_rank > 0 else self.attn_q(x)
-    q = q_proj.reshape(B, T, self.config.n_heads, self.config.head_dim).transpose(1, 2)
+    q = self._q(x)
     q_nope, q_rope = q[..., :q_nope_head_dim], q[..., q_nope_head_dim:]
     if not self.config.ssm or not self.config.ssm.kda: q_rope = apply_rope(q_rope, self.freqs_cis[start_pos:start_pos+T], self.config.rope_interleave)
     if 'weight_scale_inv' in self.attn_k_b:
@@ -590,7 +598,7 @@ class MLATransformerBlock(FFNBlock):
                                             device=x.device, yarn=self.config.yarn)
     if self.indexer: self.indexer._init_state(x)
 
-class CompressedAttentionBlock(FFNBlock):
+class CompressedAttentionBlock(MLATransformerBlock):
   # attention over a sliding window of a shared kv head and over the kv of the source block compressed ratio:1, picked by an indexer
   def __init__(self, config:TransformerConfig, ratio:int, src:CompressedAttentionBlock|None):
     # the indexer picks pools of ratio tokens, top_k counts tokens
@@ -599,10 +607,7 @@ class CompressedAttentionBlock(FFNBlock):
     super().__init__(config)
     # a weakref keeps the weights of the source out of the state dict of this block
     self.ratio, self.src = ratio, weakref.ref(src or self)
-    self.attn_q_a, self.attn_q_a_norm = Linear(config.dim, config.q_lora_rank, bias=False), nn.RMSNorm(config.q_lora_rank, config.norm_eps)
-    self.attn_q_b = Linear(config.q_lora_rank, config.n_heads * config.head_dim, bias=False)
     self.attn_kv, self.attn_kv_a_norm = Linear(config.dim, config.head_dim, bias=False), nn.RMSNorm(config.head_dim, config.norm_eps)
-    self.indexer = Indexer(config) if config.indexer else None
     self.attn_sinks = {"weight": Tensor.zeros(config.n_heads)}
     # the output projection is low rank per group of heads
     self.attn_output_a = {"weight": Tensor.zeros(config.o_groups * config.o_lora_rank, config.n_heads * config.head_dim // config.o_groups)}
@@ -642,7 +647,7 @@ class CompressedAttentionBlock(FFNBlock):
   def _attention(self, x:Tensor, start_pos:int|UOp, idx_mask:Tensor|None=None) -> Tensor:
     (B, T, _), cfg = x.shape, self.config
     freqs = self.freqs_cis[start_pos:start_pos+T]
-    q = self._rope(self.attn_q_b(self.attn_q_a_norm(self.attn_q_a(x))).reshape(B, T, cfg.n_heads, cfg.head_dim).transpose(1, 2), freqs)
+    q = self._rope(self._q(x), freqs)
     kv = self._rope(self.attn_kv_a_norm(self.attn_kv(x)).reshape(B, 1, T, cfg.head_dim), freqs)
     k = cache_store(self.cache_kv, start_pos, kv, 2)[:, :, :start_pos+T]
     mask = causal_mask(x, start_pos, cfg.sliding_window).expand(B, 1, T, -1)
@@ -651,11 +656,9 @@ class CompressedAttentionBlock(FFNBlock):
       k = k.cat(self._rope(latent.unsqueeze(1), self.freqs_cis[::self.ratio]).cast(k.dtype), dim=2)
       pools = complete_pools(latent.shape[1], self.ratio, (Tensor(start_pos) + Tensor.arange(T)).reshape(T, 1)) if idx_mask is None else idx_mask
       mask = mask.cat(pools.where(0.0, -math.inf).expand(B, 1, T, -1), dim=-1)
-    sinks = self.attn_sinks["weight"].reshape(1, -1, 1, 1).expand(B, cfg.n_heads, T, 1)
-    attn = (q @ k.transpose(-1, -2) * cfg.head_dim**-0.5 + mask).cat(sinks, dim=-1).softmax(-1)[..., :-1]
     # the values are the keys: undo the rotation of the query on the output
     cos, sin = freqs.chunk(2, dim=-1)
-    o = self._rope(attn @ k, cos.cat(-sin, dim=-1)).transpose(1, 2).reshape(B, T, cfg.o_groups, 1, -1)
+    o = self._rope(sink_attention(q, k, k, mask, self.attn_sinks["weight"]), cos.cat(-sin, dim=-1)).transpose(1, 2).reshape(B, T, cfg.o_groups, 1, -1)
     o = o @ self.attn_output_a["weight"].reshape(cfg.o_groups, cfg.o_lora_rank, -1).transpose(-1, -2)
     return self.attn_output_b(o.reshape(B, T, -1))
 
