@@ -212,6 +212,8 @@ class AttentionResidual:
     # (B, T, N+1, D) if new_block else (B, T, N, D)
     return (xs.cat(out.unsqueeze(2), dim=2) if self.new_block else xs[:, :, :-1].cat(xs[:, :, -1:] + out.unsqueeze(2), dim=2)), aux
 
+def weigh_streams(xs:Tensor, w:Tensor) -> Tensor: return (xs * w.unsqueeze(-1)).sum(2)  # (B, T, hc, D) streams by (B, T, hc) weights
+
 class HyperConnection:
   def __init__(self, config:TransformerConfig):
     self.count, self.eps, self.iters, self.norm_eps = (hc:=unwrap(config.hc)).count, hc.eps, hc.sinkhorn_iters, config.norm_eps
@@ -221,7 +223,7 @@ class HyperConnection:
   def __call__(self, xs:Tensor, sublayer:Callable[[Tensor], tuple[Tensor, Tensor|None]]) -> tuple[Tensor, Tensor|None]:
     """mHC: the sublayer sees a pre-weighted sum of the (B, T, hc, D) streams, its output is added back by post onto the streams mixed by comb"""
     pre, post, comb = self.weights(xs)
-    out, aux = sublayer((xs * pre.unsqueeze(-1)).sum(2))
+    out, aux = sublayer(weigh_streams(xs, pre))
     return out.unsqueeze(2) * post.unsqueeze(-1) + (comb.transpose(-1, -2) @ xs), aux
 
   def weights(self, xs:Tensor) -> tuple[Tensor, Tensor, Tensor]:
@@ -345,7 +347,7 @@ class FFNBlock:
       elif self.config.attn_res_block_size: res_attn, res_ffn = self.attn_res_score, self.ffn_res_score
       if pre is not None:
         # delayed hyper-connections: the sublayer sees the streams weighted by the pre mix of the hyper-connection before (the block before)
-        def delayed(hc:HyperConnection, pre:Tensor): return lambda xs, sublayer: hc(xs, lambda _: sublayer((xs * pre.unsqueeze(-1)).sum(2)))
+        def delayed(hc:HyperConnection, pre:Tensor): return lambda xs, sublayer: hc(xs, lambda _: sublayer(weigh_streams(xs, pre)))
         res_attn, res_ffn = delayed(self.hc_attn, pre), delayed(self.hc_ffn, self.hc_attn.weights(x)[0])
       x, idx_mask = res_attn(x, attend)
       if pre is not None: pre = self.hc_ffn.weights(x)[0]
@@ -434,10 +436,11 @@ class PLELayer:
     self.ple, self.count, self.dim = unwrap(config.ple), unwrap(config.hc).count, config.dim
     self.max_context, self.hist, width = config.max_context, (self.ple.conv_kernel - 1) * len(self.ple.multipliers), self.count * config.dim
     self.norm_key, self.norm_query = (GroupedRMSNorm(self.count, self.dim, config.norm_eps) for _ in range(2))
+    rows = len(self.ple.vocab_sizes) * self.ple.head_dim
     if self.ple.conv_kernel:
-      self.key, self.value = (Linear(len(self.ple.vocab_sizes) * self.ple.head_dim, out, bias=False) for out in (width, config.dim))
+      self.key, self.value = (Linear(rows, out, bias=False) for out in (width, config.dim))
       self.norm_conv, self.conv1d = GroupedRMSNorm(self.count, self.dim, config.norm_eps), {"weight": Tensor.zeros(width, self.ple.conv_kernel)}
-    else: self.kv = Linear(len(self.ple.vocab_sizes) * self.ple.head_dim, width + config.dim, bias=False)
+    else: self.kv = Linear(rows, width + config.dim, bias=False)
 
   def _init_state(self, x:Tensor):
     if self.ple.conv_kernel and not hasattr(self, "conv_state"):
@@ -802,7 +805,7 @@ class Transformer:
     # the streams start as copies of the embedding
     idx_mask, pre = None, x[..., 0].full_like(1 / hc.count) if hc is not None and hc.delayed else None
     for block in self.blk: x, idx_mask, pre = block(x, start_pos, idx_mask, pre)
-    if pre is not None: x = (x * pre.unsqueeze(-1)).sum(2)
+    if pre is not None: x = weigh_streams(x, pre)
     elif hc is not None: x = self.output_hc.mix(x)[0] if hc.low_rank else x.mean(2)
     elif self.config.attn_res_block_size: x = self.output_res_score.mix(x)
     # only run the output projection on the last token
