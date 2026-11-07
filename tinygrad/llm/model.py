@@ -218,6 +218,12 @@ class HyperConnection:
     self.fn = Linear(self.count * config.dim, (2 + self.count) * self.count, bias=False)
     self.base, self.scale = {"weight": Tensor.zeros((2 + self.count) * self.count)}, {"weight": Tensor.zeros(3)}
 
+  def __call__(self, xs:Tensor, sublayer:Callable[[Tensor], tuple[Tensor, Tensor|None]]) -> tuple[Tensor, Tensor|None]:
+    """mHC: the sublayer sees a pre-weighted sum of the (B, T, hc, D) streams, its output is added back by post onto the streams mixed by comb"""
+    pre, post, comb = self.weights(xs)
+    out, aux = sublayer((xs * pre.unsqueeze(-1)).sum(2))
+    return out.unsqueeze(2) * post.unsqueeze(-1) + (comb.transpose(-1, -2) @ xs), aux
+
   def weights(self, xs:Tensor) -> tuple[Tensor, Tensor, Tensor]:
     base, scale, mix = self.base["weight"], self.scale["weight"], self.fn(xs.flatten(2).rmsnorm(eps=self.norm_eps))
     pre  = (mix[..., :self.count] * scale[0] + base[:self.count]).sigmoid() + self.eps
@@ -226,15 +232,6 @@ class HyperConnection:
     # sinkhorn: normalize the columns then the rows, alternating, to make comb doubly stochastic
     for i in range(2 * self.iters - 1): comb = comb / (comb.sum(-1 if i % 2 else -2, keepdim=True) + self.eps)
     return pre, post, comb
-
-  def __call__(self, xs:Tensor, sublayer:Callable[[Tensor], tuple[Tensor, Tensor|None]]) -> tuple[Tensor, Tensor|None]:
-    return self.apply(xs, sublayer)
-
-  def apply(self, xs:Tensor, sublayer:Callable[[Tensor], tuple[Tensor, Tensor|None]], pre:Tensor|None=None) -> tuple[Tensor, Tensor|None]:
-    """mHC: the sublayer sees a pre-weighted sum of the (B, T, hc, D) streams, its output is added back by post onto the streams mixed by comb"""
-    own, post, comb = self.weights(xs)
-    out, aux = sublayer((xs * (own if pre is None else pre).unsqueeze(-1)).sum(2))
-    return out.unsqueeze(2) * post.unsqueeze(-1) + (comb.transpose(-1, -2) @ xs), aux
 
 class GroupedRMSNorm:  # x: (B, T, count, dim), w: (count*dim,)
   def __init__(self, count:int, dim:int, eps:float): self.weight, self.eps = Tensor.zeros(count*dim), eps
@@ -346,9 +343,10 @@ class FFNBlock:
       res_attn = res_ffn = lambda xs, sublayer: (xs + (ret:=sublayer(xs))[0], ret[1])
       if self.config.hc is not None: res_attn, res_ffn = self.hc_attn, self.hc_ffn
       elif self.config.attn_res_block_size: res_attn, res_ffn = self.attn_res_score, self.ffn_res_score
-      # delayed hyper-connections get the pre mix of the one before, the block before gave it for the attention
       if pre is not None:
-        res_attn, res_ffn = functools.partial(self.hc_attn.apply, pre=pre), functools.partial(self.hc_ffn.apply, pre=self.hc_attn.weights(x)[0])
+        # delayed hyper-connections: the sublayer sees the streams weighted by the pre mix of the hyper-connection before (the block before)
+        def delayed(hc:HyperConnection, pre:Tensor): return lambda xs, sublayer: hc(xs, lambda _: sublayer((xs * pre.unsqueeze(-1)).sum(2)))
+        res_attn, res_ffn = delayed(self.hc_attn, pre), delayed(self.hc_ffn, self.hc_attn.weights(x)[0])
       x, idx_mask = res_attn(x, attend)
       if pre is not None: pre = self.hc_ffn.weights(x)[0]
       out = res_ffn(x, lambda h: (self._feed_forward(self.ffn_norm(h)), None))[0].contiguous()
