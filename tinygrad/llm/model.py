@@ -451,12 +451,13 @@ class PLELayer:
     self.table: GGUFPackedTable
     self.ple, self.count, self.dim = unwrap(config.ple), unwrap(config.hc).count, config.dim
     self.max_context, self.hist, width = config.max_context, (self.ple.conv_kernel - 1) * len(self.ple.multipliers), self.count * config.dim
-    self.norm_key, self.norm_query = (GroupedRMSNorm(self.count, self.dim, config.norm_eps) for _ in range(2))
     rows = len(self.ple.vocab_sizes) * self.ple.head_dim
     if self.ple.conv_kernel:
       self.key, self.value = (Linear(rows, out, bias=False) for out in (width, config.dim))
-      self.norm_conv, self.conv1d = GroupedRMSNorm(self.count, self.dim, config.norm_eps), {"weight": Tensor.zeros(width, self.ple.conv_kernel)}
-    else: self.kv = Linear(rows, width + config.dim, bias=False)
+      self.norm_key, self.norm_query, self.norm_conv = (GroupedRMSNorm(self.count, self.dim, config.norm_eps) for _ in range(3))
+      self.conv1d = {"weight": Tensor.zeros(width, self.ple.conv_kernel)}
+    # the engram of DeepSeek: one projection to the keys and the value, one weight on the product of the normed key and query
+    else: self.kv, self.gate, self.eps = Linear(rows, width + config.dim, bias=False), {"weight": Tensor.zeros(self.count, self.dim)}, config.norm_eps
 
   def _init_state(self, x:Tensor):
     if self.ple.conv_kernel and not hasattr(self, "conv_state"):
@@ -476,7 +477,9 @@ class PLELayer:
     (B, T), T_pad, n = x.shape[:2], x.max_shape[1], len(self.ple.multipliers)
     emb = self.table.read(start_pos, T_pad, x.device).reshape(B, T_pad, -1)[:, :T].float()
     k, v = (self.key(emb), self.value(emb)) if self.ple.conv_kernel else self.kv(emb).split([self.count*self.dim, self.dim], dim=-1)
-    s = (self.norm_key(k.reshape(x.shape)) * self.norm_query(x)).sum(-1, keepdim=True) * self.dim**-0.5
+    k = k.reshape(x.shape)
+    kq = self.norm_key(k) * self.norm_query(x) if self.ple.conv_kernel else k.rmsnorm(eps=self.eps) * self.gate["weight"] * x.rmsnorm(eps=self.eps)
+    s = kq.sum(-1, keepdim=True) * self.dim**-0.5
     gated = v.unsqueeze(2) * (s.sign() * s.abs().clamp(min_=1e-6).sqrt()).sigmoid()
     if not self.ple.conv_kernel: return gated
     conv, store = short_conv(self.conv_state, self.norm_conv(gated).flatten(2), self.conv1d["weight"], Tensor(start_pos).eq(0), n)
@@ -878,11 +881,7 @@ class Transformer:
                   kv.get(f'{arch}.hyper_connection.low_rank', 0), arch == 'deepseek41') if f'{arch}.hyper_connection.count' in kv else None
     if hc is not None: state_dict = {re.sub(r'(hc_attn|hc_ffn|output_hc|\.ple)_', r'\1.', k):v for k,v in state_dict.items()}
 
-    if arch == 'deepseek41':
-      # the engram gate weighs the normed key, the query is normed without a weight
-      state_dict = {k.replace('.engram_kv.', '.ple.kv.').replace('.engram_gate.', '.ple.norm_key.'):
-                    v.flatten() if '.engram_gate.' in k else v for k,v in state_dict.items()}
-      state_dict.update({k.replace('.norm_key.', '.norm_query.'):v.ones_like() for k,v in state_dict.items() if '.ple.norm_key.' in k})
+    if arch == 'deepseek41': state_dict = {k.replace('.engram_', '.ple.'):v for k,v in state_dict.items()}
     sources = kv.get(f'{arch}.attention.indexer.source_layers')
     kpool = kv.get(f'{arch}.attention.indexer.block_size' if arch == 'minimax-m3' else f'{arch}.attention.indexer.kpool', 1 if sources else None)
     if arch == 'qwen4exp': kpool = max(kv[f'{arch}.attention.compress_ratios'])
