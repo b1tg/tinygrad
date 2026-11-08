@@ -86,11 +86,6 @@ def permute_rope(w:Tensor, n_heads:int, rope_dim:int) -> Tensor:
   prefix = x.shape[1]-rope_dim
   return x[:, :prefix].cat(x[:, prefix:].rearrange("n (h two) d -> n (two h) d", two=2), dim=1).reshape(w.shape)
 
-def sink_attention(q:Tensor, k:Tensor, v:Tensor, mask:Tensor, sinks:Tensor) -> Tensor:  # a zero key and value scored by the sink logit of each head
-  k, v = k.cat(k[..., :1, :].const_like(0), dim=-2), v.cat(v[..., :1, :].const_like(0), dim=-2)
-  mask = mask.expand(*q.shape[:3], mask.shape[-1]).cat(sinks.reshape(1, -1, 1, 1).expand(*q.shape[:3], 1), dim=-1)
-  return q.scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)
-
 def gated_pool(kg:Tensor, size:int, bias:Tensor|float=0.0) -> Tensor:  # (B, S, 1|2, D) values and gates to (B, S//size, D) pools
   kg = kg.reshape(kg.shape[0], -1, size, *kg.shape[2:])
   return (kg[..., 0, :] * (kg[..., -1, :] + bias).softmax(2)).sum(2)
@@ -362,6 +357,12 @@ class FFNBlock:
   def _reusable_prefix_len(self, prefix_len:int, cached_len:int) -> int: return prefix_len
   def _init_state(self, x:Tensor): raise NotImplementedError
   def _attention(self, x:Tensor, start_pos:StartPos, idx_mask:Tensor|None=None) -> Tensor: raise NotImplementedError
+  def _sdpa(self, q:Tensor, k:Tensor, v:Tensor, mask:Tensor|None) -> Tensor:  # (B,H,T,Hd)
+    if hasattr(self, 'attn_sinks'):  # a zero key and value scored by the sink logit of each head
+      if mask is None: mask = Tensor.zeros(1, 1, q.shape[2], k.shape[-2], dtype=q.dtype, buffer=False)
+      k, v = k.cat(k[..., :1, :].const_like(0), dim=-2), v.cat(v[..., :1, :].const_like(0), dim=-2)
+      mask = mask.expand(*q.shape[:3], mask.shape[-1]).cat(self.attn_sinks["weight"].reshape(1, -1, 1, 1).expand(*q.shape[:3], 1), dim=-1)
+    return q.scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)
   def _indexer_mask(self, x:Tensor, start_pos:StartPos, idx_mask:Tensor|None) -> Tensor|None:
     # a full indexer layer selects the top-k tokens for itself and the shared layers after it (MLATransformerBlock)
     return idx_mask
@@ -435,10 +436,7 @@ class TransformerBlock(FFNBlock):
     k, v = assigned_kv[0], assigned_kv[1]
     mask = (idx_mask.repeat_interleave(self.config.n_heads // int(idx_mask.shape[1]), dim=1) if idx_mask is not None else
             _causal_mask(x, start_pos, self.config.sliding_window))
-    if hasattr(self, 'attn_sinks'):
-      if mask is None: mask = Tensor.zeros(1, 1, T, k.shape[-2], dtype=x.dtype, buffer=False)
-      attn = sink_attention(q, k, v, mask, self.attn_sinks["weight"])
-    else: attn = q.scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)     # (B,H,T,Hd)
+    attn = self._sdpa(q, k, v, mask)                                                 # (B,H,T,Hd)
     attn = attn.transpose(1, 2).reshape(B, T, -1)                                    # back to (B,T,D)
     return self.attn_output(attn if not self.config.attn_output_gate else (attn * gate.sigmoid()))
 
@@ -689,7 +687,7 @@ class CompressedAttentionBlock(MLATransformerBlock):  # CSA2: a block is Full (s
       mask = mask.cat(unwrap(picked).where(0.0, -math.inf).expand(B, 1, T, -1), dim=-1)
     # the values are the keys: undo the rotation of the query position on the output
     cos, sin = freqs.chunk(2, dim=-1)
-    o = apply_rope(sink_attention(q, k, k, mask, self.attn_sinks["weight"]), cos.cat(-sin, dim=-1), True, True)
+    o = apply_rope(self._sdpa(q, k, k, mask), cos.cat(-sin, dim=-1), True, True)
     o = o.transpose(1, 2).reshape(B, T, cfg.o_groups, 1, -1)
     o = o @ self.attn_output_a["weight"].reshape(cfg.o_groups, cfg.o_lora_rank, -1).transpose(-1, -2)
     return self.attn_output_b(o.reshape(B, T, -1))
