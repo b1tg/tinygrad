@@ -46,16 +46,16 @@ def gated_activation(gate:Tensor, up:Tensor, config:TransformerConfig) -> Tensor
   # TODO: remove the need for this contiguous
   return gate * (gate * alpha).sigmoid().contiguous() * (up + up_bias)
 
-def apply_rope(x:Tensor, freqs_cis:Tensor, interleaved:bool=False) -> Tensor:
+def apply_rope(x:Tensor, freqs_cis:Tensor, interleaved:bool=False, last:bool=False) -> Tensor:
+  if (n:=freqs_cis.shape[-1]) < x.shape[-1]:  # only the first or the last n features are rotated
+    if last: return x[..., :-n].cat(apply_rope(x[..., -n:], freqs_cis, interleaved), dim=-1)
+    return apply_rope(x[..., :n], freqs_cis, interleaved).cat(x[..., n:], dim=-1)
   assert x.shape[-1] % 2 == 0
   if interleaved: x = x.rearrange("b h t (d two) -> b h t (two d)", two=2)
   cos, sin = freqs_cis.unsqueeze(-3).chunk(2, dim=-1)
   x1, x2 = x.chunk(2, dim=-1)
   out = (x1 * cos - x2 * sin).cat(x2 * cos + x1 * sin, dim=-1)
   return out.rearrange("b h t (two d) -> b h t (d two)", two=2) if interleaved else out
-
-def apply_rope_last(x:Tensor, freqs_cis:Tensor, rope_dim:int, interleaved:bool) -> Tensor:  # the rotated features come last
-  return x[..., :-rope_dim].cat(apply_rope(x[..., -rope_dim:], freqs_cis, interleaved), dim=-1)
 
 def _update_cache(cache:Tensor, value:Tensor, start_pos:StartPos, dim:int) -> Tensor:
   def store(c:Tensor, v:Tensor, pos:int|UOp) -> UOp:
@@ -525,10 +525,8 @@ class Indexer:
     if idx.msa or idx.qsa: iq = self.q_norm(iq)
     if idx.rope_dim:
       rot = Tensor.stack(*(unwrap(freqs)[p:p+T] for p in start_pos))
-      if not (idx.qsa or idx.pools):
-        k = apply_rope(k[..., :idx.rope_dim].unsqueeze(1), rot, idx.rope_interleave).squeeze(1).cat(k[..., idx.rope_dim:], dim=-1)
-      if idx.pools: iq = apply_rope_last(iq.transpose(1, 2), rot, idx.rope_dim, idx.rope_interleave).transpose(1, 2)
-      else: iq = apply_rope(iq[..., :idx.rope_dim].transpose(1, 2), rot, idx.rope_interleave).transpose(1, 2).cat(iq[..., idx.rope_dim:], dim=-1)
+      if not (idx.qsa or idx.pools): k = apply_rope(k.unsqueeze(1), rot, idx.rope_interleave).squeeze(1)
+      iq = apply_rope(iq.transpose(1, 2), rot, idx.rope_interleave, idx.pools).transpose(1, 2)
     if hasattr(self, "compressor_gate"):
       # cache an indexer key and a pooling gate per token, a pool's key is the gate softmax weighted sum of its keys
       kg = k.stack(self.compressor_gate(x), dim=2)  # (B, T, kpool, 2, D)
@@ -669,7 +667,7 @@ class CompressedAttentionBlock(MLATransformerBlock):  # CSA2: a block is Full (s
       g0, m, n = pos // r, pos % r, ceildiv(x.max_shape[1] + r - 1, r)
       kg = Tensor(kg.uop.after(store)).pad_to((kg.shape[0], r + n*r, *kg.shape[2:]))[:, r-m:r-m+n*r]
       new = self.attn_compressor_norm(gated_pool(kg, r))
-      def rope(t:Tensor) -> Tensor: return apply_rope_last(t.unsqueeze(1), self.freqs_cis[::r][g0:g0+n], self.config.rope_dim, True).squeeze(1)
+      def rope(t:Tensor) -> Tensor: return apply_rope(t.unsqueeze(1), self.freqs_cis[::r][g0:g0+n], True, True).squeeze(1)
       pools = _update_cache(self.cache_p, rope(new), (g0,), 1)
       if (ix:=self.indexer) is not None: keys = _update_cache(self.cache_k, rope(ix.k_norm(ix.attn_k(new))), (g0,), 1)
     # Full and Reindex pick the pools, on short contexts too, Reuse attends to the ones in carry.picked
@@ -677,10 +675,10 @@ class CompressedAttentionBlock(MLATransformerBlock):  # CSA2: a block is Full (s
     return self._attention(x, start_pos, carry.picked, pools)
 
   def _attention(self, x:Tensor, start_pos:StartPos, picked:Tensor|None=None, pools:Tensor|None=None) -> Tensor:
-    (B, T, _), cfg, r, pos = x.shape, self.config, self.config.rope_dim, start_pos[0]
+    (B, T, _), cfg, pos = x.shape, self.config, start_pos[0]
     freqs = self.freqs_cis[pos:pos+T]
-    q = apply_rope_last(self._q(x), freqs, r, True)
-    kv = apply_rope_last(self.attn_kv_a_norm(self.attn_kv(x)).unsqueeze(1), freqs, r, True)
+    q = apply_rope(self._q(x), freqs, True, True)
+    kv = apply_rope(self.attn_kv_a_norm(self.attn_kv(x)).unsqueeze(1), freqs, True, True)
     # the window has the keys of the positions from sliding_window before x, the ones before position 0 are masked
     (window, store), S = shift_in(self.cache_kv, kv.squeeze(1), Tensor(pos).eq(0)), cfg.sliding_window
     k = Tensor(window.uop.after(store))[:, :S+T].unsqueeze(1)
@@ -691,7 +689,7 @@ class CompressedAttentionBlock(MLATransformerBlock):  # CSA2: a block is Full (s
       mask = mask.cat(unwrap(picked).where(0.0, -math.inf).expand(B, 1, T, -1), dim=-1)
     # the values are the keys: undo the rotation of the query position on the output
     cos, sin = freqs.chunk(2, dim=-1)
-    o = apply_rope_last(sink_attention(q, k, k, mask, self.attn_sinks["weight"]), cos.cat(-sin, dim=-1), r, True)
+    o = apply_rope(sink_attention(q, k, k, mask, self.attn_sinks["weight"]), cos.cat(-sin, dim=-1), True, True)
     o = o.transpose(1, 2).reshape(B, T, cfg.o_groups, 1, -1)
     o = o @ self.attn_output_a["weight"].reshape(cfg.o_groups, cfg.o_lora_rank, -1).transpose(-1, -2)
     return self.attn_output_b(o.reshape(B, T, -1))
