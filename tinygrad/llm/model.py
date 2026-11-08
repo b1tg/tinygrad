@@ -678,8 +678,7 @@ class CompressedAttentionBlock(FFNBlock):  # CSA2: a block is Full (source), Rei
     # the window has the keys of the positions from sliding_window before x, the ones before position 0 are masked
     (window, store), S = shift_in(self.cache_kv, kv.squeeze(1), Tensor(pos).eq(0)), cfg.sliding_window
     k = Tensor(window.uop.after(store))[:, :S+T].unsqueeze(1)
-    mask = unwrap(_causal_mask(x, (S,), S)) + Tensor.full((1, 1, 1, S+T), -math.inf, buffer=False).tril(S-pos-1)
-    mask = mask.expand(B, 1, T, -1)
+    mask = (unwrap(_causal_mask(x, (S,), S)) + Tensor.full((1, 1, 1, S+T), -math.inf, buffer=False).tril(S-pos-1)).expand(B, 1, T, -1)
     if self.ratio:
       k = k.cat(unwrap(pools).unsqueeze(1).cast(k.dtype), dim=2)
       mask = mask.cat(unwrap(picked).where(0.0, -math.inf).expand(B, 1, T, -1), dim=-1)
