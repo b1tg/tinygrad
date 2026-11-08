@@ -369,7 +369,7 @@ class FFNBlock:
     carry.idx_mask = self._indexer_mask(x, start_pos, carry.idx_mask)
     return self._attention(x, start_pos, carry.idx_mask)
 
-  def __call__(self, x:Tensor, start_pos:StartPos, carry:Carry) -> tuple[Tensor, Carry]:
+  def __call__(self, x: Tensor, start_pos: StartPos, carry: Carry):
     self._init_state(x)
     if hasattr(self, 'ple'): self.ple._init_state(x)
     # we pass in the weights implicitly so we unpack the GGUF on the fly
@@ -644,8 +644,7 @@ class MLATransformerBlock(FFNBlock):
 class CompressedAttentionBlock(FFNBlock):  # CSA2: a block is Full (source), Reindex (an indexer only) or Reuse (neither)
   def __init__(self, config:TransformerConfig, ratio:int, source:bool):  # Full compresses the pools for the blocks up to the next Full
     if (idx:=config.indexer) is not None:
-      config = replace(config, indexer=replace(idx, kpool=ratio, top_k=min(idx.top_k * ratio, config.max_context),
-                                                rope_dim=config.rope_dim))
+      config = replace(config, indexer=replace(idx, kpool=ratio, top_k=min(idx.top_k * ratio, config.max_context), rope_dim=config.rope_dim))
     super().__init__(config)
     self.ratio, self.attn_sinks = ratio, {"weight": Tensor.zeros(config.n_heads)}
     self.attn_q_a, self.attn_q_a_norm = Linear(config.dim, config.q_lora_rank, bias=False), nn.RMSNorm(config.q_lora_rank, config.norm_eps)
