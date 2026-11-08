@@ -161,7 +161,6 @@ class IndexerConfig:  # select top_k tokens by scoring individual keys or pools 
   rope_interleave: bool = True
   msa: bool = False
   qsa: bool = False
-  pools: bool = False  # score the pools of the last Full layer (DeepSeek-V4 CSA2)
   candidates: tuple[int, ...] = ()  # (blocks, block size): the best blocks of pools are where the Reindex layers after this one search
 
 @dataclass(frozen=True)
@@ -497,16 +496,19 @@ class PLELayer:
     return Tensor((gated + conv[:, :T].reshape(gated.shape)).contiguous().uop.after(store))
 
 class Indexer:
-  def __init__(self, config:TransformerConfig, makes_keys:bool=True):
+  rope_last = False
+  def __init__(self, config:TransformerConfig):
     self.idx, self.max_context = (idx:=unwrap(config.indexer)), config.max_context
     self.attn_q_b = Linear(config.q_lora_rank or config.dim, idx.n_heads * idx.head_dim, bias=False)
-    # a Full layer makes the indexer keys from its pools, a Reindex layer scores them
-    if makes_keys:
-      self.attn_k = Linear(config.head_dim if idx.pools else config.dim, idx.head_dim, bias=False)
-      self.k_norm = (nn.RMSNorm if idx.msa or idx.qsa or idx.pools else nn.LayerNorm)(idx.head_dim, eps=idx.norm_eps)
+    self._init_keys(config)
     if idx.msa or idx.qsa: self.q_norm = nn.RMSNorm(idx.head_dim, eps=idx.norm_eps)
     else: self.proj = Linear(config.dim, idx.n_heads, bias=False)
-    if idx.kpool > 1 and not (idx.msa or idx.qsa or idx.pools):
+
+  def _init_keys(self, config:TransformerConfig):
+    idx = self.idx
+    self.attn_k = Linear(config.dim, idx.head_dim, bias=False)
+    self.k_norm = (nn.RMSNorm if idx.msa or idx.qsa else nn.LayerNorm)(idx.head_dim, eps=idx.norm_eps)
+    if idx.kpool > 1 and not (idx.msa or idx.qsa):
       self.compressor_gate, self.compressor_ape = Linear(config.dim, idx.head_dim, bias=False), {"weight": Tensor.zeros(idx.kpool, idx.head_dim)}
 
   def _init_state(self, x:Tensor):
@@ -515,48 +517,64 @@ class Indexer:
                                   *((2, self.idx.head_dim) if hasattr(self, "compressor_gate") else (self.idx.head_dim,)),
                                   dtype=dtypes.half, device=x.device)
 
-  def __call__(self, x:Tensor, q:Tensor, start_pos:StartPos, freqs:Tensor|None=None, keys:Tensor|None=None, carry:Carry|None=None) -> Tensor:
-    (B, T, _), idx, S = x.shape, self.idx, ssimplify(smax(start_pos) + x.shape[1])
-    # a pool indexer (DeepSeek-V4 Full, Reindex) scores the cached roped keys of the last Full layer, the rotated features come last
-    k = unwrap(keys) if idx.pools else self.attn_k(x) if idx.qsa else self.k_norm(self.attn_k(x))
-    iq = self.attn_q_b(q).reshape(B, T, idx.n_heads, idx.head_dim)
-    if idx.msa or idx.qsa: iq = self.q_norm(iq)
-    if idx.rope_dim:
-      rot = Tensor.stack(*(unwrap(freqs)[p:p+T] for p in start_pos))
-      if not (idx.qsa or idx.pools): k = apply_rope(k.unsqueeze(1), rot, idx.rope_interleave).squeeze(1)
-      iq = apply_rope(iq.transpose(1, 2), rot, idx.rope_interleave, idx.pools).transpose(1, 2)
+  def _rope(self, t:Tensor, start_pos:StartPos, freqs:Tensor|None) -> Tensor:  # t: (B, H, T, D)
+    return apply_rope(t, Tensor.stack(*(unwrap(freqs)[p:p+t.shape[2]] for p in start_pos)), self.idx.rope_interleave, self.rope_last)
+
+  def _keys(self, x:Tensor, start_pos:StartPos, freqs:Tensor|None) -> Tensor:  # (B, S, D)
+    B, idx = x.shape[0], self.idx
+    k = self.attn_k(x) if idx.qsa else self.k_norm(self.attn_k(x))
+    if idx.rope_dim and not idx.qsa: k = self._rope(k.unsqueeze(1), start_pos, freqs).squeeze(1)
     if hasattr(self, "compressor_gate"):
       # cache an indexer key and a pooling gate per token, a pool's key is the gate softmax weighted sum of its keys
       kg = k.stack(self.compressor_gate(x), dim=2)  # (B, T, kpool, 2, D)
       k = gated_pool(_update_cache(self.cache_kg, kg, start_pos, 1).float(), idx.kpool, self.compressor_ape["weight"])  # (B, S, D)
-    elif not idx.pools:
+    else:
       k = _update_cache(self.cache_kg, k, start_pos, 1).float()  # (B, S, D)
     if idx.qsa:
       k, rot = self.k_norm(k.reshape(B, -1, idx.kpool, idx.head_dim).mean(2)), unwrap(freqs)[:self.max_context:idx.kpool]
       k = apply_rope(k[..., :idx.rope_dim].unsqueeze(1), rot, idx.rope_interleave).squeeze(1).cat(k[..., idx.rope_dim:], dim=-1)
+    return k
+
+  def _scores(self, x:Tensor, q:Tensor, start_pos:StartPos, freqs:Tensor|None, k:Tensor) -> tuple[Tensor, Tensor]:
+    (B, T, _), idx = x.shape, self.idx
+    iq = self.attn_q_b(q).reshape(B, T, idx.n_heads, idx.head_dim)
+    if idx.msa or idx.qsa: iq = self.q_norm(iq)
+    if idx.rope_dim: iq = self._rope(iq.transpose(1, 2), start_pos, freqs).transpose(1, 2)
     scores = iq @ k.transpose(-1, -2).unsqueeze(1)
     if idx.msa:   scores = scores.reshape(B, T, idx.n_heads, scores.shape[-1] // idx.kpool, idx.kpool).max(-1).transpose(1, 2)
     elif idx.qsa: scores = (scores.relu() * idx.head_dim**-0.5).sum(2).unsqueeze(1)
     else:         scores = (scores.relu() * (self.proj(x) * (idx.n_heads * idx.head_dim)**-0.5).unsqueeze(-1)).sum(2).unsqueeze(1)
     # the query sees the top_k/kpool best complete pools and the tokens of its own pool while incomplete (the tail)
     q_pos = Tensor.stack(*(Tensor(p) for p in start_pos)).reshape(-1, 1, 1, 1) + Tensor.arange(T).reshape(1, 1, T, 1)
-    k_pos = Tensor.arange(S)
-    scores = ((Tensor.arange(scores.shape[-1]) + 1) * idx.kpool <= q_pos + 1).where(scores, -math.inf)
+    return ((Tensor.arange(scores.shape[-1]) + 1) * idx.kpool <= q_pos + 1).where(scores, -math.inf), q_pos  # (B, 1, T, pools)
+
+  def __call__(self, x:Tensor, q:Tensor, start_pos:StartPos, freqs:Tensor|None=None) -> Tensor:
+    idx, k_pos = self.idx, Tensor.arange(ssimplify(smax(start_pos) + x.shape[1]))
+    scores, q_pos = self._scores(x, q, start_pos, freqs, self._keys(x, start_pos, freqs))
     if idx.msa: scores = (Tensor.arange(scores.shape[-1]) == q_pos // idx.kpool).where(math.inf, scores)
-    if idx.pools:
-      if idx.candidates:
-        # the best blocks of pools are where the Reindex layers after this one search, a block scores its best pool, the newest block is always in
-        (n_blocks, size), n = idx.candidates, scores.shape[-1]
-        blocks = scores.pad((0, -n % size), value=-math.inf).reshape(*scores.shape[:-1], -1, size).max(-1)
-        blocks = (Tensor.arange(blocks.shape[-1]) == ((q_pos + 1) // idx.kpool - 1) // size).where(math.inf, blocks)
-        unwrap(carry).candidates = topk_mask(blocks, min(n_blocks, int(blocks.shape[-1]))).repeat_interleave(size, dim=-1)[..., :n]
-      elif (c:=unwrap(carry).candidates) is not None: scores = c.where(scores, -math.inf)
-      # (B, 1, T, pools), a picked pool of -inf is incomplete or not a candidate
-      return topk_mask(scores, idx.top_k // idx.kpool) & (scores > -math.inf)
     # selected incomplete pools add only tail/future tokens, handled by the final tail and causal mask
-    picked = topk_mask(scores, idx.top_k // idx.kpool).repeat_interleave(idx.kpool, dim=-1)[..., :S]
+    picked = topk_mask(scores, idx.top_k // idx.kpool).repeat_interleave(idx.kpool, dim=-1)[..., :k_pos.shape[0]]
     return ((picked | (k_pos >= (q_pos + 1) // idx.kpool * idx.kpool)) & (k_pos <= q_pos)).where(0.0, -math.inf).cast(x.dtype)
 
+class PoolIndexer(Indexer):  # DeepSeek-V4 CSA2: scores the cached roped keys of the pools of the last Full layer, the rotated features come last
+  rope_last = True
+  def __init__(self, config:TransformerConfig, makes_keys:bool):
+    super().__init__(config)
+    # a Full layer makes the indexer keys from its pools, a Reindex layer scores them
+    if makes_keys: self.attn_k, self.k_norm = Linear(config.head_dim, (d:=self.idx.head_dim), bias=False), nn.RMSNorm(d, eps=self.idx.norm_eps)
+  def _init_keys(self, config:TransformerConfig): pass
+
+  def __call__(self, x:Tensor, q:Tensor, start_pos:StartPos, freqs:Tensor|None=None, keys:Tensor|None=None, carry:Carry|None=None) -> Tensor:
+    (scores, q_pos), idx, carry = self._scores(x, q, start_pos, freqs, unwrap(keys)), self.idx, unwrap(carry)
+    if idx.candidates:
+      # the best blocks of pools are where the Reindex layers after this one search, a block scores its best pool, the newest block is always in
+      (n_blocks, size), n = idx.candidates, scores.shape[-1]
+      blocks = scores.pad((0, -n % size), value=-math.inf).reshape(*scores.shape[:-1], -1, size).max(-1)
+      blocks = (Tensor.arange(blocks.shape[-1]) == ((q_pos + 1) // idx.kpool - 1) // size).where(math.inf, blocks)
+      carry.candidates = topk_mask(blocks, min(n_blocks, int(blocks.shape[-1]))).repeat_interleave(size, dim=-1)[..., :n]
+    elif carry.candidates is not None: scores = carry.candidates.where(scores, -math.inf)
+    # (B, 1, T, pools), a picked pool of -inf is incomplete or not a candidate
+    return topk_mask(scores, idx.top_k // idx.kpool) & (scores > -math.inf)
 
 class MLATransformerBlock(FFNBlock):
   kv_b_block_size:tuple[int, int] = (128, 128)
@@ -626,7 +644,7 @@ class MLATransformerBlock(FFNBlock):
 class CompressedAttentionBlock(FFNBlock):  # CSA2: a block is Full (source), Reindex (an indexer only) or Reuse (neither)
   def __init__(self, config:TransformerConfig, ratio:int, source:bool):  # Full compresses the pools for the blocks up to the next Full
     if (idx:=config.indexer) is not None:
-      config = replace(config, indexer=replace(idx, pools=True, kpool=ratio, top_k=min(idx.top_k * ratio, config.max_context),
+      config = replace(config, indexer=replace(idx, kpool=ratio, top_k=min(idx.top_k * ratio, config.max_context),
                                                 rope_dim=config.rope_dim))
     super().__init__(config)
     self.ratio, self.attn_sinks = ratio, {"weight": Tensor.zeros(config.n_heads)}
@@ -635,7 +653,7 @@ class CompressedAttentionBlock(FFNBlock):  # CSA2: a block is Full (source), Rei
     self.attn_kv, self.attn_kv_a_norm = Linear(config.dim, config.head_dim, bias=False), nn.RMSNorm(config.head_dim, config.norm_eps)
     self.attn_output_a = {"weight": Tensor.zeros(config.o_groups * config.o_lora_rank, config.n_heads * config.head_dim // config.o_groups)}
     self.attn_output_b = Linear(config.o_groups * config.o_lora_rank, config.dim, bias=False)
-    self.indexer = Indexer(config, source) if config.indexer else None
+    self.indexer = PoolIndexer(config, source) if config.indexer else None
     if ratio and source:
       # plain matmuls: the compression in the indexer and in the attention is one store
       self.attn_compressor_kv = {"weight": Tensor.zeros(config.head_dim, config.dim)}
