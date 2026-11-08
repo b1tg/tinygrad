@@ -371,10 +371,9 @@ class FFNBlock:
   def __call__(self, x:Tensor, start_pos:StartPos, carry:Carry) -> tuple[Tensor, Carry]:
     self._init_state(x)
     if hasattr(self, 'ple'): self.ple._init_state(x)
-    names:list[str] = []
     # we pass in the weights implicitly so we unpack the GGUF on the fly
     @function(precompile=True, allow_implicit=True)
-    def _run(x:Tensor, start_pos:StartPos, given:Carry):
+    def _run(x:Tensor, start_pos:StartPos, given:Carry) -> tuple[Tensor, dict[str, Tensor]]:
       carry = replace(given)
       if hasattr(self, 'ple'): x = x + self.ple(x, start_pos)  # (B, T, hc, D)
       def attend(h:Tensor) -> Tensor: return self._attend(self.attn_norm(h), start_pos, carry)
@@ -387,10 +386,9 @@ class FFNBlock:
       if carry.pre is not None: carry.pre = self.hc_ffn.weights(x)[0]
       out = res_ffn(x, lambda h: self._feed_forward(self.ffn_norm(h))).contiguous()
       # only what this block made is returned, the rest passes by uncopied
-      names[:] = [k for k, v in vars(carry).items() if v is not None and v is not getattr(given, k)]
-      return (out, *(getattr(carry, k) for k in names))
-    out, *rest = _run(x, start_pos, carry)
-    return out, replace(carry, **dict(zip(names, rest)))
+      return out, {k: v for k, v in vars(carry).items() if v is not None and v is not getattr(given, k)}
+    out, made = _run(x, start_pos, carry)
+    return out, replace(carry, **made)
 
 class TransformerBlock(FFNBlock):
   def __init__(self, config:TransformerConfig):

@@ -1,6 +1,6 @@
 import functools, time
 from dataclasses import replace
-from typing import Generic, TypeVar, Callable, cast, overload
+from typing import Generic, TypeVar, Callable, Iterator, cast, overload
 from tinygrad.helpers import Context, dedup, getenv, DEBUG
 from tinygrad.uop.ops import UOp, Ops, GroupOp, graph_rewrite, PatternMatcher, UPat
 from tinygrad.tensor import Tensor
@@ -35,6 +35,12 @@ def renumber_invalid_outputs(uret:UOp) -> UOp:
   return uret.substitute({b:b.replace(op=Ops.ALLOC, arg=replace(b.arg, slot=i, buffer=None, bind_on_realize=False))
                           for i,b in enumerate(x for x in uret.toposort() if x in invalid)})
 
+# a function returns a Tensor or tuples and dicts of Tensors
+def _flatten(x) -> list: return [x] if isinstance(x, Tensor) else [t for v in (x.values() if isinstance(x, dict) else x) for t in _flatten(v)]
+def _unflatten(x, outs:Iterator[Tensor]):
+  if isinstance(x, Tensor): return next(outs)
+  return {k:_unflatten(v, outs) for k,v in x.items()} if isinstance(x, dict) else tuple(_unflatten(v, outs) for v in x)
+
 ReturnType = TypeVar('ReturnType')
 class _function(Generic[ReturnType]):
   depth = 0
@@ -66,8 +72,8 @@ class _function(Generic[ReturnType]):
         _function.depth -= 1
     if isinstance(ret, Tensor):
       uret = ret.uop
-    elif isinstance(ret, tuple) and all(isinstance(x, Tensor) for x in ret):
-      uret = UOp.sink(*[x.uop for x in ret])
+    elif isinstance(ret, (tuple, dict)) and all(isinstance(x, Tensor) for x in _flatten(ret)):
+      uret = UOp.sink(*[x.uop for x in _flatten(ret)])
     else:
       raise RuntimeError(f"function return type {type(ret)} not supported")
 
@@ -86,16 +92,13 @@ class _function(Generic[ReturnType]):
         buf_strs = '\n  '.join(f"{i}: dtype={b.dtype}, size={b.max_numel()}, device={b.device}" for i,b in enumerate(implicit_buffers))
         raise RuntimeError(f"function {name} has {len(implicit_buffers)} implicit buffer(s), but allow_implicit=False\n  {buf_strs}")
 
-    outs = UOp.call_with_outputs(uret.src if isinstance(ret, tuple) else (uret,), *call_uops, grad_fxn=self.grad_fxn, name=name,
+    outs = UOp.call_with_outputs((uret,) if isinstance(ret, Tensor) else uret.src, *call_uops, grad_fxn=self.grad_fxn, name=name,
                                  precompile=self.precompile, precompile_backward=self.precompile_backward)
 
     if DEBUG >= 2:
       print("  "*_function.depth+f"function {uret.key.hex()[:8]} in {(time.perf_counter()-st)*1000:8.2f} ms: {name}")
 
-    if isinstance(ret, tuple):
-      return cast(ReturnType, tuple(Tensor(o) for o in outs))
-    else:
-      return cast(ReturnType, Tensor(outs[0]))
+    return cast(ReturnType, Tensor(outs[0]) if isinstance(ret, Tensor) else _unflatten(ret, iter(Tensor(o) for o in outs)))
 
 # overload signatures support both @function and @function(precompile=True) syntax
 @overload

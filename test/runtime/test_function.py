@@ -466,6 +466,14 @@ class TestFunctionTuple(unittest.TestCase):
     assert t2.tolist() == [3,3,3]
   def test_tuple_precompile(self): self.test_tuple(True)
 
+  def test_dict(self, precompile=False):
+    x = Tensor.ones(3).contiguous()
+    @function(precompile=precompile)
+    def f(t:Tensor): return t+1, {"a": t+2, "b": (t+3,)}
+    t1, d = f(x)
+    assert t1.tolist() == [2,2,2] and d["a"].tolist() == [3,3,3] and d["b"][0].tolist() == [4,4,4]
+  def test_dict_precompile(self): self.test_dict(True)
+
   def test_grad_tuple(self, precompile=False):
     x = Tensor.ones(3).contiguous()
     y = Tensor.ones(3).contiguous()
