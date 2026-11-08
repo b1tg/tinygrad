@@ -150,6 +150,22 @@ class TestCustomKernel(unittest.TestCase):
     out = c.flatten().tolist()
     assert all(x == 2 for x in out), "all 2"
 
+  def test_reduce_device_range(self):
+    def kernel(C:UOp, A:UOp, B:UOp):
+      d = UOp.range(2, 0, AxisType.DEVICE)
+      return C[0].store(UOp.stack(A, B)[d, 0].reduce(d, arg=Ops.ADD)).sink(arg=KernelInfo(opts_to_apply=()))
+    devs = ('CPU:1', 'CPU:2')
+    lanes = [Tensor([2]).to(devs[0]).realize(), Tensor([3]).to(devs[1]).realize()]
+    out = Tensor.empty(2, dtype=lanes[0].dtype, device='CPU').shard(devs, axis=0).realize()
+    with self.assertRaises(RuntimeError): Tensor.custom_kernel(out, *lanes, fxn=kernel)[0].realize()
+
+  def test_reduce_device_range_not_copy(self):
+    def kernel(C:UOp, A:UOp):
+      d = UOp.range(2, 0, AxisType.DEVICE)
+      return UOp(Ops.NOOP).after(d.after(C[0].store(A[0])).reduce(d, arg=Ops.ADD)).sink(arg=KernelInfo(opts_to_apply=()))
+    out = Tensor.zeros(2, device='CPU').shard(('CPU:1', 'CPU:2'), axis=0).contiguous().realize()
+    with self.assertRaises(RuntimeError): Tensor.custom_kernel(out, Tensor([7.]).realize(), fxn=kernel)[0].realize()
+
   def test_sharded_add_one(self):
     # PYTHON backend explicitly checks for OOB access for wrong multi shape regression
     devs = ("PYTHON:0", "PYTHON:1")
@@ -725,6 +741,33 @@ class TestCustomKernel(unittest.TestCase):
     a, b = Tensor.custom_kernel(Tensor([3, 0]).contiguous(), Tensor.ones(1, dtype=dtypes.int).contiguous(), fxn=kernel)
     self.assertEqual((a.tolist(), b.tolist()), ([3, 7], [0]))
 
+  def test_index_vector_bitcast_widen(self):
+    def kernel(A:UOp, B:UOp): return B[0].store(A.index().load().bitcast(dtypes.int32)[1]).sink(arg=KernelInfo(opts_to_apply=()))
+    _, b = Tensor.custom_kernel(Tensor([1, 2, -3, 4], dtype=dtypes.int16).contiguous(), Tensor.zeros(1, dtype=dtypes.int32).contiguous(), fxn=kernel)
+    self.assertEqual(b.tolist(), [(-3 & 0xFFFF) + (4 << 16)])
+
+  def test_index_vector_bitcast_narrow(self):
+    def kernel(A:UOp, B:UOp): return B[0].store((A.index()+1).bitcast(dtypes.uint16)[3]).sink(arg=KernelInfo(opts_to_apply=()))
+    _, b = Tensor.custom_kernel(Tensor([1, 5 << 16], dtype=dtypes.uint32).contiguous(), Tensor.zeros(1, dtype=dtypes.uint16).contiguous(), fxn=kernel)
+    self.assertEqual(b.tolist(), [5])
+
+  def test_index_shaped_value_after_range(self):
+    def kernel(B:UOp):
+      r = UOp.range(3, 0)
+      value = UOp.stack(UOp.const(2.0, dtypes.float)).reciprocal().after(r)
+      return B[0].store(value.index(UOp.const(0, dtypes.int).after(r)).reduce(r, arg=Ops.MAX)).sink(arg=KernelInfo(opts_to_apply=()))
+    self.assertEqual(Tensor.zeros(1).contiguous().custom_kernel(fxn=kernel)[0].tolist(), [0.5])
+
+  def test_reduce_keeps_shaped_value_effect_count(self):
+    def kernel(A:UOp, B:UOp, C:UOp):
+      i = UOp.range(3, 0)
+      value = (A.index().load()*(i+1)).after(C[0].store(C.after(i)[0].load()+1)).reduce(i, arg=Ops.ADD)
+      return B[0].store(value[0]+value[1]).sink(arg=KernelInfo(opts_to_apply=()))
+    _, b, c = Tensor.custom_kernel(Tensor([1, 10]).contiguous(), Tensor.zeros(1, dtype=dtypes.int).contiguous(),
+                                   Tensor.zeros(1, dtype=dtypes.int).contiguous(), fxn=kernel)
+    Tensor.realize(b, c)
+    self.assertEqual((b.tolist(), c.tolist()), ([66], [3]))
+
   def test_simplify_keeps_read_after_store(self):
     def kernel(A:UOp, B:UOp): return B[0].store((A[0].after(A[0].store(7))*2).simplify()).sink(arg=KernelInfo(opts_to_apply=()))
     a, b = Tensor.custom_kernel(Tensor([3]).contiguous(), Tensor.zeros(1, dtype=dtypes.int).contiguous(), fxn=kernel)
@@ -736,6 +779,19 @@ class TestCustomKernel(unittest.TestCase):
       return B[0].store(UOp.stack(UOp.const(2, dtypes.int)).index(i)).sink(arg=KernelInfo(opts_to_apply=()))
     a, b = Tensor.custom_kernel(Tensor([0]).contiguous(), Tensor([9]).contiguous(), fxn=kernel)
     self.assertEqual((a.tolist(), b.tolist()), ([1], [2]))
+
+  def test_stack_index_keeps_lane_effects(self):
+    def kernel(A:UOp):
+      lanes = [A.after(A[j].store(7+2*j))[j].load() for j in range(2)]
+      return A[2].store(UOp.stack(*lanes).index(UOp.const(0, dtypes.int))).sink(arg=KernelInfo(opts_to_apply=()))
+    self.assertEqual(Tensor.zeros(3, dtype=dtypes.int).contiguous().custom_kernel(fxn=kernel)[0].tolist(), [7, 9, 7])
+
+  def test_stack_bounded_index_keeps_lane_effects(self):
+    i = UOp.range(2, 0)
+    def kernel(A:UOp):
+      lanes = [A.after(A[j].store(7+2*j))[j].load() for j in range(4)]
+      return A[4+i].store(UOp.stack(*lanes).index(i)).end(i).sink(arg=KernelInfo(opts_to_apply=()))
+    self.assertEqual(Tensor.zeros(6, dtype=dtypes.int).contiguous().custom_kernel(fxn=kernel)[0].tolist(), [7, 9, 11, 13, 7, 9])
 
   def test_valid_gate_after_effect(self):
     def kernel(A:UOp, B:UOp):
