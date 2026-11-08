@@ -165,8 +165,8 @@ class IndexerConfig:  # select top_k tokens by scoring individual keys or pools 
   rope_interleave: bool = True
   msa: bool = False
   qsa: bool = False
-  pools: bool = False  # score the pools of a kv source (DeepSeek-V4)
-  candidates: tuple[int, ...] = ()  # (blocks, block size): the best blocks of pools are where the indexers after this one search
+  pools: bool = False  # score the pools of the last Full layer (DeepSeek-V4 CSA2)
+  candidates: tuple[int, ...] = ()  # (blocks, block size): the best blocks of pools are where the Reindex layers after this one search
 
 @dataclass(frozen=True)
 class TransformerConfig:
@@ -284,10 +284,10 @@ class GatedResidual(HyperConnection):
 class Carry:  # what a block passes on to the blocks after it
   idx_mask: Tensor|None = None    # the tokens the last full indexer selected
   pre: Tensor|None = None         # the delayed mHC weights
-  pools: Tensor|None = None       # the caches of the roped pools and indexer keys of the last kv source
+  pools: Tensor|None = None       # the caches of the roped pools and indexer keys of the last Full layer
   keys: Tensor|None = None
-  picked: Tensor|None = None      # the pools the last pool indexer picked
-  candidates: Tensor|None = None  # the blocks of pools the pool indexers after a candidate source search
+  picked: Tensor|None = None      # the pools the last Full or Reindex layer picked, for the Reuse layers
+  candidates: Tensor|None = None  # the blocks of pools the Reindex layers after the candidate Full layer search
 
 class FFNBlock:
   def __init__(self, config:TransformerConfig):
@@ -501,7 +501,7 @@ class Indexer:
   def __init__(self, config:TransformerConfig, source:bool=True):
     self.idx, self.max_context = (idx:=unwrap(config.indexer)), config.max_context
     self.attn_q_b = Linear(config.q_lora_rank or config.dim, idx.n_heads * idx.head_dim, bias=False)
-    # the keys of a pool indexer are made by its kv source from the pools
+    # a Full layer makes the indexer keys from its pools, a Reindex layer scores them
     if source:
       self.attn_k = Linear(config.head_dim if idx.pools else config.dim, idx.head_dim, bias=False)
       self.k_norm = (nn.RMSNorm if idx.msa or idx.qsa or idx.pools else nn.LayerNorm)(idx.head_dim, eps=idx.norm_eps)
@@ -518,7 +518,7 @@ class Indexer:
 
   def __call__(self, x:Tensor, q:Tensor, start_pos:StartPos, freqs:Tensor|None=None, keys:Tensor|None=None, carry:Carry|None=None) -> Tensor:
     (B, T, _), idx, S = x.shape, self.idx, ssimplify(smax(start_pos) + x.shape[1])
-    # a pool indexer (DeepSeek-V4) scores the cached roped keys of its kv source, the rotated features come last
+    # a pool indexer (DeepSeek-V4 Full, Reindex) scores the cached roped keys of the last Full layer, the rotated features come last
     k = unwrap(keys) if idx.pools else self.attn_k(x) if idx.qsa else self.k_norm(self.attn_k(x))
     iq = self.attn_q_b(q).reshape(B, T, idx.n_heads, idx.head_dim)
     if idx.msa or idx.qsa: iq = self.q_norm(iq)
@@ -548,7 +548,7 @@ class Indexer:
     if idx.msa: scores = (Tensor.arange(scores.shape[-1]) == q_pos // idx.kpool).where(math.inf, scores)
     if idx.pools:
       if idx.candidates:
-        # the best blocks of pools are where the indexers after this one search, a block scores its best pool, the newest block is always in
+        # the best blocks of pools are where the Reindex layers after this one search, a block scores its best pool, the newest block is always in
         (n_blocks, size), n = idx.candidates, scores.shape[-1]
         blocks = scores.pad((0, -n % size), value=-math.inf).reshape(*scores.shape[:-1], -1, size).max(-1)
         blocks = (Tensor.arange(blocks.shape[-1]) == ((q_pos + 1) // idx.kpool - 1) // size).where(math.inf, blocks)
@@ -630,8 +630,8 @@ class MLATransformerBlock(FFNBlock):
                                             device=x.device, yarn=self.config.yarn)
     if self.indexer: self.indexer._init_state(x)
 
-class CompressedAttentionBlock(MLATransformerBlock):
-  def __init__(self, config:TransformerConfig, ratio:int, source:bool):  # a kv source compresses the pools for the blocks up to the next source
+class CompressedAttentionBlock(MLATransformerBlock):  # CSA2: a block is Full (source), Reindex (an indexer only) or Reuse (neither)
+  def __init__(self, config:TransformerConfig, ratio:int, source:bool):  # Full compresses the pools for the blocks up to the next Full
     if (idx:=config.indexer) is not None:
       config = replace(config, indexer=replace(idx, pools=True, kpool=ratio, top_k=min(idx.top_k * ratio, config.max_context),
                                                 rope_dim=config.rope_dim))
@@ -649,7 +649,7 @@ class CompressedAttentionBlock(MLATransformerBlock):
 
   def __call__(self, x:Tensor, start_pos:StartPos, carry:Carry) -> tuple[Tensor, Carry]:
     out, carry = super().__call__(x, start_pos, carry)
-    # a kv source hands its caches to the blocks up to the next source, as caches they are read in place
+    # a Full block hands its caches to the blocks up to the next Full, as caches they are read in place
     if hasattr(self, "cache_p"): carry = replace(carry, pools=self.cache_p, keys=self.cache_k if self.indexer is not None else None)
     return out, carry
 
@@ -671,7 +671,7 @@ class CompressedAttentionBlock(MLATransformerBlock):
       def rope(t:Tensor) -> Tensor: return apply_rope_last(t.unsqueeze(1), self.freqs_cis[::r][g0:g0+n], self.config.rope_dim, True).squeeze(1)
       pools = _update_cache(self.cache_p, rope(new), (g0,), 1)
       if (ix:=self.indexer) is not None: keys = _update_cache(self.cache_k, rope(ix.k_norm(ix.attn_k(new))), (g0,), 1)
-    # it runs on short contexts too: the attention takes its pools from carry.picked
+    # Full and Reindex pick the pools, on short contexts too, Reuse attends to the ones in carry.picked
     if (ix:=self.indexer) is not None: carry.picked = ix(x, self.attn_q_a_norm(self.attn_q_a(x)), start_pos, self.freqs_cis, keys, carry)
     return self._attention(x, start_pos, carry.picked, pools)
 
