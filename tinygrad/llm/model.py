@@ -51,7 +51,8 @@ def apply_rope(x:Tensor, freqs_cis:Tensor, interleaved:bool=False) -> Tensor:
   if interleaved: x = x.rearrange("b h t (d two) -> b h t (two d)", two=2)
   cos, sin = freqs_cis.unsqueeze(-3).chunk(2, dim=-1)
   x1, x2 = x.chunk(2, dim=-1)
-  return (x1 * cos - x2 * sin).cat(x2 * cos + x1 * sin, dim=-1)
+  out = (x1 * cos - x2 * sin).cat(x2 * cos + x1 * sin, dim=-1)
+  return out.rearrange("b h t (two d) -> b h t (d two)", two=2) if interleaved else out
 
 def apply_rope_last(x:Tensor, freqs_cis:Tensor, rope_dim:int, interleaved:bool) -> Tensor:  # the rotated features come last
   return x[..., :-rope_dim].cat(apply_rope(x[..., -rope_dim:], freqs_cis, interleaved), dim=-1)
@@ -688,10 +689,10 @@ class CompressedAttentionBlock(MLATransformerBlock):  # CSA2: a block is Full (s
     if self.ratio:
       k = k.cat(unwrap(pools).unsqueeze(1).cast(k.dtype), dim=2)
       mask = mask.cat(unwrap(picked).where(0.0, -math.inf).expand(B, 1, T, -1), dim=-1)
-    # the values are the keys: undo the rotation on the output, then pair its rotated features back
+    # the values are the keys: undo the rotation of the query position on the output
     cos, sin = freqs.chunk(2, dim=-1)
-    o = apply_rope_last(sink_attention(q, k, k, mask, self.attn_sinks["weight"]), cos.cat(-sin, dim=-1), r, False)
-    o = o[..., :-r].cat(o[..., -r:].rearrange("... (two d) -> ... (d two)", two=2), dim=-1).transpose(1, 2).reshape(B, T, cfg.o_groups, 1, -1)
+    o = apply_rope_last(sink_attention(q, k, k, mask, self.attn_sinks["weight"]), cos.cat(-sin, dim=-1), r, True)
+    o = o.transpose(1, 2).reshape(B, T, cfg.o_groups, 1, -1)
     o = o @ self.attn_output_a["weight"].reshape(cfg.o_groups, cfg.o_lora_rank, -1).transpose(-1, -2)
     return self.attn_output_b(o.reshape(B, T, -1))
 
