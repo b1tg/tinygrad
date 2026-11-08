@@ -569,23 +569,19 @@ class MLATransformerBlock(FFNBlock):
       self.attn_q_b = Linear(config.q_lora_rank, config.n_heads * config.head_dim, bias=False)
     else:
       self.attn_q = Linear(config.dim, config.n_heads * config.head_dim, bias=False)
-    if config.kv_lora_rank > 0:
-      self.attn_kv_a_mqa = Linear(config.dim, config.kv_lora_rank + config.rope_dim, bias=False)
-      self.attn_kv_a_norm = nn.RMSNorm(config.kv_lora_rank, config.norm_eps)
-      self.attn_k_b = {"weight": Tensor.zeros(config.n_heads, config.kv_lora_rank, qk_nope_head_dim)}
-      self.attn_v_b = {"weight": Tensor.zeros(config.n_heads, config.v_head_dim, config.kv_lora_rank)}
-      self.attn_output = Linear(config.n_heads * config.v_head_dim, config.dim, bias=False)
+    self.attn_kv_a_mqa = Linear(config.dim, config.kv_lora_rank + config.rope_dim, bias=False)
+    self.attn_kv_a_norm = nn.RMSNorm(config.kv_lora_rank, config.norm_eps)
+    self.attn_k_b = {"weight": Tensor.zeros(config.n_heads, config.kv_lora_rank, qk_nope_head_dim)}
+    self.attn_v_b = {"weight": Tensor.zeros(config.n_heads, config.v_head_dim, config.kv_lora_rank)}
+    self.attn_output = Linear(config.n_heads * config.v_head_dim, config.dim, bias=False)
     self.indexer = Indexer(config) if config.indexer else None
     if config.attn_output_gate: self.attn_gate = Linear(config.dim, config.n_heads * config.v_head_dim, bias=False)
-
-  def _q(self, x:Tensor) -> Tensor:  # (B, n_heads, T, head_dim)
-    q_proj = self.attn_q_b(self.attn_q_a_norm(self.attn_q_a(x))) if self.config.q_lora_rank > 0 else self.attn_q(x)
-    return q_proj.reshape(*x.shape[:2], self.config.n_heads, self.config.head_dim).transpose(1, 2)
 
   def _attention(self, x:Tensor, start_pos:StartPos, idx_mask:Tensor|None=None) -> Tensor:
     B, T, _ = x.shape
     q_nope_head_dim = self.config.head_dim - self.config.rope_dim
-    q = self._q(x)
+    q_proj = self.attn_q_b(self.attn_q_a_norm(self.attn_q_a(x))) if self.config.q_lora_rank > 0 else self.attn_q(x)
+    q = q_proj.reshape(B, T, self.config.n_heads, self.config.head_dim).transpose(1, 2)
     q_nope, q_rope = q[..., :q_nope_head_dim], q[..., q_nope_head_dim:]
     freqs = Tensor.stack(*(self.freqs_cis[p:p+T] for p in start_pos)) if not self.config.ssm or not self.config.ssm.kda else None
     if freqs is not None: q_rope = apply_rope(q_rope, freqs, self.config.rope_interleave)
@@ -627,13 +623,15 @@ class MLATransformerBlock(FFNBlock):
                                             device=x.device, yarn=self.config.yarn)
     if self.indexer: self.indexer._init_state(x)
 
-class CompressedAttentionBlock(MLATransformerBlock):  # CSA2: a block is Full (source), Reindex (an indexer only) or Reuse (neither)
+class CompressedAttentionBlock(FFNBlock):  # CSA2: a block is Full (source), Reindex (an indexer only) or Reuse (neither)
   def __init__(self, config:TransformerConfig, ratio:int, source:bool):  # Full compresses the pools for the blocks up to the next Full
     if (idx:=config.indexer) is not None:
       config = replace(config, indexer=replace(idx, pools=True, kpool=ratio, top_k=min(idx.top_k * ratio, config.max_context),
                                                 rope_dim=config.rope_dim))
-    super().__init__(replace(config, indexer=None))
+    super().__init__(config)
     self.ratio, self.attn_sinks = ratio, {"weight": Tensor.zeros(config.n_heads)}
+    self.attn_q_a, self.attn_q_a_norm = Linear(config.dim, config.q_lora_rank, bias=False), nn.RMSNorm(config.q_lora_rank, config.norm_eps)
+    self.attn_q_b = Linear(config.q_lora_rank, config.n_heads * config.head_dim, bias=False)
     self.attn_kv, self.attn_kv_a_norm = Linear(config.dim, config.head_dim, bias=False), nn.RMSNorm(config.head_dim, config.norm_eps)
     self.attn_output_a = {"weight": Tensor.zeros(config.o_groups * config.o_lora_rank, config.n_heads * config.head_dim // config.o_groups)}
     self.attn_output_b = Linear(config.o_groups * config.o_lora_rank, config.dim, bias=False)
@@ -675,7 +673,7 @@ class CompressedAttentionBlock(MLATransformerBlock):  # CSA2: a block is Full (s
   def _attention(self, x:Tensor, start_pos:StartPos, picked:Tensor|None=None, pools:Tensor|None=None) -> Tensor:
     (B, T, _), cfg, pos = x.shape, self.config, start_pos[0]
     freqs = self.freqs_cis[pos:pos+T]
-    q = apply_rope(self._q(x), freqs, True, True)
+    q = apply_rope(self.attn_q_b(self.attn_q_a_norm(self.attn_q_a(x))).reshape(B, T, cfg.n_heads, -1).transpose(1, 2), freqs, True, True)
     kv = apply_rope(self.attn_kv_a_norm(self.attn_kv(x)).unsqueeze(1), freqs, True, True)
     # the window has the keys of the positions from sliding_window before x, the ones before position 0 are masked
     (window, store), S = shift_in(self.cache_kv, kv.squeeze(1), Tensor(pos).eq(0)), cfg.sliding_window
