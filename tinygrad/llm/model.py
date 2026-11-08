@@ -497,11 +497,11 @@ class PLELayer:
     return Tensor((gated + conv[:, :T].reshape(gated.shape)).contiguous().uop.after(store))
 
 class Indexer:
-  def __init__(self, config:TransformerConfig, source:bool=True):
+  def __init__(self, config:TransformerConfig, makes_keys:bool=True):
     self.idx, self.max_context = (idx:=unwrap(config.indexer)), config.max_context
     self.attn_q_b = Linear(config.q_lora_rank or config.dim, idx.n_heads * idx.head_dim, bias=False)
     # a Full layer makes the indexer keys from its pools, a Reindex layer scores them
-    if source:
+    if makes_keys:
       self.attn_k = Linear(config.head_dim if idx.pools else config.dim, idx.head_dim, bias=False)
       self.k_norm = (nn.RMSNorm if idx.msa or idx.qsa or idx.pools else nn.LayerNorm)(idx.head_dim, eps=idx.norm_eps)
     if idx.msa or idx.qsa: self.q_norm = nn.RMSNorm(idx.head_dim, eps=idx.norm_eps)
