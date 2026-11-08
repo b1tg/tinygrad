@@ -892,7 +892,7 @@ class Transformer:
                   kv.get(f'{arch}.hyper_connection.low_rank', 0), arch == 'deepseek41') if f'{arch}.hyper_connection.count' in kv else None
     if hc is not None: state_dict = {re.sub(r'(hc_attn|hc_ffn|output_hc|\.ple)_', r'\1.', k):v for k,v in state_dict.items()}
 
-    if arch == 'deepseek41': state_dict = {k.replace('.engram_', '.ple.'):v for k,v in state_dict.items()}
+    state_dict = {k.replace('.engram_', '.ple.'):v for k,v in state_dict.items()}
     kpool = kv.get(f'{arch}.attention.indexer.block_size' if arch == 'minimax-m3' else f'{arch}.attention.indexer.kpool',
                    1 if f'{arch}.attention.indexer.top_k' in kv else None)
     if arch == 'qwen4exp': kpool = max(kv[f'{arch}.attention.compress_ratios'])
