@@ -545,6 +545,7 @@ class Indexer:
     picked = topk_mask(scores, idx.top_k // idx.kpool).repeat_interleave(idx.kpool, dim=-1)[..., :S]
     return ((picked | (k_pos >= (q_pos + 1) // idx.kpool * idx.kpool)) & (k_pos <= q_pos)).where(0.0, -math.inf).cast(x.dtype)
 
+
 class MLATransformerBlock(FFNBlock):
   kv_b_block_size:tuple[int, int] = (128, 128)
   def __init__(self, config:TransformerConfig):
@@ -876,12 +877,12 @@ class Transformer:
                   kv.get(f'{arch}.hyper_connection.epsilon', 0.0),
                   kv.get(f'{arch}.hyper_connection.low_rank', 0), arch == 'deepseek41') if f'{arch}.hyper_connection.count' in kv else None
     if hc is not None: state_dict = {re.sub(r'(hc_attn|hc_ffn|output_hc|\.ple)_', r'\1.', k):v for k,v in state_dict.items()}
+
     if arch == 'deepseek41':
       # the engram gate weighs the normed key, the query is normed without a weight
       state_dict = {k.replace('.engram_kv.', '.ple.kv.').replace('.engram_gate.', '.ple.norm_key.'):
                     v.flatten() if '.engram_gate.' in k else v for k,v in state_dict.items()}
       state_dict.update({k.replace('.norm_key.', '.norm_query.'):v.ones_like() for k,v in state_dict.items() if '.ple.norm_key.' in k})
-
     sources = kv.get(f'{arch}.attention.indexer.source_layers')
     kpool = kv.get(f'{arch}.attention.indexer.block_size' if arch == 'minimax-m3' else f'{arch}.attention.indexer.kpool', 1 if sources else None)
     if arch == 'qwen4exp': kpool = max(kv[f'{arch}.attention.compress_ratios'])
