@@ -7,7 +7,7 @@ from tinygrad.llm.kernels.amd import Linear, ExpertWeights, fp8_matmul, gated_de
 from tinygrad.llm.gguf import gguf_parse, gguf_shard, GGUFPackedTable, _GGML_QUANT
 from tinygrad.llm.hf import hf_load
 from tinygrad.uop.ops import resolve
-from tinygrad.helpers import unwrap, round_up, get_child
+from tinygrad.helpers import unwrap, round_up, ceildiv, get_child
 
 class ExpertGating(enum.IntEnum):
   SOFTMAX = 1
@@ -85,13 +85,17 @@ def pairwise_topk(x: Tensor, k: int) -> tuple[Tensor, Tensor]:
   sel = x.const_like(0).scatter(-1, cmp.sum(axis=-1).cast('int32'), vals)[:,:,n-k:].cast('int32')
   return x.gather(-1, sel), sel
 
+def shift_in(state:Tensor, x:Tensor, initial:Tensor) -> tuple[Tensor, UOp]:
+  # assemble the window in a static-size buffer: [state | x rows | zero-pad], state is zeroed when initial
+  T, T_pad = x.shape[1], x.max_shape[1]
+  window = initial.where(0, state).cat(x.cast(state.dtype), dim=1).pad_to((x.shape[0], state.shape[1] + T_pad, *x.shape[2:])).contiguous()
+  # the last state.shape[1] rows before the padding become the next state
+  return window, state.uop.store(window[:, T:T+state.shape[1]].uop)
+
 def short_conv(state:Tensor, x:Tensor, weight:Tensor, initial:Tensor, dilation:int=1) -> tuple[Tensor, UOp]:
   assert state.shape[1] == (weight.shape[1]-1)*dilation, f"state has {state.shape[1]} rows, expected {(weight.shape[1]-1)*dilation}"
-  # assemble the conv window in a static-size buffer: [state | x rows | zero-pad], state is zeroed when initial
-  T, T_pad = x.shape[1], x.max_shape[1]
-  window = initial.where(0, state).cat(x.cast(state.dtype), dim=1).pad_to((x.shape[0], state.shape[1] + T_pad, x.shape[-1])).contiguous()
-  # the last state.shape[1] rows before the padding become the next state
-  store = state.uop.store(window[:, T:T+state.shape[1]].uop)
+  window, store = shift_in(state, x, initial)
+  T_pad = x.max_shape[1]
   return functools.reduce(lambda a,b: a+b, (window[:, i*dilation:i*dilation+T_pad] * weight[:, i] for i in range(weight.shape[1]))).silu(), store
 
 @dataclass(frozen=True)
@@ -124,6 +128,7 @@ class PLEConfig:
   conv_kernel: int
   token_map: tuple[int, ...] = ()
   offset: int = 0
+  cut_at_eos: bool = True
 
   def layer(self, i:int) -> PLEConfig:
     j, n, v = self.layers.index(i), len(self.layers), self.vocab_sizes
@@ -259,7 +264,7 @@ class GatedResidual(HyperConnection):
 class Carry:  # what a block passes on to the blocks after it
   idx_mask: Tensor|None = None    # the tokens the last full indexer selected
   pre: Tensor|None = None         # the delayed mHC weights
-  pools: Tensor|None = None       # the compressed kv of the last kv source, and the keys of its indexer
+  pools: Tensor|None = None       # the caches of the roped pools and indexer keys of the last kv source
   keys: Tensor|None = None
   picked: Tensor|None = None      # the pools the last PoolIndexer picked
   candidates: Tensor|None = None  # the blocks of pools the PoolIndexers after a candidate source search
@@ -457,10 +462,10 @@ class PLELayer:
       self.conv_state = Tensor.zeros(x.shape[0], self.hist, self.count*self.dim, device=x.device).clone()
 
   def write_rows(self, tokens:list[int], start_pos:int, n_toks:int, chunk_size:int):
-    # hash the n-grams ending at each token (t0*m0 ^ t1*m1 ^ ..., EOS before the start or an EOS)
+    # hash the n-grams ending at each token (t0*m0 ^ t1*m1 ^ ..., EOS before the start or, with cut_at_eos, an EOS)
     ple, n, ids, offsets = self.ple, len(self.ple.multipliers), [], list(itertools.accumulate(self.ple.vocab_sizes, initial=self.ple.offset))
     for p in range(start_pos, start_pos+n_toks):
-      ctx = [ple.eos if p < i or ple.eos in tokens[p-i:p] else tokens[p-i] for i in range(n)]
+      ctx = [ple.eos if p < i or ple.cut_at_eos and ple.eos in tokens[p-i:p] else tokens[p-i] for i in range(n)]
       if ple.token_map: ctx = [ple.token_map[c] for c in ctx]
       hashes = list(itertools.accumulate((c*m for c,m in zip(ctx, ple.multipliers)), lambda a,b: a^b))[1:]
       ids.append([hashes[j*(n-1)//len(ple.vocab_sizes)] % v + o for j,(v,o) in enumerate(zip(ple.vocab_sizes, offsets))])
@@ -539,10 +544,9 @@ class PoolIndexer(Indexer):  # scores the pools of a kv source (DeepSeek-V4), it
 
   def _rope(self, x:Tensor, freqs:Tensor) -> Tensor: return apply_rope_last(x, freqs, self.idx.rope_dim, self.idx.rope_interleave)
 
-  def __call__(self, x:Tensor, q:Tensor, start_pos:int|UOp, freqs:Tensor|None=None, carry:Carry|None=None) -> Tensor:
-    (carry, freqs), idx = (unwrap(carry), unwrap(freqs)), self.idx
-    if hasattr(self, "attn_k"): carry.keys = self.k_norm(self.attn_k(unwrap(carry.pools)))
-    scores, q_pos = self._scores(x, q, self._rope(unwrap(carry.keys).unsqueeze(1), freqs[::idx.kpool]).squeeze(1), start_pos, freqs)
+  def __call__(self, x:Tensor, q:Tensor, start_pos:int|UOp, freqs:Tensor|None=None, keys:Tensor|None=None, carry:Carry|None=None) -> Tensor:
+    (carry, keys), idx = (unwrap(carry), unwrap(keys)), self.idx
+    scores, q_pos = self._scores(x, q, keys, start_pos, freqs)
     if idx.candidates:
       # the best blocks of pools are where the indexers after this one search, a block scores its best pool, the newest block is always in
       (n_blocks, size), n = idx.candidates, scores.shape[-1]
@@ -642,25 +646,45 @@ class CompressedAttentionBlock(MLATransformerBlock):
       self.attn_compressor_norm = nn.RMSNorm(config.head_dim, config.norm_eps)
       if ratio > 1: self.attn_compressor_gate = {"weight": Tensor.zeros(config.head_dim, config.dim)}
 
+  def __call__(self, x:Tensor, start_pos:int|UOp, carry:Carry) -> tuple[Tensor, Carry]:
+    out, carry = super().__call__(x, start_pos, carry)
+    # a kv source hands its caches to the blocks up to the next source, as caches they are read in place
+    if hasattr(self, "cache_p"): carry = replace(carry, pools=self.cache_p, keys=self.cache_k if self.indexer is not None else None)
+    return out, carry
+
+  # the window and the tokens of the last pool are right only for all the cached tokens
+  def _reusable_prefix_len(self, prefix_len:int, cached_len:int) -> int: return prefix_len if prefix_len == cached_len else 0
+
   def _attend(self, x:Tensor, start_pos:int|UOp, carry:Carry) -> Tensor:
+    pools, keys, r = carry.pools, carry.keys, self.ratio
     if hasattr(self, "attn_compressor_kv"):
-      # (B, max_context//ratio, head_dim) pools, the keys of the attention and, through the indexer of the source, of the indexers
+      assert self.cache_p.shape[1] * r >= self.config.max_context + x.max_shape[1] + 2*r, "the caches have room for chunks up to the first one"
+      # x writes the pools from the one of start_pos on, cache_c has the ratio tokens before x, a pool is roped at its first token
       kg = (x @ self.attn_compressor_kv["weight"].T).unsqueeze(2)
-      if self.ratio > 1: kg = kg.cat((x @ self.attn_compressor_gate["weight"].T).unsqueeze(2), dim=2)
-      carry.pools = self.attn_compressor_norm(gated_pool(cache_store(self.cache_c, start_pos, kg, 1), self.ratio))
+      if r > 1: kg = kg.cat((x @ self.attn_compressor_gate["weight"].T).unsqueeze(2), dim=2)
+      kg, store = shift_in(self.cache_c, kg, Tensor(start_pos).eq(0))
+      g0, m, n = start_pos // r, start_pos % r, ceildiv(x.max_shape[1] + r - 1, r)
+      kg = Tensor(kg.uop.after(store)).pad_to((kg.shape[0], r + n*r, *kg.shape[2:]))[:, r-m:r-m+n*r]
+      new = self.attn_compressor_norm(gated_pool(kg, r))
+      def rope(t:Tensor) -> Tensor: return apply_rope_last(t.unsqueeze(1), self.freqs_cis[::r][g0:g0+n], self.config.rope_dim, True).squeeze(1)
+      pools = cache_store(self.cache_p, g0, rope(new), 1)
+      if (ix:=self.indexer) is not None: keys = cache_store(self.cache_k, g0, rope(ix.k_norm(ix.attn_k(new))), 1)
     # it runs on short contexts too: the attention takes its pools from carry.picked
-    if isinstance(ix:=self.indexer, PoolIndexer): carry.picked = ix(x, self.attn_q_a_norm(self.attn_q_a(x)), start_pos, self.freqs_cis, carry)
-    return self._attention(x, start_pos, carry.picked, carry.pools)
+    if isinstance(ix:=self.indexer, PoolIndexer): carry.picked = ix(x, self.attn_q_a_norm(self.attn_q_a(x)), start_pos, self.freqs_cis, keys, carry)
+    return self._attention(x, start_pos, carry.picked, pools)
 
   def _attention(self, x:Tensor, start_pos:int|UOp, picked:Tensor|None=None, pools:Tensor|None=None) -> Tensor:
     (B, T, _), cfg, r = x.shape, self.config, self.config.rope_dim
     freqs = self.freqs_cis[start_pos:start_pos+T]
     q = apply_rope_last(self._q(x), freqs, r, True)
     kv = apply_rope_last(self.attn_kv_a_norm(self.attn_kv(x)).unsqueeze(1), freqs, r, True)
-    k = cache_store(self.cache_kv, start_pos, kv, 2)[:, :, :start_pos+T]
-    mask = causal_mask(x, start_pos, cfg.sliding_window).expand(B, 1, T, -1)
+    # the window has the keys of the positions from sliding_window before x, the ones before position 0 are masked
+    (window, store), S = shift_in(self.cache_kv, kv.squeeze(1), Tensor(start_pos).eq(0)), cfg.sliding_window
+    k = Tensor(window.uop.after(store))[:, :S+T].unsqueeze(1)
+    mask = causal_mask(x, S, S) + Tensor.full((1, 1, 1, S+T), -math.inf, buffer=False).tril(S-start_pos-1)
+    mask = mask.expand(B, 1, T, -1)
     if self.ratio:
-      k = k.cat(apply_rope_last(unwrap(pools).unsqueeze(1), self.freqs_cis[::self.ratio], r, True).cast(k.dtype), dim=2)
+      k = k.cat(unwrap(pools).unsqueeze(1).cast(k.dtype), dim=2)
       mask = mask.cat(unwrap(picked).where(0.0, -math.inf).expand(B, 1, T, -1), dim=-1)
     # the values are the keys: undo the rotation on the output, then pair its rotated features back
     cos, sin = freqs.chunk(2, dim=-1)
@@ -671,10 +695,15 @@ class CompressedAttentionBlock(MLATransformerBlock):
 
   def _init_state(self, x:Tensor):
     if not hasattr(self, "cache_kv"):
-      cfg, size, B = self.config, round_up(self.config.max_context, max(self.ratio, 1)), x.shape[0]
-      self.cache_kv = Tensor.empty(B, 1, size, cfg.head_dim, dtype=dtypes.half, device=x.device)
-      # zeroed: all pools are computed, the incomplete ones are masked
-      if hasattr(self, "attn_compressor_kv"): self.cache_c = Tensor.zeros(B, size, 1 + (self.ratio > 1), cfg.head_dim, device=x.device).clone()
+      # the pools of a chunk at the end of the context are written past it, one size makes the blocks share their rope tables
+      cfg, r, B, R = self.config, max(self.ratio, 1), x.shape[0], max(self.config.compress_ratios)
+      size = round_up(cfg.max_context + x.max_shape[1], R) + 2*R
+      self.cache_kv = Tensor.empty(B, cfg.sliding_window, cfg.head_dim, dtype=dtypes.half, device=x.device)
+      if hasattr(self, "attn_compressor_kv"):
+        self.cache_c = Tensor.empty(B, r, 1 + (r > 1), cfg.head_dim, device=x.device)
+        # zeroed: the attention must not see a NaN in the incomplete pools it masks
+        self.cache_p = Tensor.zeros(B, size // r, cfg.head_dim, dtype=dtypes.half, device=x.device).clone()
+        if self.indexer is not None: self.cache_k = Tensor.zeros(B, size // r, self.indexer.idx.head_dim, dtype=dtypes.half, device=x.device).clone()
       theta, yarn = (cfg.compress_rope_theta, cfg.yarn) if self.ratio else (cfg.rope_theta, None)
       self.freqs_cis = precompute_freqs_cis(cfg.rope_dim, size, theta, device=x.device, yarn=yarn)
 
@@ -949,7 +978,8 @@ class Transformer:
       sliding_window_pattern=kv.get(f'{arch}.attention.sliding_window_pattern', 2 if arch == 'gpt-oss' else 0), hc=hc, indexer=indexer,
       ple=PLEConfig(tuple(kv[f'{arch}.ple.layers']), ple_entry[1][1], tuple(kv[f'{arch}.ple.layer_multipliers']),
                     tuple(kv[f'{arch}.ple.head_vocab_sizes']), kv.get(f'{arch}.ple.eos_token_id') or kv[f'{arch}.engram.pad_token_id'],
-                    kv.get(f'{arch}.ple.conv_kernel', 0), tuple(kv.get(f'{arch}.engram.token_map', ()))) if ple_entry else None,
+                    kv.get(f'{arch}.ple.conv_kernel', 0), tuple(kv.get(f'{arch}.engram.token_map', ())),
+                    cut_at_eos=f'{arch}.ple.eos_token_id' in kv) if ple_entry else None,
       expert_latent_dim=kv.get(f'{arch}.expert_latent_length', 0), attn_res_block_size=kv.get(f'{arch}.attn_res.block_size', 0),
       situ=(kv[f'{arch}.activation.situ_beta'], kv[f'{arch}.activation.situ_linear_beta']) if f'{arch}.activation.situ_beta' in kv else None,
       indexer_shared=tuple(i not in sources for i in range(num_blocks)) if sources else (),
