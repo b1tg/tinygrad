@@ -124,11 +124,11 @@ class PLEConfig:
   head_dim: int
   multipliers: tuple[int, ...]
   vocab_sizes: tuple[int, ...]
-  eos: int
+  pad: int
   conv_kernel: int
   token_map: tuple[int, ...] = ()
   offset: int = 0
-  cut_at_eos: bool = True
+  cut_at_pad: bool = True
 
   def layer(self, i:int) -> PLEConfig:
     j, n, v = self.layers.index(i), len(self.layers), self.vocab_sizes
@@ -462,10 +462,10 @@ class PLELayer:
       self.conv_state = Tensor.zeros(x.shape[0], self.hist, self.count*self.dim, device=x.device).clone()
 
   def write_rows(self, tokens:list[int], start_pos:int, n_toks:int, chunk_size:int):
-    # hash the n-grams ending at each token (t0*m0 ^ t1*m1 ^ ..., EOS before the start or, with cut_at_eos, an EOS)
+    # hash the n-grams ending at each token (t0*m0 ^ t1*m1 ^ ..., pad before the start or, with cut_at_pad, a pad)
     ple, n, ids, offsets = self.ple, len(self.ple.multipliers), [], list(itertools.accumulate(self.ple.vocab_sizes, initial=self.ple.offset))
     for p in range(start_pos, start_pos+n_toks):
-      ctx = [ple.eos if p < i or ple.cut_at_eos and ple.eos in tokens[p-i:p] else tokens[p-i] for i in range(n)]
+      ctx = [ple.pad if p < i or ple.cut_at_pad and ple.pad in tokens[p-i:p] else tokens[p-i] for i in range(n)]
       if ple.token_map: ctx = [ple.token_map[c] for c in ctx]
       hashes = list(itertools.accumulate((c*m for c,m in zip(ctx, ple.multipliers)), lambda a,b: a^b))[1:]
       ids.append([hashes[j*(n-1)//len(ple.vocab_sizes)] % v + o for j,(v,o) in enumerate(zip(ple.vocab_sizes, offsets))])
@@ -979,7 +979,7 @@ class Transformer:
       ple=PLEConfig(tuple(kv[f'{arch}.ple.layers']), ple_entry[1][1], tuple(kv[f'{arch}.ple.layer_multipliers']),
                     tuple(kv[f'{arch}.ple.head_vocab_sizes']), kv.get(f'{arch}.ple.eos_token_id') or kv[f'{arch}.engram.pad_token_id'],
                     kv.get(f'{arch}.ple.conv_kernel', 0), tuple(kv.get(f'{arch}.engram.token_map', ())),
-                    cut_at_eos=f'{arch}.ple.eos_token_id' in kv) if ple_entry else None,
+                    cut_at_pad=f'{arch}.ple.eos_token_id' in kv) if ple_entry else None,
       expert_latent_dim=kv.get(f'{arch}.expert_latent_length', 0), attn_res_block_size=kv.get(f'{arch}.attn_res.block_size', 0),
       situ=(kv[f'{arch}.activation.situ_beta'], kv[f'{arch}.activation.situ_linear_beta']) if f'{arch}.activation.situ_beta' in kv else None,
       indexer_shared=tuple(i not in sources for i in range(num_blocks)) if sources else (),
