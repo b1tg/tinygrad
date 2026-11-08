@@ -337,22 +337,30 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
 
   def test_flash_attention_decode_gqa_output_layout(self): self._test_flash_decode(4, 1, 128, 256, 3)
   def test_flash_attention_decode_large_gqa_group(self): self._test_flash_decode(8, 1, 256, 256, 73)
+  def test_flash_attention_decode_masked(self):
+    with patch.object(Tensor, "scaled_dot_product_attention", side_effect=AssertionError("expected custom decode")):
+      self._test_flash_decode(24, 2, 256, 4096, 1037, symbolic=True, masked=True)
 
-  def _test_flash_decode(self, heads, kv_heads, dim, n, valid, symbolic=False):
+  def _test_flash_decode(self, heads, kv_heads, dim, n, valid, symbolic=False, masked=False):
     if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
     rng = np.random.default_rng(42)
     q = rng.normal(size=(1, heads, 1, dim)).astype(np.float16)
     cache = rng.normal(size=(2, 1, kv_heads, n, dim)).astype(np.float16)
     k, v = (np.repeat(c[0, :, :valid].astype(np.float32), heads//kv_heads, axis=0) for c in cache)
     scores = q[0].astype(np.float32) @ k.transpose(0, 2, 1) / np.sqrt(dim)
+    # a sparse mask that also drops whole 64-key chunks, the last key stays visible
+    mask = np.where(rng.random(valid) < 0.3, 0, -np.inf).astype(np.float16)
+    mask[64:192], mask[-1] = -np.inf, 0
+    if masked: scores = scores + mask
     probs = np.exp(scores - scores.max(-1, keepdims=True))
     expected = (probs / probs.sum(-1, keepdims=True)) @ v
-    cache_tensor = Tensor(cache)
+    cache_tensor, mask_tensor = Tensor(cache), Tensor(mask.reshape(1, 1, 1, valid)) if masked else None
     if symbolic:
       start_pos = UOp.variable("start_pos", 0, n-1).bind(valid-1)
       valid = start_pos + 1
       cache_tensor = cache_tensor.realize()
-    np.testing.assert_allclose(flash_attention(Tensor(q), cache_tensor, valid).numpy(), expected[None], rtol=2e-3, atol=2e-3)
+      if mask_tensor is not None: mask_tensor = mask_tensor.pad_to((1, 1, 1, n)).contiguous()[..., :valid]
+    np.testing.assert_allclose(flash_attention(Tensor(q), cache_tensor, valid, mask_tensor).numpy(), expected[None], rtol=2e-3, atol=2e-3)
 
   def test_attention_symbolic_length_jit(self):
     if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3/4 required")
