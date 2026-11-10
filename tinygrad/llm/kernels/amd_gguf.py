@@ -313,7 +313,7 @@ def _wmma_stores(out, outputs, tokens, accs, update, lane, wave, output_waves, k
   return [out[token, output].store(value) for ot,(output,output_accs) in enumerate(zip(outputs, accs))
           for tile,(tile_tokens,_acc) in enumerate(zip(tokens, output_accs)) for token,value in zip(tile_tokens, values(ot*tt+tile))]
 
-def _quant_linear_wmma(out, x, out_features, in_features, type_words, layout, dequant, name, kgroups, lanes):
+def _quant_linear_wmma(out, x, out_features, in_features, type_words, layout, dequant, name, kgroups, lanes, ksplits=1):
   x = x.reshape(out.shape[0], in_features)
   output_waves, token_block, output_block, lane, wave, lane_group, outputs, input_tokens, tokens = layout
   token_tile, output_tiles = len(tokens)*16, len(outputs)
@@ -322,7 +322,9 @@ def _quant_linear_wmma(out, x, out_features, in_features, type_words, layout, de
   accs = tuple(tuple(UOp.alloc((len(tokens[0]),), dtypes.float32, addrspace=AddrSpace.REG)
                      for tile in range(token_tile // 16)) for ot in range(output_tiles))
   accs = tuple(tuple(acc.after(acc.store(acc.const_like(0))) for acc in output_accs) for output_accs in accs)
-  group = UOp.range(in_features // Q8_GROUP_SIZE, 4, AxisType.LOOP)
+  # split-K: workgroup kpart sums its part of the input into its own columns of the output
+  kpart, group_rng = UOp.range(ksplits, 2), UOp.range(in_features // Q8_GROUP_SIZE // ksplits, 4, AxisType.LOOP)
+  group = group_rng if ksplits == 1 else kpart * (in_features // Q8_GROUP_SIZE // ksplits) + group_rng
   block, subgroup = group // 8, group % 8
   wmma_accs = [list(output_accs) for output_accs in accs]
   ks = tuple(word*4 + b for word in _wmma_words(lane_group, kgroups) for b in range(4))
@@ -332,12 +334,12 @@ def _quant_linear_wmma(out, x, out_features, in_features, type_words, layout, de
     for output_tile,output in enumerate(outputs):
       bfrag = UOp.stack(*dequant(output*output_words + block*type_words, subgroup, half))
       for tile,afrag in enumerate(afrags):
-        previous = accs[output_tile][tile].after(group) if half == 0 else wmma_accs[output_tile][tile]
+        previous = accs[output_tile][tile].after(group_rng) if half == 0 else wmma_accs[output_tile][tile]
         wmma_accs[output_tile][tile] = UOp.wmma(afrag, bfrag, previous, WMMA_ARG[0], lanes)
   update = UOp.group(*(acc.store(value) for output_accs,output_values in zip(accs, wmma_accs)
-                       for acc,value in zip(output_accs, output_values))).end(group)
-  stores = _wmma_stores(out, outputs, tokens, accs, update, lane, wave, output_waves, kgroups)
-  return UOp.group(*stores).end(token_block, output_block, lane, wave).sink(arg=KernelInfo(name=name, opts_to_apply=()))
+                       for acc,value in zip(output_accs, output_values))).end(group_rng)
+  stores = _wmma_stores(out, tuple(kpart*out_features + o for o in outputs), tokens, accs, update, lane, wave, output_waves, kgroups)
+  return UOp.group(*stores).end(token_block, output_block, lane, wave, kpart).sink(arg=KernelInfo(name=name, opts_to_apply=()))
 
 @functools.cache
 def _q5_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, out_features:int, in_features:int, ggml_type:int, kgroups:int, lanes:int) -> UOp:
@@ -375,7 +377,7 @@ def _iq4_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, lut:UOp, out_features:i
 
 @functools.cache
 def _quant_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, *grids:UOp,
-                                  out_features:int, in_features:int, ggml_type:int, kgroups:int, lanes:int) -> UOp:
+                                  out_features:int, in_features:int, ggml_type:int, kgroups:int, lanes:int, ksplits:int=1) -> UOp:
   token_tile = 64 if out.shape[0] % 64 == 0 else 32 if out.shape[0] % 32 == 0 else 16
   layout = _wmma_layout(out, out_features, token_tile, 2, lanes)
   output_waves, _, _, lane, wave, lane_group, _, _, _ = layout
@@ -409,7 +411,7 @@ def _quant_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, *grids:UOp,
     return tuple((((word >> (b*8)).cast(dtypes.uint8).bitcast(dtypes.int8).float()-zero)*scale-minimum).cast(dtypes.half)
                  for word in words for b in range(4))
   return _quant_linear_wmma(out, x, out_features, in_features, QUANT_SIZES[ggml_type]//raw.dtype.itemsize,
-                            layout, dequant, f"linear_{QUANT_NAMES[ggml_type]}_f16_wmma", kgroups, lanes)
+                            layout, dequant, f"linear_{QUANT_NAMES[ggml_type]}_f16_wmma", kgroups, lanes, ksplits)
 
 def q8_linear(layer:Linear, x:Tensor) -> Tensor:
   assert layer.ggml_type in QUANT_SIZES
@@ -422,13 +424,18 @@ def q8_linear(layer:Linear, x:Tensor) -> Tensor:
   extra = (_iq_grid(x.device, layer.ggml_type),) if layer.ggml_type in (IQ2_XS, IQ3_XXS, IQ3_S, IQ2_S) else ()
   # the kernels write the output features of their own device
   local_out = out_features // len(dev) if isinstance(dev:=layer.weight.device, tuple) and layer.shard_axis == 0 else out_features
-  cdna = _is_cdna(x.device)
+  cdna, ksplits = _is_cdna(x.device), 1
   if tokens % 16 == 0 and local_out % 16 == 0:
     if layer.ggml_type == IQ4_XS:
       fxn, extra = _iq4_linear_f16_wmma_kernel, (iq4_half_lut(x.device),)
     else:
       fxn = functools.partial(_q5_linear_f16_wmma_kernel if layer.ggml_type in (Q4_K, Q5_K) else _quant_linear_f16_wmma_kernel,
                               ggml_type=layer.ggml_type)
+    # few outputs of a long input (the hyper-connection down projection) are few workgroups: split the input over more
+    if layer.ggml_type == Q8_0 and layer.shard_axis is None and out_features <= 512 and tokens <= 2048 and \
+       in_features >= 4096 and in_features % (Q8_GROUP_SIZE*32) == 0:
+      ksplits = 32 if tokens <= 64 else 16 if tokens <= 512 else 8
+      fxn, out_shape = functools.partial(fxn, ksplits=ksplits), (tokens, ksplits*out_features)
     fxn = functools.partial(fxn, kgroups=4 if cdna else 2 if _is_rdna4(x.device) else 1, lanes=64 if cdna else 32)
     srcs = (x.cast(dtypes.float16).contiguous(), *extra)
   else:
@@ -438,6 +445,7 @@ def q8_linear(layer:Linear, x:Tensor) -> Tensor:
   out = Tensor.empty(out_shape, dtype=dtypes.float32, device=x.device, axis=None if layer.shard_axis is None else 1-layer.shard_axis)
   result = Tensor.custom_kernel(out, layer.weight, *srcs, fxn=functools.partial(fxn, out_features=local_out, in_features=in_features))[0]
   if len(result.shape) == 3: result = result.sum(-1)
+  if ksplits > 1: result = result.reshape(tokens, ksplits, out_features).sum(1)
   # row parallel: every device wrote the partial sum of its input features, the sum over the devices is the allreduce
   if splits > 1: result = result.reshape(splits, tokens, out_features).sum(0)
   result = result.reshape(*x.shape[:-1], out_features)
