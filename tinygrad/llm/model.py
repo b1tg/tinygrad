@@ -3,7 +3,7 @@ import enum, functools, itertools, json, math, pathlib, re
 from dataclasses import dataclass, replace
 from typing import Callable
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
-from tinygrad.llm.kernels.amd import Linear, ExpertWeights, fp8_matmul, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
+from tinygrad.llm.kernels.amd import Linear, ExpertWeights, fp8_matmul, gated_delta_prefill, flash_attention, amd_custom_kernels_supported, hc_gates
 from tinygrad.llm.gguf import gguf_parse, gguf_shard, GGUFPackedTable, _GGML_QUANT
 from tinygrad.llm.hf import hf_load
 from tinygrad.uop.ops import resolve, smax, ssimplify
@@ -252,14 +252,20 @@ class HyperConnection:
 
   def delayed(self, pre:Tensor) -> Callable: return lambda xs, sublayer: self(xs, lambda _: sublayer((xs * pre.unsqueeze(-1)).sum(2)))
 
-  def __call__(self, xs:Tensor, sublayer:Callable[[Tensor], tuple[Tensor, Tensor|None]]) -> tuple[Tensor, Tensor|None]:
-    """mHC: the sublayer sees a pre-weighted sum of the (B, T, hc, D) streams, its output is added back by post onto the streams mixed by comb"""
-    (mixed, mix), base, scale = self.mix(xs), self.base["weight"], self.scale["weight"]
+  def gates(self, xs:Tensor) -> tuple[Tensor, Tensor, Tensor]:  # pre, post and comb
+    base, scale = self.base["weight"], self.scale["weight"]
+    if (fused:=hc_gates(xs, self.fn.weight, base, scale, self.count, self.iters, self.eps, self.norm_eps)) is not None: return fused
+    pre, mix = self.pre(xs)
     post = (mix[..., self.count:2*self.count] * scale[1] + base[self.count:2*self.count]).sigmoid() * 2
     comb = (mix[..., 2*self.count:] * scale[2] + base[2*self.count:]).reshape(*mix.shape[:-1], self.count, self.count).softmax(-1) + self.eps
     # sinkhorn: normalize the columns then the rows, alternating, to make comb doubly stochastic
     for i in range(2 * self.iters - 1): comb = comb / (comb.sum(-1 if i % 2 else -2, keepdim=True) + self.eps)
-    out, aux = sublayer(mixed)
+    return pre, post, comb
+
+  def __call__(self, xs:Tensor, sublayer:Callable[[Tensor], tuple[Tensor, Tensor|None]]) -> tuple[Tensor, Tensor|None]:
+    """mHC: the sublayer sees a pre-weighted sum of the (B, T, hc, D) streams, its output is added back by post onto the streams mixed by comb"""
+    pre, post, comb = self.gates(xs)
+    out, aux = sublayer((xs * pre.unsqueeze(-1)).sum(2))
     return out.unsqueeze(2) * post.unsqueeze(-1) + (comb.transpose(-1, -2) @ xs), aux
 
 class GroupedRMSNorm:  # x: (B, T, count, dim), w: (count*dim,)
@@ -379,9 +385,9 @@ class FFNBlock:
       res_attn = res_ffn = lambda xs, sublayer: (xs + (ret:=sublayer(xs))[0], ret[1])
       if self.config.hc is not None: res_attn, res_ffn = self.hc_attn, self.hc_ffn
       elif self.config.attn_res_block_size: res_attn, res_ffn = self.attn_res_score, self.ffn_res_score
-      if pre is not None: res_attn, res_ffn = self.hc_attn.delayed(pre), self.hc_ffn.delayed(self.hc_attn.pre(x)[0])
+      if pre is not None: res_attn, res_ffn = self.hc_attn.delayed(pre), self.hc_ffn.delayed(self.hc_attn.gates(x)[0])
       x, idx_mask = res_attn(x, lambda h: self._attend(self.attn_norm(h), start_pos, idx_mask))
-      if pre is not None: pre = self.hc_ffn.pre(x)[0]
+      if pre is not None: pre = self.hc_ffn.gates(x)[0]
       out = res_ffn(x, lambda h: (self._feed_forward(self.ffn_norm(h), tokens), None))[0].contiguous()
       return (out, *(t for t in (idx_mask, pre) if t is not None))
     out, *rest = _run(x, start_pos, idx_mask, tokens, pre)

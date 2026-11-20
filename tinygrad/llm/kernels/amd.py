@@ -174,6 +174,64 @@ def f16_gemv(layer:Linear, x:Tensor) -> Tensor:
   srcs = (out, weight.reshape(-1), x.reshape(tokens, layer.in_features)) + (() if layer.bias is None else (_view_back(layer.bias),))
   return Tensor.custom_kernel(*srcs, fxn=fxn)[0].reshape(*x.shape[:-1], layer.out_features)
 
+# ******** hyper connection gates ********
+
+@functools.cache
+def _hc_dot_kernel(part:UOp, xs:UOp, w:UOp, block:int=1024) -> UOp:
+  # split-K over the flattened streams: a block's partial fn rows and sum of squares, a thread takes 4 values
+  (T, K), N = cast(tuple[int, int], xs.shape), cast(int, w.shape[0])
+  splits, waves = K // block, block // (4*WARP_SIZE)
+  token_split, wave, lane = UOp.range(T*splits, 0, AxisType.GLOBAL), UOp.range(waves, 1, AxisType.LOCAL), UOp.range(WARP_SIZE, -1, AxisType.WARP)
+  token, k = token_split // splits, (token_split % splits)*block + (wave*WARP_SIZE + lane)*4
+  xv = _vec_load(xs[token, k], 4)
+  vals = [sum((a*b for a, b in zip(_vec_load(w[n, k], 4), xv)), UOp.const(0, dtypes.float)) for n in range(N)]
+  vals.append(sum((a*a for a in xv), UOp.const(0, dtypes.float)))
+  lds = UOp.alloc((waves, N+1), dtypes.float, addrspace=AddrSpace.LOCAL)
+  lds = lds.after(*[lds[wave, i].store(warp_reduce(v, full_wave=True)) for i, v in enumerate(vals)])
+  tid = wave*WARP_SIZE + lane
+  i = tid.valid(tid < N+1)
+  store = part[token, token_split % splits, i].store(sum((lds[j, i].load() for j in range(waves)), UOp.const(0, dtypes.float)))
+  return store.end(lane, wave, token_split).sink(arg=KernelInfo(name="hc_dot", opts_to_apply=()))
+
+@functools.cache
+def _hc_gates_kernel(pre:UOp, post:UOp, comb:UOp, part:UOp, base:UOp, scale:UOp, count:int, iters:int, eps:float, norm_eps:float, K:int) -> UOp:
+  # a thread a token: the rmsnormed mix logits, the pre and post gates and the sinkhorn normalized comb
+  (T, splits, N1), n = cast(tuple[int, int, int], part.shape), count
+  token = UOp.range(T, 0, AxisType.GLOBAL)
+  sums = [sum((part[token, s, i].load() for s in range(1, splits)), part[token, 0, i].load()) for i in range(N1)]
+  r = (sums[-1] / K + norm_eps).sqrt().reciprocal()
+  logits = [sums[i] * r * scale[min(i // n, 2)].load() + base[i].load() for i in range(N1 - 1)]
+  rows = [logits[2*n+i*n:2*n+(i+1)*n] for i in range(n)]
+  rows = [[(x - functools.reduce(UOp.maximum, r)).exp() for x in r] for r in rows]
+  comb_rows = [[x / sum(r[1:], r[0]) + eps for x in r] for r in rows]
+  # normalize the columns then the rows, alternating
+  for i in range(2*iters-1):
+    if i % 2: comb_rows = [[x / (sum(r[1:], r[0]) + eps) for x in r] for r in comb_rows]
+    else:
+      col_sums = [sum((r[j] for r in comb_rows[1:]), comb_rows[0][j]) + eps for j in range(n)]
+      comb_rows = [[x / s for x, s in zip(r, col_sums)] for r in comb_rows]
+  stores = [pre[token, i].store(logits[i].sigmoid() + eps) for i in range(n)] + [post[token, i].store(logits[n+i].sigmoid() * 2) for i in range(n)]
+  stores += [comb[token, i*n+j].store(comb_rows[i][j]) for i in range(n) for j in range(n)]
+  return UOp.group(*stores).end(token).sink(arg=KernelInfo(name="hc_gates", opts_to_apply=()))
+
+@functools.lru_cache(maxsize=64)  # the pre of a hyper-connection is also asked for on its own, custom kernels are not deduplicated
+def _hc_gates(xs:UOp, fn:UOp, base:UOp, scale:UOp, count:int, iters:int, eps:float, norm_eps:float) -> tuple[UOp, UOp, UOp]:
+  tokens, K = cast(tuple[int, int], xs.shape)
+  part = Tensor.empty(tokens, K // 1024, fn.shape[0] + 1, dtype=dtypes.float32, device=xs.device)
+  part = Tensor.custom_kernel(part, Tensor(xs), Tensor(fn), fxn=_hc_dot_kernel)[0]
+  outs = [Tensor.empty(tokens, c, dtype=dtypes.float32, device=xs.device) for c in (count, count, count*count)]
+  fxn = functools.partial(_hc_gates_kernel, count=count, iters=iters, eps=eps, norm_eps=norm_eps, K=K)
+  return tuple(t.uop for t in Tensor.custom_kernel(*outs, part, Tensor(base), Tensor(scale), fxn=fxn)[:3])  # type: ignore[return-value]
+
+def hc_gates(xs:Tensor, fn:Tensor, base:Tensor, scale:Tensor, count:int, iters:int, eps:float, norm_eps:float) -> tuple[Tensor, Tensor, Tensor]|None:
+  # xs: (B, T, count, D) -> the pre (B, T, count) and post gates (B, T, count) and comb (B, T, count, count), or None if not supported
+  *lead, n, D = xs.shape
+  if not (isinstance(xs.device, str) and amd_custom_kernels_supported(xs.device) and isinstance(tokens:=prod(lead), int) and tokens <= 8 and
+          isinstance(D, int) and (n*D) % 1024 == 0 and fn.dtype in dtypes.floats): return None
+  pre, post, comb = _hc_gates(xs.reshape(tokens, n*D).float().contiguous().uop, fn.float().contiguous().uop, base.float().contiguous().uop,
+                              scale.float().contiguous().uop, count, iters, eps, norm_eps)
+  return Tensor(pre).reshape(*lead, n), Tensor(post).reshape(*lead, n), Tensor(comb).reshape(*lead, n, n)
+
 # ******** flash attention on the KV cache ********
 
 def _vec_load(ptr:UOp, lanes:int) -> tuple[UOp, ...]:
