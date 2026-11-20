@@ -1060,6 +1060,10 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
       if self.op is Ops.SUB: return wrapped(self.dtype, s0_vmin-s1_vmax, s0_vmax-s1_vmin)
       if self.op is Ops.AND and dtypes.is_int(self.dtype) and s1_vmin == s1_vmax and (s0_vmin >= 0 or s1_vmax >= 0):
         return 0, s1_vmax if s0_vmin < 0 else min(s0_vmax, int(s1_vmax) & ((1 << int(s0_vmax).bit_length()) - 1))
+      # non-negative operands: and can only clear bits, or can only set bits below the wider operand's next power of two
+      if self.op is Ops.AND and dtypes.is_int(self.dtype) and s0_vmin >= 0 and s1_vmin >= 0: return 0, min(s0_vmax, s1_vmax)
+      if self.op is Ops.OR and dtypes.is_int(self.dtype) and s0_vmin >= 0 and s1_vmin >= 0:
+        return max(s0_vmin, s1_vmin), min(s0_vmax+s1_vmax, (1 << int(max(s0_vmax, s1_vmax)).bit_length()) - 1)
       if self.op is Ops.MUL: return wrapped(self.dtype, min(vals:=(s0_vmin*s1_vmin, s0_vmin*s1_vmax, s0_vmax*s1_vmin, s0_vmax*s1_vmax)), max(vals))
       # SHL/SHR on consts only
       if self.op is Ops.SHL and s1_vmin == s1_vmax and all_int(t:=(s0_vmin, s0_vmax, s1_vmin)): return wrapped(self.dtype, t[0] << t[2], t[1] << t[2])
