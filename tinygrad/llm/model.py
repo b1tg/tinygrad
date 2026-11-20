@@ -3,7 +3,8 @@ import enum, functools, itertools, json, math, pathlib, re
 from dataclasses import dataclass, replace
 from typing import Callable
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
-from tinygrad.llm.kernels.amd import Linear, ExpertWeights, fp8_matmul, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
+from tinygrad.llm.kernels.amd import Linear, ExpertWeights, fp8_matmul, gated_delta_prefill, flash_attention, amd_custom_kernels_supported, \
+  hc_coeffs, hc_coeffs_supported
 from tinygrad.llm.gguf import gguf_parse, gguf_shard, GGUFPackedTable, _GGML_QUANT
 from tinygrad.llm.hf import hf_load
 from tinygrad.uop.ops import resolve, smax, ssimplify
@@ -227,22 +228,31 @@ class HyperConnection:
   def __init__(self, config:TransformerConfig, head:bool=False):
     self.count, self.eps, self.iters, self.norm_eps = (hc:=unwrap(config.hc)).count, hc.eps, hc.sinkhorn_iters, config.norm_eps
     self.fn = Linear(self.count * config.dim, (n:=self.count * (1 if head else 2 + self.count)), bias=False)
-    self.base, self.scale = {"weight": Tensor.zeros(n)}, {"weight": Tensor.zeros(1 if head else 3)}
+    self.base, self.scale, self.head = {"weight": Tensor.zeros(n)}, {"weight": Tensor.zeros(1 if head else 3)}, head
 
-  def mix(self, xs:Tensor) -> tuple[Tensor, Tensor]:
-    base, scale, mix = self.base["weight"], self.scale["weight"], self.fn(xs.flatten(2).rmsnorm(eps=self.norm_eps))
-    pre  = (mix[..., :self.count] * scale[0] + base[:self.count]).sigmoid() + self.eps
-    return (xs * pre.unsqueeze(-1)).sum(2), mix
-
-  def __call__(self, xs:Tensor, sublayer:Callable[[Tensor], tuple[Tensor, Tensor|None]]) -> tuple[Tensor, Tensor|None]:
-    """mHC: the sublayer sees a pre-weighted sum of the (B, T, hc, D) streams, its output is added back by post onto the streams mixed by comb"""
-    (mixed, mix), base, scale = self.mix(xs), self.base["weight"], self.scale["weight"]
+  def coeffs(self, xs:Tensor) -> tuple[Tensor, Tensor|None, Tensor|None]:
+    """pre, post (B, T, hc) and comb (B, T, hc, hc) of the (B, T, hc, D) streams (only pre for a head)"""
+    base, scale, flat = self.base["weight"], self.scale["weight"], xs.flatten(2)
+    if not self.head and hc_coeffs_supported(flat, self.count):  # one kernel for the rms, pre, post and the sinkhorn iterations
+      return hc_coeffs(self.fn, flat, base, scale, self.iters, self.eps, self.norm_eps)
+    mix = self.fn(flat.rmsnorm(eps=self.norm_eps))
+    pre = (mix[..., :self.count] * scale[0] + base[:self.count]).sigmoid() + self.eps
+    if self.head: return pre, None, None
     post = (mix[..., self.count:2*self.count] * scale[1] + base[self.count:2*self.count]).sigmoid() * 2
     comb = (mix[..., 2*self.count:] * scale[2] + base[2*self.count:]).reshape(*mix.shape[:-1], self.count, self.count).softmax(-1) + self.eps
     # sinkhorn: normalize the columns then the rows, alternating, to make comb doubly stochastic
     for i in range(2 * self.iters - 1): comb = comb / (comb.sum(-1 if i % 2 else -2, keepdim=True) + self.eps)
-    out, aux = sublayer(mixed)
-    return out.unsqueeze(2) * post.unsqueeze(-1) + (comb.transpose(-1, -2) @ xs), aux
+    return pre, post, comb
+
+  def mix(self, xs:Tensor) -> tuple[Tensor, Tensor]:
+    pre = self.coeffs(xs)[0]
+    return (xs * pre.unsqueeze(-1)).sum(2), pre
+
+  def __call__(self, xs:Tensor, sublayer:Callable[[Tensor], tuple[Tensor, Tensor|None]]) -> tuple[Tensor, Tensor|None]:
+    """mHC: the sublayer sees a pre-weighted sum of the (B, T, hc, D) streams, its output is added back by post onto the streams mixed by comb"""
+    pre, post, comb = self.coeffs(xs)
+    out, aux = sublayer((xs * pre.unsqueeze(-1)).sum(2))
+    return out.unsqueeze(2) * unwrap(post).unsqueeze(-1) + (unwrap(comb).transpose(-1, -2) @ xs), aux
 
 class GroupedRMSNorm:  # x: (B, T, count, dim), w: (count*dim,)
   def __init__(self, count:int, dim:int, eps:float): self.weight, self.eps = Tensor.zeros(count*dim), eps

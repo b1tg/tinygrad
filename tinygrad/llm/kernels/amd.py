@@ -1,6 +1,6 @@
 from __future__ import annotations
 import functools, math
-from typing import cast
+from typing import Callable, cast
 from tinygrad import Tensor, UOp, nn, Device, Context
 from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.helpers import prod, getenv, unwrap
@@ -423,6 +423,55 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
   if isinstance(valid_end, UOp): assigned_kv = Tensor(assigned_kv.uop.after(valid_end))
   out = Tensor.custom_kernel(out, q.half().reshape(B*H, T, D), assigned_kv, fxn=fxn)[0].reshape(B, H, T, D)
   return out if q_start is None else out[:, :, :T_real]
+
+# ******** mHC coefficients: pre, post and the sinkhorn of comb of a token in one wave, the rms norm of the streams folded in ********
+
+def _lane_xor(val:UOp, mask:int) -> UOp:
+  return UOp.native(f"__builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, {{0}}), {0x1f | mask<<10}))",
+                    shape=val.shape, dtype=dtypes.float, fmt=True).call(val)
+
+@functools.cache
+def _hc_coeffs(out:UOp, mix:UOp, sq:UOp, base:UOp, scale:UOp, iters:int, eps:float, norm_eps:float, features:int) -> UOp:
+  # mix (N, 24) is fn of the streams before their rms norm, sq (N, 32) partial sums of their squares: mix*rms is fn of the normed streams.
+  # lanes [0, 16) hold comb[lane//4][lane%4] (sums over a row or a column are lane swizzles), lanes [16, 20) pre and [20, 24) post
+  C = 4
+  token, lane = UOp.range(out.shape[0], 0, AxisType.GLOBAL), UOp.range(WARP_SIZE, -1, axis_type=AxisType.WARP)
+  rms = (warp_reduce(sq[token, lane].load(), full_wave=True) * (1/features) + norm_eps).rsqrt()
+  is_comb, is_pre = lane < C*C, (lane >= C*C) & (lane < C*C + C)
+  idx = is_comb.where(lane + 2*C, (lane - C*C).minimum(2*C-1))
+  s = is_comb.where(scale[2].load().float(), is_pre.where(scale[0].load().float(), scale[1].load().float()))
+  v = mix[token, idx].load() * rms * s + base[idx].load().float()
+  sig = (1 + (v * -LOG2E).exp2()).reciprocal()
+  def rowsum(x:UOp, op=UOp.__add__) -> UOp: return op(y:=op(x, _lane_xor(x, 1)), _lane_xor(y, 2))
+  def colsum(x:UOp) -> UOp: return (y:=x + _lane_xor(x, 4)) + _lane_xor(y, 8)
+  # comb: softmax over the row plus eps, then normalize the columns then the rows, alternating, each by its sum plus eps
+  e = ((v - rowsum(v, UOp.maximum)) * LOG2E).exp2()
+  c = e * rowsum(e).reciprocal() + eps
+  for it in range(2*iters - 1): c = c * ((colsum(c) if it % 2 == 0 else rowsum(c)) + eps).reciprocal()
+  value = is_comb.where(c, is_pre.where(sig + eps, sig * 2))
+  out_idx = is_comb.where(lane + 2*C, lane - C*C)
+  return out[token, out_idx.valid(lane < C*C + 2*C)].store(value).end(token, lane).sink(arg=KernelInfo(name="hc_coeffs", opts_to_apply=()))
+
+def hc_coeffs_supported(x:Tensor, count:int) -> bool:
+  return amd_custom_kernels_supported(x.device) and count == 4 and x.uop.axis is None and x.shape[-1] % 32 == 0
+
+def hc_coeffs(fn:Callable[[Tensor], Tensor], x:Tensor, base:Tensor, scale:Tensor, iters:int, eps:float,
+              norm_eps:float) -> tuple[Tensor, Tensor, Tensor]:
+  """
+  pre (..., 4), post (..., 4) and comb (..., 4, 4) of mHC from the flattened streams x (..., 4*dim): fn(rmsnorm(x)) is fn(x) times
+  the rms, the sums of squares and fn(x) are two kernels, the coefficients and the sinkhorn iterations one
+  """
+  # symbolic token count: pad to the max chunk size so the kernels see static shapes, the padded rows are sliced off
+  lead, padded = x.shape[:-1], x if isinstance(x.numel(), int) else x.pad_to(x.max_shape)
+  rows, features = prod(padded.shape[:-1]), padded.shape[-1]
+  flat = padded.reshape(rows, features)
+  mix = fn(flat)
+  out = Tensor.empty(rows, mix.shape[-1], dtype=dtypes.float32, device=x.device)
+  out = Tensor.custom_kernel(out, mix.float().contiguous(), flat.float().square().reshape(rows, 32, -1).sum(-1).contiguous(), base.contiguous(),
+                             scale.contiguous(), fxn=functools.partial(_hc_coeffs, iters=iters, eps=eps, norm_eps=norm_eps, features=features))[0]
+  out = out.reshape(*padded.shape[:-1], -1)
+  if padded is not x: out = out.shrink(tuple((0, s) for s in (*lead, out.shape[-1])))
+  return out[..., :4], out[..., 4:8], out[..., 8:].reshape(*lead, 4, 4)
 
 # ******** gated delta net: fused recurrent scan ********
 
