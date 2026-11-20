@@ -5,12 +5,16 @@ from typing import Callable
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
 from tinygrad.llm.kernels.amd import Linear, ExpertWeights, fp8_matmul, gated_delta_prefill, flash_attention, amd_custom_kernels_supported, \
   hc_coeffs, hc_coeffs_supported
-from tinygrad.llm.gguf import gguf_parse, gguf_shard, GGUFPackedTable, _GGML_QUANT
+from tinygrad.llm.gguf import gguf_parse, gguf_shard, gguf_can_split, gguf_pad_cols, GGUFPackedTable, _GGML_QUANT
 from tinygrad.llm.hf import hf_load
 from tinygrad.uop.ops import resolve, smax, ssimplify
 from tinygrad.helpers import unwrap, round_up, ceildiv, get_child
 
 StartPos = tuple[int|UOp, ...]
+# the weights of MLA and KDA layers with a block of rows per attention head
+HEAD_ROWS = {'attn_q.weight', 'attn_k.weight', 'attn_v.weight', 'attn_q_b.weight', 'attn_k_b.weight', 'attn_v_b.weight', 'attn_gate.weight',
+             'ssm_conv1d_q.weight', 'ssm_conv1d_k.weight', 'ssm_conv1d_v.weight', 'ssm_dt.bias', 'ssm_a', 'ssm_beta.weight', 'ssm_f.weight',
+             'ssm_f_b.weight', 'ssm_g.weight', 'ssm_g_b.weight'}
 
 class ExpertGating(enum.IntEnum):
   SOFTMAX = 1
@@ -209,6 +213,7 @@ class TransformerConfig:
   o_groups: int = 0
   o_lora_rank: int = 0
   hash_layers: int = 0
+  vocab_pad: int = 0  # zero rows of the embedding and the output padding the vocab to split over the devices
   expert_hash: bool = False
 
 class AttentionResidual:
@@ -787,12 +792,12 @@ class Transformer:
       if i < config.hash_layers: c = replace(c, expert_hash=True, expert_bias=False)
       if config.compress_ratios: self.blk.append(CompressedAttentionBlock(c, config.compress_ratios[i]))
       else: self.blk.append(GatedDeltaNetBlock(c, config.ssm) if config.ssm and config.ssm_layers[i] else block_cls(c))
-    self.token_embd  = nn.Embedding(config.vocab_size, config.dim)
+    self.token_embd  = nn.Embedding(config.vocab_size + config.vocab_pad, config.dim)
     self.output_norm: Callable[[Tensor], Tensor] = nn.RMSNorm(config.dim, config.norm_eps)
     if config.hc and config.hc.head: self.output_hc = HyperConnection(config, head=True)
     if config.hc and config.hc.low_rank: self.output_hc, self.output_norm = GatedResidual(config, inject=False), lambda x: x
     if config.attn_res_block_size: self.output_res_score = AttentionResidual(config)
-    self.output = Linear(config.dim, config.vocab_size, bias=False)
+    self.output = Linear(config.dim, config.vocab_size + config.vocab_pad, bias=False)
     self.max_context = config.max_context
     self.has_recurrent_block = any(isinstance(b, GatedDeltaNetBlock) for b in self.blk)
     self._cached_tokens: list[int] = []
@@ -811,6 +816,7 @@ class Transformer:
     elif self.config.attn_res_block_size: x = self.output_res_score.mix(x)
     # only run the output projection on the last token
     logits = self.output(self.output_norm(x[:, -1:]))[:, -1, :].to(tokens.device)
+    if self.config.vocab_pad: logits = logits[:, :self.config.vocab_size]
     # Gumbel-max trick: argmax(logits/temp - log(-log(uniform))) is equivalent to sampling from softmax(logits/temp)
     return (logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1, keepdim=True)
 
@@ -833,6 +839,9 @@ class Transformer:
     ple_entry = entries.pop('per_layer_token_embd.weight', None)
     if arch == 'bailingmoe3': entries = {k.replace('ssm_f_a', 'ssm_f').replace('ssm_g_a', 'ssm_g'):v for k,v in entries.items()}
     n_heads, n_kv_heads = kv[f'{arch}.attention.head_count'], kv[f'{arch}.attention.head_count_kv']
+    gguf_heads = n_heads
+    # MLA and KDA heads that don't split over the devices are zero padded (below), the other attention heads have to split
+    pad_heads = (kda or bool(kv.get(f'{arch}.attention.kv_lora_rank'))) and not kv.get(f'{arch}.attention.output_group_count')
     assert shard >= 1, f"shard must be at least 1, got {shard}"
     shard_map, repeats = {}, {}
     if shard > 1:
@@ -841,7 +850,7 @@ class Transformer:
         repeats = {k: shard // n_kv_heads for k in entries if k.split('.', 2)[-1] in ('attn_k.weight', 'attn_v.weight', 'attn_k.bias', 'attn_v.bias')}
         n_kv_heads = shard
       heads = n_heads if kv.get(f'{arch}.attention.kv_lora_rank') else n_kv_heads
-      assert heads % shard == 0, f"tensor parallel needs the attention heads to split over {shard} devices"
+      assert heads % shard == 0 or pad_heads, f"tensor parallel needs the attention heads to split over {shard} devices"
       # shard MLA heads and routed experts while replicating latent projections, KV cache and shared experts
       rules = {**{w: 0 for w in ('token_embd.weight', 'output.weight', 'attn_q.weight', 'attn_k.weight', 'attn_v.weight', 'ffn_gate.weight',
         'ffn_up.weight', 'attn_q_b.weight', 'attn_k_b.weight', 'attn_v_b.weight', 'attn_output_a.weight')}, 'ffn_down_exps.weight':2,
@@ -851,7 +860,26 @@ class Transformer:
       shard_map = {name: rules[k] for name in entries if (k:=re.sub(r"^blk\.\d+\.", "", name)) in rules}
     devices = tuple(Device.canonicalize(f'{Device.DEFAULT}:{i}') for i in range(shard))
     ep = any(shape[-1] % (shard*_GGML_QUANT.get(typ, (1,))[0]) for k,(_,shape,typ) in entries.items() if 'ffn_down_exps.' in k)
-    state_dict = gguf_shard(entries, devices, {k: 0 if ep and '_exps.' in k else v for k,v in shard_map.items()}, repeats)
+    pads:dict[str, int] = {}
+    if shard > 1 and pad_heads and n_heads % shard:
+      # a zero head's query, key and value are zero, so is its output, and its columns of the output projection are zeros too.
+      # the head count is the smallest one every per head weight splits at, a split of the output projection keeps whole quant blocks
+      head_rows = [k for k in shard_map if re.sub(r"^blk\.\d+\.", "", k) in HEAD_ROWS]
+      head_cols = [k for k in shard_map if re.sub(r"^blk\.\d+\.", "", k) == 'attn_output.weight']
+      assert all(entries[k][1][0] % n_heads == 0 for k in head_rows) and all(entries[k][1][-1] % n_heads == 0 for k in head_cols)
+      def splits(h:int) -> bool:
+        rows = all(gguf_can_split((s[0]//n_heads*h, *s[1:]), t, 0, shard) for _,s,t in (entries[k] for k in head_rows))
+        return rows and all(s[-1]//n_heads*(h-n_heads) % _GGML_QUANT.get(t, (1,))[0] == 0 and
+                            gguf_can_split((*s[:-1], s[-1]//n_heads*h), t, len(s)-1, shard) for _,s,t in (entries[k] for k in head_cols))
+      padded = next(h for h in range(round_up(n_heads, shard), 4*n_heads, shard) if splits(h))
+      for k in head_rows: pads[k] = entries[k][1][0] // n_heads * (padded - n_heads)
+      for k in head_cols: entries[k] = gguf_pad_cols(entries[k], entries[k][1][-1] // n_heads * (padded - n_heads))
+      n_heads = padded
+    # a vocab that doesn't split is zero padded too: a padded token's logit is cut before sampling
+    vocab = len(kv['tokenizer.ggml.tokens'])
+    vocab_pad = round_up(vocab, shard) - vocab if shard > 1 else 0
+    pads.update({k: vocab_pad for k in ('token_embd.weight', 'output.weight') if vocab_pad and k in shard_map and entries[k][1][0] == vocab})
+    state_dict = gguf_shard(entries, devices, {k: 0 if ep and '_exps.' in k else v for k,v in shard_map.items()}, repeats, pads)
 
     # all float state items should be float16, not float32
     state_dict = {k:v.cast('float16') if getenv("HALF", 1) and dtypes.is_float(v.dtype) else v for k,v in state_dict.items()}
@@ -902,7 +930,7 @@ class Transformer:
       state_dict = {k.replace('post_attention_norm', 'ffn_norm'):v for k,v in state_dict.items()}
 
     kv_lora_rank = kv.get(f'{arch}.attention.kv_lora_rank', 0)
-    head_dim = kv.get(f'{arch}.attention.key_length_mla', kv.get(f'{arch}.attention.key_length', kv[f'{arch}.embedding_length'] // n_heads))
+    head_dim = kv.get(f'{arch}.attention.key_length_mla', kv.get(f'{arch}.attention.key_length', kv[f'{arch}.embedding_length'] // gguf_heads))
     rope_dim, log_mul = kv.get(f'{arch}.rope.dimension_count', head_dim), kv.get(f'{arch}.rope.scaling.yarn_log_multiplier', 0.0)
     mscale = log_mul * math.log(kv.get(f'{arch}.rope.scaling.factor', 1.0)) + 1.0 if kv_lora_rank or arch.startswith('deepseek') else None
     yarn = YaRNConfig(factor=kv[f'{arch}.rope.scaling.factor'],
@@ -924,7 +952,7 @@ class Transformer:
       num_blocks=num_blocks, dim=kv[f'{arch}.embedding_length'],
       hidden_dim=kv.get(f'{arch}.expert_feed_forward_length', kv.get(f'{arch}.feed_forward_length', 0)),
       n_heads=n_heads, n_kv_heads=n_kv_heads, norm_eps=kv[f'{arch}.attention.layer_norm_rms_epsilon'],
-      vocab_size=len(kv['tokenizer.ggml.tokens']),
+      vocab_size=vocab, vocab_pad=vocab_pad,
       head_dim=head_dim,
       rope_theta=kv.get(f'{arch}.rope.freq_base', 10000.0), rope_dim=rope_dim, yarn=yarn,
       v_head_dim=kv.get(f'{arch}.attention.value_length_mla', kv.get(f'{arch}.attention.value_length', head_dim)),
