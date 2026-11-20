@@ -966,7 +966,8 @@ class Transformer:
               realize=bool(getenv("REALIZE", 0)), shard:int=1) -> tuple[Transformer, dict]:
     path = pathlib.Path(path)
     cfg = json.loads((path/'config.json').read_text())
-    assert cfg['architectures'][0] == 'GlmMoeDsaForCausalLM', "from_hf only supports glm-dsa checkpoints"
+    deepseek4 = cfg['architectures'][0] == 'DeepseekV4ForCausalLM'
+    assert (deepseek4 and shard == 1) or cfg['architectures'][0] == 'GlmMoeDsaForCausalLM', "from_hf supports glm-dsa and single device deepseek-v4"
     assert shard >= 1 and cfg['num_attention_heads'] % shard == 0, "tensor parallel must divide the attention heads"
     devices = tuple(Device.canonicalize(f'{Device.DEFAULT}:{i}') for i in range(shard))
     hf_names = {'token_embd.weight': 'model.embed_tokens.weight', 'output_norm.weight': 'model.norm.weight', 'output.weight': 'lm_head.weight',
@@ -981,16 +982,32 @@ class Transformer:
                 **{f'ffn_{p}.weight': f'mlp.{p}_proj.weight' for p in ('gate', 'up', 'down')},
                 **{f'ffn_{p}_shexp.weight': f'mlp.shared_experts.{p}_proj.weight' for p in ('gate', 'up', 'down')},
                 **{f'ffn_{p}_exps.weight': f'mlp.experts.{{}}.{p}_proj.weight' for p in ('gate', 'up', 'down')}}
+    if deepseek4:
+      hf_names = {'token_embd.weight': 'embed.weight', 'output_norm.weight': 'norm.weight', 'output.weight': 'head.weight',
+                  'attn_norm.weight': 'attn_norm.weight', 'ffn_norm.weight': 'ffn_norm.weight', 'attn_sinks.weight': 'attn.attn_sink',
+                  **{f'attn_{k}.weight': f'attn.{v}.weight' for k, v in (('q_a', 'wq_a'), ('q_a_norm', 'q_norm'), ('q_b', 'wq_b'), ('kv', 'wkv'),
+                                                                          ('kv_a_norm', 'kv_norm'), ('output_a', 'wo_a'), ('output_b', 'wo_b'))},
+                  'indexer.attn_q_b.weight': 'attn.indexer.wq_b.weight', 'indexer.proj.weight': 'attn.indexer.weights_proj.weight',
+                  'ffn_gate_inp.weight': 'ffn.gate.weight', 'exp_probs_b.bias': 'ffn.gate.bias', 'ffn_gate_tid2eid.weight': 'ffn.gate.tid2eid',
+                  **{f'{dst}compressor.{k}.weight': f'attn.{src}compressor.{v}' for dst, src in (('attn_', ''), ('indexer.', 'indexer.'))
+                     for k, v in (('ape', 'ape'), ('norm', 'norm.weight'), ('gate', 'wgate.weight'), ('kv', 'wkv.weight'))},
+                  **{f'{hc}.{p}.weight': f'hc_{src}_{p}' for hc, src in (('hc_attn', 'attn'), ('hc_ffn', 'ffn'), ('output_hc', 'head'))
+                     for p in ('fn', 'base', 'scale')},
+                  **{f'ffn_{p}_{e}.weight': f'ffn.{src}.{w}.weight' for p, w in (('gate', 'w1'), ('down', 'w2'), ('up', 'w3'))
+                     for e, src in (('shexp', 'shared_experts'), ('exps', 'experts.{}'))}}
+      cfg = {**cfg, 'qk_nope_head_dim': cfg['head_dim'] - cfg['qk_rope_head_dim'], 'v_head_dim': cfg['head_dim'],
+             'rope_parameters': {'rope_theta': cfg['rope_theta']}, 'kv_lora_rank': 0, 'first_k_dense_replace': 0, 'intermediate_size': 0,
+             'indexer_types': ['full'] * cfg['num_hidden_layers'], 'indexer_rope_interleave': True, 'rope_interleave': False}
     shard_axes = {**{w: 0 for w in ('token_embd.weight', 'output.weight', 'attn_q_b.weight', 'attn_k_b.weight', 'ffn_gate.weight', 'ffn_up.weight')},
                   **{w: 1 for w in ('attn_output.weight', 'ffn_down.weight', 'ffn_gate_exps.weight', 'ffn_up_exps.weight')},
                   **{w: 2 for w in ('ffn_down_exps.weight',)}}
 
-    global_names = ('token_embd.weight', 'output_norm.weight', 'output.weight')
+    global_names = [k for k in hf_names if k.startswith(('token_embd.', 'output'))]
     sources:dict[str, str|list[str]] = {k: hf_names[k] for k in global_names}
     for layer in range(cfg['num_hidden_layers']):
       for key, source in hf_names.items():
         if key in global_names or (key.startswith('indexer.') and cfg['indexer_types'][layer] != 'full'): continue
-        source = f'model.layers.{layer}.' + source
+        source = f'{"" if deepseek4 else "model."}layers.{layer}.' + source
         sources[f'blk.{layer}.{key}'] = [source.format(i) for i in range(cfg['n_routed_experts'])] if '{}' in source else source
     shard_map = {name: shard_axes[key] for name in sources if (key:=re.sub(r'^blk\.\d+\.', '', name)) in shard_axes}
     state_dict = hf_load(path, devices, sources, shard_map)
@@ -1012,9 +1029,17 @@ class Transformer:
       indexer=IndexerConfig(cfg['index_n_heads'], cfg['index_head_dim'], cfg['index_topk'], rope_dim=cfg['qk_rope_head_dim'],
                             rope_interleave=cfg['indexer_rope_interleave']),
       indexer_shared=tuple(t != 'full' for t in cfg['indexer_types']), rope_interleave=cfg['rope_interleave'])
+    if deepseek4:
+      yarn = cfg['rope_scaling']
+      config = replace(config, yarn=YaRNConfig(yarn['factor'], yarn['original_max_position_embeddings'], yarn['beta_fast'], yarn['beta_slow'], 1.0),
+        expert_gating_func=ExpertGating.SQRT_SOFTPLUS, swiglu_limit=cfg['swiglu_limit'], sliding_window=cfg['sliding_window'],
+        hc=HCConfig(cfg['hc_mult'], cfg['hc_sinkhorn_iters'], cfg['hc_eps'], head=True), hash_layers=cfg['num_hash_layers'],
+        indexer=replace(unwrap(config.indexer), top_k=cfg['index_topk'] * 4, kpool=4), o_groups=cfg['o_groups'], o_lora_rank=cfg['o_lora_rank'],
+        compress_ratios=tuple(cfg['compress_ratios'][:cfg['num_hidden_layers']]), compress_rope_theta=cfg['compress_rope_theta'])
     model = Transformer(config)
     for p in (nn.state.get_parameters(model) if shard > 1 else []): p.to_(devices)
     for i, block in enumerate(model.blk):
+      if deepseek4: continue
       assert isinstance(block, MLATransformerBlock)
       prefix = f'blk.{i}.'
       w = state_dict[prefix+'attn_k_b.weight']
@@ -1032,6 +1057,7 @@ class Transformer:
       projection = get_child(model, name.removesuffix('.weight_scale_inv'))
       if isinstance(projection, dict): projection['weight_scale_inv'] = scale
       else: projection.weight_scale_inv, projection.weight_block_size = scale, block_size
+      if scale.dtype == dtypes.uint8: projection.weight = state_dict[name.removesuffix('_scale_inv')]
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)
     if realize:
       params = nn.state.get_parameters(model)

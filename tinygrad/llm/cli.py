@@ -94,7 +94,8 @@ def main():
         f"max context {args.max_context} on {nn.state.get_parameters(model)[0].device}")
 
   # get tokenizer
-  tok = SimpleTokenizer.from_hf(path, preset='glm4') if path.is_dir() else SimpleTokenizer.from_gguf_kv(kv)
+  hf_presets = {'glm_moe_dsa': 'glm4', 'deepseek_v4': 'joyai-llm'}
+  tok = SimpleTokenizer.from_hf(path, preset=hf_presets[kv['model_type']]) if path.is_dir() else SimpleTokenizer.from_gguf_kv(kv)
 
   # use the model's chat template if jinja2 is available (enables model-specific formatting)
   template: jinja2.Template|FallbackTemplate = FallbackTemplate(tok)

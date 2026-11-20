@@ -68,8 +68,9 @@ class SimpleTokenizer:
     vocab = tok["model"]["vocab"]
     eos = cfg.get("eos_token_id", 0)
     eos = eos if isinstance(eos, list) else [eos]
+    bos = tok_cfg.get("bos_token")
     return SimpleTokenizer({t: i for t, i in vocab.items() if t not in added}, added, preset,
-      bos_id=vocab.get(tok_cfg.get("bos_token")), eos_id=eos[0],
+      bos_id=vocab.get(bos["content"] if isinstance(bos, dict) else bos), eos_id=eos[0],
       eot_id=eos[1] if len(eos) > 1 else None, eom_id=eos[2] if len(eos) > 2 else None,
       chat_template=template.read_text() if (template:=path / "chat_template.jinja").exists() else tok_cfg.get("chat_template"))
 

@@ -65,6 +65,12 @@ def fp8_matmul(x:Tensor, weight:Tensor, scale:Tensor, block_size:tuple[int, int]
   w_scale = scale.transpose(-1, -2).repeat_interleave(block_n, -1)[..., None, :n]
   return (partials * x_scale * w_scale).sum(-3).cast(x.dtype)
 
+def mxfp4_matmul(x:Tensor, codes:Tensor, scales:Tensor) -> Tensor:
+  # two e2m1 codes a byte (the low nibble first), an e8m0 scale per 32
+  lut = Tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6], device=codes.device)
+  w = lut[Tensor.stack(codes & 0xF, codes >> 4, dim=-1).flatten(-2).cast(dtypes.int32)].unflatten(-1, (-1, 32))
+  return x @ (w * (scales.float() - 127).exp2().unsqueeze(-1)).flatten(-2).transpose(-1, -2)
+
 class Linear(nn.Linear):
   ggml_type:int|None = None
   use_custom_quant = True
@@ -83,7 +89,10 @@ class Linear(nn.Linear):
   def __call__(self, x:Tensor) -> Tensor:
     from tinygrad.llm.kernels.amd_gguf import QUANT_SIZES, q8_linear
     if self.weight_scale_inv is not None:
-      out = fp8_matmul(x, self.weight, self.weight_scale_inv, self.weight_block_size)
+      if self.groups > 1:
+        w, scale = self.weight.unflatten(0, (self.groups, -1)), self.weight_scale_inv.unflatten(0, (self.groups, -1))
+        out = fp8_matmul(x.unsqueeze(-2), w, scale, self.weight_block_size).squeeze(-2)
+      else: out = fp8_matmul(x, self.weight, self.weight_scale_inv, self.weight_block_size)
       return out + self.bias if self.bias is not None else out
     grouped_ok = self.groups == 1 or (self.weight.uop.axis, x.uop.axis) in ((None, None), (0, x.ndim-2))
     supported = self.use_custom_quant and amd_custom_kernels_supported(self.weight.device) and grouped_ok
@@ -131,7 +140,9 @@ class ExpertWeights:
       self.set_quantized()
       if self.ggml_type is None: self.use_custom_quant = supported = False  # not a supported quant format
     assert self.weight.uop.axis != 0 or (self.ggml_type is not None and supported and not hasattr(self, 'bias')), "split experts need the moe kernel"
-    if self.weight_scale_inv is not None:
+    if self.weight_scale_inv is not None and self.weight.dtype == dtypes.uint8:
+      ret = mxfp4_matmul(x.unsqueeze(-2), self.weight[sel], self.weight_scale_inv[sel]).squeeze(-2)
+    elif self.weight_scale_inv is not None:
       ret = fp8_matmul(x.unsqueeze(-2), self.weight[sel], self.weight_scale_inv[sel], self.weight_block_size).squeeze(-2)
     elif self.ggml_type is not None and supported: ret = moe_linear(self, sel, x)
     else: ret = (x.unsqueeze(-2) @ self.weight[sel].transpose(-1, -2)).contiguous().squeeze(-2)
