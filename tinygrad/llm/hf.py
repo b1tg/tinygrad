@@ -13,7 +13,9 @@ def hf_load(path:pathlib.Path, devices:tuple[str, ...], names:dict[str, str|list
     _, _, metadata = nn.state.safe_load_metadata(path / "model.safetensors")
     weight_map = dict.fromkeys(metadata, "model.safetensors")
   needed = {s for source in names.values() for s in (source if isinstance(source, list) else [source])}
-  needed |= {s + "_scale_inv" for s in needed}
+  # the scale of x.weight is x.weight_scale_inv (glm) or x.scale (deepseek-v4)
+  def scale_name(s:str) -> str: return s + "_scale_inv" if s + "_scale_inv" in weight_map else s.removesuffix("weight") + "scale"
+  needed |= {scale_name(s) for s in needed}
   weights:dict[str, tuple[Tensor, dict]] = {}
 
   def pop_tensor(source:str|list[str], axis:int|None) -> Tensor:
@@ -28,7 +30,7 @@ def hf_load(path:pathlib.Path, devices:tuple[str, ...], names:dict[str, str|list
       parts.append(weights.pop(s))
 
     m0 = parts[0][1]
-    shape, dtype = m0['shape'], nn.state.safe_dtypes[m0['dtype']]
+    shape, dtype = m0['shape'], {'F8_E8M0': dtypes.uint8, **nn.state.safe_dtypes}[m0['dtype']]
     nbytes = prod(shape) * dtype.itemsize
     assert all(m['shape'] == shape and m['dtype'] == m0['dtype'] and
                0 <= m['data_offsets'][0] <= m['data_offsets'][1] <= d.numel() and
@@ -62,9 +64,11 @@ def hf_load(path:pathlib.Path, devices:tuple[str, ...], names:dict[str, str|list
     if first not in weight_map: continue
     axis = shard_map.get(name)
     w = pop_tensor(source, axis)
-    scale_source = [s + "_scale_inv" for s in source] if isinstance(source, list) else source + "_scale_inv"
-    scale = pop_tensor(scale_source, axis) if first + "_scale_inv" in weight_map else None
-    if scale is not None and use_fnuz:
+    scale_source = [scale_name(s) for s in source] if isinstance(source, list) else scale_name(source)
+    scale = pop_tensor(scale_source, axis) if scale_name(first) in weight_map else None
+    if w.dtype == dtypes.int8: w = w.bitcast(dtypes.uint8)  # fp4: a byte holds an (even, odd) pair of e2m1 weights, the e8m0 scale per 32 stays raw
+    elif scale is not None and scale.dtype == dtypes.uint8: scale = (scale.float() - 127).exp2()  # e8m0
+    if scale is not None and use_fnuz and w.dtype != dtypes.uint8:
       w, scale = e4m3fn_to_fnuz(w, scale)
       Tensor.realize(w, scale)
     state_dict[name] = w.realize()

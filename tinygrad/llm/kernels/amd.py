@@ -4,7 +4,7 @@ from typing import cast
 from tinygrad import Tensor, UOp, nn, Device, Context
 from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.helpers import prod, getenv, unwrap
-from tinygrad.uop.ops import AxisType, KernelInfo, Ops, resolve
+from tinygrad.uop.ops import AxisType, KernelInfo, Ops, resolve, sint
 from tinygrad.renderer.cstyle import HIPRenderer
 
 BLOCK_M, BLOCK_N, WARP_SIZE = 32, 32, 32
@@ -81,8 +81,9 @@ class Linear(nn.Linear):
     self.shard_axis = decoded.uop.axis
   def __call__(self, x:Tensor) -> Tensor:
     from tinygrad.llm.kernels.amd_gguf import QUANT_SIZES, q8_linear
+    from tinygrad.llm.kernels.amd_hf import fp8_linear, bf16_linear
     if self.weight_scale_inv is not None:
-      out = fp8_matmul(x, self.weight, self.weight_scale_inv, self.weight_block_size)
+      out = fp8_linear(x, self.weight, self.weight_scale_inv, self.weight_block_size)
       return out + self.bias if self.bias is not None else out
     supported = self.use_custom_quant and amd_custom_kernels_supported(self.weight.device)
     if self.ggml_type is None and supported:
@@ -96,6 +97,8 @@ class Linear(nn.Linear):
           if isinstance(numel, int) or prod(max_shape) // self.in_features <= 32:
             out = f16_gemv(self, x if isinstance(numel, int) else x.pad_to(max_shape))
             return out if isinstance(numel, int) else out.shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
+        if self.weight.dtype == dtypes.bfloat16 and isinstance(self.weight.device, str) and (dense:=bf16_linear(x, self.weight)) is not None:
+          return dense if self.bias is None else dense + self.bias
         self.use_custom_quant = supported = False  # not a supported quant format
     if self.ggml_type in QUANT_SIZES and supported:
       if isinstance(x.numel(), int): return q8_linear(self, x)
@@ -120,13 +123,16 @@ class ExpertWeights:
     self.ggml_type, self.packed = found
   def __call__(self, sel:Tensor, x:Tensor) -> Tensor:
     from tinygrad.llm.kernels.amd_gguf import moe_linear
+    from tinygrad.llm.kernels.amd_hf import mxfp4_moe
     # sel: (B, T, k), x: (B, T, 1, in) or (B, T, k, in) -> output: (B, T, k, out)
     supported = self.weight_scale_inv is None and self.use_custom_quant and amd_custom_kernels_supported(self.weight.device)
     if self.ggml_type is None and supported:
       self.set_quantized()
       if self.ggml_type is None: self.use_custom_quant = supported = False  # not a supported quant format
     assert self.weight.uop.axis != 0 or (self.ggml_type is not None and supported and not hasattr(self, 'bias')), "split experts need the moe kernel"
-    if self.weight_scale_inv is not None:
+    if self.weight_scale_inv is not None and self.weight.dtype == dtypes.uint8:
+      ret = mxfp4_moe(self.weight, self.weight_scale_inv, sel, x)  # fp4 codes, e8m0 scales
+    elif self.weight_scale_inv is not None:
       ret = fp8_matmul(x.unsqueeze(-2), self.weight[sel], self.weight_scale_inv[sel], self.weight_block_size).squeeze(-2)
     elif self.ggml_type is not None and supported: ret = moe_linear(self, sel, x)
     else: ret = (x.unsqueeze(-2) @ self.weight[sel].transpose(-1, -2)).contiguous().squeeze(-2)
@@ -168,6 +174,228 @@ def f16_gemv(layer:Linear, x:Tensor) -> Tensor:
   fxn = functools.partial(_amd_f16_gemv_kernel, in_features=layer.in_features, out_features=layer.out_features, tokens=tokens)
   srcs = (out, weight.reshape(-1), x.reshape(tokens, layer.in_features)) + (() if layer.bias is None else (_view_back(layer.bias),))
   return Tensor.custom_kernel(*srcs, fxn=fxn)[0].reshape(*x.shape[:-1], layer.out_features)
+
+# ******** hyper connection mixes ********
+
+@functools.cache
+def _hc_dot_kernel(part:UOp, xs:UOp, w:UOp, block:int=1024) -> UOp:
+  # split-K over the flattened streams: a block's partial fn rows and sum of squares, a thread takes 4 values
+  (T, K), N = cast(tuple[int, int], xs.shape), cast(int, w.shape[0])
+  splits, waves = K // block, block // (4*WARP_SIZE)
+  token_split, wave, lane = UOp.range(T*splits, 0, AxisType.GLOBAL), UOp.range(waves, 1, AxisType.LOCAL), UOp.range(WARP_SIZE, -1, AxisType.WARP)
+  token, k = token_split // splits, (token_split % splits)*block + (wave*WARP_SIZE + lane)*4
+  xv = _vec_load(xs[token, k], 4)
+  vals = [sum((a*b for a, b in zip(_vec_load(w[n, k], 4), xv)), UOp.const(0, dtypes.float)) for n in range(N)]
+  vals.append(sum((a*a for a in xv), UOp.const(0, dtypes.float)))
+  lds = UOp.alloc((waves, N+1), dtypes.float, addrspace=AddrSpace.LOCAL)
+  lds = lds.after(*[lds[wave, i].store(warp_reduce(v, full_wave=True)) for i, v in enumerate(vals)])
+  tid = wave*WARP_SIZE + lane
+  i = tid.valid(tid < N+1)
+  store = part[token, token_split % splits, i].store(sum((lds[j, i].load() for j in range(waves)), UOp.const(0, dtypes.float)))
+  return store.end(lane, wave, token_split).sink(arg=KernelInfo(name="hc_dot", opts_to_apply=()))
+
+@functools.cache
+def _hc_apply_kernel(mixed:UOp, post:UOp, comb:UOp, part:UOp, xs:UOp, base:UOp, scale:UOp, count:int, iters:int, eps:float, norm_eps:float,
+                     threads:int=256) -> UOp:
+  # a block a token: the rmsnormed mix logits, the pre weighted sum of the streams, the post gates and the sinkhorn normalized comb
+  (T, splits, N1), n, K = cast(tuple[int, int, int], part.shape), count, cast(int, xs.shape[1])
+  token, tid = UOp.range(T, 0, AxisType.GLOBAL), UOp.range(threads, 1, AxisType.LOCAL)
+  sums = [sum((part[token, s, i].load() for s in range(1, splits)), part[token, 0, i].load()) for i in range(N1)]
+  r = (sums[-1] / K + norm_eps).sqrt().reciprocal()
+  logits = [sums[i] * r * scale[min(i // n, 2)].load() + base[i].load() for i in range(N1 - 1)]
+  pre = [logits[i].sigmoid() + eps for i in range(n)]
+  stores = [mixed[token, d].store(sum((pre[i] * xs[token, i*(K//n) + d].load() for i in range(1, n)), pre[0] * xs[token, d].load()))
+            for d in (tid + j*threads for j in range(K // n // threads))]
+  rows = [logits[2*n+i*n:2*n+(i+1)*n] for i in range(n)]
+  rows = [[(x - functools.reduce(UOp.maximum, r)).exp() for x in r] for r in rows]
+  comb_rows = [[x / sum(r[1:], r[0]) + eps for x in r] for r in rows]
+  # normalize the columns then the rows, alternating
+  for i in range(2*iters-1):
+    if i % 2: comb_rows = [[x / (sum(r[1:], r[0]) + eps) for x in r] for r in comb_rows]
+    else:
+      col_sums = [sum((r[j] for r in comb_rows[1:]), comb_rows[0][j]) + eps for j in range(n)]
+      comb_rows = [[x / s for x, s in zip(r, col_sums)] for r in comb_rows]
+  first = tid.eq(0)
+  stores += [post[token, UOp.const(i, dtypes.weakint).valid(first)].store(logits[n+i].sigmoid() * 2) for i in range(n)]
+  stores += [comb[token, UOp.const(i*n+j, dtypes.weakint).valid(first)].store(comb_rows[i][j]) for i in range(n) for j in range(n)]
+  return UOp.group(*stores).end(tid, token).sink(arg=KernelInfo(name="hc_apply", opts_to_apply=()))
+
+def hc_pre(xs:Tensor, fn:Tensor, base:Tensor, scale:Tensor, count:int, iters:int, eps:float, norm_eps:float) -> tuple[Tensor, Tensor, Tensor]|None:
+  # xs: (B, T, count, D) -> the pre weighted sum of the streams (B, T, D), the post gates (B, T, count) and comb (B, T, count, count)
+  *lead, n, D = xs.shape
+  if not (isinstance(xs.device, str) and amd_custom_kernels_supported(xs.device) and isinstance(tokens:=prod(lead), int) and tokens <= 8 and
+          isinstance(D, int) and D % 256 == 0 and (n*D) % 1024 == 0 and fn.dtype in dtypes.floats): return None
+  K = n*D
+  part = Tensor.empty(tokens, K // 1024, fn.shape[0] + 1, dtype=dtypes.float32, device=xs.device)
+  xs2 = xs.reshape(tokens, K).float().contiguous()
+  part = Tensor.custom_kernel(part, xs2, fn.float().contiguous(), fxn=_hc_dot_kernel)[0]
+  outs = [Tensor.empty(tokens, c, dtype=dtypes.float32, device=xs.device) for c in (D, n, n*n)]
+  fxn = functools.partial(_hc_apply_kernel, count=count, iters=iters, eps=eps, norm_eps=norm_eps)
+  mixed, post, comb = Tensor.custom_kernel(*outs, part, xs2, base.float().contiguous(), scale.float().contiguous(), fxn=fxn)[:3]
+  return mixed.reshape(*lead, D), post.reshape(*lead, n), comb.reshape(*lead, n, n)
+
+# ******** top-k mask ********
+
+@functools.cache
+def _topk_mask_kernel(mask:UOp, scores:UOp, k:int, waves:int=8) -> UOp:
+  # one workgroup a row: binary search the bits of the k-th largest order preserving key, then the index bound of the ties (lower first)
+  rows, n = cast(tuple[int, int], scores.shape)
+  per = -(-n // (waves*WARP_SIZE))
+  row, wave, lane = UOp.range(rows, 0, AxisType.GLOBAL), UOp.range(waves, 1, AxisType.LOCAL), UOp.range(WARP_SIZE, -1, AxisType.WARP)
+  idxs = [(wave*WARP_SIZE + lane)*per + i for i in range(per)]
+  bits = [(i < n).where(scores[row, i.minimum(n-1)].load(), -math.inf).bitcast(dtypes.uint32) for i in idxs]
+  # -0.0 ties with 0.0
+  keys = [(b >> 31).eq(1).where(b ^ 0xffffffff, b | 0x80000000) for b in (b.eq(0x80000000).where(0, b) for b in bits)]
+  lds = UOp.alloc((33 + n.bit_length(), waves), dtypes.float, addrspace=AddrSpace.LOCAL)
+  def count(step:int, hits:list[UOp]) -> UOp:
+    hit_count = warp_reduce(sum((h.where(1.0, 0.0) for h in hits), UOp.const(0, dtypes.float)), full_wave=True)
+    lds_step = lds.after(lds[step, wave.valid(lane.eq(0))].store(hit_count))
+    return sum((lds_step[step, w].load() for w in range(waves)), UOp.const(0, dtypes.float))
+  threshold = UOp.const(0, dtypes.uint32)
+  for step in range(32):
+    cand = threshold | (1 << (31-step))
+    threshold = (count(step, [(key < cand).logical_not() for key in keys]) < k).where(threshold, cand)
+  ties, bound = [key.eq(threshold) for key in keys], UOp.const(0, dtypes.weakint)
+  rank = k - count(32, [threshold < key for key in keys])
+  for step in range(n.bit_length()):
+    cand = bound | (1 << (n.bit_length()-1-step))
+    bound = (rank < count(33+step, [t & (i < cand) for t, i in zip(ties, idxs)])).where(bound, cand)
+  # -inf scores (and the padding) are never picked
+  picked = [((threshold < key) | (t & (i < bound))) & (0x007fffff < key) for key, t, i in zip(keys, ties, idxs)]
+  stores = [mask[row, i.valid(i < n)].store(p) for p, i in zip(picked, idxs)]
+  return UOp.group(*stores).end(row, wave, lane).sink(arg=KernelInfo(name="topk_mask", opts_to_apply=()))
+
+def topk_mask(scores:Tensor, k:int) -> Tensor:
+  # the k largest of the last axis that are not -inf, ties go to the lower index
+  if not (isinstance(scores.device, str) and amd_custom_kernels_supported(scores.device) and isinstance(scores.numel(), int)):
+    return scores.zeros_like(dtype=dtypes.bool).scatter(-1, scores.topk(k)[1], True) & (scores > -math.inf)
+  n = int(scores.shape[-1])
+  mask = Tensor.empty(int(scores.numel()) // n, n, dtype=dtypes.bool, device=scores.device)
+  mask = Tensor.custom_kernel(mask, scores.reshape(-1, n).float().contiguous(), fxn=functools.partial(_topk_mask_kernel, k=k))[0]
+  return mask.reshape(scores.shape)
+
+@functools.cache
+def _index_scores_kernel(out:UOp, q:UOp, k:UOp, w:UOp, block:int=16, groups:int=4) -> UOp:
+  # a block takes `block` keys, a thread a head and block//groups keys, the heads are summed by the warps and then in LDS
+  (H, D), P = cast(tuple[int, int], q.shape), cast(int, k.shape[0])
+  hw, per = H // WARP_SIZE, block // groups
+  key_block, wave = UOp.range(-(-P // block), 0, AxisType.GLOBAL), UOp.range(groups*hw, 1, AxisType.LOCAL)
+  lane = UOp.range(WARP_SIZE, -1, AxisType.WARP)
+  head, group = (wave % hw)*WARP_SIZE + lane, wave // hw
+  keys = [(key_block*block + group*per + j).minimum(P-1) for j in range(per)]
+  accs = [UOp.const(0, dtypes.float)] * per
+  for c in range(0, D, 4):
+    qv = _vec_load(q[head, c], 4)
+    for j, key in enumerate(keys): accs[j] = accs[j] + sum((a*b for a, b in zip(qv, _vec_load(k[key, c], 4))), UOp.const(0, dtypes.float))
+  lds = UOp.alloc((groups, per, hw), dtypes.float, addrspace=AddrSpace.LOCAL)
+  wh = w[head].load()
+  lds = lds.after(*[lds[group, j, wave % hw].store(warp_reduce(acc.maximum(0) * wh, full_wave=True))
+                    for j, acc in enumerate(accs)])
+  tid = wave*WARP_SIZE + lane
+  t, key = tid % block, (key_block*block + tid).valid((tid < block) & (key_block*block + tid < P))
+  store = out[key].store(sum((lds[t // per, t % per, i].load() for i in range(hw)), UOp.const(0, dtypes.float)))
+  return store.end(lane, wave, key_block).sink(arg=KernelInfo(name="index_scores", opts_to_apply=()))
+
+def index_scores(q:Tensor, k:Tensor, w:Tensor) -> Tensor:
+  # q: (B, T, H, D), k: (B, P, D), w: (B, T, H) -> the w weighted sum over heads of relu(q . k): (B, 1, T, P)
+  B, T, H, D = q.shape
+  if not (isinstance(q.device, str) and amd_custom_kernels_supported(q.device) and B == 1 and resolve(T == 1, False) and
+          isinstance(k.shape[1], int) and H % WARP_SIZE == 0 and D % 4 == 0):
+    return ((q @ k.transpose(-1, -2).unsqueeze(1)).relu() * w.unsqueeze(-1)).sum(2).unsqueeze(1)
+  P = int(k.shape[1])
+  out = Tensor.empty(P, dtype=dtypes.float32, device=q.device)
+  srcs = (q.reshape(H, D).float().contiguous(), k.reshape(P, D).contiguous(), w.reshape(H).float().contiguous())
+  return Tensor.custom_kernel(out, *srcs, fxn=_index_scores_kernel)[0].reshape(1, 1, 1, P)
+
+# ******** attention on keys that are also the values, with a sink ********
+
+@functools.cache
+def _sink_decode_partial(out:UOp, stats:UOp, q:UOp, kv:UOp, bias:UOp, *idx:UOp, heads:int=4, waves:int=4) -> UOp:
+  # a block takes `heads` heads and a chunk of keys (of the idx list of key positions, -1 is none), a wave scores its keys then accumulates them
+  (H, D), C = cast(tuple[int, int], q.shape), cast(int, out.shape[1])
+  N = cast(int, (idx[0] if idx else kv).shape[0])
+  DPL, block_n = D // WARP_SIZE, -(-N // C)
+  per_wave = -(-block_n // waves)
+  head_block, chunk = UOp.range(H // heads, 0, AxisType.GLOBAL), UOp.range(C, 1, AxisType.GLOBAL)
+  lane, wave = UOp.range(WARP_SIZE, -1, AxisType.WARP), UOp.range(waves, 3, AxisType.LOCAL)
+  qf = [_vec_load(q[head_block*heads + h, lane*DPL], DPL) for h in range(heads)]
+  slots = [chunk*block_n + wave*per_wave + j for j in range(per_wave)]
+  valid = [(s < N) & (s < (chunk+1)*block_n) for s in slots]
+  keys = [idx[0][s.minimum(N-1)].load().cast(dtypes.weakint) if idx else s.minimum(N-1) for s in slots]
+  if idx: valid, keys = [v & (key >= 0) for v, key in zip(valid, keys)], [key.maximum(0) for key in keys]
+  kfs = [_vec_load(kv[key, lane*DPL], DPL) for key in keys]
+  scores = [[warp_reduce(sum((a*b for a, b in zip(qf[h], kf)), UOp.const(0, dtypes.float)), full_wave=True) / math.sqrt(D) +
+             v.where(bias[key].load(), -math.inf) for h in range(heads)] for key, v, kf in zip(keys, valid, kfs)]
+  # a finite max keeps fully masked waves from computing exp(-inf - -inf)
+  m = [functools.reduce(UOp.maximum, (s[h] for s in scores), UOp.const(-1e30, dtypes.float)) for h in range(heads)]
+  p = [[((s[h] - m[h]) * LOG2E).exp2() for h in range(heads)] for s in scores]
+  acc_lds = UOp.alloc((waves, heads, D), dtypes.float, addrspace=AddrSpace.LOCAL)
+  ml_lds = UOp.alloc((waves, heads, 2), dtypes.float, addrspace=AddrSpace.LOCAL)
+  stores = [acc_lds[wave, h, lane*DPL + i].store(sum((pj[h]*kf[i] for pj, kf in zip(p, kfs)), UOp.const(0, dtypes.float)))
+            for h in range(heads) for i in range(DPL)]
+  stores += [ml_lds[wave, h, i].store(x) for h in range(heads) for i, x in enumerate((m[h], sum((pj[h] for pj in p), UOp.const(0, dtypes.float))))]
+  acc_lds, ml_lds = acc_lds.after(*stores), ml_lds.after(*stores)
+  tid, final_stores = wave*WARP_SIZE + lane, []
+  for i in range(heads*D // (waves*WARP_SIZE)):
+    h, d = (tid + i*waves*WARP_SIZE) // D, (tid + i*waves*WARP_SIZE) % D
+    M = functools.reduce(UOp.maximum, (ml_lds[w, h, 0].load() for w in range(waves)))
+    val = sum((((ml_lds[w, h, 0].load() - M) * LOG2E).exp2() * acc_lds[w, h, d].load() for w in range(waves)), UOp.const(0, dtypes.float))
+    final_stores.append(out[head_block*heads + h, chunk, d].store(val))
+  h = tid.valid(tid < heads) if waves*WARP_SIZE > heads else tid
+  M = functools.reduce(UOp.maximum, (ml_lds[w, h, 0].load() for w in range(waves)))
+  L = sum((((ml_lds[w, h, 0].load() - M) * LOG2E).exp2() * ml_lds[w, h, 1].load() for w in range(waves)), UOp.const(0, dtypes.float))
+  final_stores += [stats[head_block*heads + h, chunk, 0].store(M), stats[head_block*heads + h, chunk, 1].store(L)]
+  return UOp.group(*final_stores).end(lane, wave, chunk, head_block).sink(arg=KernelInfo(name="sink_decode_partial", opts_to_apply=()))
+
+@functools.cache
+def _sink_decode_combine(o:UOp, partial:UOp, stats:UOp, sink:UOp, tile:int=64) -> UOp:
+  # one wave a (head, tile of dims), the sink is an empty key: it only adds to the denominator
+  H, C, D = cast(tuple[int, int, int], partial.shape)
+  head, dim_tile, lane = UOp.range(H, 0, AxisType.GLOBAL), UOp.range(D // tile, 1, AxisType.GLOBAL), UOp.range(WARP_SIZE, -1, AxisType.WARP)
+  M = functools.reduce(UOp.maximum, (stats[head, c, 0].load() for c in range(C)), sink[head].load())
+  w = [((stats[head, c, 0].load() - M) * LOG2E).exp2() for c in range(C)]
+  L = sum((wc * stats[head, c, 1].load() for c, wc in enumerate(w)), ((sink[head].load() - M) * LOG2E).exp2())
+  dims = [dim_tile*tile + lane*(tile // WARP_SIZE) + i for i in range(tile // WARP_SIZE)]
+  stores = [o[head, d].store(sum((wc * partial[head, c, d].load() for c, wc in enumerate(w)), UOp.const(0, dtypes.float)) / L) for d in dims]
+  return UOp.group(*stores).end(lane, dim_tile, head).sink(arg=KernelInfo(name="sink_decode_combine", opts_to_apply=()))
+
+@functools.cache
+def _compact_kernel(idx:UOp, bias:UOp, threads:int=256) -> UOp:
+  # the positions of the keys that are not masked, in order, then -1: one block, a thread takes a run of keys
+  N, L = cast(int, bias.shape[0]), cast(int, idx.shape[0])
+  per, tid = -(-N // threads), UOp.range(threads, 0, AxisType.LOCAL)
+  pos = [tid*per + i for i in range(per)]
+  ok = [(p < N) & (UOp.const(-math.inf, dtypes.float) < bias[p.minimum(N-1)].load()) for p in pos]
+  lds = UOp.alloc((threads,), dtypes.int32, addrspace=AddrSpace.LOCAL)
+  lds = lds.after(lds[tid].store(sum((o.cast(dtypes.int32) for o in ok), UOp.const(0, dtypes.int32))))
+  before = sum(((UOp.const(u, dtypes.weakint) < tid).where(lds[u].load(), 0) for u in range(threads)), UOp.const(0, dtypes.int32))
+  total = sum((lds[u].load() for u in range(threads)), UOp.const(0, dtypes.int32))
+  stores, dest = [], before.cast(dtypes.weakint)
+  for p, o in zip(pos, ok):
+    stores.append(idx[dest.valid(o & (dest < L))].store(p.cast(dtypes.int32)))
+    dest = dest + o.cast(dtypes.weakint)
+  pads = [tid*-(-L // threads) + j for j in range(-(-L // threads))]
+  stores += [idx[d.valid((d < L) & (total.cast(dtypes.weakint) <= d))].store(UOp.const(-1, dtypes.int32)) for d in pads]
+  return UOp.group(*stores).end(tid).sink(arg=KernelInfo(name="compact_keys", opts_to_apply=()))
+
+def sink_attention(q:Tensor, k:Tensor, mask:Tensor, sink:Tensor, max_keys:sint|None=None) -> Tensor:
+  # q: (B, H, T, D), k: (B, 1, N, D) keys that are also the values, mask: (B, 1, T, N) additive, sink: (H,) the logit of an empty key
+  # with at most max_keys keys unmasked, the attention reads only those (sparse)
+  B, H, T, D = q.shape
+  if not (isinstance(q.device, str) and amd_custom_kernels_supported(q.device) and B == 1 and resolve(T == 1, False) and D % WARP_SIZE == 0):
+    k = k.cat(k[..., :1, :].const_like(0), dim=-2)
+    mask = mask.expand(B, H, T, -1).cat(sink.reshape(1, -1, 1, 1).expand(B, -1, T, 1), dim=-1)
+    return q.scaled_dot_product_attention(k, k, attn_mask=mask, enable_gqa=True)
+  N, bias = int(k.shape[2]), mask.reshape(-1).float().contiguous()
+  idx, L = [], max_keys if isinstance(max_keys, int) and max_keys < N else N
+  if L < N: idx = [Tensor.custom_kernel(Tensor.empty(L, dtype=dtypes.int32, device=q.device), bias, fxn=_compact_kernel)[0]]
+  chunks = -(-L // 64)
+  partial = Tensor.empty(H, chunks, D, dtype=dtypes.float32, device=q.device)
+  stats = Tensor.empty(H, chunks, 2, dtype=dtypes.float32, device=q.device)
+  srcs = (q.reshape(H, D).float().contiguous(), k.reshape(N, D).half().contiguous(), bias, *idx)
+  partial, stats = Tensor.custom_kernel(partial, stats, *srcs, fxn=_sink_decode_partial)[:2]
+  out = Tensor.empty(H, D, dtype=dtypes.float32, device=q.device)
+  return Tensor.custom_kernel(out, partial, stats, sink.float().contiguous(), fxn=_sink_decode_combine)[0].reshape(B, H, T, D)
 
 # ******** flash attention on the KV cache ********
 
